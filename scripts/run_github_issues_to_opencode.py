@@ -88,16 +88,28 @@ def build_prompt(issue: dict) -> str:
     )
 
 
-def run_agent(issue: dict, agent: str, model: str | None, dry_run: bool) -> int:
+def run_agent(
+    issue: dict,
+    runner: str,
+    agent: str,
+    model: str | None,
+    dry_run: bool,
+) -> int:
     prompt = build_prompt(issue)
-    command = ["opencode", "run", "--agent", agent]
-    if model:
-        command.extend(["--model", model])
-    command.append(prompt)
+
+    if runner == "claude":
+        command = ["claude", "-p", prompt]
+        if model:
+            command.extend(["--model", model])
+    else:
+        command = ["opencode", "run", "--agent", agent]
+        if model:
+            command.extend(["--model", model])
+        command.append(prompt)
 
     if dry_run:
         print(
-            f"[dry-run] Would run: {' '.join(command[:5])} ... for issue #{issue['number']}"
+            f"[dry-run] Would run: {' '.join(command[:4])} ... for issue #{issue['number']}"
         )
         return 0
 
@@ -172,7 +184,7 @@ def open_pr(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Fetch GitHub issues with gh and run opencode agent for each issue body."
+        description="Fetch GitHub issues with gh and run an AI agent for each issue body."
     )
     parser.add_argument(
         "--repo", help="GitHub repo in owner/name format. Defaults to current gh repo."
@@ -181,8 +193,14 @@ def main() -> int:
     parser.add_argument(
         "--limit", type=int, default=10, help="Maximum number of issues to process."
     )
-    parser.add_argument("--agent", default="build", help="Opencode agent name.")
-    parser.add_argument("--model", help="Optional model override for opencode.")
+    parser.add_argument(
+        "--runner",
+        default="claude",
+        choices=["claude", "opencode"],
+        help="AI agent runner to use (default: claude).",
+    )
+    parser.add_argument("--agent", default="build", help="Opencode agent name (only used with --runner opencode).")
+    parser.add_argument("--model", help="Optional model override. For Claude: e.g. claude-sonnet-4-6. For OpenCode: e.g. openai/gpt-4o.")
     parser.add_argument(
         "--branch-prefix",
         default="issue-fix",
@@ -199,7 +217,7 @@ def main() -> int:
         help="Stop after first failed agent run.",
     )
     parser.add_argument(
-        "--dry-run", action="store_true", help="Print actions without running opencode."
+        "--dry-run", action="store_true", help="Print actions without running the agent."
     )
     args = parser.parse_args()
 
@@ -235,7 +253,11 @@ def main() -> int:
             )
 
             exit_code = run_agent(
-                issue=issue, agent=args.agent, model=args.model, dry_run=args.dry_run
+                issue=issue,
+                runner=args.runner,
+                agent=args.agent,
+                model=args.model,
+                dry_run=args.dry_run,
             )
             if exit_code != 0:
                 raise RuntimeError(

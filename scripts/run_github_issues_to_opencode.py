@@ -98,7 +98,7 @@ def run_agent(
     prompt = build_prompt(issue)
 
     if runner == "claude":
-        command = ["claude", "-p", prompt]
+        command = ["claude", "--dangerously-skip-permissions", "-p", prompt]
         if model:
             command.extend(["--model", model])
     else:

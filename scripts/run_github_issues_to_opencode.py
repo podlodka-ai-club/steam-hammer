@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 
@@ -12,6 +13,12 @@ def run_capture(command: list[str]) -> str:
         stderr = result.stderr.strip()
         raise RuntimeError(f"Command failed: {' '.join(command)}\n{stderr}")
     return result.stdout
+
+
+def run_command(command: list[str]) -> None:
+    result = subprocess.run(command)
+    if result.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(command)}")
 
 
 def detect_repo() -> str:
@@ -46,9 +53,34 @@ def fetch_issues(repo: str, state: str, limit: int) -> list[dict]:
     return issues
 
 
+def current_branch() -> str:
+    return run_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"]).strip()
+
+
+def ensure_clean_worktree() -> None:
+    status = run_capture(["git", "status", "--porcelain"]).strip()
+    if status:
+        raise RuntimeError("Git working tree must be clean before running this script.")
+
+
+def slugify(text: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", text.lower()).strip("-")
+    return cleaned[:40] or "issue"
+
+
+def branch_name_for_issue(issue: dict, prefix: str) -> str:
+    return f"{prefix}/#{issue['number']}-{slugify(issue['title'])}".replace("#", "")
+
+
+def has_changes() -> bool:
+    return bool(run_capture(["git", "status", "--porcelain"]).strip())
+
+
 def build_prompt(issue: dict) -> str:
     return (
-        "You are working on a GitHub issue.\n\n"
+        "You are working on a GitHub issue in the current git branch.\n"
+        "Implement the fix for the issue in the repository files.\n"
+        "Do not run git commands; git actions are handled by orchestration script.\n\n"
         f"Issue: #{issue['number']} - {issue['title']}\n"
         f"URL: {issue['url']}\n\n"
         "Issue body:\n"
@@ -74,6 +106,70 @@ def run_agent(issue: dict, agent: str, model: str | None, dry_run: bool) -> int:
     return result.returncode
 
 
+def create_branch(base_branch: str, branch_name: str, dry_run: bool) -> None:
+    if dry_run:
+        print(f"[dry-run] Would create branch '{branch_name}' from '{base_branch}'")
+        return
+    run_command(["git", "checkout", base_branch])
+    run_command(["git", "checkout", "-b", branch_name])
+
+
+def commit_changes(issue: dict, dry_run: bool) -> str:
+    message = f"Fix issue #{issue['number']}: {issue['title']}"
+    if dry_run:
+        print(f"[dry-run] Would commit with message: {message}")
+        return message
+    run_command(["git", "add", "-A"])
+    run_command(["git", "commit", "-m", message])
+    return message
+
+
+def push_branch(branch_name: str, dry_run: bool) -> None:
+    if dry_run:
+        print(f"[dry-run] Would push branch '{branch_name}' to origin")
+        return
+    run_command(["git", "push", "-u", "origin", branch_name])
+
+
+def open_pr(
+    repo: str,
+    base_branch: str,
+    branch_name: str,
+    issue: dict,
+    dry_run: bool,
+) -> str:
+    title = f"Fix issue #{issue['number']}: {issue['title']}"
+    body = (
+        "## Summary\n"
+        f"- Implements fix for issue #{issue['number']}\n"
+        f"- Source issue: {issue['url']}\n\n"
+        f"Closes #{issue['number']}\n"
+    )
+    if dry_run:
+        print(
+            f"[dry-run] Would create PR '{title}' from '{branch_name}' to '{base_branch}'"
+        )
+        return ""
+    output = run_capture(
+        [
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            repo,
+            "--base",
+            base_branch,
+            "--head",
+            branch_name,
+            "--title",
+            title,
+            "--body",
+            body,
+        ]
+    )
+    return output.strip()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Fetch GitHub issues with gh and run opencode agent for each issue body."
@@ -85,8 +181,13 @@ def main() -> int:
     parser.add_argument(
         "--limit", type=int, default=10, help="Maximum number of issues to process."
     )
-    parser.add_argument("--agent", default="general", help="Opencode agent name.")
+    parser.add_argument("--agent", default="build", help="Opencode agent name.")
     parser.add_argument("--model", help="Optional model override for opencode.")
+    parser.add_argument(
+        "--branch-prefix",
+        default="issue-fix",
+        help="Prefix for per-issue git branches.",
+    )
     parser.add_argument(
         "--include-empty",
         action="store_true",
@@ -103,6 +204,8 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        ensure_clean_worktree()
+        base_branch = current_branch()
         repo = args.repo or detect_repo()
         issues = fetch_issues(repo=repo, state=args.state, limit=args.limit)
     except Exception as exc:  # noqa: BLE001
@@ -115,6 +218,7 @@ def main() -> int:
 
     failures = 0
     processed = 0
+    created_prs: list[str] = []
 
     for issue in issues:
         body = (issue.get("body") or "").strip()
@@ -123,19 +227,54 @@ def main() -> int:
             continue
 
         processed += 1
-        exit_code = run_agent(
-            issue=issue, agent=args.agent, model=args.model, dry_run=args.dry_run
-        )
-        if exit_code != 0:
-            failures += 1
-            print(
-                f"Agent failed for issue #{issue['number']} with exit code {exit_code}",
-                file=sys.stderr,
+        issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
+
+        try:
+            create_branch(
+                base_branch=base_branch, branch_name=issue_branch, dry_run=args.dry_run
             )
+
+            exit_code = run_agent(
+                issue=issue, agent=args.agent, model=args.model, dry_run=args.dry_run
+            )
+            if exit_code != 0:
+                raise RuntimeError(
+                    f"Agent failed for issue #{issue['number']} with exit code {exit_code}"
+                )
+
+            if not args.dry_run and not has_changes():
+                print(
+                    f"No changes detected for issue #{issue['number']}; skipping commit and PR"
+                )
+                run_command(["git", "checkout", base_branch])
+                continue
+
+            commit_changes(issue=issue, dry_run=args.dry_run)
+            push_branch(branch_name=issue_branch, dry_run=args.dry_run)
+            pr_url = open_pr(
+                repo=repo,
+                base_branch=base_branch,
+                branch_name=issue_branch,
+                issue=issue,
+                dry_run=args.dry_run,
+            )
+            if pr_url:
+                created_prs.append(pr_url)
+                print(f"Created PR: {pr_url}")
+
+            if not args.dry_run:
+                run_command(["git", "checkout", base_branch])
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            print(f"Issue #{issue['number']} failed: {exc}", file=sys.stderr)
             if args.stop_on_error:
                 break
 
     print(f"Done. Processed: {processed}, failures: {failures}")
+    if created_prs:
+        print("PRs:")
+        for pr_url in created_prs:
+            print(f"- {pr_url}")
     return 1 if failures > 0 else 0
 
 

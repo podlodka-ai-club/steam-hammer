@@ -53,6 +53,25 @@ def fetch_issues(repo: str, state: str, limit: int) -> list[dict]:
     return issues
 
 
+def fetch_issue(repo: str, number: int) -> dict:
+    output = run_capture(
+        [
+            "gh",
+            "issue",
+            "view",
+            str(number),
+            "--repo",
+            repo,
+            "--json",
+            "number,title,body,url",
+        ]
+    )
+    issue = json.loads(output)
+    if not isinstance(issue, dict):
+        raise RuntimeError(f"Unexpected response fetching issue #{number}")
+    return issue
+
+
 def current_branch() -> str:
     return run_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"]).strip()
 
@@ -190,6 +209,9 @@ def main() -> int:
     parser.add_argument(
         "--repo", help="GitHub repo in owner/name format. Defaults to current gh repo."
     )
+    parser.add_argument(
+        "--issue", type=int, help="Process a single issue by number, ignoring --limit and --state."
+    )
     parser.add_argument("--state", default="open", choices=["open", "closed", "all"])
     parser.add_argument(
         "--limit", type=int, default=10, help="Maximum number of issues to process."
@@ -226,7 +248,10 @@ def main() -> int:
         ensure_clean_worktree()
         base_branch = current_branch()
         repo = args.repo or detect_repo()
-        issues = fetch_issues(repo=repo, state=args.state, limit=args.limit)
+        if args.issue is not None:
+            issues = [fetch_issue(repo=repo, number=args.issue)]
+        else:
+            issues = fetch_issues(repo=repo, state=args.state, limit=args.limit)
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}", file=sys.stderr)
         return 1

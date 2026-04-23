@@ -127,6 +127,7 @@ def run_agent(
         command.append(prompt)
 
     if dry_run:
+        shown = [part if part != prompt else "<prompt>" for part in command]
         print(
             f"[dry-run] Would run: {' '.join(command[:4])} ... for issue #{issue['number']}"
         )

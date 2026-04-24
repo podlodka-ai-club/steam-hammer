@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -129,7 +130,7 @@ def run_agent(
     if dry_run:
         shown = [part if part != prompt else "<prompt>" for part in command]
         print(
-            f"[dry-run] Would run: {' '.join(shown)} for issue #{issue['number']}"
+            f"[dry-run] Would run: {' '.join(command[:4])} ... for issue #{issue['number']}"
         )
         return 0
 
@@ -240,9 +241,25 @@ def main() -> int:
         help="Stop after first failed agent run.",
     )
     parser.add_argument(
+        "--dir",
+        default=".",
+        help="Path to the local git repository to operate on. Defaults to the current directory.",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="Print actions without running the agent."
     )
     args = parser.parse_args()
+
+    try:
+        target_dir = os.path.abspath(args.dir)
+        if not os.path.isdir(target_dir):
+            raise RuntimeError(f"--dir path does not exist or is not a directory: {target_dir}")
+        if not os.path.isdir(os.path.join(target_dir, ".git")):
+            raise RuntimeError(f"--dir path is not a git repository: {target_dir}")
+        os.chdir(target_dir)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     try:
         ensure_clean_worktree()

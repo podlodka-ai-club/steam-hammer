@@ -103,6 +103,41 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(items, [])
         self.assertEqual(stats["threads_outdated"], 1)
 
+    def test_normalize_review_items_skips_pr_author_replies(self) -> None:
+        threads = [
+            {
+                "isResolved": False,
+                "comments": {
+                    "nodes": [
+                        {
+                            "body": "done, fixed",
+                            "path": "scripts/tool.py",
+                            "line": 10,
+                            "outdated": False,
+                            "author": {"login": "pr-owner"},
+                        },
+                        {
+                            "body": "please add a test",
+                            "path": "scripts/tool.py",
+                            "line": 12,
+                            "outdated": False,
+                            "author": {"login": "reviewer"},
+                        },
+                    ]
+                },
+            }
+        ]
+
+        items, stats = self.mod.normalize_review_items(
+            threads=threads,
+            reviews=[],
+            pr_author_login="pr-owner",
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["author"], "reviewer")
+        self.assertEqual(stats["comments_pr_author"], 1)
+
     def test_build_pr_review_prompt_contains_locations_and_links(self) -> None:
         pull_request = {
             "number": 23,
@@ -160,6 +195,23 @@ class PrReviewModeTests(unittest.TestCase):
         fetch_issue_mock.assert_called_once_with(repo="owner/repo", number=17)
         self.assertEqual(linked[0]["number"], 17)
         self.assertEqual(linked[0]["body"], "Issue body context")
+
+    def test_fetch_pr_review_threads_raises_when_pr_missing(self) -> None:
+        graphql_response = {
+            "data": {
+                "repository": {
+                    "pullRequest": None,
+                }
+            }
+        }
+
+        with mock.patch.object(
+            self.mod,
+            "run_capture",
+            return_value=self.mod.json.dumps(graphql_response),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not found"):
+                self.mod.fetch_pr_review_threads(repo="owner/repo", number=23)
 
     def test_main_pr_mode_dry_run_handles_empty_actionable_comments(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

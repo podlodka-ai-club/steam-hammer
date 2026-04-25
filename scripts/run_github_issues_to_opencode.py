@@ -95,7 +95,7 @@ def fetch_pull_request(repo: str, number: int) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,url,state,baseRefName,headRefName,reviews,closingIssuesReferences",
+            "number,title,body,url,state,baseRefName,headRefName,author,reviews,closingIssuesReferences",
         ]
     )
     pull_request = json.loads(output)
@@ -164,12 +164,19 @@ def fetch_pr_review_threads(repo: str, number: int) -> list[dict]:
                 f"GraphQL error fetching review threads for PR #{number}: {response['errors']}"
             )
 
-        pr_data = (
-            response.get("data", {})
-            .get("repository", {})
-            .get("pullRequest", {})
-            .get("reviewThreads", {})
-        )
+        repository = response.get("data", {}).get("repository")
+        if not isinstance(repository, dict):
+            raise RuntimeError(f"Unexpected GraphQL repository payload for PR #{number}")
+
+        pull_request = repository.get("pullRequest")
+        if pull_request is None:
+            raise RuntimeError(f"Pull request #{number} not found in GraphQL response")
+        if not isinstance(pull_request, dict):
+            raise RuntimeError(f"Unexpected GraphQL pullRequest payload for PR #{number}")
+
+        pr_data = pull_request.get("reviewThreads") or {}
+        if not isinstance(pr_data, dict):
+            raise RuntimeError(f"Unexpected review thread structure for PR #{number}")
         page_nodes = pr_data.get("nodes") or []
         if not isinstance(page_nodes, list):
             raise RuntimeError(f"Unexpected review thread structure for PR #{number}")
@@ -184,8 +191,13 @@ def fetch_pr_review_threads(repo: str, number: int) -> list[dict]:
     return threads
 
 
-def normalize_review_items(threads: list[dict], reviews: list[dict]) -> tuple[list[dict], dict]:
+def normalize_review_items(
+    threads: list[dict],
+    reviews: list[dict],
+    pr_author_login: str | None = None,
+) -> tuple[list[dict], dict]:
     actionable: list[dict] = []
+    pr_author = (pr_author_login or "").strip().lower()
     stats = {
         "threads_total": len(threads),
         "threads_resolved": 0,
@@ -193,6 +205,7 @@ def normalize_review_items(threads: list[dict], reviews: list[dict]) -> tuple[li
         "comments_total": 0,
         "comments_empty": 0,
         "comments_outdated": 0,
+        "comments_pr_author": 0,
         "reviews_total": len(reviews),
         "reviews_used": 0,
     }
@@ -215,6 +228,11 @@ def normalize_review_items(threads: list[dict], reviews: list[dict]) -> tuple[li
                 stats["comments_outdated"] += 1
                 continue
 
+            author_login = ((comment.get("author") or {}).get("login") or "").strip()
+            if pr_author and author_login.lower() == pr_author:
+                stats["comments_pr_author"] += 1
+                continue
+
             body = (comment.get("body") or "").strip()
             if not body:
                 stats["comments_empty"] += 1
@@ -223,7 +241,7 @@ def normalize_review_items(threads: list[dict], reviews: list[dict]) -> tuple[li
             actionable.append(
                 {
                     "type": "review_comment",
-                    "author": (comment.get("author") or {}).get("login") or "unknown",
+                    "author": author_login or "unknown",
                     "body": body,
                     "path": comment.get("path") or "",
                     "line": comment.get("line") or comment.get("originalLine"),
@@ -395,6 +413,7 @@ def print_review_dry_run(pull_request: dict, review_items: list[dict], stats: di
         f"comments_total={stats.get('comments_total', 0)}, "
         f"comments_outdated={stats.get('comments_outdated', 0)}, "
         f"comments_empty={stats.get('comments_empty', 0)}, reviews_used={stats.get('reviews_used', 0)}"
+        f", comments_pr_author={stats.get('comments_pr_author', 0)}"
     )
     preview = review_items[:10]
     for item in preview:
@@ -765,7 +784,12 @@ def main() -> int:
                 return 0
             threads = fetch_pr_review_threads(repo=repo, number=args.pr)
             reviews = pull_request.get("reviews") or []
-            review_items, review_stats = normalize_review_items(threads=threads, reviews=reviews)
+            pr_author_login = ((pull_request.get("author") or {}).get("login") or "").strip()
+            review_items, review_stats = normalize_review_items(
+                threads=threads,
+                reviews=reviews,
+                pr_author_login=pr_author_login,
+            )
             linked_issue_context = load_linked_issue_context(repo=repo, pull_request=pull_request)
             if args.dry_run:
                 print_review_dry_run(

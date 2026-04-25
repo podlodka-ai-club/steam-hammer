@@ -4,8 +4,10 @@ import argparse
 import json
 import os
 import re
+import selectors
 import subprocess
 import sys
+import time
 
 
 def run_capture(command: list[str]) -> str:
@@ -114,6 +116,9 @@ def run_agent(
     agent: str,
     model: str | None,
     dry_run: bool,
+    timeout_seconds: int,
+    idle_timeout_seconds: int | None,
+    opencode_auto_approve: bool,
 ) -> int:
     prompt = build_prompt(issue)
 
@@ -125,18 +130,85 @@ def run_agent(
         command = ["opencode", "run", "--agent", agent]
         if model:
             command.extend(["--model", model])
+        if opencode_auto_approve:
+            command.append("--dangerously-skip-permissions")
         command.append(prompt)
 
     if dry_run:
-        shown = [part if part != prompt else "<prompt>" for part in command]
         print(
             f"[dry-run] Would run: {' '.join(command[:4])} ... for issue #{issue['number']}"
         )
         return 0
 
     print(f"Running agent for issue #{issue['number']}: {issue['title']}")
-    result = subprocess.run(command)
-    return result.returncode
+    start = time.monotonic()
+    last_output = start
+
+    process = subprocess.Popen(  # noqa: S603
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    selector = selectors.DefaultSelector()
+    if process.stdout is not None:
+        selector.register(process.stdout, selectors.EVENT_READ)
+    if process.stderr is not None:
+        selector.register(process.stderr, selectors.EVENT_READ)
+
+    try:
+        while True:
+            now = time.monotonic()
+            elapsed = now - start
+            idle_elapsed = now - last_output
+
+            if timeout_seconds > 0 and elapsed > timeout_seconds:
+                process.kill()
+                process.wait(timeout=10)
+                raise RuntimeError(
+                    f"Agent timed out after {timeout_seconds}s for issue #{issue['number']}. "
+                    "Possible causes: waiting for interactive approval, network stall, "
+                    "or a long-running task. Try increasing --agent-timeout-seconds, "
+                    "setting --agent-idle-timeout-seconds, or using --opencode-auto-approve "
+                    "for OpenCode if safe in your environment."
+                )
+
+            if idle_timeout_seconds and idle_elapsed > idle_timeout_seconds:
+                process.kill()
+                process.wait(timeout=10)
+                raise RuntimeError(
+                    f"Agent produced no output for {idle_timeout_seconds}s on issue "
+                    f"#{issue['number']}; aborting to avoid indefinite hang. "
+                    "Possible causes: waiting for interactive approval or a stuck process. "
+                    "Try --opencode-auto-approve (if safe) or a larger "
+                    "--agent-idle-timeout-seconds."
+                )
+
+            events = selector.select(timeout=1.0)
+            if events:
+                for key, _ in events:
+                    line = key.fileobj.readline()
+                    if line:
+                        last_output = time.monotonic()
+                        if key.fileobj is process.stderr:
+                            print(line, end="", file=sys.stderr)
+                        else:
+                            print(line, end="")
+
+            if process.poll() is not None:
+                if process.stdout is not None:
+                    remainder = process.stdout.read() or ""
+                    if remainder:
+                        print(remainder, end="")
+                if process.stderr is not None:
+                    remainder = process.stderr.read() or ""
+                    if remainder:
+                        print(remainder, end="", file=sys.stderr)
+                return process.returncode
+    finally:
+        selector.close()
 
 
 def create_branch(base_branch: str, branch_name: str, dry_run: bool) -> None:
@@ -226,6 +298,25 @@ def main() -> int:
     parser.add_argument("--agent", default="build", help="Opencode agent name (only used with --runner opencode).")
     parser.add_argument("--model", help="Optional model override. For Claude: e.g. claude-sonnet-4-6. For OpenCode: e.g. openai/gpt-4o.")
     parser.add_argument(
+        "--agent-timeout-seconds",
+        type=int,
+        default=900,
+        help="Hard timeout for agent execution in seconds (default: 900).",
+    )
+    parser.add_argument(
+        "--agent-idle-timeout-seconds",
+        type=int,
+        help="Abort if agent produces no output for this many seconds.",
+    )
+    parser.add_argument(
+        "--opencode-auto-approve",
+        action="store_true",
+        help=(
+            "For --runner opencode, pass --dangerously-skip-permissions to reduce "
+            "interactive approval waits. Use with caution."
+        ),
+    )
+    parser.add_argument(
         "--branch-prefix",
         default="issue-fix",
         help="Prefix for per-issue git branches.",
@@ -301,6 +392,9 @@ def main() -> int:
                 agent=args.agent,
                 model=args.model,
                 dry_run=args.dry_run,
+                timeout_seconds=args.agent_timeout_seconds,
+                idle_timeout_seconds=args.agent_idle_timeout_seconds,
+                opencode_auto_approve=args.opencode_auto_approve,
             )
             if exit_code != 0:
                 raise RuntimeError(

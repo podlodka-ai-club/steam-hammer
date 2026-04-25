@@ -26,6 +26,16 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --limit 1 --ru
 python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 20 --runner opencode --model openai/gpt-5.3-codex --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
 ```
 
+**Issue run with automatic PR-review mode (when linked open PR exists):**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --runner opencode --agent build
+```
+
+**Force legacy issue-flow even if issue has open PR:**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --force-issue-flow
+```
+
 ## Local config preset (per user/per machine)
 
 You can define local defaults without changing repository defaults.
@@ -55,6 +65,7 @@ Supported local config keys:
 - `include_empty` (boolean)
 - `stop_on_error` (boolean)
 - `fail_on_existing` (boolean)
+- `force_issue_flow` (boolean)
 
 You can also point to a different local config file:
 
@@ -91,6 +102,7 @@ Useful options:
 - `--opencode-auto-approve` pass `--dangerously-skip-permissions` to OpenCode (use with caution)
 - `--local-config path` load local JSON defaults (default: `local-config.json` under `--dir`)
 - `--fail-on-existing` strict mode: fail if issue branch or PR already exists
+- `--force-issue-flow` disable auto-switch to PR-review mode for `--issue`
 
 If `--repo` is not provided, script tries to detect repository from current `gh` context.
 
@@ -110,6 +122,14 @@ Note: script expects a clean git working tree before run.
 - If an open PR already exists for `base <- issue-branch`, the script reuses that PR and pushes new commits to the same branch.
 - Use `--dry-run` to preview whether each issue will create or reuse branch/PR resources.
 - Use `--fail-on-existing` when you want strict behavior and prefer the run to fail if branch/PR already exists.
+
+## Auto switch to PR-review mode
+
+- When you run with `--issue <n>`, the script checks whether this issue has a linked open PR.
+- If found, it automatically switches to PR-review mode and builds the agent prompt from issue + PR + review comments context.
+- The script logs that auto-switch happened and why (including the PR number).
+- `--dry-run` prints selected mode (`issue-flow` or `pr-review`) and the reason.
+- Use `--force-issue-flow` to keep legacy issue-flow behavior.
 
 ## Verification
 

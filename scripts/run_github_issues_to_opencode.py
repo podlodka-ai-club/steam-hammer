@@ -143,7 +143,7 @@ def fetch_pull_request(repo: str, number: int) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,url,state,headRefName,baseRefName,author,closingIssuesReferences,reviews",
+            "number,title,body,url,state,mergeStateStatus,headRefName,baseRefName,author,closingIssuesReferences,reviews",
         ]
     )
     pull_request = json.loads(output)
@@ -428,6 +428,8 @@ def normalize_review_items(
             }
         )
         stats["reviews_used"] += 1
+        if is_pr_author_feedback:
+            stats["reviews_pr_author"] += 1
 
     for comment in conversation_comments or []:
         if not isinstance(comment, dict):
@@ -939,19 +941,23 @@ def auto_resolve_merge_conflicts_with_base() -> int:
 
 def merge_sync_with_auto_resolution(remote_base_ref: str, branch_name: str) -> bool:
     before_sync_sha = current_head_sha()
+    print(
+        f"Sync attempt: merge reused branch '{branch_name}' with '{remote_base_ref}' "
+        "using base-favored strategy"
+    )
 
     try:
         run_command(["git", "merge", "--no-edit", "-X", "theirs", remote_base_ref])
     except RuntimeError:
         print(
-            f"Merge sync for reused branch '{branch_name}' hit conflicts; "
-            "attempting automatic conflict resolution in favor of base branch"
+            f"Conflict detected during merge sync for reused branch '{branch_name}'; "
+            "auto-resolving by keeping selected base branch changes"
         )
         try:
             resolved_files_count = auto_resolve_merge_conflicts_with_base()
             print(
                 f"Auto-resolved {resolved_files_count} conflicted file(s) "
-                f"for reused branch '{branch_name}'"
+                f"for reused branch '{branch_name}' via base-favored merge resolution"
             )
         except Exception as resolve_exc:  # noqa: BLE001
             command_succeeds(["git", "merge", "--abort"])
@@ -1031,7 +1037,7 @@ def sync_reused_branch_with_base(
         return False
 
     print(
-        f"Syncing reused branch '{branch_name}' with '{remote_base_ref}' "
+        f"Sync attempt: reused branch '{branch_name}' with '{remote_base_ref}' "
         f"using '{strategy}' strategy"
     )
 
@@ -1049,8 +1055,8 @@ def sync_reused_branch_with_base(
     except RuntimeError:
         command_succeeds(["git", "rebase", "--abort"])
         print(
-            f"Rebase sync for reused branch '{branch_name}' hit conflicts; "
-            "falling back to merge-based auto-resolution"
+            f"Conflict detected during rebase sync for reused branch '{branch_name}'; "
+            "switching to merge-based auto-resolution"
         )
         return merge_sync_with_auto_resolution(
             remote_base_ref=remote_base_ref,
@@ -1764,6 +1770,7 @@ def main() -> int:
             linked_open_pr: dict | None = None
             mode = "issue-flow"
             mode_reason = "batch issue processing"
+            skip_agent_run = False
             if issue_number_arg is not None and has_force_issue_flow_flag:
                 linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
                 mode, mode_reason = choose_execution_mode(
@@ -1797,6 +1804,13 @@ def main() -> int:
                     f"Auto-switch to PR-review mode for issue #{issue['number']}: {mode_reason}."
                 )
                 pull_request = fetch_pull_request(repo=repo, number=pr_number)
+                merge_state = str(pull_request.get("mergeStateStatus") or "").strip().upper()
+                should_force_sync_rerun = merge_state in {"DIRTY", "CONFLICTING"}
+                if should_force_sync_rerun:
+                    print(
+                        f"Linked PR #{pr_number} is not mergeable with base yet "
+                        f"(mergeStateStatus={merge_state}); rerun will auto-sync and resolve routine conflicts"
+                    )
                 thread_items = fetch_pr_review_threads(repo=repo, number=pr_number)
                 conversation_comments = fetch_pr_conversation_comments(
                     repo=repo,
@@ -1820,19 +1834,6 @@ def main() -> int:
                     "Review prompt sources: "
                     f"{format_review_filtering_stats(_review_stats)}"
                 )
-                if not review_items:
-                    print(
-                        f"No actionable review comments for linked PR #{pr_number}; "
-                        "skipping issue run."
-                    )
-                    continue
-
-                linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
-                prompt_override = build_pr_review_prompt(
-                    pull_request=pull_request,
-                    review_items=review_items,
-                    linked_issues=linked_issues,
-                )
                 issue_branch = str(linked_open_pr.get("headRefName") or "").strip()
                 if not issue_branch:
                     raise RuntimeError(
@@ -1841,6 +1842,28 @@ def main() -> int:
                 target_base_branch = str(linked_open_pr.get("baseRefName") or base_branch).strip()
                 if not target_base_branch:
                     target_base_branch = base_branch
+
+                if not review_items:
+                    if should_force_sync_rerun:
+                        skip_agent_run = True
+                        print(
+                            f"No actionable review comments for linked PR #{pr_number}; "
+                            f"continuing with sync-only rerun because mergeStateStatus={merge_state}"
+                        )
+                    else:
+                        print(
+                            f"No actionable review comments for linked PR #{pr_number}; "
+                            "skipping issue run."
+                        )
+                        continue
+
+                if review_items:
+                    linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                    prompt_override = build_pr_review_prompt(
+                        pull_request=pull_request,
+                        review_items=review_items,
+                        linked_issues=linked_issues,
+                    )
 
                 review_comment_count = len(review_items)
                 if args.dry_run:
@@ -1895,21 +1918,27 @@ def main() -> int:
                     f"strategy: '{args.sync_strategy}')"
                 )
 
-            exit_code = run_agent(
-                issue=issue,
-                runner=args.runner,
-                agent=args.agent,
-                model=args.model,
-                dry_run=args.dry_run,
-                timeout_seconds=args.agent_timeout_seconds,
-                idle_timeout_seconds=args.agent_idle_timeout_seconds,
-                opencode_auto_approve=args.opencode_auto_approve,
-                prompt_override=prompt_override,
-            )
-            if exit_code != 0:
-                raise RuntimeError(
-                    f"Agent failed for issue #{issue['number']} with exit code {exit_code}"
+            if skip_agent_run:
+                print(
+                    f"Skipping agent run for issue #{issue['number']} in pr-review mode: "
+                    "no actionable review comments; running sync-only path"
                 )
+            else:
+                exit_code = run_agent(
+                    issue=issue,
+                    runner=args.runner,
+                    agent=args.agent,
+                    model=args.model,
+                    dry_run=args.dry_run,
+                    timeout_seconds=args.agent_timeout_seconds,
+                    idle_timeout_seconds=args.agent_idle_timeout_seconds,
+                    opencode_auto_approve=args.opencode_auto_approve,
+                    prompt_override=prompt_override,
+                )
+                if exit_code != 0:
+                    raise RuntimeError(
+                        f"Agent failed for issue #{issue['number']} with exit code {exit_code}"
+                    )
 
             if not args.dry_run and not has_changes():
                 if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:
@@ -1917,11 +1946,24 @@ def main() -> int:
                         f"No file changes from agent for issue #{issue['number']}; "
                         "pushing sync-only branch updates"
                     )
+                    used_force_with_lease = args.sync_strategy == "rebase"
                     push_branch(
                         branch_name=issue_branch,
                         dry_run=False,
-                        force_with_lease=args.sync_strategy == "rebase",
+                        force_with_lease=used_force_with_lease,
                     )
+                    print(
+                        f"Sync-only push result for issue #{issue['number']}: "
+                        f"branch '{issue_branch}' pushed "
+                        f"(force-with-lease: {'yes' if used_force_with_lease else 'no'})"
+                    )
+                    if mode == "pr-review" and linked_open_pr is not None:
+                        linked_pr_number = linked_open_pr.get("number")
+                        if type(linked_pr_number) is int:
+                            print(
+                                f"PR #{linked_pr_number} rerun sync pushed; "
+                                "GitHub mergeability should be recalculated without manual conflict steps"
+                            )
                     pr_status, pr_url = ensure_pr(
                         repo=repo,
                         base_branch=target_base_branch,

@@ -24,6 +24,7 @@ BUILTIN_DEFAULTS = {
     "include_empty": False,
     "stop_on_error": False,
     "fail_on_existing": False,
+    "force_issue_flow": False,
     "dir": ".",
 }
 
@@ -98,6 +99,85 @@ def fetch_issue(repo: str, number: int) -> dict:
     return issue
 
 
+def pr_links_issue(pr: dict, issue_number: int) -> bool:
+    references = pr.get("closingIssuesReferences")
+    if isinstance(references, list):
+        for reference in references:
+            if isinstance(reference, dict) and reference.get("number") == issue_number:
+                return True
+
+    token = f"#{issue_number}"
+    title = str(pr.get("title") or "")
+    body = str(pr.get("body") or "")
+    if token in title or token in body:
+        return True
+
+    head_ref = str(pr.get("headRefName") or "")
+    if re.search(rf"(^|[^0-9]){issue_number}([^0-9]|$)", head_ref):
+        return True
+
+    return False
+
+
+def find_open_pr_for_issue(repo: str, issue_number: int) -> dict | None:
+    output = run_capture(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "number,title,url,body,headRefName,baseRefName,closingIssuesReferences",
+        ]
+    )
+    prs = json.loads(output)
+    if not isinstance(prs, list):
+        raise RuntimeError("Unexpected response from gh pr list while searching linked PR")
+
+    for pr in prs:
+        if isinstance(pr, dict) and pr_links_issue(pr, issue_number=issue_number):
+            return pr
+    return None
+
+
+def fetch_pr_review_comments(repo: str, pr_number: int) -> list[dict]:
+    output = run_capture(
+        [
+            "gh",
+            "api",
+            f"repos/{repo}/pulls/{pr_number}/comments",
+            "--method",
+            "GET",
+            "-f",
+            "per_page=100",
+        ]
+    )
+    comments = json.loads(output)
+    if not isinstance(comments, list):
+        raise RuntimeError("Unexpected response from gh api while fetching PR review comments")
+
+    normalized_comments: list[dict] = []
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        normalized_comments.append(
+            {
+                "author": str(user.get("login") or "unknown"),
+                "path": str(comment.get("path") or ""),
+                "line": comment.get("line"),
+                "body": str(comment.get("body") or "").strip(),
+                "url": str(comment.get("html_url") or ""),
+            }
+        )
+    return normalized_comments
+
+
 def current_branch() -> str:
     return run_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"]).strip()
 
@@ -133,6 +213,60 @@ def build_prompt(issue: dict) -> str:
     )
 
 
+def build_pr_review_prompt(issue: dict, pr: dict, review_comments: list[dict]) -> str:
+    comment_lines: list[str] = []
+    if review_comments:
+        for index, comment in enumerate(review_comments, start=1):
+            path = comment.get("path") or "unknown-file"
+            line = comment.get("line")
+            line_suffix = f":{line}" if isinstance(line, int) else ""
+            author = comment.get("author") or "unknown"
+            body = str(comment.get("body") or "").strip()
+            comment_url = comment.get("url") or ""
+            comment_lines.append(
+                f"{index}. [{author}] {path}{line_suffix}: {body}\n   {comment_url}".strip()
+            )
+    else:
+        comment_lines.append("No inline review comments found in the PR API response.")
+
+    pr_number = pr.get("number")
+    pr_title = str(pr.get("title") or "")
+    pr_url = str(pr.get("url") or "")
+    pr_body = str(pr.get("body") or "").strip()
+    comments_text = "\n".join(comment_lines)
+
+    return (
+        "You are working on an existing GitHub pull request review cycle in the current git branch.\n"
+        "Implement the fix requested in PR review comments in repository files.\n"
+        "Do not run git commands; git actions are handled by orchestration script.\n\n"
+        f"Issue: #{issue['number']} - {issue['title']}\n"
+        f"Issue URL: {issue['url']}\n"
+        f"PR: #{pr_number} - {pr_title}\n"
+        f"PR URL: {pr_url}\n\n"
+        "Issue body:\n"
+        f"{issue.get('body', '').strip()}\n\n"
+        "PR description:\n"
+        f"{pr_body}\n\n"
+        "Review comments to address:\n"
+        f"{comments_text}\n"
+    )
+
+
+def choose_execution_mode(
+    issue_number: int,
+    linked_open_pr: dict | None,
+    force_issue_flow: bool,
+) -> tuple[str, str]:
+    if force_issue_flow:
+        return "issue-flow", "--force-issue-flow is set"
+
+    if linked_open_pr is None:
+        return "issue-flow", f"no open PR linked to issue #{issue_number}"
+
+    pr_number = linked_open_pr.get("number")
+    return "pr-review", f"found linked open PR #{pr_number}"
+
+
 def run_agent(
     issue: dict,
     runner: str,
@@ -142,8 +276,9 @@ def run_agent(
     timeout_seconds: int,
     idle_timeout_seconds: int | None,
     opencode_auto_approve: bool,
+    prompt_override: str | None = None,
 ) -> int:
-    prompt = build_prompt(issue)
+    prompt = prompt_override if prompt_override is not None else build_prompt(issue)
 
     if runner == "claude":
         command = ["claude", "--dangerously-skip-permissions", "-p", prompt]
@@ -439,6 +574,7 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "include_empty",
         "stop_on_error",
         "fail_on_existing",
+        "force_issue_flow",
     }
 
     unsupported = sorted(set(config) - supported_keys)
@@ -493,7 +629,13 @@ def validate_local_config(config: dict, config_path: str) -> dict:
             )
         validated["agent_idle_timeout_seconds"] = value
 
-    for key in ["opencode_auto_approve", "include_empty", "stop_on_error", "fail_on_existing"]:
+    for key in [
+        "opencode_auto_approve",
+        "include_empty",
+        "stop_on_error",
+        "fail_on_existing",
+        "force_issue_flow",
+    ]:
         if key in config:
             if not isinstance(config[key], bool):
                 raise RuntimeError(f"Local config key '{key}' must be a boolean")
@@ -611,6 +753,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--force-issue-flow",
+        action="store_true",
+        help=(
+            "Disable auto-switch to PR-review mode when --issue has a linked open PR. "
+            "Keeps legacy issue-flow behavior."
+        ),
+    )
+    parser.add_argument(
         "--dir",
         default=BUILTIN_DEFAULTS["dir"],
         help="Path to the local git repository to operate on. Defaults to the current directory.",
@@ -679,17 +829,81 @@ def main() -> int:
     touched_prs: list[str] = []
 
     for issue in issues:
-        body = (issue.get("body") or "").strip()
-        if not body and not args.include_empty:
-            print(f"Skipping issue #{issue['number']} (empty body)")
-            continue
-
-        processed += 1
-        issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
-
         try:
+            linked_open_pr: dict | None = None
+            mode = "issue-flow"
+            mode_reason = "batch issue processing"
+            if args.issue is not None:
+                linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
+                mode, mode_reason = choose_execution_mode(
+                    issue_number=issue["number"],
+                    linked_open_pr=linked_open_pr,
+                    force_issue_flow=args.force_issue_flow,
+                )
+
+            body = (issue.get("body") or "").strip()
+            if mode == "issue-flow" and not body and not args.include_empty:
+                print(f"Skipping issue #{issue['number']} (empty body)")
+                continue
+
+            processed += 1
+
+            prompt_override: str | None = None
+            if mode == "pr-review":
+                if linked_open_pr is None:
+                    raise RuntimeError(
+                        f"Internal error: PR-review mode selected without linked PR for issue #{issue['number']}"
+                    )
+
+                pr_number_raw = linked_open_pr.get("number")
+                if type(pr_number_raw) is not int:
+                    raise RuntimeError(
+                        f"Linked PR for issue #{issue['number']} has invalid number: {pr_number_raw}"
+                    )
+                pr_number = pr_number_raw
+
+                print(
+                    f"Auto-switch to PR-review mode for issue #{issue['number']}: {mode_reason}."
+                )
+                review_comments = fetch_pr_review_comments(repo=repo, pr_number=pr_number)
+                prompt_override = build_pr_review_prompt(
+                    issue=issue,
+                    pr=linked_open_pr,
+                    review_comments=review_comments,
+                )
+                issue_branch = str(linked_open_pr.get("headRefName") or "").strip()
+                if not issue_branch:
+                    raise RuntimeError(
+                        f"Linked PR #{pr_number} has empty headRefName; cannot select working branch"
+                    )
+                target_base_branch = str(linked_open_pr.get("baseRefName") or base_branch).strip()
+                if not target_base_branch:
+                    target_base_branch = base_branch
+
+                review_comment_count = len(review_comments)
+                if args.dry_run:
+                    print(
+                        "[dry-run] Selected mode: pr-review "
+                        f"(reason: {mode_reason}; PR #{pr_number}; review comments: {review_comment_count})"
+                    )
+                else:
+                    print(
+                        f"Selected mode: pr-review (reason: {mode_reason}; "
+                        f"PR #{pr_number}; review comments: {review_comment_count})"
+                    )
+            else:
+                if args.issue is not None:
+                    if args.dry_run:
+                        print(
+                            f"[dry-run] Selected mode: issue-flow (reason: {mode_reason})"
+                        )
+                    else:
+                        print(f"Selected mode: issue-flow (reason: {mode_reason})")
+                issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
+                target_base_branch = base_branch
+
             branch_status = prepare_issue_branch(
-                base_branch=base_branch,
+                base_branch=target_base_branch,
                 branch_name=issue_branch,
                 dry_run=args.dry_run,
                 fail_on_existing=args.fail_on_existing,
@@ -705,6 +919,7 @@ def main() -> int:
                 timeout_seconds=args.agent_timeout_seconds,
                 idle_timeout_seconds=args.agent_idle_timeout_seconds,
                 opencode_auto_approve=args.opencode_auto_approve,
+                prompt_override=prompt_override,
             )
             if exit_code != 0:
                 raise RuntimeError(
@@ -722,7 +937,7 @@ def main() -> int:
             push_branch(branch_name=issue_branch, dry_run=args.dry_run)
             pr_status, pr_url = ensure_pr(
                 repo=repo,
-                base_branch=base_branch,
+                base_branch=target_base_branch,
                 branch_name=issue_branch,
                 issue=issue,
                 dry_run=args.dry_run,

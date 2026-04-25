@@ -127,6 +127,35 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 fail_on_existing=True,
             )
 
+    @patch(
+        "scripts.run_github_issues_to_opencode.find_existing_pr",
+        return_value={
+            "number": 24,
+            "url": "https://github.com/owner/repo/pull/24",
+            "baseRefName": "main",
+        },
+    )
+    def test_ensure_pr_strict_mode_reports_existing_and_selected_bases(
+        self,
+        _find_existing_pr,
+    ) -> None:
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"to 'main' \(#24; selected base 'issue-fix/26-some-other-branch'\)",
+        ):
+            ensure_pr(
+                repo="owner/repo",
+                base_branch="issue-fix/26-some-other-branch",
+                branch_name="issue-fix/23-pr-review-comments",
+                issue={
+                    "number": 23,
+                    "title": "PR review comments",
+                    "url": "https://example.com/issues/23",
+                },
+                dry_run=False,
+                fail_on_existing=True,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

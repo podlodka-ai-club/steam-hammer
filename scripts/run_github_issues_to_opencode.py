@@ -446,14 +446,19 @@ def ensure_pr(
     if existing_pr is not None:
         pr_url = str(existing_pr.get("url", "")).strip()
         pr_number = existing_pr.get("number")
+        existing_base = str(existing_pr.get("baseRefName", "")).strip()
         if fail_on_existing:
+            if existing_base and existing_base != base_branch:
+                raise RuntimeError(
+                    f"PR already exists for branch '{branch_name}' to '{existing_base}' "
+                    f"(#{pr_number}; selected base '{base_branch}') and --fail-on-existing is enabled"
+                )
             raise RuntimeError(
                 f"PR already exists for branch '{branch_name}' to '{base_branch}' "
                 f"(#{pr_number}) and --fail-on-existing is enabled"
             )
 
         if dry_run:
-            existing_base = str(existing_pr.get("baseRefName", "")).strip()
             if existing_base and existing_base != base_branch:
                 print(
                     f"[dry-run] Would reuse existing PR #{pr_number} from '{branch_name}' to "
@@ -464,7 +469,6 @@ def ensure_pr(
                     f"[dry-run] Would reuse existing PR #{pr_number} from '{branch_name}' to '{base_branch}'"
                 )
         else:
-            existing_base = str(existing_pr.get("baseRefName", "")).strip()
             if existing_base and existing_base != base_branch:
                 print(
                     f"Reusing existing PR #{pr_number}: {pr_url} "

@@ -50,6 +50,10 @@ def command_succeeds(command: list[str]) -> bool:
     return result.returncode == 0
 
 
+def current_head_sha() -> str:
+    return run_capture(["git", "rev-parse", "HEAD"]).strip()
+
+
 def detect_repo() -> str:
     output = run_capture(
         ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]
@@ -457,7 +461,7 @@ def sync_reused_branch_with_base(
     branch_name: str,
     strategy: str,
     dry_run: bool,
-) -> None:
+) -> bool:
     remote_base_ref = f"origin/{base_branch}"
 
     if dry_run:
@@ -465,12 +469,14 @@ def sync_reused_branch_with_base(
             f"[dry-run] Would sync reused branch '{branch_name}' with '{remote_base_ref}' "
             f"using '{strategy}' strategy"
         )
-        return
+        return False
 
     print(
         f"Syncing reused branch '{branch_name}' with '{remote_base_ref}' "
         f"using '{strategy}' strategy"
     )
+
+    before_sync_sha = current_head_sha()
 
     run_command(["git", "fetch", "origin", base_branch])
 
@@ -497,6 +503,14 @@ def sync_reused_branch_with_base(
             "--no-sync-reused-branch."
         ) from exc
 
+    after_sync_sha = current_head_sha()
+    synced = before_sync_sha != after_sync_sha
+    if synced:
+        print(f"Reused branch '{branch_name}' updated after sync")
+    else:
+        print(f"Reused branch '{branch_name}' already up to date with '{remote_base_ref}'")
+    return synced
+
 
 def commit_changes(issue: dict, dry_run: bool) -> str:
     message = f"Fix issue #{issue['number']}: {issue['title']}"
@@ -508,11 +522,20 @@ def commit_changes(issue: dict, dry_run: bool) -> str:
     return message
 
 
-def push_branch(branch_name: str, dry_run: bool) -> None:
+def push_branch(branch_name: str, dry_run: bool, force_with_lease: bool = False) -> None:
+    command = ["git", "push", "-u", "origin", branch_name]
+    if force_with_lease:
+        command.insert(3, "--force-with-lease")
+
     if dry_run:
-        print(f"[dry-run] Would push branch '{branch_name}' to origin")
+        if force_with_lease:
+            print(
+                f"[dry-run] Would push branch '{branch_name}' to origin with --force-with-lease"
+            )
+        else:
+            print(f"[dry-run] Would push branch '{branch_name}' to origin")
         return
-    run_command(["git", "push", "-u", "origin", branch_name])
+    run_command(command)
 
 
 def open_pr(
@@ -1066,9 +1089,11 @@ def main() -> int:
             )
             print(f"Branch status for issue #{issue['number']}: {branch_status}")
 
+            reused_branch_sync_changed = False
+
             if branch_status == "reused":
                 if args.sync_reused_branch:
-                    sync_reused_branch_with_base(
+                    reused_branch_sync_changed = sync_reused_branch_with_base(
                         base_branch=target_base_branch,
                         branch_name=issue_branch,
                         strategy=args.sync_strategy,
@@ -1104,6 +1129,30 @@ def main() -> int:
                 )
 
             if not args.dry_run and not has_changes():
+                if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:
+                    print(
+                        f"No file changes from agent for issue #{issue['number']}; "
+                        "pushing sync-only branch updates"
+                    )
+                    push_branch(
+                        branch_name=issue_branch,
+                        dry_run=False,
+                        force_with_lease=args.sync_strategy == "rebase",
+                    )
+                    pr_status, pr_url = ensure_pr(
+                        repo=repo,
+                        base_branch=target_base_branch,
+                        branch_name=issue_branch,
+                        issue=issue,
+                        dry_run=False,
+                        fail_on_existing=args.fail_on_existing,
+                    )
+                    if pr_url:
+                        touched_prs.append(pr_url)
+                        print(f"PR status for issue #{issue['number']}: {pr_status} ({pr_url})")
+                    run_command(["git", "checkout", base_branch])
+                    continue
+
                 print(
                     f"No changes detected for issue #{issue['number']}; skipping commit and PR"
                 )
@@ -1111,7 +1160,16 @@ def main() -> int:
                 continue
 
             commit_changes(issue=issue, dry_run=args.dry_run)
-            push_branch(branch_name=issue_branch, dry_run=args.dry_run)
+            push_branch(
+                branch_name=issue_branch,
+                dry_run=args.dry_run,
+                force_with_lease=(
+                    branch_status == "reused"
+                    and args.sync_reused_branch
+                    and args.sync_strategy == "rebase"
+                    and reused_branch_sync_changed
+                ),
+            )
             pr_status, pr_url = ensure_pr(
                 repo=repo,
                 base_branch=target_base_branch,

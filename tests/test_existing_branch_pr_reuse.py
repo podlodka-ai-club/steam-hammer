@@ -6,11 +6,24 @@ from scripts.run_github_issues_to_opencode import (
     ensure_pr,
     main,
     prepare_issue_branch,
+    push_branch,
     sync_reused_branch_with_base,
 )
 
 
 class ExistingBranchAndPrReuseTests(unittest.TestCase):
+    @patch("scripts.run_github_issues_to_opencode.run_command")
+    def test_push_branch_uses_force_with_lease_when_requested(self, run_command_mock) -> None:
+        push_branch(
+            branch_name="issue-fix/33-sync-reused-branch",
+            dry_run=False,
+            force_with_lease=True,
+        )
+
+        run_command_mock.assert_called_once_with(
+            ["git", "push", "-u", "--force-with-lease", "origin", "issue-fix/33-sync-reused-branch"]
+        )
+
     @patch("scripts.run_github_issues_to_opencode.run_command")
     @patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False)
     @patch("scripts.run_github_issues_to_opencode.local_branch_exists", return_value=True)
@@ -77,8 +90,14 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             )
 
     @patch("scripts.run_github_issues_to_opencode.run_command")
-    def test_sync_reused_branch_with_base_rebase_happy_path(self, run_command_mock) -> None:
-        sync_reused_branch_with_base(
+    @patch("scripts.run_github_issues_to_opencode.current_head_sha")
+    def test_sync_reused_branch_with_base_rebase_happy_path(
+        self,
+        current_head_sha_mock,
+        run_command_mock,
+    ) -> None:
+        current_head_sha_mock.side_effect = ["sha-before", "sha-after"]
+        changed = sync_reused_branch_with_base(
             base_branch="main",
             branch_name="issue-fix/26-rerun",
             strategy="rebase",
@@ -92,11 +111,14 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 unittest.mock.call(["git", "rebase", "origin/main"]),
             ],
         )
+        self.assertTrue(changed)
 
     @patch("scripts.run_github_issues_to_opencode.command_succeeds", return_value=True)
     @patch("scripts.run_github_issues_to_opencode.run_command")
+    @patch("scripts.run_github_issues_to_opencode.current_head_sha", return_value="sha-before")
     def test_sync_reused_branch_with_base_rebase_failure_aborts_and_raises(
         self,
+        _current_head_sha,
         run_command_mock,
         command_succeeds_mock,
     ) -> None:
@@ -176,6 +198,81 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         run_agent_mock.assert_not_called()
         self.assertIn("Issue #33 failed: sync failed", stderr_mock.getvalue())
+
+    def test_main_pushes_sync_only_rebase_updates_with_force_with_lease(self) -> None:
+        args = type("Args", (), {
+            "repo": "owner/repo",
+            "issue": 33,
+            "state": "open",
+            "limit": 10,
+            "runner": "opencode",
+            "agent": "build",
+            "model": None,
+            "agent_timeout_seconds": 900,
+            "agent_idle_timeout_seconds": None,
+            "opencode_auto_approve": False,
+            "branch_prefix": "issue-fix",
+            "include_empty": False,
+            "stop_on_error": False,
+            "fail_on_existing": False,
+            "force_issue_flow": False,
+            "sync_reused_branch": True,
+            "sync_strategy": "rebase",
+            "dir": ".",
+            "local_config": "local-config.json",
+            "dry_run": False,
+        })()
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_issue",
+                return_value={
+                    "number": 33,
+                    "title": "Sync reused branch",
+                    "body": "rerun",
+                    "url": "https://github.com/owner/repo/issues/33",
+                },
+            ),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
+            patch(
+                "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
+                return_value=True,
+            ),
+            patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0),
+            patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False),
+            patch("scripts.run_github_issues_to_opencode.push_branch") as push_branch_mock,
+            patch(
+                "scripts.run_github_issues_to_opencode.ensure_pr",
+                return_value=("reused", "https://github.com/owner/repo/pull/34"),
+            ) as ensure_pr_mock,
+            patch("scripts.run_github_issues_to_opencode.run_command") as run_command_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        push_branch_mock.assert_called_once_with(
+            branch_name="issue-fix/33-sync-reused-branch",
+            dry_run=False,
+            force_with_lease=True,
+        )
+        ensure_pr_mock.assert_called_once_with(
+            repo="owner/repo",
+            base_branch="main",
+            branch_name="issue-fix/33-sync-reused-branch",
+            issue={
+                "number": 33,
+                "title": "Sync reused branch",
+                "body": "rerun",
+                "url": "https://github.com/owner/repo/issues/33",
+            },
+            dry_run=False,
+            fail_on_existing=False,
+        )
+        run_command_mock.assert_called_once_with(["git", "checkout", "main"])
 
     @patch("scripts.run_github_issues_to_opencode.open_pr")
     @patch(

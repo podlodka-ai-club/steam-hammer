@@ -130,6 +130,8 @@ Note: script expects a clean git working tree before run.
 - Base branch selection is deterministic: issue runs target the repository default branch from GitHub, not your current local branch.
 - On rerun with a reused branch, the script syncs that branch with the selected base before running the agent (`--sync-strategy rebase` by default).
 - If sync fails (for example conflict during rebase/merge), the run stops before agent execution with a clear error and hints to resolve conflicts.
+- If sync updates branch history and agent produces no new file changes, the script still pushes sync-only branch updates so existing PR conflict status can be refreshed.
+- For rebase-based sync that rewrites branch history, push uses `--force-with-lease` automatically.
 - Use `--sync-strategy merge` if you prefer merge-based sync instead of rebase.
 - Use `--no-sync-reused-branch` only when you intentionally want to skip auto-sync.
 - Use `--dry-run` to preview selected base branch and whether each issue will create or reuse branch/PR resources.

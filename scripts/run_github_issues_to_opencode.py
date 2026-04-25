@@ -25,6 +25,8 @@ BUILTIN_DEFAULTS = {
     "stop_on_error": False,
     "fail_on_existing": False,
     "force_issue_flow": False,
+    "sync_reused_branch": True,
+    "sync_strategy": "rebase",
     "dir": ".",
 }
 
@@ -46,6 +48,10 @@ def run_command(command: list[str]) -> None:
 def command_succeeds(command: list[str]) -> bool:
     result = subprocess.run(command, capture_output=True, text=True)
     return result.returncode == 0
+
+
+def current_head_sha() -> str:
+    return run_capture(["git", "rev-parse", "HEAD"]).strip()
 
 
 def detect_repo() -> str:
@@ -715,6 +721,56 @@ def remote_branch_exists(branch_name: str) -> bool:
     )
 
 
+def list_conflicted_paths() -> list[str]:
+    output = run_capture(["git", "diff", "--name-only", "--diff-filter=U"])
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def auto_resolve_merge_conflicts_with_base() -> int:
+    conflicted_paths = list_conflicted_paths()
+    if not conflicted_paths:
+        raise RuntimeError("Merge failed, but no conflicted files were detected")
+
+    for path in conflicted_paths:
+        run_command(["git", "checkout", "--theirs", "--", path])
+
+    run_command(["git", "add", "-A"])
+    run_command(["git", "commit", "--no-edit"])
+    return len(conflicted_paths)
+
+
+def merge_sync_with_auto_resolution(remote_base_ref: str, branch_name: str) -> bool:
+    before_sync_sha = current_head_sha()
+
+    try:
+        run_command(["git", "merge", "--no-edit", "-X", "theirs", remote_base_ref])
+    except RuntimeError:
+        print(
+            f"Merge sync for reused branch '{branch_name}' hit conflicts; "
+            "attempting automatic conflict resolution in favor of base branch"
+        )
+        try:
+            resolved_files_count = auto_resolve_merge_conflicts_with_base()
+            print(
+                f"Auto-resolved {resolved_files_count} conflicted file(s) "
+                f"for reused branch '{branch_name}'"
+            )
+        except Exception as resolve_exc:  # noqa: BLE001
+            command_succeeds(["git", "merge", "--abort"])
+            raise RuntimeError(
+                f"Failed to auto-resolve merge conflicts while syncing reused branch "
+                f"'{branch_name}' with '{remote_base_ref}'. "
+                "Resolve conflicts manually or rerun with --no-sync-reused-branch."
+            ) from resolve_exc
+    after_sync_sha = current_head_sha()
+    synced = before_sync_sha != after_sync_sha
+    if synced:
+        print(f"Reused branch '{branch_name}' updated after sync")
+    else:
+        print(f"Reused branch '{branch_name}' already up to date with '{remote_base_ref}'")
+    return synced
+
+
 def prepare_issue_branch(
     base_branch: str,
     branch_name: str,
@@ -756,14 +812,60 @@ def prepare_issue_branch(
     return branch_status
 
 
-def create_followup_branch(current_branch_name: str, branch_name: str, dry_run: bool) -> None:
+def sync_reused_branch_with_base(
+    base_branch: str,
+    branch_name: str,
+    strategy: str,
+    dry_run: bool,
+) -> bool:
+    if strategy not in {"rebase", "merge"}:
+        raise RuntimeError(
+            f"Unsupported sync strategy '{strategy}'. Use one of: rebase, merge"
+        )
+
+    remote_base_ref = f"origin/{base_branch}"
+
     if dry_run:
         print(
-            f"[dry-run] Would create follow-up branch '{branch_name}' from '{current_branch_name}'"
+            f"[dry-run] Would sync reused branch '{branch_name}' with '{remote_base_ref}' "
+            f"using '{strategy}' strategy"
         )
-        return
-    run_command(["git", "checkout", current_branch_name])
-    run_command(["git", "checkout", "-b", branch_name])
+        return False
+
+    print(
+        f"Syncing reused branch '{branch_name}' with '{remote_base_ref}' "
+        f"using '{strategy}' strategy"
+    )
+
+    run_command(["git", "fetch", "origin", base_branch])
+
+    if strategy == "merge":
+        return merge_sync_with_auto_resolution(
+            remote_base_ref=remote_base_ref,
+            branch_name=branch_name,
+        )
+
+    before_sync_sha = current_head_sha()
+    try:
+        run_command(["git", "rebase", remote_base_ref])
+    except RuntimeError:
+        command_succeeds(["git", "rebase", "--abort"])
+        print(
+            f"Rebase sync for reused branch '{branch_name}' hit conflicts; "
+            "falling back to merge-based auto-resolution"
+        )
+        return merge_sync_with_auto_resolution(
+            remote_base_ref=remote_base_ref,
+            branch_name=branch_name,
+        )
+
+    after_sync_sha = current_head_sha()
+    synced = before_sync_sha != after_sync_sha
+    if synced:
+        print(f"Reused branch '{branch_name}' updated after rebase sync")
+    else:
+        print(f"Reused branch '{branch_name}' already up to date with '{remote_base_ref}'")
+    return synced
 
 
 def commit_changes(issue: dict, dry_run: bool) -> str:
@@ -776,11 +878,20 @@ def commit_changes(issue: dict, dry_run: bool) -> str:
     return message
 
 
-def push_branch(branch_name: str, dry_run: bool) -> None:
+def push_branch(branch_name: str, dry_run: bool, force_with_lease: bool = False) -> None:
+    command = ["git", "push", "-u", "origin", branch_name]
+    if force_with_lease:
+        command.insert(3, "--force-with-lease")
+
     if dry_run:
-        print(f"[dry-run] Would push branch '{branch_name}' to origin")
+        if force_with_lease:
+            print(
+                f"[dry-run] Would push branch '{branch_name}' to origin with --force-with-lease"
+            )
+        else:
+            print(f"[dry-run] Would push branch '{branch_name}' to origin")
         return
-    run_command(["git", "push", "-u", "origin", branch_name])
+    run_command(command)
 
 
 def push_current_branch(dry_run: bool) -> None:
@@ -1006,6 +1117,8 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "stop_on_error",
         "fail_on_existing",
         "force_issue_flow",
+        "sync_reused_branch",
+        "sync_strategy",
     }
 
     unsupported = sorted(set(config) - supported_keys)
@@ -1066,6 +1179,7 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "stop_on_error",
         "fail_on_existing",
         "force_issue_flow",
+        "sync_reused_branch",
     ]:
         if key in config:
             if not isinstance(config[key], bool):
@@ -1078,6 +1192,11 @@ def validate_local_config(config: dict, config_path: str) -> dict:
                 "Local config key 'branch_prefix' must be a non-empty string"
             )
         validated["branch_prefix"] = config["branch_prefix"]
+
+    if "sync_strategy" in config:
+        if config["sync_strategy"] not in {"rebase", "merge"}:
+            raise RuntimeError("Local config key 'sync_strategy' must be one of: rebase, merge")
+        validated["sync_strategy"] = config["sync_strategy"]
 
     return validated
 
@@ -1211,6 +1330,31 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Disable auto-switch to PR-review mode when --issue has a linked open PR. "
             "Keeps legacy issue-flow behavior."
+        ),
+    )
+    parser.add_argument(
+        "--sync-reused-branch",
+        dest="sync_reused_branch",
+        action="store_true",
+        default=BUILTIN_DEFAULTS["sync_reused_branch"],
+        help=(
+            "Sync reused issue branches with the selected base branch before running the "
+            "agent. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-sync-reused-branch",
+        dest="sync_reused_branch",
+        action="store_false",
+        help="Disable sync for reused issue branches before the agent step.",
+    )
+    parser.add_argument(
+        "--sync-strategy",
+        default=BUILTIN_DEFAULTS["sync_strategy"],
+        choices=["rebase", "merge"],
+        help=(
+            "Strategy to sync reused issue branches with base before agent run "
+            "(default: rebase)."
         ),
     )
     parser.add_argument(
@@ -1514,6 +1658,29 @@ def main() -> int:
             )
             print(f"Branch status for issue #{issue['number']}: {branch_status}")
 
+            reused_branch_sync_changed = False
+
+            if branch_status == "reused":
+                if args.sync_reused_branch:
+                    reused_branch_sync_changed = sync_reused_branch_with_base(
+                        base_branch=target_base_branch,
+                        branch_name=issue_branch,
+                        strategy=args.sync_strategy,
+                        dry_run=args.dry_run,
+                    )
+                else:
+                    prefix = "[dry-run] " if args.dry_run else ""
+                    print(
+                        f"{prefix}Skipping reused-branch sync for '{issue_branch}' "
+                        f"(selected base: '{target_base_branch}', strategy: '{args.sync_strategy}')"
+                    )
+            elif args.dry_run:
+                print(
+                    f"[dry-run] Reused-branch sync not needed for '{issue_branch}' "
+                    f"(branch status: created; selected base: '{target_base_branch}'; "
+                    f"strategy: '{args.sync_strategy}')"
+                )
+
             exit_code = run_agent(
                 issue=issue,
                 runner=args.runner,
@@ -1531,6 +1698,30 @@ def main() -> int:
                 )
 
             if not args.dry_run and not has_changes():
+                if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:
+                    print(
+                        f"No file changes from agent for issue #{issue['number']}; "
+                        "pushing sync-only branch updates"
+                    )
+                    push_branch(
+                        branch_name=issue_branch,
+                        dry_run=False,
+                        force_with_lease=args.sync_strategy == "rebase",
+                    )
+                    pr_status, pr_url = ensure_pr(
+                        repo=repo,
+                        base_branch=target_base_branch,
+                        branch_name=issue_branch,
+                        issue=issue,
+                        dry_run=False,
+                        fail_on_existing=args.fail_on_existing,
+                    )
+                    if pr_url:
+                        touched_prs.append(pr_url)
+                        print(f"PR status for issue #{issue['number']}: {pr_status} ({pr_url})")
+                    run_command(["git", "checkout", base_branch])
+                    continue
+
                 print(
                     f"No changes detected for issue #{issue['number']}; skipping commit and PR"
                 )
@@ -1538,7 +1729,16 @@ def main() -> int:
                 continue
 
             commit_changes(issue=issue, dry_run=args.dry_run)
-            push_branch(branch_name=issue_branch, dry_run=args.dry_run)
+            push_branch(
+                branch_name=issue_branch,
+                dry_run=args.dry_run,
+                force_with_lease=(
+                    branch_status == "reused"
+                    and args.sync_reused_branch
+                    and args.sync_strategy == "rebase"
+                    and reused_branch_sync_changed
+                ),
+            )
             pr_status, pr_url = ensure_pr(
                 repo=repo,
                 base_branch=target_base_branch,

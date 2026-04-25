@@ -741,19 +741,23 @@ def auto_resolve_merge_conflicts_with_base() -> int:
 
 def merge_sync_with_auto_resolution(remote_base_ref: str, branch_name: str) -> bool:
     before_sync_sha = current_head_sha()
+    print(
+        f"Sync attempt: merge reused branch '{branch_name}' with '{remote_base_ref}' "
+        "using base-favored strategy"
+    )
 
     try:
         run_command(["git", "merge", "--no-edit", "-X", "theirs", remote_base_ref])
     except RuntimeError:
         print(
-            f"Merge sync for reused branch '{branch_name}' hit conflicts; "
-            "attempting automatic conflict resolution in favor of base branch"
+            f"Conflict detected during merge sync for reused branch '{branch_name}'; "
+            "auto-resolving by keeping selected base branch changes"
         )
         try:
             resolved_files_count = auto_resolve_merge_conflicts_with_base()
             print(
                 f"Auto-resolved {resolved_files_count} conflicted file(s) "
-                f"for reused branch '{branch_name}'"
+                f"for reused branch '{branch_name}' via base-favored merge resolution"
             )
         except Exception as resolve_exc:  # noqa: BLE001
             command_succeeds(["git", "merge", "--abort"])
@@ -833,7 +837,7 @@ def sync_reused_branch_with_base(
         return False
 
     print(
-        f"Syncing reused branch '{branch_name}' with '{remote_base_ref}' "
+        f"Sync attempt: reused branch '{branch_name}' with '{remote_base_ref}' "
         f"using '{strategy}' strategy"
     )
 
@@ -851,8 +855,8 @@ def sync_reused_branch_with_base(
     except RuntimeError:
         command_succeeds(["git", "rebase", "--abort"])
         print(
-            f"Rebase sync for reused branch '{branch_name}' hit conflicts; "
-            "falling back to merge-based auto-resolution"
+            f"Conflict detected during rebase sync for reused branch '{branch_name}'; "
+            "switching to merge-based auto-resolution"
         )
         return merge_sync_with_auto_resolution(
             remote_base_ref=remote_base_ref,
@@ -1703,10 +1707,16 @@ def main() -> int:
                         f"No file changes from agent for issue #{issue['number']}; "
                         "pushing sync-only branch updates"
                     )
+                    used_force_with_lease = args.sync_strategy == "rebase"
                     push_branch(
                         branch_name=issue_branch,
                         dry_run=False,
-                        force_with_lease=args.sync_strategy == "rebase",
+                        force_with_lease=used_force_with_lease,
+                    )
+                    print(
+                        f"Sync-only push result for issue #{issue['number']}: "
+                        f"branch '{issue_branch}' pushed "
+                        f"(force-with-lease: {'yes' if used_force_with_lease else 'no'})"
                     )
                     pr_status, pr_url = ensure_pr(
                         repo=repo,

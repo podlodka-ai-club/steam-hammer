@@ -354,6 +354,141 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         )
         run_command_mock.assert_called_once_with(["git", "checkout", "main"])
 
+    def test_main_pr_review_mode_auto_resolves_sync_conflict_and_pushes_sync_only_update(self) -> None:
+        args = type("Args", (), {
+            "repo": "owner/repo",
+            "issue": 35,
+            "state": "open",
+            "limit": 10,
+            "runner": "opencode",
+            "agent": "build",
+            "model": None,
+            "agent_timeout_seconds": 900,
+            "agent_idle_timeout_seconds": None,
+            "opencode_auto_approve": False,
+            "branch_prefix": "issue-fix",
+            "include_empty": False,
+            "stop_on_error": False,
+            "fail_on_existing": False,
+            "force_issue_flow": False,
+            "sync_reused_branch": True,
+            "sync_strategy": "rebase",
+            "dir": ".",
+            "local_config": "local-config.json",
+            "dry_run": False,
+        })()
+
+        def run_command_side_effect(command: list[str]) -> None:
+            if command == ["git", "rebase", "origin/main"]:
+                raise RuntimeError("Command failed: git rebase origin/main")
+            if command == ["git", "merge", "--no-edit", "-X", "theirs", "origin/main"]:
+                raise RuntimeError("Command failed: git merge --no-edit -X theirs origin/main")
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_issue",
+                return_value={
+                    "number": 35,
+                    "title": "Auto-resolve PR conflicts in pr-review mode",
+                    "body": "Fix conflict handling",
+                    "url": "https://github.com/owner/repo/issues/35",
+                },
+            ),
+            patch(
+                "scripts.run_github_issues_to_opencode.find_open_pr_for_issue",
+                return_value={
+                    "number": 77,
+                    "headRefName": "issue-fix/35-auto-resolve-pr-conflicts",
+                    "baseRefName": "main",
+                },
+            ),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_pull_request",
+                return_value={
+                    "number": 77,
+                    "title": "Fix sync conflicts",
+                    "url": "https://github.com/owner/repo/pull/77",
+                    "state": "OPEN",
+                    "body": "PR body",
+                    "reviews": [],
+                    "author": {"login": "pr-owner"},
+                },
+            ),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_pr_review_threads",
+                return_value=[
+                    {
+                        "isResolved": False,
+                        "comments": {
+                            "nodes": [
+                                {
+                                    "body": "Please resolve sync conflicts automatically",
+                                    "path": "scripts/run_github_issues_to_opencode.py",
+                                    "line": 1,
+                                    "outdated": False,
+                                    "author": {"login": "reviewer"},
+                                    "url": "https://github.com/owner/repo/pull/77#discussion_r1",
+                                }
+                            ]
+                        },
+                    }
+                ],
+            ),
+            patch("scripts.run_github_issues_to_opencode.load_linked_issue_context", return_value=[]),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
+            patch(
+                "scripts.run_github_issues_to_opencode.current_head_sha",
+                side_effect=["sha-before-rebase", "sha-before-merge", "sha-after-merge"],
+            ),
+            patch(
+                "scripts.run_github_issues_to_opencode.list_conflicted_paths",
+                return_value=["README.md"],
+            ),
+            patch("scripts.run_github_issues_to_opencode.command_succeeds", return_value=True),
+            patch(
+                "scripts.run_github_issues_to_opencode.run_command",
+                side_effect=run_command_side_effect,
+            ),
+            patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0),
+            patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False),
+            patch("scripts.run_github_issues_to_opencode.push_branch") as push_branch_mock,
+            patch(
+                "scripts.run_github_issues_to_opencode.ensure_pr",
+                return_value=("reused", "https://github.com/owner/repo/pull/77"),
+            ) as ensure_pr_mock,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        push_branch_mock.assert_called_once_with(
+            branch_name="issue-fix/35-auto-resolve-pr-conflicts",
+            dry_run=False,
+            force_with_lease=True,
+        )
+        ensure_pr_mock.assert_called_once_with(
+            repo="owner/repo",
+            base_branch="main",
+            branch_name="issue-fix/35-auto-resolve-pr-conflicts",
+            issue={
+                "number": 35,
+                "title": "Auto-resolve PR conflicts in pr-review mode",
+                "body": "Fix conflict handling",
+                "url": "https://github.com/owner/repo/issues/35",
+            },
+            dry_run=False,
+            fail_on_existing=False,
+        )
+
+        output = stdout_mock.getvalue()
+        self.assertIn("Selected mode: pr-review", output)
+        self.assertIn("Conflict detected during rebase sync", output)
+        self.assertIn("Conflict detected during merge sync", output)
+        self.assertIn("Sync-only push result for issue #35", output)
+
     @patch("scripts.run_github_issues_to_opencode.open_pr")
     @patch(
         "scripts.run_github_issues_to_opencode.find_existing_pr",

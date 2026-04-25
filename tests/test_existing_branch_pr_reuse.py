@@ -1,7 +1,11 @@
 import unittest
 from unittest.mock import patch
 
-from scripts.run_github_issues_to_opencode import ensure_pr, prepare_issue_branch
+from scripts.run_github_issues_to_opencode import (
+    ensure_pr,
+    prepare_issue_branch,
+    sync_reused_branch_with_base,
+)
 
 
 class ExistingBranchAndPrReuseTests(unittest.TestCase):
@@ -69,6 +73,55 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 dry_run=False,
                 fail_on_existing=True,
             )
+
+    @patch("scripts.run_github_issues_to_opencode.run_command")
+    def test_sync_reused_branch_with_base_rebase_happy_path(self, run_command_mock) -> None:
+        sync_reused_branch_with_base(
+            base_branch="main",
+            branch_name="issue-fix/26-rerun",
+            strategy="rebase",
+            dry_run=False,
+        )
+
+        self.assertEqual(
+            run_command_mock.call_args_list,
+            [
+                unittest.mock.call(["git", "fetch", "origin", "main"]),
+                unittest.mock.call(["git", "rebase", "origin/main"]),
+            ],
+        )
+
+    @patch("scripts.run_github_issues_to_opencode.command_succeeds", return_value=True)
+    @patch("scripts.run_github_issues_to_opencode.run_command")
+    def test_sync_reused_branch_with_base_rebase_failure_aborts_and_raises(
+        self,
+        run_command_mock,
+        command_succeeds_mock,
+    ) -> None:
+        run_command_mock.side_effect = [
+            None,
+            RuntimeError("Command failed: git rebase origin/main"),
+        ]
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Failed to sync reused branch 'issue-fix/26-rerun' with 'origin/main' using rebase",
+        ):
+            sync_reused_branch_with_base(
+                base_branch="main",
+                branch_name="issue-fix/26-rerun",
+                strategy="rebase",
+                dry_run=False,
+            )
+
+        self.assertEqual(
+            run_command_mock.call_args_list,
+            [
+                unittest.mock.call(["git", "fetch", "origin", "main"]),
+                unittest.mock.call(["git", "rebase", "origin/main"]),
+            ],
+        )
+        command_succeeds_mock.assert_called_once_with(["git", "rebase", "--abort"])
 
     @patch("scripts.run_github_issues_to_opencode.open_pr")
     @patch(

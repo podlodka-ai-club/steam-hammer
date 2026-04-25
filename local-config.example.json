@@ -6,5 +6,7 @@
   "agent_idle_timeout_seconds": 180,
   "opencode_auto_approve": true,
   "fail_on_existing": false,
-  "force_issue_flow": false
+  "force_issue_flow": false,
+  "sync_reused_branch": true,
+  "sync_strategy": "rebase"
 }

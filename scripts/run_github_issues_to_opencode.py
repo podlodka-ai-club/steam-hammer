@@ -25,6 +25,8 @@ BUILTIN_DEFAULTS = {
     "stop_on_error": False,
     "fail_on_existing": False,
     "force_issue_flow": False,
+    "sync_reused_branch": True,
+    "sync_strategy": "rebase",
     "dir": ".",
 }
 
@@ -450,6 +452,52 @@ def prepare_issue_branch(
     return branch_status
 
 
+def sync_reused_branch_with_base(
+    base_branch: str,
+    branch_name: str,
+    strategy: str,
+    dry_run: bool,
+) -> None:
+    remote_base_ref = f"origin/{base_branch}"
+
+    if dry_run:
+        print(
+            f"[dry-run] Would sync reused branch '{branch_name}' with '{remote_base_ref}' "
+            f"using '{strategy}' strategy"
+        )
+        return
+
+    print(
+        f"Syncing reused branch '{branch_name}' with '{remote_base_ref}' "
+        f"using '{strategy}' strategy"
+    )
+
+    run_command(["git", "fetch", "origin", base_branch])
+
+    try:
+        if strategy == "rebase":
+            run_command(["git", "rebase", remote_base_ref])
+        else:
+            run_command(["git", "merge", "--no-edit", remote_base_ref])
+    except RuntimeError as exc:
+        if strategy == "rebase":
+            command_succeeds(["git", "rebase", "--abort"])
+            raise RuntimeError(
+                f"Failed to sync reused branch '{branch_name}' with '{remote_base_ref}' "
+                "using rebase (likely merge conflicts). Rebase was aborted. "
+                "Resolve conflicts manually or rerun with --sync-strategy merge or "
+                "--no-sync-reused-branch."
+            ) from exc
+
+        command_succeeds(["git", "merge", "--abort"])
+        raise RuntimeError(
+            f"Failed to sync reused branch '{branch_name}' with '{remote_base_ref}' "
+            "using merge (likely merge conflicts). Merge was aborted. "
+            "Resolve conflicts manually or rerun with --sync-strategy rebase or "
+            "--no-sync-reused-branch."
+        ) from exc
+
+
 def commit_changes(issue: dict, dry_run: bool) -> str:
     message = f"Fix issue #{issue['number']}: {issue['title']}"
     if dry_run:
@@ -645,6 +693,8 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "stop_on_error",
         "fail_on_existing",
         "force_issue_flow",
+        "sync_reused_branch",
+        "sync_strategy",
     }
 
     unsupported = sorted(set(config) - supported_keys)
@@ -705,6 +755,7 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "stop_on_error",
         "fail_on_existing",
         "force_issue_flow",
+        "sync_reused_branch",
     ]:
         if key in config:
             if not isinstance(config[key], bool):
@@ -717,6 +768,11 @@ def validate_local_config(config: dict, config_path: str) -> dict:
                 "Local config key 'branch_prefix' must be a non-empty string"
             )
         validated["branch_prefix"] = config["branch_prefix"]
+
+    if "sync_strategy" in config:
+        if config["sync_strategy"] not in {"rebase", "merge"}:
+            raise RuntimeError("Local config key 'sync_strategy' must be one of: rebase, merge")
+        validated["sync_strategy"] = config["sync_strategy"]
 
     return validated
 
@@ -828,6 +884,31 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Disable auto-switch to PR-review mode when --issue has a linked open PR. "
             "Keeps legacy issue-flow behavior."
+        ),
+    )
+    parser.add_argument(
+        "--sync-reused-branch",
+        dest="sync_reused_branch",
+        action="store_true",
+        default=BUILTIN_DEFAULTS["sync_reused_branch"],
+        help=(
+            "Sync reused issue branches with the selected base branch before running the "
+            "agent. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-sync-reused-branch",
+        dest="sync_reused_branch",
+        action="store_false",
+        help="Disable sync for reused issue branches before the agent step.",
+    )
+    parser.add_argument(
+        "--sync-strategy",
+        default=BUILTIN_DEFAULTS["sync_strategy"],
+        choices=["rebase", "merge"],
+        help=(
+            "Strategy to sync reused issue branches with base before agent run "
+            "(default: rebase)."
         ),
     )
     parser.add_argument(
@@ -984,6 +1065,27 @@ def main() -> int:
                 fail_on_existing=args.fail_on_existing,
             )
             print(f"Branch status for issue #{issue['number']}: {branch_status}")
+
+            if branch_status == "reused":
+                if args.sync_reused_branch:
+                    sync_reused_branch_with_base(
+                        base_branch=target_base_branch,
+                        branch_name=issue_branch,
+                        strategy=args.sync_strategy,
+                        dry_run=args.dry_run,
+                    )
+                else:
+                    prefix = "[dry-run] " if args.dry_run else ""
+                    print(
+                        f"{prefix}Skipping reused-branch sync for '{issue_branch}' "
+                        f"(selected base: '{target_base_branch}', strategy: '{args.sync_strategy}')"
+                    )
+            elif args.dry_run:
+                print(
+                    f"[dry-run] Reused-branch sync not needed for '{issue_branch}' "
+                    f"(branch status: created; selected base: '{target_base_branch}'; "
+                    f"strategy: '{args.sync_strategy}')"
+                )
 
             exit_code = run_agent(
                 issue=issue,

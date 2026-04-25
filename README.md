@@ -66,6 +66,8 @@ Supported local config keys:
 - `stop_on_error` (boolean)
 - `fail_on_existing` (boolean)
 - `force_issue_flow` (boolean)
+- `sync_reused_branch` (boolean)
+- `sync_strategy` (`rebase` or `merge`)
 
 You can also point to a different local config file:
 
@@ -83,10 +85,11 @@ Workflow per issue:
 
 1. Chooses a stable base branch (repository default branch from GitHub)
 2. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
-3. Runs the AI agent with issue title/body context
-4. On changes, creates commit
-5. Pushes issue branch to `origin`
-6. Reuses an existing open PR for the issue branch when present; otherwise creates one to the stable base branch
+3. For reused branches, syncs with the latest selected base branch before agent run (default: `rebase`)
+4. Runs the AI agent with issue title/body context
+5. On changes, creates commit
+6. Pushes issue branch to `origin`
+7. Reuses an existing open PR for the issue branch when present; otherwise creates one to the stable base branch
 
 Useful options:
 
@@ -104,6 +107,8 @@ Useful options:
 - `--local-config path` load local JSON defaults (default: `local-config.json` under `--dir`)
 - `--fail-on-existing` strict mode: fail if issue branch or PR already exists
 - `--force-issue-flow` disable auto-switch to PR-review mode for `--issue`
+- `--sync-reused-branch` / `--no-sync-reused-branch` enable or disable reused-branch sync before agent run (default: enabled)
+- `--sync-strategy rebase|merge` choose how to sync a reused branch with selected base (default: `rebase`)
 
 If `--repo` is not provided, script tries to detect repository from current `gh` context.
 
@@ -123,7 +128,12 @@ Note: script expects a clean git working tree before run.
 - If an open PR already exists for the issue branch, the script reuses it (even if your currently checked-out local branch is different).
 - PR reuse first checks `base+head`, then falls back to `head`-only lookup to avoid duplicate PR creation when reruns start from another feature branch.
 - Base branch selection is deterministic: issue runs target the repository default branch from GitHub, not your current local branch.
+- On rerun with a reused branch, the script syncs that branch with the selected base before running the agent (`--sync-strategy rebase` by default).
+- If sync fails (for example conflict during rebase/merge), the run stops before agent execution with a clear error and hints to resolve conflicts.
+- Use `--sync-strategy merge` if you prefer merge-based sync instead of rebase.
+- Use `--no-sync-reused-branch` only when you intentionally want to skip auto-sync.
 - Use `--dry-run` to preview selected base branch and whether each issue will create or reuse branch/PR resources.
+- `--dry-run` also shows whether reused-branch sync will run and which strategy will be used.
 - Use `--fail-on-existing` when you want strict behavior and prefer the run to fail if branch/PR already exists.
 
 ## Auto switch to PR-review mode

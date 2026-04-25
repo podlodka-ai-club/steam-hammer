@@ -15,6 +15,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(args.runner, BUILTIN_DEFAULTS["runner"])
         self.assertEqual(args.limit, BUILTIN_DEFAULTS["limit"])
         self.assertEqual(args.branch_prefix, BUILTIN_DEFAULTS["branch_prefix"])
+        self.assertEqual(args.fail_on_existing, BUILTIN_DEFAULTS["fail_on_existing"])
 
     def test_local_config_overrides_built_in_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -26,6 +27,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
                         "runner": "opencode",
                         "limit": 3,
                         "branch_prefix": "my-fixes",
+                        "fail_on_existing": True,
                     },
                     config_file,
                 )
@@ -35,6 +37,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(args.runner, "opencode")
         self.assertEqual(args.limit, 3)
         self.assertEqual(args.branch_prefix, "my-fixes")
+        self.assertTrue(args.fail_on_existing)
 
     def test_cli_flags_override_local_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

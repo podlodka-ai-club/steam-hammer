@@ -54,6 +54,7 @@ Supported local config keys:
 - `branch_prefix` (string)
 - `include_empty` (boolean)
 - `stop_on_error` (boolean)
+- `fail_on_existing` (boolean)
 
 You can also point to a different local config file:
 
@@ -69,11 +70,11 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --limit 1
 
 Workflow per issue:
 
-1. Creates a new branch from current branch (`--branch-prefix`, default `issue-fix`)
+1. Creates a new branch from current branch (`--branch-prefix`, default `issue-fix`) or reuses an existing one
 2. Runs the AI agent with issue title/body context
 3. On changes, creates commit
 4. Pushes issue branch to `origin`
-5. Creates PR back to the original base branch
+5. Creates PR back to the original base branch, or reuses an existing open PR for the same base/head pair
 
 Useful options:
 
@@ -89,6 +90,7 @@ Useful options:
 - `--agent-idle-timeout-seconds N` fail if agent prints no output for `N` seconds
 - `--opencode-auto-approve` pass `--dangerously-skip-permissions` to OpenCode (use with caution)
 - `--local-config path` load local JSON defaults (default: `local-config.json` under `--dir`)
+- `--fail-on-existing` strict mode: fail if issue branch or PR already exists
 
 If `--repo` is not provided, script tries to detect repository from current `gh` context.
 
@@ -101,6 +103,13 @@ Note: script expects a clean git working tree before run.
   - `--agent-idle-timeout-seconds 180`
 - If OpenCode may be waiting for interactive permission approvals, try `--opencode-auto-approve` only in trusted environments.
 - On timeout/idle-timeout the script now exits with a clear error so normal failure handling (`--stop-on-error`) can proceed.
+
+## Reruns and conflict resolution
+
+- Re-running for an issue now auto-detects existing issue branches and reuses them instead of failing on `git checkout -b`.
+- If an open PR already exists for `base <- issue-branch`, the script reuses that PR and pushes new commits to the same branch.
+- Use `--dry-run` to preview whether each issue will create or reuse branch/PR resources.
+- Use `--fail-on-existing` when you want strict behavior and prefer the run to fail if branch/PR already exists.
 
 ## Verification
 

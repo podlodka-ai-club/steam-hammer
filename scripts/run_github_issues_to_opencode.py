@@ -23,6 +23,7 @@ BUILTIN_DEFAULTS = {
     "branch_prefix": "issue-fix",
     "include_empty": False,
     "stop_on_error": False,
+    "fail_on_existing": False,
     "dir": ".",
 }
 
@@ -39,6 +40,11 @@ def run_command(command: list[str]) -> None:
     result = subprocess.run(command)
     if result.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(command)}")
+
+
+def command_succeeds(command: list[str]) -> bool:
+    result = subprocess.run(command, capture_output=True, text=True)
+    return result.returncode == 0
 
 
 def detect_repo() -> str:
@@ -229,11 +235,63 @@ def run_agent(
 
 
 def create_branch(base_branch: str, branch_name: str, dry_run: bool) -> None:
+    prepare_issue_branch(
+        base_branch=base_branch,
+        branch_name=branch_name,
+        dry_run=dry_run,
+        fail_on_existing=False,
+    )
+
+
+def local_branch_exists(branch_name: str) -> bool:
+    return command_succeeds(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"])
+
+
+def remote_branch_exists(branch_name: str) -> bool:
+    return command_succeeds(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch_name}"]
+    )
+
+
+def prepare_issue_branch(
+    base_branch: str,
+    branch_name: str,
+    dry_run: bool,
+    fail_on_existing: bool,
+) -> str:
+    local_exists = local_branch_exists(branch_name)
+    remote_exists = remote_branch_exists(branch_name)
+    branch_exists = local_exists or remote_exists
+
+    if branch_exists and fail_on_existing:
+        raise RuntimeError(
+            f"Branch '{branch_name}' already exists and --fail-on-existing is enabled"
+        )
+
+    branch_status = "reused" if branch_exists else "created"
+
     if dry_run:
-        print(f"[dry-run] Would create branch '{branch_name}' from '{base_branch}'")
-        return
+        if branch_exists:
+            print(f"[dry-run] Would reuse existing branch '{branch_name}'")
+        else:
+            print(f"[dry-run] Would create branch '{branch_name}' from '{base_branch}'")
+        return branch_status
+
     run_command(["git", "checkout", base_branch])
+
+    if local_exists:
+        run_command(["git", "checkout", branch_name])
+        print(f"Reusing existing branch: {branch_name}")
+        return branch_status
+
+    if remote_exists:
+        run_command(["git", "checkout", "-b", branch_name, "--track", f"origin/{branch_name}"])
+        print(f"Reusing existing remote branch: {branch_name}")
+        return branch_status
+
     run_command(["git", "checkout", "-b", branch_name])
+    print(f"Created branch: {branch_name}")
+    return branch_status
 
 
 def commit_changes(issue: dict, dry_run: bool) -> str:
@@ -292,6 +350,74 @@ def open_pr(
     return output.strip()
 
 
+def find_existing_pr(repo: str, base_branch: str, branch_name: str) -> dict | None:
+    output = run_capture(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--base",
+            base_branch,
+            "--head",
+            branch_name,
+            "--state",
+            "open",
+            "--limit",
+            "1",
+            "--json",
+            "number,url",
+        ]
+    )
+    prs = json.loads(output)
+    if not isinstance(prs, list):
+        raise RuntimeError("Unexpected response from gh pr list")
+    if not prs:
+        return None
+    pr = prs[0]
+    if not isinstance(pr, dict):
+        raise RuntimeError("Unexpected PR entry format from gh pr list")
+    return pr
+
+
+def ensure_pr(
+    repo: str,
+    base_branch: str,
+    branch_name: str,
+    issue: dict,
+    dry_run: bool,
+    fail_on_existing: bool,
+) -> tuple[str, str]:
+    existing_pr = find_existing_pr(repo=repo, base_branch=base_branch, branch_name=branch_name)
+    if existing_pr is not None:
+        pr_url = str(existing_pr.get("url", "")).strip()
+        pr_number = existing_pr.get("number")
+        if fail_on_existing:
+            raise RuntimeError(
+                f"PR already exists for branch '{branch_name}' to '{base_branch}' "
+                f"(#{pr_number}) and --fail-on-existing is enabled"
+            )
+
+        if dry_run:
+            print(
+                f"[dry-run] Would reuse existing PR #{pr_number} from '{branch_name}' to '{base_branch}'"
+            )
+        else:
+            print(f"Reusing existing PR #{pr_number}: {pr_url}")
+
+        return "reused", pr_url
+
+    pr_url = open_pr(
+        repo=repo,
+        base_branch=base_branch,
+        branch_name=branch_name,
+        issue=issue,
+        dry_run=dry_run,
+    )
+    return "created", pr_url
+
+
 def resolve_local_config_path(raw_path: str | None, target_dir: str) -> str:
     config_path = raw_path or LOCAL_CONFIG_RELATIVE_PATH
     if not os.path.isabs(config_path):
@@ -312,6 +438,7 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "branch_prefix",
         "include_empty",
         "stop_on_error",
+        "fail_on_existing",
     }
 
     unsupported = sorted(set(config) - supported_keys)
@@ -366,7 +493,7 @@ def validate_local_config(config: dict, config_path: str) -> dict:
             )
         validated["agent_idle_timeout_seconds"] = value
 
-    for key in ["opencode_auto_approve", "include_empty", "stop_on_error"]:
+    for key in ["opencode_auto_approve", "include_empty", "stop_on_error", "fail_on_existing"]:
         if key in config:
             if not isinstance(config[key], bool):
                 raise RuntimeError(f"Local config key '{key}' must be a boolean")
@@ -476,6 +603,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop after first failed agent run.",
     )
     parser.add_argument(
+        "--fail-on-existing",
+        action="store_true",
+        help=(
+            "Fail instead of reusing existing issue branch/PR. By default existing "
+            "branch/PR are reused when possible."
+        ),
+    )
+    parser.add_argument(
         "--dir",
         default=BUILTIN_DEFAULTS["dir"],
         help="Path to the local git repository to operate on. Defaults to the current directory.",
@@ -541,7 +676,7 @@ def main() -> int:
 
     failures = 0
     processed = 0
-    created_prs: list[str] = []
+    touched_prs: list[str] = []
 
     for issue in issues:
         body = (issue.get("body") or "").strip()
@@ -553,9 +688,13 @@ def main() -> int:
         issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
 
         try:
-            create_branch(
-                base_branch=base_branch, branch_name=issue_branch, dry_run=args.dry_run
+            branch_status = prepare_issue_branch(
+                base_branch=base_branch,
+                branch_name=issue_branch,
+                dry_run=args.dry_run,
+                fail_on_existing=args.fail_on_existing,
             )
+            print(f"Branch status for issue #{issue['number']}: {branch_status}")
 
             exit_code = run_agent(
                 issue=issue,
@@ -581,16 +720,17 @@ def main() -> int:
 
             commit_changes(issue=issue, dry_run=args.dry_run)
             push_branch(branch_name=issue_branch, dry_run=args.dry_run)
-            pr_url = open_pr(
+            pr_status, pr_url = ensure_pr(
                 repo=repo,
                 base_branch=base_branch,
                 branch_name=issue_branch,
                 issue=issue,
                 dry_run=args.dry_run,
+                fail_on_existing=args.fail_on_existing,
             )
             if pr_url:
-                created_prs.append(pr_url)
-                print(f"Created PR: {pr_url}")
+                touched_prs.append(pr_url)
+                print(f"PR status for issue #{issue['number']}: {pr_status} ({pr_url})")
 
             if not args.dry_run:
                 run_command(["git", "checkout", base_branch])
@@ -601,9 +741,9 @@ def main() -> int:
                 break
 
     print(f"Done. Processed: {processed}, failures: {failures}")
-    if created_prs:
+    if touched_prs:
         print("PRs:")
-        for pr_url in created_prs:
+        for pr_url in touched_prs:
             print(f"- {pr_url}")
     return 1 if failures > 0 else 0
 

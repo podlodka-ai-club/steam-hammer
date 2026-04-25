@@ -17,7 +17,6 @@ class IssueBaseBranchResolutionTests(unittest.TestCase):
                 "gh",
                 "repo",
                 "view",
-                "--repo",
                 "owner/repo",
                 "--json",
                 "defaultBranchRef",

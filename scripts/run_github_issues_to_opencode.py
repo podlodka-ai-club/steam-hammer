@@ -63,7 +63,6 @@ def detect_default_branch(repo: str) -> str:
             "gh",
             "repo",
             "view",
-            "--repo",
             repo,
             "--json",
             "defaultBranchRef",

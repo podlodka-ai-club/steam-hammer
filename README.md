@@ -5,14 +5,23 @@ Script can run in two modes:
 - Issue mode: fetches GitHub issues via `gh`, runs an AI agent on each issue body, and automates git workflow for a fix branch.
 - PR review mode: fetches unresolved PR review feedback, builds a focused prompt for the agent, and prepares a follow-up commit.
 
-## Requirements
+Memo link: https://www.notion.so/Hacker-Sprint-1-33f2db4c860e8064a657e199b4578f66
 
 - `gh` (GitHub CLI) authenticated (`gh auth status`)
 - Python 3.10+
 - `claude` (Claude Code CLI) — default runner
 - `opencode` — only if using `--runner opencode`
 
-## Usage
+```text
+.
+├── .gitignore
+├── README.md
+├── readme.md
+└── scripts
+    └── run_github_issues_to_opencode.py
+```
+
+## Run Example
 
 **With Claude (default):**
 ```bash
@@ -96,8 +105,11 @@ Workflow per issue:
 
 Workflow in PR review mode:
 
-1. Loads PR metadata and review threads/comments
-2. Filters out resolved/outdated/empty feedback and builds an actionable prompt with file/line links
+1. Loads PR metadata and all feedback sources:
+   - unresolved inline review thread comments
+   - latest review summary per reviewer (`CHANGES_REQUESTED`, `COMMENTED`, `APPROVED`)
+   - PR conversation comments (issue comments on the PR)
+2. Filters and de-duplicates feedback, then builds an actionable prompt with file/line links
 3. Adds PR description and linked issue context (including issue body when available)
 4. Runs AI agent in current branch (or optional follow-up branch)
 5. On changes, creates commit and pushes updates
@@ -134,7 +146,16 @@ PR mode notes:
 - `--pr` must be used together with `--from-review-comments`.
 - If PR is closed/non-open, script exits without changes.
 - If there are no actionable unresolved comments, script exits successfully without running the agent.
+- Prompt input priority is deterministic: unresolved inline comments first, then review summaries, then conversation comments.
 - Review summaries are taken from the latest review per author to avoid reprocessing superseded feedback.
+- Filtering rules are deterministic and backward-compatible:
+  - Exclude resolved/outdated inline threads, outdated inline comments, empty comments, and PR-author self-comments.
+  - Keep `CHANGES_REQUESTED` review summaries when non-empty.
+  - Keep `COMMENTED`/`APPROVED` review summaries only when actionable (for example: contains concrete change requests).
+  - Keep conversation comments only when actionable.
+  - Exclude obvious non-actionable noise (`lgtm`, `looks good`, `thanks`, `+1`, punctuation-only text, etc.).
+  - De-duplicate across all included sources while preserving priority order.
+- Prompt-generation logs now include per-source counts and included/excluded breakdown.
 
 ## Smoke test
 

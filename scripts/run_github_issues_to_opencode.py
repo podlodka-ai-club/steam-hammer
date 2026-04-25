@@ -221,9 +221,87 @@ def _submitted_at_key(review: dict) -> str:
     return value
 
 
+def _canonical_feedback_text(body: str) -> str:
+    return re.sub(r"\s+", " ", body.strip().lower())
+
+
+def _is_actionable_feedback(body: str) -> bool:
+    text = _canonical_feedback_text(body)
+    if not text:
+        return False
+
+    if re.fullmatch(r"[\W_]+", text):
+        return False
+
+    non_actionable_exact = {
+        "lgtm",
+        "looks good",
+        "looks good to me",
+        "approved",
+        "ship it",
+        "thanks",
+        "thank you",
+        "great work",
+        "+1",
+        "done",
+    }
+    if text in non_actionable_exact:
+        return False
+
+    actionable_markers = [
+        r"\bplease\b",
+        r"\bcan you\b",
+        r"\bshould\b",
+        r"\bneed(?:s|ed)?\b",
+        r"\bmust\b",
+        r"\bfix\b",
+        r"\bchange\b",
+        r"\bupdate\b",
+        r"\brename\b",
+        r"\badd\b",
+        r"\bremove\b",
+        r"\bconsider\b",
+        r"\bavoid\b",
+        r"\buse\b",
+        r"\bnit\b",
+        r"\btodo\b",
+        r"\bfollow up\b",
+    ]
+    for marker in actionable_markers:
+        if re.search(marker, text):
+            return True
+
+    if "`" in body or "\n" in body:
+        return True
+
+    return False
+
+
+def _dedupe_review_items(items: list[dict], stats: dict[str, int]) -> list[dict]:
+    seen: set[tuple[str, str]] = set()
+    deduped: list[dict] = []
+    for item in items:
+        item_type = str(item.get("type") or "")
+        author = str(item.get("author") or "").strip().lower()
+        body = _canonical_feedback_text(str(item.get("body") or ""))
+        key = (author, body)
+        if key in seen:
+            if item_type == "review_comment":
+                stats["comments_duplicates"] += 1
+            elif item_type == "review_summary":
+                stats["reviews_duplicates"] += 1
+            elif item_type == "conversation_comment":
+                stats["conversation_duplicates"] += 1
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
 def normalize_review_items(
     threads: list[dict],
     reviews: list[dict],
+    conversation_comments: list[dict] | None = None,
     pr_author_login: str | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
     stats = {
@@ -234,10 +312,21 @@ def normalize_review_items(
         "comments_outdated": 0,
         "comments_empty": 0,
         "comments_pr_author": 0,
+        "comments_duplicates": 0,
+        "comments_used": 0,
         "reviews_total": 0,
         "reviews_used": 0,
         "reviews_superseded": 0,
         "reviews_pr_author": 0,
+        "reviews_empty": 0,
+        "reviews_non_actionable": 0,
+        "reviews_duplicates": 0,
+        "conversation_total": 0,
+        "conversation_used": 0,
+        "conversation_pr_author": 0,
+        "conversation_empty": 0,
+        "conversation_non_actionable": 0,
+        "conversation_duplicates": 0,
     }
     normalized: list[dict] = []
     author_login = (pr_author_login or "").strip().lower()
@@ -276,7 +365,6 @@ def normalize_review_items(
                 comment_author = str(author_payload.get("login") or "unknown")
             if author_login and comment_author.lower() == author_login:
                 stats["comments_pr_author"] += 1
-                continue
 
             normalized.append(
                 {
@@ -288,6 +376,7 @@ def normalize_review_items(
                     "url": str(comment.get("url") or ""),
                 }
             )
+            stats["comments_used"] += 1
 
     latest_review_by_author: dict[str, dict] = {}
     for review in reviews:
@@ -315,13 +404,18 @@ def normalize_review_items(
         if isinstance(author_payload, dict):
             review_author = str(author_payload.get("login") or "unknown")
 
-        is_pr_author_feedback = bool(author_login and key == author_login)
+        if author_login and key == author_login:
+            stats["reviews_pr_author"] += 1
 
         state = str(review.get("state") or "").strip().upper()
         body = str(review.get("body") or "").strip()
         if not body:
+            stats["reviews_empty"] += 1
             continue
-        if state not in {"CHANGES_REQUESTED", "COMMENTED"}:
+        if state not in {"CHANGES_REQUESTED", "COMMENTED", "APPROVED"}:
+            continue
+        if state in {"COMMENTED", "APPROVED"} and not _is_actionable_feedback(body):
+            stats["reviews_non_actionable"] += 1
             continue
 
         normalized.append(
@@ -337,7 +431,71 @@ def normalize_review_items(
         if is_pr_author_feedback:
             stats["reviews_pr_author"] += 1
 
+    for comment in conversation_comments or []:
+        if not isinstance(comment, dict):
+            continue
+        stats["conversation_total"] += 1
+
+        body = str(comment.get("body") or "").strip()
+        if not body:
+            stats["conversation_empty"] += 1
+            continue
+
+        comment_author = str(comment.get("author") or "unknown")
+        if author_login and comment_author.lower() == author_login:
+            stats["conversation_pr_author"] += 1
+
+        if not _is_actionable_feedback(body):
+            stats["conversation_non_actionable"] += 1
+            continue
+
+        normalized.append(
+            {
+                "type": "conversation_comment",
+                "author": comment_author,
+                "body": body,
+                "url": str(comment.get("url") or ""),
+            }
+        )
+        stats["conversation_used"] += 1
+
+    normalized = _dedupe_review_items(items=normalized, stats=stats)
     return normalized, stats
+
+
+def format_review_filtering_stats(stats: dict[str, int]) -> str:
+    inline_summary = (
+        "inline="
+        f"total:{stats.get('comments_total', 0)} "
+        f"included:{stats.get('comments_used', 0)}(from_pr_author:{stats.get('comments_pr_author', 0)}) "
+        f"excluded(outdated:{stats.get('comments_outdated', 0)}, "
+        f"empty:{stats.get('comments_empty', 0)}, "
+        f"duplicates:{stats.get('comments_duplicates', 0)})"
+    )
+    summary_review = (
+        "review_summaries="
+        f"total:{stats.get('reviews_total', 0)} "
+        f"included:{stats.get('reviews_used', 0)}(from_pr_author:{stats.get('reviews_pr_author', 0)}) "
+        f"excluded(superseded:{stats.get('reviews_superseded', 0)}, "
+        f"empty:{stats.get('reviews_empty', 0)}, "
+        f"non_actionable:{stats.get('reviews_non_actionable', 0)}, "
+        f"duplicates:{stats.get('reviews_duplicates', 0)})"
+    )
+    conversation_summary = (
+        "conversation="
+        f"total:{stats.get('conversation_total', 0)} "
+        f"included:{stats.get('conversation_used', 0)}(from_pr_author:{stats.get('conversation_pr_author', 0)}) "
+        f"excluded(empty:{stats.get('conversation_empty', 0)}, "
+        f"non_actionable:{stats.get('conversation_non_actionable', 0)}, "
+        f"duplicates:{stats.get('conversation_duplicates', 0)})"
+    )
+    thread_summary = (
+        "threads="
+        f"total:{stats.get('threads_total', 0)} "
+        f"excluded(resolved:{stats.get('threads_resolved', 0)}, "
+        f"outdated:{stats.get('threads_outdated', 0)})"
+    )
+    return f"{thread_summary}; {inline_summary}; {summary_review}; {conversation_summary}"
 
 
 def load_linked_issue_context(repo: str, pull_request: dict) -> list[dict]:
@@ -453,6 +611,37 @@ def fetch_pr_review_comments(repo: str, pr_number: int) -> list[dict]:
     return normalized_comments
 
 
+def fetch_pr_conversation_comments(repo: str, pr_number: int) -> list[dict]:
+    output = run_capture(
+        [
+            "gh",
+            "api",
+            f"repos/{repo}/issues/{pr_number}/comments",
+            "--method",
+            "GET",
+            "-f",
+            "per_page=100",
+        ]
+    )
+    comments = json.loads(output)
+    if not isinstance(comments, list):
+        raise RuntimeError("Unexpected response from gh api while fetching PR conversation comments")
+
+    normalized_comments: list[dict] = []
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        normalized_comments.append(
+            {
+                "author": str(user.get("login") or "unknown"),
+                "body": str(comment.get("body") or "").strip(),
+                "url": str(comment.get("html_url") or ""),
+            }
+        )
+    return normalized_comments
+
+
 def current_branch() -> str:
     return run_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"]).strip()
 
@@ -531,6 +720,17 @@ def build_pr_review_prompt(
                     f"{index}. Type: review_summary\n"
                     f"   Author: {author}\n"
                     f"   State: {state}\n"
+                    f"   Feedback: {body}\n"
+                    f"   Link: {url}"
+                ).strip()
+            )
+            continue
+
+        if item_type == "conversation_comment":
+            comment_lines.append(
+                (
+                    f"{index}. Type: conversation_comment\n"
+                    f"   Author: {author}\n"
                     f"   Feedback: {body}\n"
                     f"   Link: {url}"
                 ).strip()
@@ -1459,6 +1659,10 @@ def main() -> int:
                 return 0
 
             threads = fetch_pr_review_threads(repo=repo, number=pr_number_arg)
+            conversation_comments = fetch_pr_conversation_comments(
+                repo=repo,
+                pr_number=pr_number_arg,
+            )
             reviews = pull_request.get("reviews")
             if not isinstance(reviews, list):
                 reviews = []
@@ -1471,15 +1675,18 @@ def main() -> int:
             review_items, review_stats = normalize_review_items(
                 threads=threads,
                 reviews=reviews,
+                conversation_comments=conversation_comments,
                 pr_author_login=pr_author_login,
+            )
+            print(
+                "Review prompt sources: "
+                f"{format_review_filtering_stats(review_stats)}"
             )
             if not review_items:
                 print(
                     "No actionable review comments found "
                     f"for PR #{pr_number_arg}; nothing to do."
                 )
-                if args.dry_run:
-                    print(f"[dry-run] Review filtering stats: {review_stats}")
                 return 0
 
             linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
@@ -1605,6 +1812,10 @@ def main() -> int:
                         f"(mergeStateStatus={merge_state}); rerun will auto-sync and resolve routine conflicts"
                     )
                 thread_items = fetch_pr_review_threads(repo=repo, number=pr_number)
+                conversation_comments = fetch_pr_conversation_comments(
+                    repo=repo,
+                    pr_number=pr_number,
+                )
                 pr_reviews = pull_request.get("reviews")
                 if not isinstance(pr_reviews, list):
                     pr_reviews = []
@@ -1616,8 +1827,19 @@ def main() -> int:
                 review_items, _review_stats = normalize_review_items(
                     threads=thread_items,
                     reviews=pr_reviews,
+                    conversation_comments=conversation_comments,
                     pr_author_login=pr_author_login,
                 )
+                print(
+                    "Review prompt sources: "
+                    f"{format_review_filtering_stats(_review_stats)}"
+                )
+                if not review_items:
+                    print(
+                        f"No actionable review comments for linked PR #{pr_number}; "
+                        "skipping issue run."
+                    )
+                    continue
 
                 issue_branch = str(linked_open_pr.get("headRefName") or "").strip()
                 if not issue_branch:

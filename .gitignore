@@ -3,5 +3,5 @@ __pycache__/
 .DS_Store
 
 .claude/
-.opencode/
-opencode.jsonc
+/.opencode/
+/opencode.jsonc

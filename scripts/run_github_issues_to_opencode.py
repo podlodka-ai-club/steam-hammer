@@ -143,7 +143,7 @@ def fetch_pull_request(repo: str, number: int) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,url,state,headRefName,baseRefName,author,closingIssuesReferences,reviews",
+            "number,title,body,url,state,mergeStateStatus,headRefName,baseRefName,author,closingIssuesReferences,reviews",
         ]
     )
     pull_request = json.loads(output)
@@ -1596,6 +1596,12 @@ def main() -> int:
                     f"Auto-switch to PR-review mode for issue #{issue['number']}: {mode_reason}."
                 )
                 pull_request = fetch_pull_request(repo=repo, number=pr_number)
+                merge_state = str(pull_request.get("mergeStateStatus") or "").strip().upper()
+                if merge_state == "DIRTY":
+                    print(
+                        f"Linked PR #{pr_number} is not mergeable with base yet "
+                        "(mergeStateStatus=DIRTY); rerun will auto-sync and resolve routine conflicts"
+                    )
                 thread_items = fetch_pr_review_threads(repo=repo, number=pr_number)
                 pr_reviews = pull_request.get("reviews")
                 if not isinstance(pr_reviews, list):
@@ -1718,6 +1724,13 @@ def main() -> int:
                         f"branch '{issue_branch}' pushed "
                         f"(force-with-lease: {'yes' if used_force_with_lease else 'no'})"
                     )
+                    if mode == "pr-review" and linked_open_pr is not None:
+                        linked_pr_number = linked_open_pr.get("number")
+                        if type(linked_pr_number) is int:
+                            print(
+                                f"PR #{linked_pr_number} rerun sync pushed; "
+                                "GitHub mergeability should be recalculated without manual conflict steps"
+                            )
                     pr_status, pr_url = ensure_pr(
                         repo=repo,
                         base_branch=target_base_branch,

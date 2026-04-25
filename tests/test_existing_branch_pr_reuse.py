@@ -354,7 +354,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         )
         run_command_mock.assert_called_once_with(["git", "checkout", "main"])
 
-    def test_main_pr_review_mode_auto_resolves_sync_conflict_and_pushes_sync_only_update(self) -> None:
+    def test_main_pr_review_mode_rerun_with_conflicted_open_pr_auto_resolves_and_pushes(self) -> None:
         args = type("Args", (), {
             "repo": "owner/repo",
             "issue": 35,
@@ -412,6 +412,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                     "title": "Fix sync conflicts",
                     "url": "https://github.com/owner/repo/pull/77",
                     "state": "OPEN",
+                    "mergeStateStatus": "DIRTY",
                     "body": "PR body",
                     "reviews": [],
                     "author": {"login": "pr-owner"},
@@ -485,9 +486,11 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
 
         output = stdout_mock.getvalue()
         self.assertIn("Selected mode: pr-review", output)
+        self.assertIn("mergeStateStatus=DIRTY", output)
         self.assertIn("Conflict detected during rebase sync", output)
         self.assertIn("Conflict detected during merge sync", output)
         self.assertIn("Sync-only push result for issue #35", output)
+        self.assertIn("PR #77 rerun sync pushed", output)
 
     @patch("scripts.run_github_issues_to_opencode.open_pr")
     @patch(

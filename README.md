@@ -5,14 +5,23 @@ Script can run in two modes:
 - Issue mode: fetches GitHub issues via `gh`, runs an AI agent on each issue body, and automates git workflow for a fix branch.
 - PR review mode: fetches unresolved PR review feedback, builds a focused prompt for the agent, and prepares a follow-up commit.
 
-## Requirements
+Memo link: https://www.notion.so/Hacker-Sprint-1-33f2db4c860e8064a657e199b4578f66
 
 - `gh` (GitHub CLI) authenticated (`gh auth status`)
 - Python 3.10+
 - `claude` (Claude Code CLI) — default runner
 - `opencode` — only if using `--runner opencode`
 
-## Usage
+```text
+.
+├── .gitignore
+├── README.md
+├── readme.md
+└── scripts
+    └── run_github_issues_to_opencode.py
+```
+
+## Run Example
 
 **With Claude (default):**
 ```bash

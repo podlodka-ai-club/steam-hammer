@@ -1834,13 +1834,6 @@ def main() -> int:
                     "Review prompt sources: "
                     f"{format_review_filtering_stats(_review_stats)}"
                 )
-                if not review_items:
-                    print(
-                        f"No actionable review comments for linked PR #{pr_number}; "
-                        "skipping issue run."
-                    )
-                    continue
-
                 issue_branch = str(linked_open_pr.get("headRefName") or "").strip()
                 if not issue_branch:
                     raise RuntimeError(

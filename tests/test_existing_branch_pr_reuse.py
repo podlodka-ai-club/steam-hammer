@@ -438,6 +438,10 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                     }
                 ],
             ),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments",
+                return_value=[],
+            ),
             patch("scripts.run_github_issues_to_opencode.load_linked_issue_context", return_value=[]),
             patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
             patch(
@@ -491,6 +495,10 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         self.assertIn("Conflict detected during merge sync", output)
         self.assertIn("Sync-only push result for issue #35", output)
         self.assertIn("PR #77 rerun sync pushed", output)
+        self.assertIn(
+            "GitHub mergeability should be recalculated without manual conflict steps",
+            output,
+        )
 
     def test_main_pr_review_mode_conflicted_pr_without_actionable_comments_still_syncs(self) -> None:
         args = type("Args", (), {
@@ -552,6 +560,10 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             ),
             patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]),
             patch(
+                "scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments",
+                return_value=[],
+            ),
+            patch(
                 "scripts.run_github_issues_to_opencode.normalize_review_items",
                 return_value=([], {}),
             ),
@@ -600,6 +612,11 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         self.assertIn("No actionable review comments for linked PR #77", output)
         self.assertIn("Skipping agent run for issue #35 in pr-review mode", output)
         self.assertIn("Sync-only push result for issue #35", output)
+        self.assertIn("PR #77 rerun sync pushed", output)
+        self.assertIn(
+            "GitHub mergeability should be recalculated without manual conflict steps",
+            output,
+        )
 
     @patch("scripts.run_github_issues_to_opencode.open_pr")
     @patch(

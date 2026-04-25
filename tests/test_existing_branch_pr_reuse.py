@@ -1,8 +1,10 @@
+import io
 import unittest
 from unittest.mock import patch
 
 from scripts.run_github_issues_to_opencode import (
     ensure_pr,
+    main,
     prepare_issue_branch,
     sync_reused_branch_with_base,
 )
@@ -122,6 +124,58 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             ],
         )
         command_succeeds_mock.assert_called_once_with(["git", "rebase", "--abort"])
+
+    def test_main_stops_issue_when_reused_branch_sync_fails(self) -> None:
+        args = type("Args", (), {
+            "repo": "owner/repo",
+            "issue": 33,
+            "state": "open",
+            "limit": 10,
+            "runner": "opencode",
+            "agent": "build",
+            "model": None,
+            "agent_timeout_seconds": 900,
+            "agent_idle_timeout_seconds": None,
+            "opencode_auto_approve": False,
+            "branch_prefix": "issue-fix",
+            "include_empty": False,
+            "stop_on_error": False,
+            "fail_on_existing": False,
+            "force_issue_flow": False,
+            "sync_reused_branch": True,
+            "sync_strategy": "rebase",
+            "dir": ".",
+            "local_config": "local-config.json",
+            "dry_run": False,
+        })()
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_issue",
+                return_value={
+                    "number": 33,
+                    "title": "Sync reused branch",
+                    "body": "rerun",
+                    "url": "https://github.com/owner/repo/issues/33",
+                },
+            ),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
+            patch(
+                "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
+                side_effect=RuntimeError("sync failed"),
+            ),
+            patch("scripts.run_github_issues_to_opencode.run_agent") as run_agent_mock,
+            patch("sys.stderr", new_callable=io.StringIO) as stderr_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 1)
+        run_agent_mock.assert_not_called()
+        self.assertIn("Issue #33 failed: sync failed", stderr_mock.getvalue())
 
     @patch("scripts.run_github_issues_to_opencode.open_pr")
     @patch(

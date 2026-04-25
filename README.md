@@ -82,6 +82,7 @@ PR mode notes:
 - `--pr` must be used together with `--from-review-comments`.
 - If PR is closed/non-open, script exits without changes.
 - If there are no actionable unresolved comments, script exits successfully without running the agent.
+- Review summaries are taken from the latest review per author to avoid reprocessing superseded feedback.
 
 ## Smoke test
 

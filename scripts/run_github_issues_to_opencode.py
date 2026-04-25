@@ -208,6 +208,8 @@ def normalize_review_items(
         "comments_pr_author": 0,
         "reviews_total": len(reviews),
         "reviews_used": 0,
+        "reviews_pr_author": 0,
+        "reviews_superseded": 0,
     }
 
     for thread in threads:
@@ -249,18 +251,53 @@ def normalize_review_items(
                 }
             )
 
-    for review in reviews:
+    latest_reviews_by_author: dict[str, dict] = {}
+    for idx, review in enumerate(reviews):
+        if not isinstance(review, dict):
+            continue
+        author_login = ((review.get("author") or {}).get("login") or "unknown").strip()
+        submitted_at = (review.get("submittedAt") or "").strip()
+        key = author_login.lower() if author_login else f"unknown-{idx}"
+        candidate = {
+            "index": idx,
+            "author_login": author_login,
+            "submitted_at": submitted_at,
+            "review": review,
+        }
+        existing = latest_reviews_by_author.get(key)
+        if existing is None:
+            latest_reviews_by_author[key] = candidate
+            continue
+
+        existing_submitted_at = existing["submitted_at"]
+        if submitted_at and existing_submitted_at:
+            if submitted_at > existing_submitted_at:
+                latest_reviews_by_author[key] = candidate
+            continue
+        if submitted_at and not existing_submitted_at:
+            latest_reviews_by_author[key] = candidate
+            continue
+        if not submitted_at and not existing_submitted_at and idx > existing["index"]:
+            latest_reviews_by_author[key] = candidate
+
+    for review_record in latest_reviews_by_author.values():
+        review = review_record["review"]
+        author_login = review_record["author_login"]
+        if pr_author and author_login and author_login.lower() == pr_author:
+            stats["reviews_pr_author"] += 1
+            continue
         state = (review.get("state") or "").upper()
         body = (review.get("body") or "").strip()
         if state not in {"CHANGES_REQUESTED", "COMMENTED"}:
+            stats["reviews_superseded"] += 1
             continue
         if not body:
             continue
 
         actionable.append(
             {
-                "type": "review_summary",
-                "author": (review.get("author") or {}).get("login") or "unknown",
+                    "type": "review_summary",
+                "author": author_login or "unknown",
                 "body": body,
                 "path": "",
                 "line": None,
@@ -414,6 +451,8 @@ def print_review_dry_run(pull_request: dict, review_items: list[dict], stats: di
         f"comments_outdated={stats.get('comments_outdated', 0)}, "
         f"comments_empty={stats.get('comments_empty', 0)}, reviews_used={stats.get('reviews_used', 0)}"
         f", comments_pr_author={stats.get('comments_pr_author', 0)}"
+        f", reviews_pr_author={stats.get('reviews_pr_author', 0)}"
+        f", reviews_superseded={stats.get('reviews_superseded', 0)}"
     )
     preview = review_items[:10]
     for item in preview:

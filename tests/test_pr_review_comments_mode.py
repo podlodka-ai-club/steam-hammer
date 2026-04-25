@@ -138,6 +138,65 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(items[0]["author"], "reviewer")
         self.assertEqual(stats["comments_pr_author"], 1)
 
+    def test_normalize_review_items_uses_latest_review_state_per_author(self) -> None:
+        reviews = [
+            {
+                "state": "CHANGES_REQUESTED",
+                "body": "Please split this function",
+                "author": {"login": "alice"},
+                "submittedAt": "2026-04-24T10:00:00Z",
+                "url": "https://example/review/11",
+            },
+            {
+                "state": "APPROVED",
+                "body": "Looks good now",
+                "author": {"login": "alice"},
+                "submittedAt": "2026-04-24T11:00:00Z",
+                "url": "https://example/review/12",
+            },
+            {
+                "state": "COMMENTED",
+                "body": "Please also update README",
+                "author": {"login": "bob"},
+                "submittedAt": "2026-04-24T12:00:00Z",
+                "url": "https://example/review/13",
+            },
+        ]
+
+        items, stats = self.mod.normalize_review_items(threads=[], reviews=reviews)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["type"], "review_summary")
+        self.assertEqual(items[0]["author"], "bob")
+        self.assertEqual(stats["reviews_used"], 1)
+        self.assertEqual(stats["reviews_superseded"], 1)
+
+    def test_normalize_review_items_skips_pr_author_review_summaries(self) -> None:
+        reviews = [
+            {
+                "state": "COMMENTED",
+                "body": "I pushed a fix",
+                "author": {"login": "pr-owner"},
+                "submittedAt": "2026-04-24T10:00:00Z",
+            },
+            {
+                "state": "CHANGES_REQUESTED",
+                "body": "Still needs test coverage",
+                "author": {"login": "reviewer"},
+                "submittedAt": "2026-04-24T10:01:00Z",
+            },
+        ]
+
+        items, stats = self.mod.normalize_review_items(
+            threads=[],
+            reviews=reviews,
+            pr_author_login="pr-owner",
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["author"], "reviewer")
+        self.assertEqual(stats["reviews_pr_author"], 1)
+
     def test_build_pr_review_prompt_contains_locations_and_links(self) -> None:
         pull_request = {
             "number": 23,

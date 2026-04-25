@@ -57,6 +57,28 @@ def detect_repo() -> str:
     return repo
 
 
+def detect_default_branch(repo: str) -> str:
+    output = run_capture(
+        [
+            "gh",
+            "repo",
+            "view",
+            "--repo",
+            repo,
+            "--json",
+            "defaultBranchRef",
+            "--jq",
+            ".defaultBranchRef.name",
+        ]
+    )
+    branch = output.strip()
+    if not branch:
+        raise RuntimeError(
+            "Unable to detect repository default branch. Use a valid --repo or check gh auth context."
+        )
+    return branch
+
+
 def fetch_issues(repo: str, state: str, limit: int) -> list[dict]:
     output = run_capture(
         [
@@ -367,7 +389,33 @@ def find_existing_pr(repo: str, base_branch: str, branch_name: str) -> dict | No
             "--limit",
             "1",
             "--json",
-            "number,url",
+            "number,url,baseRefName",
+        ]
+    )
+    prs = json.loads(output)
+    if not isinstance(prs, list):
+        raise RuntimeError("Unexpected response from gh pr list")
+    if prs:
+        pr = prs[0]
+        if not isinstance(pr, dict):
+            raise RuntimeError("Unexpected PR entry format from gh pr list")
+        return pr
+
+    output = run_capture(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--head",
+            branch_name,
+            "--state",
+            "open",
+            "--limit",
+            "2",
+            "--json",
+            "number,url,baseRefName",
         ]
     )
     prs = json.loads(output)
@@ -375,6 +423,11 @@ def find_existing_pr(repo: str, base_branch: str, branch_name: str) -> dict | No
         raise RuntimeError("Unexpected response from gh pr list")
     if not prs:
         return None
+    if len(prs) > 1:
+        raise RuntimeError(
+            f"Multiple open PRs found for head '{branch_name}'. Resolve ambiguity manually."
+        )
+
     pr = prs[0]
     if not isinstance(pr, dict):
         raise RuntimeError("Unexpected PR entry format from gh pr list")
@@ -400,11 +453,25 @@ def ensure_pr(
             )
 
         if dry_run:
-            print(
-                f"[dry-run] Would reuse existing PR #{pr_number} from '{branch_name}' to '{base_branch}'"
-            )
+            existing_base = str(existing_pr.get("baseRefName", "")).strip()
+            if existing_base and existing_base != base_branch:
+                print(
+                    f"[dry-run] Would reuse existing PR #{pr_number} from '{branch_name}' to "
+                    f"'{existing_base}' (selected base branch: '{base_branch}')"
+                )
+            else:
+                print(
+                    f"[dry-run] Would reuse existing PR #{pr_number} from '{branch_name}' to '{base_branch}'"
+                )
         else:
-            print(f"Reusing existing PR #{pr_number}: {pr_url}")
+            existing_base = str(existing_pr.get("baseRefName", "")).strip()
+            if existing_base and existing_base != base_branch:
+                print(
+                    f"Reusing existing PR #{pr_number}: {pr_url} "
+                    f"(base '{existing_base}', selected base '{base_branch}')"
+                )
+            else:
+                print(f"Reusing existing PR #{pr_number}: {pr_url}")
 
         return "reused", pr_url
 
@@ -660,8 +727,13 @@ def main() -> int:
 
     try:
         ensure_clean_worktree()
-        base_branch = current_branch()
         repo = args.repo or detect_repo()
+        base_branch = detect_default_branch(repo)
+        mode_label = "[dry-run]" if args.dry_run else ""
+        if mode_label:
+            print(f"{mode_label} Selected stable base branch: {base_branch}")
+        else:
+            print(f"Selected stable base branch: {base_branch}")
         if args.issue is not None:
             issues = [fetch_issue(repo=repo, number=args.issue)]
         else:

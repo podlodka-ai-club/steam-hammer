@@ -171,7 +171,7 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(stats["reviews_used"], 1)
         self.assertEqual(stats["reviews_superseded"], 1)
 
-    def test_normalize_review_items_skips_pr_author_review_summaries(self) -> None:
+    def test_normalize_review_items_includes_pr_author_review_summaries(self) -> None:
         reviews = [
             {
                 "state": "COMMENTED",
@@ -193,8 +193,9 @@ class PrReviewModeTests(unittest.TestCase):
             pr_author_login="pr-owner",
         )
 
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["author"], "reviewer")
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["author"], "pr-owner")
+        self.assertEqual(items[1]["author"], "reviewer")
         self.assertEqual(stats["reviews_pr_author"], 1)
 
     def test_build_pr_review_prompt_contains_locations_and_links(self) -> None:

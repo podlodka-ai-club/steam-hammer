@@ -315,9 +315,7 @@ def normalize_review_items(
         if isinstance(author_payload, dict):
             review_author = str(author_payload.get("login") or "unknown")
 
-        if author_login and key == author_login:
-            stats["reviews_pr_author"] += 1
-            continue
+        is_pr_author_feedback = bool(author_login and key == author_login)
 
         state = str(review.get("state") or "").strip().upper()
         body = str(review.get("body") or "").strip()
@@ -336,6 +334,8 @@ def normalize_review_items(
             }
         )
         stats["reviews_used"] += 1
+        if is_pr_author_feedback:
+            stats["reviews_pr_author"] += 1
 
     return normalized, stats
 

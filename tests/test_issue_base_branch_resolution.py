@@ -102,6 +102,9 @@ class IssueBaseBranchResolutionTests(unittest.TestCase):
             include_empty=False,
             stop_on_error=False,
             fail_on_existing=False,
+            force_issue_flow=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
             dir=".",
             local_config="local-config.json",
             dry_run=True,
@@ -124,7 +127,9 @@ class IssueBaseBranchResolutionTests(unittest.TestCase):
                     "url": "https://github.com/owner/repo/issues/23",
                 },
             ),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
             patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused") as prepare_issue_branch_mock,
+            patch("scripts.run_github_issues_to_opencode.sync_reused_branch_with_base") as sync_reused_branch_with_base_mock,
             patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0),
             patch("scripts.run_github_issues_to_opencode.commit_changes"),
             patch("scripts.run_github_issues_to_opencode.push_branch"),
@@ -156,6 +161,12 @@ class IssueBaseBranchResolutionTests(unittest.TestCase):
             },
             dry_run=True,
             fail_on_existing=False,
+        )
+        sync_reused_branch_with_base_mock.assert_called_once_with(
+            base_branch="main",
+            branch_name="issue-fix/23-pr-review-comments",
+            strategy="rebase",
+            dry_run=True,
         )
         output = stdout_mock.getvalue()
         self.assertIn("[dry-run] Selected stable base branch: main", output)

@@ -1,6 +1,9 @@
-# GitHub Issue -> AI Agent Runner
+# GitHub Issue/PR -> AI Agent Runner
 
-Script fetches GitHub issues via `gh`, runs an AI agent on each issue body, and then automates git workflow for a fix branch.
+Script can run in two modes:
+
+- Issue mode: fetches GitHub issues via `gh`, runs an AI agent on each issue body, and automates git workflow for a fix branch.
+- PR review mode: fetches unresolved PR review feedback, builds a focused prompt for the agent, and prepares a follow-up commit.
 
 ## Requirements
 
@@ -91,6 +94,15 @@ Workflow per issue:
 6. Pushes issue branch to `origin`
 7. Reuses an existing open PR for the issue branch when present; otherwise creates one to the stable base branch
 
+Workflow in PR review mode:
+
+1. Loads PR metadata and review threads/comments
+2. Filters out resolved/outdated/empty feedback and builds an actionable prompt with file/line links
+3. Adds PR description and linked issue context (including issue body when available)
+4. Runs AI agent in current branch (or optional follow-up branch)
+5. On changes, creates commit and pushes updates
+6. Optionally posts a summary comment to the PR
+
 Useful options:
 
 - `--runner claude|opencode` to select the AI agent runner (default: `claude`)
@@ -98,6 +110,9 @@ Useful options:
 - `--include-empty` to process issues with empty body
 - `--stop-on-error` to stop on first failed run
 - `--dry-run` to preview without executing the agent
+- `--pr N --from-review-comments` to run PR review-comments mode
+- `--pr-followup-branch-prefix prefix` to create a follow-up branch in PR mode instead of committing to current branch
+- `--post-pr-summary` to leave a short summary comment in the PR after successful PR mode run
 - `--model model-name` to override model (e.g. `claude-sonnet-4-6` for Claude, `openai/gpt-4o` for OpenCode)
 - `--agent name` agent name for OpenCode (ignored when using Claude)
 - `--branch-prefix prefix` to customize fix branch names
@@ -113,6 +128,19 @@ Useful options:
 If `--repo` is not provided, script tries to detect repository from current `gh` context.
 
 Note: script expects a clean git working tree before run.
+
+PR mode notes:
+
+- `--pr` must be used together with `--from-review-comments`.
+- If PR is closed/non-open, script exits without changes.
+- If there are no actionable unresolved comments, script exits successfully without running the agent.
+- Review summaries are taken from the latest review per author to avoid reprocessing superseded feedback.
+
+## Smoke test
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
 
 ## Troubleshooting hangs
 

@@ -126,6 +126,254 @@ def fetch_issue(repo: str, number: int) -> dict:
     return issue
 
 
+def split_repo_name(repo: str) -> tuple[str, str]:
+    owner, separator, name = repo.partition("/")
+    if not separator or not owner or not name:
+        raise RuntimeError(f"Invalid repo format '{repo}'. Expected owner/name.")
+    return owner, name
+
+
+def fetch_pull_request(repo: str, number: int) -> dict:
+    output = run_capture(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(number),
+            "--repo",
+            repo,
+            "--json",
+            "number,title,body,url,state,headRefName,baseRefName,author,closingIssuesReferences,reviews",
+        ]
+    )
+    pull_request = json.loads(output)
+    if not isinstance(pull_request, dict):
+        raise RuntimeError(f"Unexpected response fetching PR #{number}")
+    return pull_request
+
+
+def fetch_pr_review_threads(repo: str, number: int) -> list[dict]:
+    owner, name = split_repo_name(repo)
+    query = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          isOutdated
+          comments(first: 100) {
+            nodes {
+              body
+              path
+              line
+              outdated
+              url
+              author {
+                login
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+""".strip()
+    output = run_capture(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={number}",
+        ]
+    )
+    payload = json.loads(output)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected response from gh api while fetching PR review threads")
+
+    repository_data = payload.get("data", {}).get("repository")
+    if not isinstance(repository_data, dict):
+        raise RuntimeError("Unexpected GraphQL payload while fetching PR review threads")
+    pull_request = repository_data.get("pullRequest")
+    if pull_request is None:
+        raise RuntimeError(f"Pull request #{number} not found in repository {repo}")
+    if not isinstance(pull_request, dict):
+        raise RuntimeError("Unexpected pullRequest payload while fetching review threads")
+
+    threads = pull_request.get("reviewThreads", {}).get("nodes", [])
+    if not isinstance(threads, list):
+        raise RuntimeError("Unexpected reviewThreads payload while fetching PR review threads")
+    return threads
+
+
+def _submitted_at_key(review: dict) -> str:
+    value = review.get("submittedAt")
+    if not isinstance(value, str):
+        return ""
+    return value
+
+
+def normalize_review_items(
+    threads: list[dict],
+    reviews: list[dict],
+    pr_author_login: str | None = None,
+) -> tuple[list[dict], dict[str, int]]:
+    stats = {
+        "threads_total": 0,
+        "threads_resolved": 0,
+        "threads_outdated": 0,
+        "comments_total": 0,
+        "comments_outdated": 0,
+        "comments_empty": 0,
+        "comments_pr_author": 0,
+        "reviews_total": 0,
+        "reviews_used": 0,
+        "reviews_superseded": 0,
+        "reviews_pr_author": 0,
+    }
+    normalized: list[dict] = []
+    author_login = (pr_author_login or "").strip().lower()
+
+    for thread in threads:
+        if not isinstance(thread, dict):
+            continue
+        stats["threads_total"] += 1
+        if bool(thread.get("isResolved")):
+            stats["threads_resolved"] += 1
+            continue
+        if bool(thread.get("isOutdated")):
+            stats["threads_outdated"] += 1
+            continue
+
+        comments = thread.get("comments", {}).get("nodes", [])
+        if not isinstance(comments, list):
+            continue
+        for comment in comments:
+            if not isinstance(comment, dict):
+                continue
+            stats["comments_total"] += 1
+
+            if bool(comment.get("outdated")):
+                stats["comments_outdated"] += 1
+                continue
+
+            body = str(comment.get("body") or "").strip()
+            if not body:
+                stats["comments_empty"] += 1
+                continue
+
+            comment_author = "unknown"
+            author_payload = comment.get("author")
+            if isinstance(author_payload, dict):
+                comment_author = str(author_payload.get("login") or "unknown")
+            if author_login and comment_author.lower() == author_login:
+                stats["comments_pr_author"] += 1
+                continue
+
+            normalized.append(
+                {
+                    "type": "review_comment",
+                    "author": comment_author,
+                    "body": body,
+                    "path": str(comment.get("path") or ""),
+                    "line": comment.get("line"),
+                    "url": str(comment.get("url") or ""),
+                }
+            )
+
+    latest_review_by_author: dict[str, dict] = {}
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        stats["reviews_total"] += 1
+        review_author = "unknown"
+        author_payload = review.get("author")
+        if isinstance(author_payload, dict):
+            review_author = str(author_payload.get("login") or "unknown")
+        key = review_author.lower()
+
+        existing = latest_review_by_author.get(key)
+        if existing is None:
+            latest_review_by_author[key] = review
+            continue
+
+        if _submitted_at_key(review) >= _submitted_at_key(existing):
+            latest_review_by_author[key] = review
+        stats["reviews_superseded"] += 1
+
+    for key, review in latest_review_by_author.items():
+        review_author = "unknown"
+        author_payload = review.get("author")
+        if isinstance(author_payload, dict):
+            review_author = str(author_payload.get("login") or "unknown")
+
+        if author_login and key == author_login:
+            stats["reviews_pr_author"] += 1
+            continue
+
+        state = str(review.get("state") or "").strip().upper()
+        body = str(review.get("body") or "").strip()
+        if not body:
+            continue
+        if state not in {"CHANGES_REQUESTED", "COMMENTED"}:
+            continue
+
+        normalized.append(
+            {
+                "type": "review_summary",
+                "author": review_author,
+                "body": body,
+                "state": state,
+                "url": str(review.get("url") or ""),
+            }
+        )
+        stats["reviews_used"] += 1
+
+    return normalized, stats
+
+
+def load_linked_issue_context(repo: str, pull_request: dict) -> list[dict]:
+    references = pull_request.get("closingIssuesReferences")
+    if not isinstance(references, list):
+        return []
+
+    linked_issues: list[dict] = []
+    for reference in references:
+        if not isinstance(reference, dict):
+            continue
+        number = reference.get("number")
+        if type(number) is not int:
+            continue
+
+        title = str(reference.get("title") or "").strip()
+        body = str(reference.get("body") or "").strip()
+        url = str(reference.get("url") or "").strip()
+        if not title or not body or not url:
+            issue = fetch_issue(repo=repo, number=number)
+            if isinstance(issue, dict):
+                title = str(issue.get("title") or title)
+                body = str(issue.get("body") or body)
+                url = str(issue.get("url") or url)
+
+        linked_issues.append(
+            {
+                "number": number,
+                "title": title,
+                "body": body,
+                "url": url,
+            }
+        )
+    return linked_issues
+
+
 def pr_links_issue(pr: dict, issue_number: int) -> bool:
     references = pr.get("closingIssuesReferences")
     if isinstance(references, list):
@@ -240,40 +488,78 @@ def build_prompt(issue: dict) -> str:
     )
 
 
-def build_pr_review_prompt(issue: dict, pr: dict, review_comments: list[dict]) -> str:
-    comment_lines: list[str] = []
-    if review_comments:
-        for index, comment in enumerate(review_comments, start=1):
-            path = comment.get("path") or "unknown-file"
-            line = comment.get("line")
-            line_suffix = f":{line}" if isinstance(line, int) else ""
-            author = comment.get("author") or "unknown"
-            body = str(comment.get("body") or "").strip()
-            comment_url = comment.get("url") or ""
-            comment_lines.append(
-                f"{index}. [{author}] {path}{line_suffix}: {body}\n   {comment_url}".strip()
-            )
-    else:
-        comment_lines.append("No inline review comments found in the PR API response.")
+def build_pr_review_prompt(
+    pull_request: dict,
+    review_items: list[dict],
+    linked_issues: list[dict] | None = None,
+) -> str:
+    pr_number = pull_request.get("number")
+    pr_title = str(pull_request.get("title") or "")
+    pr_url = str(pull_request.get("url") or "")
+    pr_body = str(pull_request.get("body") or "").strip()
+    issue_context_lines: list[str] = []
+    for issue in linked_issues or []:
+        if not isinstance(issue, dict):
+            continue
+        issue_number = issue.get("number")
+        issue_title = str(issue.get("title") or "")
+        issue_url = str(issue.get("url") or "")
+        issue_body = str(issue.get("body") or "").strip()
+        issue_context_lines.append(
+            f"- Issue #{issue_number}: {issue_title}\n  URL: {issue_url}\n  Body: {issue_body}".strip()
+        )
 
-    pr_number = pr.get("number")
-    pr_title = str(pr.get("title") or "")
-    pr_url = str(pr.get("url") or "")
-    pr_body = str(pr.get("body") or "").strip()
+    if not issue_context_lines:
+        issue_context_lines.append("- No linked issue context found.")
+
+    comment_lines: list[str] = []
+    for index, item in enumerate(review_items, start=1):
+        item_type = str(item.get("type") or "review_comment")
+        author = str(item.get("author") or "unknown")
+        body = str(item.get("body") or "").strip()
+        url = str(item.get("url") or "")
+        path = str(item.get("path") or "")
+        line = item.get("line")
+        location = path
+        if isinstance(line, int):
+            location = f"{path}:{line}" if path else str(line)
+
+        if item_type == "review_summary":
+            state = str(item.get("state") or "").strip()
+            comment_lines.append(
+                (
+                    f"{index}. Type: review_summary\n"
+                    f"   Author: {author}\n"
+                    f"   State: {state}\n"
+                    f"   Feedback: {body}\n"
+                    f"   Link: {url}"
+                ).strip()
+            )
+            continue
+
+        comment_lines.append(
+            (
+                f"{index}. Type: review_comment\n"
+                f"   Author: {author}\n"
+                f"   Location: {location or 'unknown-location'}\n"
+                f"   Feedback: {body}\n"
+                f"   Link: {url}"
+            ).strip()
+        )
+
     comments_text = "\n".join(comment_lines)
+    issue_context = "\n".join(issue_context_lines)
 
     return (
         "You are working on an existing GitHub pull request review cycle in the current git branch.\n"
         "Implement the fix requested in PR review comments in repository files.\n"
         "Do not run git commands; git actions are handled by orchestration script.\n\n"
-        f"Issue: #{issue['number']} - {issue['title']}\n"
-        f"Issue URL: {issue['url']}\n"
-        f"PR: #{pr_number} - {pr_title}\n"
+        f"Pull Request: #{pr_number} - {pr_title}\n"
         f"PR URL: {pr_url}\n\n"
-        "Issue body:\n"
-        f"{issue.get('body', '').strip()}\n\n"
         "PR description:\n"
         f"{pr_body}\n\n"
+        "Linked issue context:\n"
+        f"{issue_context}\n\n"
         "Review comments to address:\n"
         f"{comments_text}\n"
     )
@@ -306,7 +592,30 @@ def run_agent(
     prompt_override: str | None = None,
 ) -> int:
     prompt = prompt_override if prompt_override is not None else build_prompt(issue)
+    return run_agent_with_prompt(
+        prompt=prompt,
+        item_label=f"issue #{issue['number']}",
+        runner=runner,
+        agent=agent,
+        model=model,
+        dry_run=dry_run,
+        timeout_seconds=timeout_seconds,
+        idle_timeout_seconds=idle_timeout_seconds,
+        opencode_auto_approve=opencode_auto_approve,
+    )
 
+
+def run_agent_with_prompt(
+    prompt: str,
+    item_label: str,
+    runner: str,
+    agent: str,
+    model: str | None,
+    dry_run: bool,
+    timeout_seconds: int,
+    idle_timeout_seconds: int | None,
+    opencode_auto_approve: bool,
+) -> int:
     if runner == "claude":
         command = ["claude", "--dangerously-skip-permissions", "-p", prompt]
         if model:
@@ -320,12 +629,10 @@ def run_agent(
         command.append(prompt)
 
     if dry_run:
-        print(
-            f"[dry-run] Would run: {' '.join(command[:4])} ... for issue #{issue['number']}"
-        )
+        print(f"[dry-run] Would run: {' '.join(command[:4])} ... for {item_label}")
         return 0
 
-    print(f"Running agent for issue #{issue['number']}: {issue['title']}")
+    print(f"Running agent for {item_label}")
     start = time.monotonic()
     last_output = start
 
@@ -353,7 +660,7 @@ def run_agent(
                 process.kill()
                 process.wait(timeout=10)
                 raise RuntimeError(
-                    f"Agent timed out after {timeout_seconds}s for issue #{issue['number']}. "
+                    f"Agent timed out after {timeout_seconds}s for {item_label}. "
                     "Possible causes: waiting for interactive approval, network stall, "
                     "or a long-running task. Try increasing --agent-timeout-seconds, "
                     "setting --agent-idle-timeout-seconds, or using --opencode-auto-approve "
@@ -364,11 +671,10 @@ def run_agent(
                 process.kill()
                 process.wait(timeout=10)
                 raise RuntimeError(
-                    f"Agent produced no output for {idle_timeout_seconds}s on issue "
-                    f"#{issue['number']}; aborting to avoid indefinite hang. "
-                    "Possible causes: waiting for interactive approval or a stuck process. "
-                    "Try --opencode-auto-approve (if safe) or a larger "
-                    "--agent-idle-timeout-seconds."
+                    f"Agent produced no output for {idle_timeout_seconds}s on {item_label}; "
+                    "aborting to avoid indefinite hang. Possible causes: waiting for "
+                    "interactive approval or a stuck process. Try --opencode-auto-approve "
+                    "(if safe) or a larger --agent-idle-timeout-seconds."
                 )
 
             events = selector.select(timeout=1.0)
@@ -586,6 +892,51 @@ def push_branch(branch_name: str, dry_run: bool, force_with_lease: bool = False)
             print(f"[dry-run] Would push branch '{branch_name}' to origin")
         return
     run_command(command)
+
+
+def push_current_branch(dry_run: bool) -> None:
+    if dry_run:
+        print("[dry-run] Would push current branch to origin")
+        return
+    run_command(["git", "push"])
+
+
+def commit_pr_review_changes(pull_request: dict, dry_run: bool) -> str:
+    message = f"Address review comments for PR #{pull_request['number']}"
+    if dry_run:
+        print(f"[dry-run] Would commit with message: {message}")
+        return message
+    run_command(["git", "add", "-A"])
+    run_command(["git", "commit", "-m", message])
+    return message
+
+
+def leave_pr_summary_comment(
+    repo: str,
+    pr_number: int,
+    review_items_count: int,
+    dry_run: bool,
+) -> None:
+    body = (
+        "Automated follow-up completed.\n\n"
+        f"- Addressed review feedback items: {review_items_count}\n"
+        "- Please run another review pass for confirmation."
+    )
+    if dry_run:
+        print(f"[dry-run] Would leave summary comment in PR #{pr_number}")
+        return
+    run_command(
+        [
+            "gh",
+            "pr",
+            "comment",
+            str(pr_number),
+            "--repo",
+            repo,
+            "--body",
+            body,
+        ]
+    )
 
 
 def open_pr(
@@ -881,6 +1232,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Process a single issue by number, ignoring --limit and --state.",
     )
     parser.add_argument(
+        "--pr",
+        type=int,
+        help="Process a single pull request by number (requires --from-review-comments).",
+    )
+    parser.add_argument(
+        "--from-review-comments",
+        action="store_true",
+        help="Enable PR review-comments mode (must be used with --pr).",
+    )
+    parser.add_argument(
         "--state",
         default=BUILTIN_DEFAULTS["state"],
         choices=["open", "closed", "all"],
@@ -932,6 +1293,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--branch-prefix",
         default=BUILTIN_DEFAULTS["branch_prefix"],
         help="Prefix for per-issue git branches.",
+    )
+    parser.add_argument(
+        "--pr-followup-branch-prefix",
+        help=(
+            "Optional prefix for follow-up branch in PR review mode. If omitted, "
+            "changes are committed to the current PR branch."
+        ),
+    )
+    parser.add_argument(
+        "--post-pr-summary",
+        action="store_true",
+        help="Post a short summary comment to PR after successful PR review run.",
     )
     parser.add_argument(
         "--include-empty",
@@ -1021,6 +1394,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    issue_number_arg = getattr(args, "issue", None)
+    pr_number_arg = getattr(args, "pr", None)
+    from_review_comments = bool(getattr(args, "from_review_comments", False))
+    force_issue_flow = bool(getattr(args, "force_issue_flow", False))
+    has_force_issue_flow_flag = hasattr(args, "force_issue_flow")
+    pr_followup_branch_prefix = getattr(args, "pr_followup_branch_prefix", None)
+    post_pr_summary = bool(getattr(args, "post_pr_summary", False))
+
     try:
         target_dir = os.path.abspath(args.dir)
         if not os.path.isdir(target_dir):
@@ -1033,21 +1414,137 @@ def main() -> int:
         return 1
 
     try:
+        if issue_number_arg is not None and pr_number_arg is not None:
+            raise RuntimeError("Use either --issue or --pr, not both.")
+        pr_mode_requested = pr_number_arg is not None or from_review_comments
+        if from_review_comments and pr_number_arg is None:
+            raise RuntimeError("--from-review-comments requires --pr <number>.")
+        if pr_number_arg is not None and not from_review_comments:
+            raise RuntimeError("--pr requires --from-review-comments.")
+
         ensure_clean_worktree()
         repo = args.repo or detect_repo()
-        base_branch = detect_default_branch(repo)
-        mode_label = "[dry-run]" if args.dry_run else ""
-        if mode_label:
-            print(f"{mode_label} Selected stable base branch: {base_branch}")
+        if pr_mode_requested:
+            base_branch = ""
+            issues = []
         else:
-            print(f"Selected stable base branch: {base_branch}")
-        if args.issue is not None:
-            issues = [fetch_issue(repo=repo, number=args.issue)]
-        else:
-            issues = fetch_issues(repo=repo, state=args.state, limit=args.limit)
+            base_branch = detect_default_branch(repo)
+            mode_label = "[dry-run]" if args.dry_run else ""
+            if mode_label:
+                print(f"{mode_label} Selected stable base branch: {base_branch}")
+            else:
+                print(f"Selected stable base branch: {base_branch}")
+
+            if issue_number_arg is not None:
+                issues = [fetch_issue(repo=repo, number=issue_number_arg)]
+            else:
+                issues = fetch_issues(repo=repo, state=args.state, limit=args.limit)
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+
+    if pr_mode_requested:
+        try:
+            if type(pr_number_arg) is not int:
+                raise RuntimeError("--pr must be an integer pull request number")
+
+            pull_request = fetch_pull_request(repo=repo, number=pr_number_arg)
+            pr_state = str(pull_request.get("state") or "").strip().upper()
+            if pr_state != "OPEN":
+                print(f"PR #{pr_number_arg} is not open (state: {pr_state}); skipping.")
+                return 0
+
+            threads = fetch_pr_review_threads(repo=repo, number=pr_number_arg)
+            reviews = pull_request.get("reviews")
+            if not isinstance(reviews, list):
+                reviews = []
+
+            pr_author_payload = pull_request.get("author")
+            pr_author_login = ""
+            if isinstance(pr_author_payload, dict):
+                pr_author_login = str(pr_author_payload.get("login") or "")
+
+            review_items, review_stats = normalize_review_items(
+                threads=threads,
+                reviews=reviews,
+                pr_author_login=pr_author_login,
+            )
+            if not review_items:
+                print(
+                    "No actionable review comments found "
+                    f"for PR #{pr_number_arg}; nothing to do."
+                )
+                if args.dry_run:
+                    print(f"[dry-run] Review filtering stats: {review_stats}")
+                return 0
+
+            linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+            prompt = build_pr_review_prompt(
+                pull_request=pull_request,
+                review_items=review_items,
+                linked_issues=linked_issues,
+            )
+
+            base_branch_for_run = current_branch()
+            active_branch = base_branch_for_run
+            if pr_followup_branch_prefix:
+                followup_branch = (
+                    f"{pr_followup_branch_prefix}/pr-{pr_number_arg}-review-comments"
+                )
+                create_followup_branch(
+                    current_branch_name=base_branch_for_run,
+                    branch_name=followup_branch,
+                    dry_run=args.dry_run,
+                )
+                active_branch = followup_branch
+
+            exit_code = run_agent_with_prompt(
+                prompt=prompt,
+                item_label=f"PR #{pr_number_arg}",
+                runner=args.runner,
+                agent=args.agent,
+                model=args.model,
+                dry_run=args.dry_run,
+                timeout_seconds=args.agent_timeout_seconds,
+                idle_timeout_seconds=args.agent_idle_timeout_seconds,
+                opencode_auto_approve=args.opencode_auto_approve,
+            )
+            if exit_code != 0:
+                raise RuntimeError(
+                    f"Agent failed for PR #{pr_number_arg} with exit code {exit_code}"
+                )
+
+            if not args.dry_run and not has_changes():
+                print(f"No changes detected for PR #{pr_number_arg}; skipping commit and push")
+                if pr_followup_branch_prefix:
+                    run_command(["git", "checkout", base_branch_for_run])
+                return 0
+
+            commit_pr_review_changes(pull_request=pull_request, dry_run=args.dry_run)
+            if pr_followup_branch_prefix:
+                push_branch(branch_name=active_branch, dry_run=args.dry_run)
+                print(f"Pushed follow-up branch for PR #{pr_number_arg}: {active_branch}")
+            else:
+                push_current_branch(dry_run=args.dry_run)
+
+            if post_pr_summary:
+                leave_pr_summary_comment(
+                    repo=repo,
+                    pr_number=pr_number_arg,
+                    review_items_count=len(review_items),
+                    dry_run=args.dry_run,
+                )
+
+            if not args.dry_run and pr_followup_branch_prefix:
+                run_command(["git", "checkout", base_branch_for_run])
+
+            print(
+                f"Done. Processed PR #{pr_number_arg} with {len(review_items)} actionable review items."
+            )
+            return 0
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     if not issues:
         print("No issues found.")
@@ -1062,12 +1559,12 @@ def main() -> int:
             linked_open_pr: dict | None = None
             mode = "issue-flow"
             mode_reason = "batch issue processing"
-            if args.issue is not None:
+            if issue_number_arg is not None and has_force_issue_flow_flag:
                 linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
                 mode, mode_reason = choose_execution_mode(
                     issue_number=issue["number"],
                     linked_open_pr=linked_open_pr,
-                    force_issue_flow=args.force_issue_flow,
+                    force_issue_flow=force_issue_flow,
                 )
 
             body = (issue.get("body") or "").strip()
@@ -1094,11 +1591,33 @@ def main() -> int:
                 print(
                     f"Auto-switch to PR-review mode for issue #{issue['number']}: {mode_reason}."
                 )
-                review_comments = fetch_pr_review_comments(repo=repo, pr_number=pr_number)
+                pull_request = fetch_pull_request(repo=repo, number=pr_number)
+                thread_items = fetch_pr_review_threads(repo=repo, number=pr_number)
+                pr_reviews = pull_request.get("reviews")
+                if not isinstance(pr_reviews, list):
+                    pr_reviews = []
+                pr_author_payload = pull_request.get("author")
+                pr_author_login = ""
+                if isinstance(pr_author_payload, dict):
+                    pr_author_login = str(pr_author_payload.get("login") or "")
+
+                review_items, _review_stats = normalize_review_items(
+                    threads=thread_items,
+                    reviews=pr_reviews,
+                    pr_author_login=pr_author_login,
+                )
+                if not review_items:
+                    print(
+                        f"No actionable review comments for linked PR #{pr_number}; "
+                        "skipping issue run."
+                    )
+                    continue
+
+                linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
                 prompt_override = build_pr_review_prompt(
-                    issue=issue,
-                    pr=linked_open_pr,
-                    review_comments=review_comments,
+                    pull_request=pull_request,
+                    review_items=review_items,
+                    linked_issues=linked_issues,
                 )
                 issue_branch = str(linked_open_pr.get("headRefName") or "").strip()
                 if not issue_branch:
@@ -1109,7 +1628,7 @@ def main() -> int:
                 if not target_base_branch:
                     target_base_branch = base_branch
 
-                review_comment_count = len(review_comments)
+                review_comment_count = len(review_items)
                 if args.dry_run:
                     print(
                         "[dry-run] Selected mode: pr-review "
@@ -1121,7 +1640,7 @@ def main() -> int:
                         f"PR #{pr_number}; review comments: {review_comment_count})"
                     )
             else:
-                if args.issue is not None:
+                if issue_number_arg is not None:
                     if args.dry_run:
                         print(
                             f"[dry-run] Selected mode: issue-flow (reason: {mode_reason})"

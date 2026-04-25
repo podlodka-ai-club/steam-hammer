@@ -1563,6 +1563,7 @@ def main() -> int:
             linked_open_pr: dict | None = None
             mode = "issue-flow"
             mode_reason = "batch issue processing"
+            skip_agent_run = False
             if issue_number_arg is not None and has_force_issue_flow_flag:
                 linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
                 mode, mode_reason = choose_execution_mode(
@@ -1597,10 +1598,11 @@ def main() -> int:
                 )
                 pull_request = fetch_pull_request(repo=repo, number=pr_number)
                 merge_state = str(pull_request.get("mergeStateStatus") or "").strip().upper()
-                if merge_state == "DIRTY":
+                should_force_sync_rerun = merge_state in {"DIRTY", "CONFLICTING"}
+                if should_force_sync_rerun:
                     print(
                         f"Linked PR #{pr_number} is not mergeable with base yet "
-                        "(mergeStateStatus=DIRTY); rerun will auto-sync and resolve routine conflicts"
+                        f"(mergeStateStatus={merge_state}); rerun will auto-sync and resolve routine conflicts"
                     )
                 thread_items = fetch_pr_review_threads(repo=repo, number=pr_number)
                 pr_reviews = pull_request.get("reviews")
@@ -1616,19 +1618,7 @@ def main() -> int:
                     reviews=pr_reviews,
                     pr_author_login=pr_author_login,
                 )
-                if not review_items:
-                    print(
-                        f"No actionable review comments for linked PR #{pr_number}; "
-                        "skipping issue run."
-                    )
-                    continue
 
-                linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
-                prompt_override = build_pr_review_prompt(
-                    pull_request=pull_request,
-                    review_items=review_items,
-                    linked_issues=linked_issues,
-                )
                 issue_branch = str(linked_open_pr.get("headRefName") or "").strip()
                 if not issue_branch:
                     raise RuntimeError(
@@ -1637,6 +1627,28 @@ def main() -> int:
                 target_base_branch = str(linked_open_pr.get("baseRefName") or base_branch).strip()
                 if not target_base_branch:
                     target_base_branch = base_branch
+
+                if not review_items:
+                    if should_force_sync_rerun:
+                        skip_agent_run = True
+                        print(
+                            f"No actionable review comments for linked PR #{pr_number}; "
+                            f"continuing with sync-only rerun because mergeStateStatus={merge_state}"
+                        )
+                    else:
+                        print(
+                            f"No actionable review comments for linked PR #{pr_number}; "
+                            "skipping issue run."
+                        )
+                        continue
+
+                if review_items:
+                    linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                    prompt_override = build_pr_review_prompt(
+                        pull_request=pull_request,
+                        review_items=review_items,
+                        linked_issues=linked_issues,
+                    )
 
                 review_comment_count = len(review_items)
                 if args.dry_run:
@@ -1691,21 +1703,27 @@ def main() -> int:
                     f"strategy: '{args.sync_strategy}')"
                 )
 
-            exit_code = run_agent(
-                issue=issue,
-                runner=args.runner,
-                agent=args.agent,
-                model=args.model,
-                dry_run=args.dry_run,
-                timeout_seconds=args.agent_timeout_seconds,
-                idle_timeout_seconds=args.agent_idle_timeout_seconds,
-                opencode_auto_approve=args.opencode_auto_approve,
-                prompt_override=prompt_override,
-            )
-            if exit_code != 0:
-                raise RuntimeError(
-                    f"Agent failed for issue #{issue['number']} with exit code {exit_code}"
+            if skip_agent_run:
+                print(
+                    f"Skipping agent run for issue #{issue['number']} in pr-review mode: "
+                    "no actionable review comments; running sync-only path"
                 )
+            else:
+                exit_code = run_agent(
+                    issue=issue,
+                    runner=args.runner,
+                    agent=args.agent,
+                    model=args.model,
+                    dry_run=args.dry_run,
+                    timeout_seconds=args.agent_timeout_seconds,
+                    idle_timeout_seconds=args.agent_idle_timeout_seconds,
+                    opencode_auto_approve=args.opencode_auto_approve,
+                    prompt_override=prompt_override,
+                )
+                if exit_code != 0:
+                    raise RuntimeError(
+                        f"Agent failed for issue #{issue['number']} with exit code {exit_code}"
+                    )
 
             if not args.dry_run and not has_changes():
                 if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:

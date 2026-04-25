@@ -78,6 +78,7 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(stats["threads_resolved"], 1)
         self.assertEqual(stats["threads_outdated"], 0)
         self.assertEqual(stats["comments_outdated"], 1)
+        self.assertEqual(stats["reviews_non_actionable"], 1)
 
     def test_normalize_review_items_skips_outdated_threads(self) -> None:
         threads = [
@@ -170,6 +171,141 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(items[0]["author"], "bob")
         self.assertEqual(stats["reviews_used"], 1)
         self.assertEqual(stats["reviews_superseded"], 1)
+
+    def test_normalize_review_items_includes_actionable_approved_review_summary(self) -> None:
+        reviews = [
+            {
+                "state": "APPROVED",
+                "body": "Approved after you add docs for this endpoint",
+                "author": {"login": "alice"},
+                "submittedAt": "2026-04-24T12:00:00Z",
+            }
+        ]
+
+        items, stats = self.mod.normalize_review_items(threads=[], reviews=reviews)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["type"], "review_summary")
+        self.assertEqual(items[0]["state"], "APPROVED")
+        self.assertEqual(stats["reviews_used"], 1)
+
+    def test_normalize_review_items_filters_non_actionable_conversation_comments(self) -> None:
+        comments = [
+            {
+                "author": "alice",
+                "body": "thanks",
+                "url": "https://example/comment/1",
+            },
+            {
+                "author": "bob",
+                "body": "Please update README and add a short migration note",
+                "url": "https://example/comment/2",
+            },
+            {
+                "author": "carol",
+                "body": "",
+                "url": "https://example/comment/3",
+            },
+        ]
+
+        items, stats = self.mod.normalize_review_items(
+            threads=[],
+            reviews=[],
+            conversation_comments=comments,
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["type"], "conversation_comment")
+        self.assertEqual(items[0]["author"], "bob")
+        self.assertEqual(stats["conversation_total"], 3)
+        self.assertEqual(stats["conversation_non_actionable"], 1)
+        self.assertEqual(stats["conversation_empty"], 1)
+
+    def test_normalize_review_items_mixed_sources_preserve_priority_and_deduplicate(self) -> None:
+        threads = [
+            {
+                "isResolved": False,
+                "isOutdated": False,
+                "comments": {
+                    "nodes": [
+                        {
+                            "body": "Please rename this variable",
+                            "path": "scripts/tool.py",
+                            "line": 7,
+                            "outdated": False,
+                            "author": {"login": "alice"},
+                            "url": "https://example/review-comment/1",
+                        }
+                    ]
+                },
+            }
+        ]
+        reviews = [
+            {
+                "state": "COMMENTED",
+                "body": "Please rename this variable",
+                "author": {"login": "alice"},
+                "submittedAt": "2026-04-24T10:00:00Z",
+            },
+            {
+                "state": "CHANGES_REQUESTED",
+                "body": "Add tests for this behavior",
+                "author": {"login": "bob"},
+                "submittedAt": "2026-04-24T11:00:00Z",
+            },
+        ]
+        comments = [
+            {
+                "author": "dave",
+                "body": "Please update changelog",
+                "url": "https://example/comment/10",
+            }
+        ]
+
+        items, stats = self.mod.normalize_review_items(
+            threads=threads,
+            reviews=reviews,
+            conversation_comments=comments,
+        )
+
+        self.assertEqual(len(items), 3)
+        self.assertEqual(items[0]["type"], "review_comment")
+        self.assertEqual(items[1]["type"], "review_summary")
+        self.assertEqual(items[2]["type"], "conversation_comment")
+        self.assertEqual(stats["reviews_duplicates"], 1)
+
+    def test_format_review_filtering_stats_contains_source_breakdown(self) -> None:
+        stats = {
+            "threads_total": 2,
+            "threads_resolved": 1,
+            "threads_outdated": 0,
+            "comments_total": 3,
+            "comments_used": 1,
+            "comments_outdated": 1,
+            "comments_empty": 1,
+            "comments_pr_author": 0,
+            "comments_duplicates": 0,
+            "reviews_total": 2,
+            "reviews_used": 1,
+            "reviews_superseded": 1,
+            "reviews_empty": 0,
+            "reviews_pr_author": 0,
+            "reviews_non_actionable": 0,
+            "reviews_duplicates": 0,
+            "conversation_total": 1,
+            "conversation_used": 1,
+            "conversation_empty": 0,
+            "conversation_pr_author": 0,
+            "conversation_non_actionable": 0,
+            "conversation_duplicates": 0,
+        }
+
+        text = self.mod.format_review_filtering_stats(stats)
+
+        self.assertIn("threads=total:2", text)
+        self.assertIn("inline=total:3", text)
+        self.assertIn("review_summaries=total:2", text)
+        self.assertIn("conversation=total:1", text)
 
     def test_normalize_review_items_skips_pr_author_review_summaries(self) -> None:
         reviews = [
@@ -299,6 +435,7 @@ class PrReviewModeTests(unittest.TestCase):
                 mock.patch.object(self.mod, "detect_repo", return_value="owner/repo"),
                 mock.patch.object(self.mod, "fetch_pull_request", return_value=pull_request),
                 mock.patch.object(self.mod, "fetch_pr_review_threads", return_value=[]),
+                mock.patch.object(self.mod, "fetch_pr_conversation_comments", return_value=[]),
                 mock.patch.object(
                     self.mod,
                     "normalize_review_items",
@@ -308,6 +445,72 @@ class PrReviewModeTests(unittest.TestCase):
                 exit_code = self.mod.main()
 
         self.assertEqual(exit_code, 0)
+
+    def test_issue_mode_auto_switch_uses_actionable_conversation_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pathlib.Path(tmpdir, ".git").mkdir()
+            argv = [
+                "runner",
+                "--issue",
+                "37",
+                "--dry-run",
+                "--dir",
+                tmpdir,
+            ]
+            issue = {
+                "number": 37,
+                "title": "Consider all PR comments in pr-review mode",
+                "body": "Issue body",
+                "url": "https://example/issues/37",
+            }
+            linked_pr = {
+                "number": 101,
+                "headRefName": "issue-fix/37-comments",
+                "baseRefName": "main",
+            }
+            pull_request = {
+                "number": 101,
+                "title": "Fix PR-review comment aggregation",
+                "url": "https://example/pr/101",
+                "body": "PR description",
+                "author": {"login": "author"},
+                "reviews": [],
+            }
+
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(self.mod, "ensure_clean_worktree"),
+                mock.patch.object(self.mod, "detect_repo", return_value="owner/repo"),
+                mock.patch.object(self.mod, "detect_default_branch", return_value="main"),
+                mock.patch.object(self.mod, "fetch_issue", return_value=issue),
+                mock.patch.object(self.mod, "find_open_pr_for_issue", return_value=linked_pr),
+                mock.patch.object(self.mod, "fetch_pull_request", return_value=pull_request),
+                mock.patch.object(self.mod, "fetch_pr_review_threads", return_value=[]),
+                mock.patch.object(
+                    self.mod,
+                    "fetch_pr_conversation_comments",
+                    return_value=[
+                        {
+                            "author": "maintainer",
+                            "body": "Please include review summaries and issue comments",
+                            "url": "https://example/comment/777",
+                        }
+                    ],
+                ),
+                mock.patch.object(self.mod, "prepare_issue_branch", return_value="reused"),
+                mock.patch.object(self.mod, "sync_reused_branch_with_base", return_value=False),
+                mock.patch.object(self.mod, "run_agent", return_value=0) as run_agent_mock,
+                mock.patch.object(self.mod, "ensure_pr", return_value=("reused", "")),
+                mock.patch.object(self.mod, "push_branch"),
+                mock.patch.object(self.mod, "commit_changes"),
+            ):
+                exit_code = self.mod.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(run_agent_mock.called)
+        prompt_override = run_agent_mock.call_args.kwargs["prompt_override"]
+        self.assertIn("conversation_comment", prompt_override)
+        self.assertIn("review summaries", prompt_override)
 
 
 if __name__ == "__main__":

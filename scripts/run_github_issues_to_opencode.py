@@ -10,7 +10,23 @@ import sys
 import time
 
 
-MAX_REVIEW_ITEMS = 40
+LOCAL_CONFIG_RELATIVE_PATH = "local-config.json"
+BUILTIN_DEFAULTS = {
+    "state": "open",
+    "limit": 10,
+    "runner": "claude",
+    "agent": "build",
+    "model": None,
+    "agent_timeout_seconds": 900,
+    "agent_idle_timeout_seconds": None,
+    "opencode_auto_approve": False,
+    "branch_prefix": "issue-fix",
+    "include_empty": False,
+    "stop_on_error": False,
+    "fail_on_existing": False,
+    "force_issue_flow": False,
+    "dir": ".",
+}
 
 
 def run_capture(command: list[str]) -> str:
@@ -27,6 +43,11 @@ def run_command(command: list[str]) -> None:
         raise RuntimeError(f"Command failed: {' '.join(command)}")
 
 
+def command_succeeds(command: list[str]) -> bool:
+    result = subprocess.run(command, capture_output=True, text=True)
+    return result.returncode == 0
+
+
 def detect_repo() -> str:
     output = run_capture(
         ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]
@@ -35,6 +56,27 @@ def detect_repo() -> str:
     if not repo:
         raise RuntimeError("Unable to detect GitHub repository. Use --repo owner/name.")
     return repo
+
+
+def detect_default_branch(repo: str) -> str:
+    output = run_capture(
+        [
+            "gh",
+            "repo",
+            "view",
+            repo,
+            "--json",
+            "defaultBranchRef",
+            "--jq",
+            ".defaultBranchRef.name",
+        ]
+    )
+    branch = output.strip()
+    if not branch:
+        raise RuntimeError(
+            "Unable to detect repository default branch. Use a valid --repo or check gh auth context."
+        )
+    return branch
 
 
 def fetch_issues(repo: str, state: str, limit: int) -> list[dict]:
@@ -78,280 +120,83 @@ def fetch_issue(repo: str, number: int) -> dict:
     return issue
 
 
-def parse_repo(repo: str) -> tuple[str, str]:
-    parts = repo.split("/", 1)
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        raise RuntimeError(f"Invalid --repo format: {repo}. Expected owner/name.")
-    return parts[0], parts[1]
+def pr_links_issue(pr: dict, issue_number: int) -> bool:
+    references = pr.get("closingIssuesReferences")
+    if isinstance(references, list):
+        for reference in references:
+            if isinstance(reference, dict) and reference.get("number") == issue_number:
+                return True
+
+    token = f"#{issue_number}"
+    title = str(pr.get("title") or "")
+    body = str(pr.get("body") or "")
+    if token in title or token in body:
+        return True
+
+    head_ref = str(pr.get("headRefName") or "")
+    if re.search(rf"(^|[^0-9]){issue_number}([^0-9]|$)", head_ref):
+        return True
+
+    return False
 
 
-def fetch_pull_request(repo: str, number: int) -> dict:
+def find_open_pr_for_issue(repo: str, issue_number: int) -> dict | None:
     output = run_capture(
         [
             "gh",
             "pr",
-            "view",
-            str(number),
+            "list",
             "--repo",
             repo,
+            "--state",
+            "open",
+            "--limit",
+            "100",
             "--json",
-            "number,title,body,url,state,baseRefName,headRefName,author,reviews,closingIssuesReferences",
+            "number,title,url,body,headRefName,baseRefName,closingIssuesReferences",
         ]
     )
-    pull_request = json.loads(output)
-    if not isinstance(pull_request, dict):
-        raise RuntimeError(f"Unexpected response fetching PR #{number}")
-    return pull_request
+    prs = json.loads(output)
+    if not isinstance(prs, list):
+        raise RuntimeError("Unexpected response from gh pr list while searching linked PR")
+
+    for pr in prs:
+        if isinstance(pr, dict) and pr_links_issue(pr, issue_number=issue_number):
+            return pr
+    return None
 
 
-def fetch_pr_review_threads(repo: str, number: int) -> list[dict]:
-    owner, name = parse_repo(repo)
-    query = (
-        "query($owner:String!, $name:String!, $number:Int!, $cursor:String) {"
-        " repository(owner:$owner, name:$name) {"
-        "   pullRequest(number:$number) {"
-        "     reviewThreads(first:100, after:$cursor) {"
-        "       nodes {"
-        "         id"
-        "         isResolved"
-        "         isOutdated"
-        "         comments(first:100) {"
-        "           nodes {"
-        "             id"
-        "             body"
-        "             path"
-        "             line"
-        "             originalLine"
-        "             url"
-        "             outdated"
-        "             author { login }"
-        "           }"
-        "         }"
-        "       }"
-        "       pageInfo { hasNextPage endCursor }"
-        "     }"
-        "   }"
-        " }"
-        "}"
-    )
-
-    threads: list[dict] = []
-    cursor: str | None = None
-
-    while True:
-        command = [
+def fetch_pr_review_comments(repo: str, pr_number: int) -> list[dict]:
+    output = run_capture(
+        [
             "gh",
             "api",
-            "graphql",
+            f"repos/{repo}/pulls/{pr_number}/comments",
+            "--method",
+            "GET",
             "-f",
-            f"query={query}",
-            "-F",
-            f"owner={owner}",
-            "-F",
-            f"name={name}",
-            "-F",
-            f"number={number}",
+            "per_page=100",
         ]
-        if cursor:
-            command.extend(["-F", f"cursor={cursor}"])
+    )
+    comments = json.loads(output)
+    if not isinstance(comments, list):
+        raise RuntimeError("Unexpected response from gh api while fetching PR review comments")
 
-        output = run_capture(command)
-        if not output.strip():
-            raise RuntimeError(f"Empty response fetching review threads for PR #{number}")
-        response = json.loads(output)
-        if "errors" in response:
-            raise RuntimeError(
-                f"GraphQL error fetching review threads for PR #{number}: {response['errors']}"
-            )
-
-        repository = response.get("data", {}).get("repository")
-        if not isinstance(repository, dict):
-            raise RuntimeError(f"Unexpected GraphQL repository payload for PR #{number}")
-
-        pull_request = repository.get("pullRequest")
-        if pull_request is None:
-            raise RuntimeError(f"Pull request #{number} not found in GraphQL response")
-        if not isinstance(pull_request, dict):
-            raise RuntimeError(f"Unexpected GraphQL pullRequest payload for PR #{number}")
-
-        pr_data = pull_request.get("reviewThreads") or {}
-        if not isinstance(pr_data, dict):
-            raise RuntimeError(f"Unexpected review thread structure for PR #{number}")
-        page_nodes = pr_data.get("nodes") or []
-        if not isinstance(page_nodes, list):
-            raise RuntimeError(f"Unexpected review thread structure for PR #{number}")
-        threads.extend(page_nodes)
-
-        page_info = pr_data.get("pageInfo") or {}
-        has_next = bool(page_info.get("hasNextPage"))
-        cursor = page_info.get("endCursor")
-        if not has_next:
-            break
-
-    return threads
-
-
-def normalize_review_items(
-    threads: list[dict],
-    reviews: list[dict],
-    pr_author_login: str | None = None,
-) -> tuple[list[dict], dict]:
-    actionable: list[dict] = []
-    pr_author = (pr_author_login or "").strip().lower()
-    stats = {
-        "threads_total": len(threads),
-        "threads_resolved": 0,
-        "threads_outdated": 0,
-        "comments_total": 0,
-        "comments_empty": 0,
-        "comments_outdated": 0,
-        "comments_pr_author": 0,
-        "reviews_total": len(reviews),
-        "reviews_used": 0,
-        "reviews_pr_author": 0,
-        "reviews_superseded": 0,
-    }
-
-    for thread in threads:
-        if thread.get("isResolved"):
-            stats["threads_resolved"] += 1
+    normalized_comments: list[dict] = []
+    for comment in comments:
+        if not isinstance(comment, dict):
             continue
-        if thread.get("isOutdated"):
-            stats["threads_outdated"] += 1
-            continue
-
-        comments = (thread.get("comments") or {}).get("nodes") or []
-        if not isinstance(comments, list):
-            continue
-
-        for comment in comments:
-            stats["comments_total"] += 1
-            if comment.get("outdated"):
-                stats["comments_outdated"] += 1
-                continue
-
-            author_login = ((comment.get("author") or {}).get("login") or "").strip()
-            if pr_author and author_login.lower() == pr_author:
-                stats["comments_pr_author"] += 1
-                continue
-
-            body = (comment.get("body") or "").strip()
-            if not body:
-                stats["comments_empty"] += 1
-                continue
-
-            actionable.append(
-                {
-                    "type": "review_comment",
-                    "author": author_login or "unknown",
-                    "body": body,
-                    "path": comment.get("path") or "",
-                    "line": comment.get("line") or comment.get("originalLine"),
-                    "url": comment.get("url") or "",
-                }
-            )
-
-    latest_reviews_by_author: dict[str, dict] = {}
-    for idx, review in enumerate(reviews):
-        if not isinstance(review, dict):
-            continue
-        author_login = ((review.get("author") or {}).get("login") or "unknown").strip()
-        submitted_at = (review.get("submittedAt") or "").strip()
-        key = author_login.lower() if author_login else f"unknown-{idx}"
-        candidate = {
-            "index": idx,
-            "author_login": author_login,
-            "submitted_at": submitted_at,
-            "review": review,
-        }
-        existing = latest_reviews_by_author.get(key)
-        if existing is None:
-            latest_reviews_by_author[key] = candidate
-            continue
-
-        existing_submitted_at = existing["submitted_at"]
-        if submitted_at and existing_submitted_at:
-            if submitted_at > existing_submitted_at:
-                latest_reviews_by_author[key] = candidate
-            continue
-        if submitted_at and not existing_submitted_at:
-            latest_reviews_by_author[key] = candidate
-            continue
-        if not submitted_at and not existing_submitted_at and idx > existing["index"]:
-            latest_reviews_by_author[key] = candidate
-
-    for review_record in latest_reviews_by_author.values():
-        review = review_record["review"]
-        author_login = review_record["author_login"]
-        if pr_author and author_login and author_login.lower() == pr_author:
-            stats["reviews_pr_author"] += 1
-            continue
-        state = (review.get("state") or "").upper()
-        body = (review.get("body") or "").strip()
-        if state not in {"CHANGES_REQUESTED", "COMMENTED"}:
-            stats["reviews_superseded"] += 1
-            continue
-        if not body:
-            continue
-
-        actionable.append(
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        normalized_comments.append(
             {
-                    "type": "review_summary",
-                "author": author_login or "unknown",
-                "body": body,
-                "path": "",
-                "line": None,
-                "url": review.get("url") or "",
-                "state": state,
+                "author": str(user.get("login") or "unknown"),
+                "path": str(comment.get("path") or ""),
+                "line": comment.get("line"),
+                "body": str(comment.get("body") or "").strip(),
+                "url": str(comment.get("html_url") or ""),
             }
         )
-        stats["reviews_used"] += 1
-
-    return actionable[:MAX_REVIEW_ITEMS], stats
-
-
-def _linked_issue_number(candidate: dict) -> int | None:
-    number = candidate.get("number")
-    return number if isinstance(number, int) and number > 0 else None
-
-
-def load_linked_issue_context(repo: str, pull_request: dict) -> list[dict]:
-    linked = pull_request.get("closingIssuesReferences") or []
-    if not isinstance(linked, list) or not linked:
-        return []
-
-    context_items: list[dict] = []
-    for linked_issue in linked[:5]:
-        number = _linked_issue_number(linked_issue)
-        if number is None:
-            continue
-
-        title = (linked_issue.get("title") or "").strip()
-        body = (linked_issue.get("body") or "").strip()
-        url = (linked_issue.get("url") or "").strip()
-
-        if title and (body or url):
-            context_items.append(
-                {
-                    "number": number,
-                    "title": title,
-                    "body": body,
-                    "url": url,
-                }
-            )
-            continue
-
-        fetched = fetch_issue(repo=repo, number=number)
-        context_items.append(
-            {
-                "number": fetched.get("number", number),
-                "title": (fetched.get("title") or "").strip(),
-                "body": (fetched.get("body") or "").strip(),
-                "url": (fetched.get("url") or "").strip(),
-            }
-        )
-
-    return context_items
+    return normalized_comments
 
 
 def current_branch() -> str:
@@ -389,83 +234,58 @@ def build_prompt(issue: dict) -> str:
     )
 
 
-def build_pr_review_prompt(
-    pull_request: dict,
-    review_items: list[dict],
-    linked_issues: list[dict] | None = None,
-) -> str:
-    pr_number = pull_request["number"]
-    lines = [
-        "You are working on review feedback for an existing GitHub pull request in the current git branch.",
-        "Implement fixes for the review comments in repository files.",
-        "Do not run git commands; git actions are handled by orchestration script.",
-        "",
-        f"Pull Request: #{pr_number} - {pull_request['title']}",
-        f"URL: {pull_request['url']}",
-        "",
-        "PR description:",
-        (pull_request.get("body") or "").strip() or "(empty)",
-    ]
-
-    if linked_issues:
-        lines.extend(["", "Linked issues context:"])
-        for issue in linked_issues[:5]:
-            issue_body = (issue.get("body") or "").strip()
-            lines.append(
-                f"- #{issue.get('number')} {issue.get('title')} ({issue.get('url')})"
+def build_pr_review_prompt(issue: dict, pr: dict, review_comments: list[dict]) -> str:
+    comment_lines: list[str] = []
+    if review_comments:
+        for index, comment in enumerate(review_comments, start=1):
+            path = comment.get("path") or "unknown-file"
+            line = comment.get("line")
+            line_suffix = f":{line}" if isinstance(line, int) else ""
+            author = comment.get("author") or "unknown"
+            body = str(comment.get("body") or "").strip()
+            comment_url = comment.get("url") or ""
+            comment_lines.append(
+                f"{index}. [{author}] {path}{line_suffix}: {body}\n   {comment_url}".strip()
             )
-            if issue_body:
-                lines.append(issue_body)
+    else:
+        comment_lines.append("No inline review comments found in the PR API response.")
 
-    lines.extend(["", "Review feedback to address:"])
-    for idx, item in enumerate(review_items, start=1):
-        location = item["path"]
-        if item.get("line"):
-            location = f"{location}:{item['line']}" if location else f"line {item['line']}"
-        if not location:
-            location = "general"
-        url = item.get("url") or "n/a"
-        item_type = "summary" if item["type"] == "review_summary" else "comment"
-        lines.extend(
-            [
-                f"{idx}. [{item_type}] by @{item['author']}",
-                f"   Location: {location}",
-                f"   Link: {url}",
-                f"   Text: {item['body']}",
-            ]
-        )
+    pr_number = pr.get("number")
+    pr_title = str(pr.get("title") or "")
+    pr_url = str(pr.get("url") or "")
+    pr_body = str(pr.get("body") or "").strip()
+    comments_text = "\n".join(comment_lines)
 
-    return "\n".join(lines) + "\n"
-
-
-def print_review_dry_run(pull_request: dict, review_items: list[dict], stats: dict) -> None:
-    print(
-        f"[dry-run] PR #{pull_request['number']} review mode: "
-        f"{len(review_items)} actionable items"
+    return (
+        "You are working on an existing GitHub pull request review cycle in the current git branch.\n"
+        "Implement the fix requested in PR review comments in repository files.\n"
+        "Do not run git commands; git actions are handled by orchestration script.\n\n"
+        f"Issue: #{issue['number']} - {issue['title']}\n"
+        f"Issue URL: {issue['url']}\n"
+        f"PR: #{pr_number} - {pr_title}\n"
+        f"PR URL: {pr_url}\n\n"
+        "Issue body:\n"
+        f"{issue.get('body', '').strip()}\n\n"
+        "PR description:\n"
+        f"{pr_body}\n\n"
+        "Review comments to address:\n"
+        f"{comments_text}\n"
     )
-    print(
-        "[dry-run] Review scan stats: "
-        f"threads={stats.get('threads_total', 0)}, resolved={stats.get('threads_resolved', 0)}, "
-        f"outdated_threads={stats.get('threads_outdated', 0)}, "
-        f"comments_total={stats.get('comments_total', 0)}, "
-        f"comments_outdated={stats.get('comments_outdated', 0)}, "
-        f"comments_empty={stats.get('comments_empty', 0)}, reviews_used={stats.get('reviews_used', 0)}"
-        f", comments_pr_author={stats.get('comments_pr_author', 0)}"
-        f", reviews_pr_author={stats.get('reviews_pr_author', 0)}"
-        f", reviews_superseded={stats.get('reviews_superseded', 0)}"
-    )
-    preview = review_items[:10]
-    for item in preview:
-        location = item["path"] or "general"
-        if item.get("line"):
-            location = f"{location}:{item['line']}"
-        body = item["body"].replace("\n", " ").strip()
-        short_body = body if len(body) <= 160 else f"{body[:157]}..."
-        print(
-            f"[dry-run] - @{item['author']} {location} -> {short_body}"
-        )
-    if len(review_items) > len(preview):
-        print(f"[dry-run] ... and {len(review_items) - len(preview)} more item(s)")
+
+
+def choose_execution_mode(
+    issue_number: int,
+    linked_open_pr: dict | None,
+    force_issue_flow: bool,
+) -> tuple[str, str]:
+    if force_issue_flow:
+        return "issue-flow", "--force-issue-flow is set"
+
+    if linked_open_pr is None:
+        return "issue-flow", f"no open PR linked to issue #{issue_number}"
+
+    pr_number = linked_open_pr.get("number")
+    return "pr-review", f"found linked open PR #{pr_number}"
 
 
 def run_agent(
@@ -477,18 +297,9 @@ def run_agent(
     timeout_seconds: int,
     idle_timeout_seconds: int | None,
     opencode_auto_approve: bool,
+    prompt_override: str | None = None,
 ) -> int:
-    return run_agent_with_prompt(
-        prompt=build_prompt(issue),
-        item_label=f"issue #{issue['number']}: {issue['title']}",
-        runner=runner,
-        agent=agent,
-        model=model,
-        dry_run=dry_run,
-        timeout_seconds=timeout_seconds,
-        idle_timeout_seconds=idle_timeout_seconds,
-        opencode_auto_approve=opencode_auto_approve,
-    )
+    prompt = prompt_override if prompt_override is not None else build_prompt(issue)
 
 
 def run_agent_with_prompt(
@@ -589,11 +400,63 @@ def run_agent_with_prompt(
 
 
 def create_branch(base_branch: str, branch_name: str, dry_run: bool) -> None:
+    prepare_issue_branch(
+        base_branch=base_branch,
+        branch_name=branch_name,
+        dry_run=dry_run,
+        fail_on_existing=False,
+    )
+
+
+def local_branch_exists(branch_name: str) -> bool:
+    return command_succeeds(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"])
+
+
+def remote_branch_exists(branch_name: str) -> bool:
+    return command_succeeds(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch_name}"]
+    )
+
+
+def prepare_issue_branch(
+    base_branch: str,
+    branch_name: str,
+    dry_run: bool,
+    fail_on_existing: bool,
+) -> str:
+    local_exists = local_branch_exists(branch_name)
+    remote_exists = remote_branch_exists(branch_name)
+    branch_exists = local_exists or remote_exists
+
+    if branch_exists and fail_on_existing:
+        raise RuntimeError(
+            f"Branch '{branch_name}' already exists and --fail-on-existing is enabled"
+        )
+
+    branch_status = "reused" if branch_exists else "created"
+
     if dry_run:
-        print(f"[dry-run] Would create branch '{branch_name}' from '{base_branch}'")
-        return
+        if branch_exists:
+            print(f"[dry-run] Would reuse existing branch '{branch_name}'")
+        else:
+            print(f"[dry-run] Would create branch '{branch_name}' from '{base_branch}'")
+        return branch_status
+
     run_command(["git", "checkout", base_branch])
+
+    if local_exists:
+        run_command(["git", "checkout", branch_name])
+        print(f"Reusing existing branch: {branch_name}")
+        return branch_status
+
+    if remote_exists:
+        run_command(["git", "checkout", "-b", branch_name, "--track", f"origin/{branch_name}"])
+        print(f"Reusing existing remote branch: {branch_name}")
+        return branch_status
+
     run_command(["git", "checkout", "-b", branch_name])
+    print(f"Created branch: {branch_name}")
+    return branch_status
 
 
 def create_followup_branch(current_branch_name: str, branch_name: str, dry_run: bool) -> None:
@@ -707,7 +570,240 @@ def open_pr(
     return output.strip()
 
 
-def main() -> int:
+def find_existing_pr(repo: str, base_branch: str, branch_name: str) -> dict | None:
+    output = run_capture(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--base",
+            base_branch,
+            "--head",
+            branch_name,
+            "--state",
+            "open",
+            "--limit",
+            "1",
+            "--json",
+            "number,url,baseRefName",
+        ]
+    )
+    prs = json.loads(output)
+    if not isinstance(prs, list):
+        raise RuntimeError("Unexpected response from gh pr list")
+    if prs:
+        pr = prs[0]
+        if not isinstance(pr, dict):
+            raise RuntimeError("Unexpected PR entry format from gh pr list")
+        return pr
+
+    output = run_capture(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--head",
+            branch_name,
+            "--state",
+            "open",
+            "--limit",
+            "2",
+            "--json",
+            "number,url,baseRefName",
+        ]
+    )
+    prs = json.loads(output)
+    if not isinstance(prs, list):
+        raise RuntimeError("Unexpected response from gh pr list")
+    if not prs:
+        return None
+    if len(prs) > 1:
+        raise RuntimeError(
+            f"Multiple open PRs found for head '{branch_name}'. Resolve ambiguity manually."
+        )
+
+    pr = prs[0]
+    if not isinstance(pr, dict):
+        raise RuntimeError("Unexpected PR entry format from gh pr list")
+    return pr
+
+
+def ensure_pr(
+    repo: str,
+    base_branch: str,
+    branch_name: str,
+    issue: dict,
+    dry_run: bool,
+    fail_on_existing: bool,
+) -> tuple[str, str]:
+    existing_pr = find_existing_pr(repo=repo, base_branch=base_branch, branch_name=branch_name)
+    if existing_pr is not None:
+        pr_url = str(existing_pr.get("url", "")).strip()
+        pr_number = existing_pr.get("number")
+        existing_base = str(existing_pr.get("baseRefName", "")).strip()
+        if fail_on_existing:
+            if existing_base and existing_base != base_branch:
+                raise RuntimeError(
+                    f"PR already exists for branch '{branch_name}' to '{existing_base}' "
+                    f"(#{pr_number}; selected base '{base_branch}') and --fail-on-existing is enabled"
+                )
+            raise RuntimeError(
+                f"PR already exists for branch '{branch_name}' to '{base_branch}' "
+                f"(#{pr_number}) and --fail-on-existing is enabled"
+            )
+
+        if dry_run:
+            if existing_base and existing_base != base_branch:
+                print(
+                    f"[dry-run] Would reuse existing PR #{pr_number} from '{branch_name}' to "
+                    f"'{existing_base}' (selected base branch: '{base_branch}')"
+                )
+            else:
+                print(
+                    f"[dry-run] Would reuse existing PR #{pr_number} from '{branch_name}' to '{base_branch}'"
+                )
+        else:
+            if existing_base and existing_base != base_branch:
+                print(
+                    f"Reusing existing PR #{pr_number}: {pr_url} "
+                    f"(base '{existing_base}', selected base '{base_branch}')"
+                )
+            else:
+                print(f"Reusing existing PR #{pr_number}: {pr_url}")
+
+        return "reused", pr_url
+
+    pr_url = open_pr(
+        repo=repo,
+        base_branch=base_branch,
+        branch_name=branch_name,
+        issue=issue,
+        dry_run=dry_run,
+    )
+    return "created", pr_url
+
+
+def resolve_local_config_path(raw_path: str | None, target_dir: str) -> str:
+    config_path = raw_path or LOCAL_CONFIG_RELATIVE_PATH
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(target_dir, config_path)
+    return os.path.abspath(config_path)
+
+
+def validate_local_config(config: dict, config_path: str) -> dict:
+    supported_keys = {
+        "state",
+        "limit",
+        "runner",
+        "agent",
+        "model",
+        "agent_timeout_seconds",
+        "agent_idle_timeout_seconds",
+        "opencode_auto_approve",
+        "branch_prefix",
+        "include_empty",
+        "stop_on_error",
+        "fail_on_existing",
+        "force_issue_flow",
+    }
+
+    unsupported = sorted(set(config) - supported_keys)
+    if unsupported:
+        unsupported_text = ", ".join(unsupported)
+        raise RuntimeError(
+            f"Unsupported key(s) in local config {config_path}: {unsupported_text}"
+        )
+
+    validated: dict = {}
+
+    if "state" in config:
+        if config["state"] not in {"open", "closed", "all"}:
+            raise RuntimeError("Local config key 'state' must be one of: open, closed, all")
+        validated["state"] = config["state"]
+
+    if "limit" in config:
+        if type(config["limit"]) is not int or config["limit"] <= 0:
+            raise RuntimeError("Local config key 'limit' must be a positive integer")
+        validated["limit"] = config["limit"]
+
+    if "runner" in config:
+        if config["runner"] not in {"claude", "opencode"}:
+            raise RuntimeError(
+                "Local config key 'runner' must be one of: claude, opencode"
+            )
+        validated["runner"] = config["runner"]
+
+    if "agent" in config:
+        if not isinstance(config["agent"], str) or not config["agent"].strip():
+            raise RuntimeError("Local config key 'agent' must be a non-empty string")
+        validated["agent"] = config["agent"]
+
+    if "model" in config:
+        if config["model"] is not None and not isinstance(config["model"], str):
+            raise RuntimeError("Local config key 'model' must be a string or null")
+        validated["model"] = config["model"]
+
+    if "agent_timeout_seconds" in config:
+        value = config["agent_timeout_seconds"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError(
+                "Local config key 'agent_timeout_seconds' must be a positive integer"
+            )
+        validated["agent_timeout_seconds"] = value
+
+    if "agent_idle_timeout_seconds" in config:
+        value = config["agent_idle_timeout_seconds"]
+        if value is not None and (type(value) is not int or value <= 0):
+            raise RuntimeError(
+                "Local config key 'agent_idle_timeout_seconds' must be a positive integer or null"
+            )
+        validated["agent_idle_timeout_seconds"] = value
+
+    for key in [
+        "opencode_auto_approve",
+        "include_empty",
+        "stop_on_error",
+        "fail_on_existing",
+        "force_issue_flow",
+    ]:
+        if key in config:
+            if not isinstance(config[key], bool):
+                raise RuntimeError(f"Local config key '{key}' must be a boolean")
+            validated[key] = config[key]
+
+    if "branch_prefix" in config:
+        if not isinstance(config["branch_prefix"], str) or not config["branch_prefix"].strip():
+            raise RuntimeError(
+                "Local config key 'branch_prefix' must be a non-empty string"
+            )
+        validated["branch_prefix"] = config["branch_prefix"]
+
+    return validated
+
+
+def load_local_config(config_path: str) -> dict:
+    if not os.path.exists(config_path):
+        return {}
+
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            data = json.load(config_file)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON in local config {config_path}: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read local config {config_path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Local config {config_path} must contain a JSON object")
+
+    return validate_local_config(config=data, config_path=config_path)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fetch GitHub issues with gh and run an AI agent for each issue body."
     )
@@ -715,32 +811,43 @@ def main() -> int:
         "--repo", help="GitHub repo in owner/name format. Defaults to current gh repo."
     )
     parser.add_argument(
-        "--issue", type=int, help="Process a single issue by number, ignoring --limit and --state."
+        "--issue",
+        type=int,
+        help="Process a single issue by number, ignoring --limit and --state.",
     )
     parser.add_argument(
-        "--pr", type=int, help="Process a single pull request by number."
+        "--state",
+        default=BUILTIN_DEFAULTS["state"],
+        choices=["open", "closed", "all"],
     )
     parser.add_argument(
-        "--from-review-comments",
-        action="store_true",
-        help="Enable PR review-comments mode (requires --pr).",
-    )
-    parser.add_argument("--state", default="open", choices=["open", "closed", "all"])
-    parser.add_argument(
-        "--limit", type=int, default=10, help="Maximum number of issues to process."
+        "--limit",
+        type=int,
+        default=BUILTIN_DEFAULTS["limit"],
+        help="Maximum number of issues to process.",
     )
     parser.add_argument(
         "--runner",
-        default="claude",
+        default=BUILTIN_DEFAULTS["runner"],
         choices=["claude", "opencode"],
         help="AI agent runner to use (default: claude).",
     )
-    parser.add_argument("--agent", default="build", help="Opencode agent name (only used with --runner opencode).")
-    parser.add_argument("--model", help="Optional model override. For Claude: e.g. claude-sonnet-4-6. For OpenCode: e.g. openai/gpt-4o.")
+    parser.add_argument(
+        "--agent",
+        default=BUILTIN_DEFAULTS["agent"],
+        help="Opencode agent name (only used with --runner opencode).",
+    )
+    parser.add_argument(
+        "--model",
+        help=(
+            "Optional model override. For Claude: e.g. claude-sonnet-4-6. "
+            "For OpenCode: e.g. openai/gpt-4o."
+        ),
+    )
     parser.add_argument(
         "--agent-timeout-seconds",
         type=int,
-        default=900,
+        default=BUILTIN_DEFAULTS["agent_timeout_seconds"],
         help="Hard timeout for agent execution in seconds (default: 900).",
     )
     parser.add_argument(
@@ -758,7 +865,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--branch-prefix",
-        default="issue-fix",
+        default=BUILTIN_DEFAULTS["branch_prefix"],
         help="Prefix for per-issue git branches.",
     )
     parser.add_argument(
@@ -784,14 +891,57 @@ def main() -> int:
         help="Stop after first failed agent run.",
     )
     parser.add_argument(
+        "--fail-on-existing",
+        action="store_true",
+        help=(
+            "Fail instead of reusing existing issue branch/PR. By default existing "
+            "branch/PR are reused when possible."
+        ),
+    )
+    parser.add_argument(
+        "--force-issue-flow",
+        action="store_true",
+        help=(
+            "Disable auto-switch to PR-review mode when --issue has a linked open PR. "
+            "Keeps legacy issue-flow behavior."
+        ),
+    )
+    parser.add_argument(
         "--dir",
-        default=".",
+        default=BUILTIN_DEFAULTS["dir"],
         help="Path to the local git repository to operate on. Defaults to the current directory.",
+    )
+    parser.add_argument(
+        "--local-config",
+        help=(
+            "Path to local JSON config with user-specific defaults. "
+            "Defaults to local-config.json under --dir."
+        ),
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="Print actions without running the agent."
     )
-    args = parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    bootstrap_parser = argparse.ArgumentParser(add_help=False)
+    bootstrap_parser.add_argument("--dir", default=BUILTIN_DEFAULTS["dir"])
+    bootstrap_parser.add_argument("--local-config")
+    bootstrap_args, _ = bootstrap_parser.parse_known_args(argv)
+
+    target_dir = os.path.abspath(bootstrap_args.dir)
+    local_config_path = resolve_local_config_path(bootstrap_args.local_config, target_dir)
+    local_defaults = load_local_config(local_config_path)
+
+    parser = build_parser()
+    parser.set_defaults(**local_defaults)
+    parser.set_defaults(local_config=local_config_path)
+    return parser.parse_args(argv)
+
+
+def main() -> int:
+    args = parse_args()
 
     try:
         target_dir = os.path.abspath(args.dir)
@@ -814,87 +964,13 @@ def main() -> int:
             raise RuntimeError("--pr requires --from-review-comments.")
 
         ensure_clean_worktree()
-        base_branch = current_branch()
         repo = args.repo or detect_repo()
-        if pr_mode_requested:
-            pull_request = fetch_pull_request(repo=repo, number=args.pr)
-            if pull_request.get("state") != "OPEN":
-                print(f"PR #{pull_request['number']} is not open; nothing to do.")
-                return 0
-            threads = fetch_pr_review_threads(repo=repo, number=args.pr)
-            reviews = pull_request.get("reviews") or []
-            pr_author_login = ((pull_request.get("author") or {}).get("login") or "").strip()
-            review_items, review_stats = normalize_review_items(
-                threads=threads,
-                reviews=reviews,
-                pr_author_login=pr_author_login,
-            )
-            linked_issue_context = load_linked_issue_context(repo=repo, pull_request=pull_request)
-            if args.dry_run:
-                print_review_dry_run(
-                    pull_request=pull_request,
-                    review_items=review_items,
-                    stats=review_stats,
-                )
-            if not review_items:
-                print(f"No actionable unresolved review feedback found for PR #{args.pr}.")
-                return 0
-            prompt = build_pr_review_prompt(
-                pull_request=pull_request,
-                review_items=review_items,
-                linked_issues=linked_issue_context,
-            )
-            followup_branch = ""
-            if args.pr_followup_branch_prefix:
-                followup_branch = (
-                    f"{args.pr_followup_branch_prefix}/pr-{pull_request['number']}-"
-                    f"{slugify(pull_request['title'])}"
-                )
-                create_followup_branch(
-                    current_branch_name=base_branch,
-                    branch_name=followup_branch,
-                    dry_run=args.dry_run,
-                )
-
-            exit_code = run_agent_with_prompt(
-                prompt=prompt,
-                item_label=f"PR #{pull_request['number']} review comments",
-                runner=args.runner,
-                agent=args.agent,
-                model=args.model,
-                dry_run=args.dry_run,
-                timeout_seconds=args.agent_timeout_seconds,
-                idle_timeout_seconds=args.agent_idle_timeout_seconds,
-                opencode_auto_approve=args.opencode_auto_approve,
-            )
-            if exit_code != 0:
-                raise RuntimeError(
-                    f"Agent failed for PR #{pull_request['number']} with exit code {exit_code}"
-                )
-
-            if not args.dry_run and not has_changes():
-                print(f"No changes detected after processing PR #{pull_request['number']} comments")
-                return 0
-
-            commit_pr_review_changes(pull_request=pull_request, dry_run=args.dry_run)
-            if followup_branch:
-                push_branch(branch_name=followup_branch, dry_run=args.dry_run)
-            else:
-                push_current_branch(dry_run=args.dry_run)
-            if args.post_pr_summary:
-                leave_pr_summary_comment(
-                    repo=repo,
-                    pr_number=pull_request["number"],
-                    review_items_count=len(review_items),
-                    dry_run=args.dry_run,
-                )
-
-            print(
-                f"Done. Processed PR #{pull_request['number']} review mode; "
-                "failures: 0"
-            )
-            return 0
-
+        base_branch = detect_default_branch(repo)
+        mode_label = "[dry-run]" if args.dry_run else ""
+        if mode_label:
+            print(f"{mode_label} Selected stable base branch: {base_branch}")
+        else:
+            print(f"Selected stable base branch: {base_branch}")
         if args.issue is not None:
             issues = [fetch_issue(repo=repo, number=args.issue)]
         else:
@@ -909,21 +985,89 @@ def main() -> int:
 
     failures = 0
     processed = 0
-    created_prs: list[str] = []
+    touched_prs: list[str] = []
 
     for issue in issues:
-        body = (issue.get("body") or "").strip()
-        if not body and not args.include_empty:
-            print(f"Skipping issue #{issue['number']} (empty body)")
-            continue
-
-        processed += 1
-        issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
-
         try:
-            create_branch(
-                base_branch=base_branch, branch_name=issue_branch, dry_run=args.dry_run
+            linked_open_pr: dict | None = None
+            mode = "issue-flow"
+            mode_reason = "batch issue processing"
+            if args.issue is not None:
+                linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
+                mode, mode_reason = choose_execution_mode(
+                    issue_number=issue["number"],
+                    linked_open_pr=linked_open_pr,
+                    force_issue_flow=args.force_issue_flow,
+                )
+
+            body = (issue.get("body") or "").strip()
+            if mode == "issue-flow" and not body and not args.include_empty:
+                print(f"Skipping issue #{issue['number']} (empty body)")
+                continue
+
+            processed += 1
+
+            prompt_override: str | None = None
+            if mode == "pr-review":
+                if linked_open_pr is None:
+                    raise RuntimeError(
+                        f"Internal error: PR-review mode selected without linked PR for issue #{issue['number']}"
+                    )
+
+                pr_number_raw = linked_open_pr.get("number")
+                if type(pr_number_raw) is not int:
+                    raise RuntimeError(
+                        f"Linked PR for issue #{issue['number']} has invalid number: {pr_number_raw}"
+                    )
+                pr_number = pr_number_raw
+
+                print(
+                    f"Auto-switch to PR-review mode for issue #{issue['number']}: {mode_reason}."
+                )
+                review_comments = fetch_pr_review_comments(repo=repo, pr_number=pr_number)
+                prompt_override = build_pr_review_prompt(
+                    issue=issue,
+                    pr=linked_open_pr,
+                    review_comments=review_comments,
+                )
+                issue_branch = str(linked_open_pr.get("headRefName") or "").strip()
+                if not issue_branch:
+                    raise RuntimeError(
+                        f"Linked PR #{pr_number} has empty headRefName; cannot select working branch"
+                    )
+                target_base_branch = str(linked_open_pr.get("baseRefName") or base_branch).strip()
+                if not target_base_branch:
+                    target_base_branch = base_branch
+
+                review_comment_count = len(review_comments)
+                if args.dry_run:
+                    print(
+                        "[dry-run] Selected mode: pr-review "
+                        f"(reason: {mode_reason}; PR #{pr_number}; review comments: {review_comment_count})"
+                    )
+                else:
+                    print(
+                        f"Selected mode: pr-review (reason: {mode_reason}; "
+                        f"PR #{pr_number}; review comments: {review_comment_count})"
+                    )
+            else:
+                if args.issue is not None:
+                    if args.dry_run:
+                        print(
+                            f"[dry-run] Selected mode: issue-flow (reason: {mode_reason})"
+                        )
+                    else:
+                        print(f"Selected mode: issue-flow (reason: {mode_reason})")
+                issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
+                target_base_branch = base_branch
+
+            branch_status = prepare_issue_branch(
+                base_branch=target_base_branch,
+                branch_name=issue_branch,
+                dry_run=args.dry_run,
+                fail_on_existing=args.fail_on_existing,
             )
+            print(f"Branch status for issue #{issue['number']}: {branch_status}")
 
             exit_code = run_agent(
                 issue=issue,
@@ -934,6 +1078,7 @@ def main() -> int:
                 timeout_seconds=args.agent_timeout_seconds,
                 idle_timeout_seconds=args.agent_idle_timeout_seconds,
                 opencode_auto_approve=args.opencode_auto_approve,
+                prompt_override=prompt_override,
             )
             if exit_code != 0:
                 raise RuntimeError(
@@ -949,16 +1094,17 @@ def main() -> int:
 
             commit_changes(issue=issue, dry_run=args.dry_run)
             push_branch(branch_name=issue_branch, dry_run=args.dry_run)
-            pr_url = open_pr(
+            pr_status, pr_url = ensure_pr(
                 repo=repo,
-                base_branch=base_branch,
+                base_branch=target_base_branch,
                 branch_name=issue_branch,
                 issue=issue,
                 dry_run=args.dry_run,
+                fail_on_existing=args.fail_on_existing,
             )
             if pr_url:
-                created_prs.append(pr_url)
-                print(f"Created PR: {pr_url}")
+                touched_prs.append(pr_url)
+                print(f"PR status for issue #{issue['number']}: {pr_status} ({pr_url})")
 
             if not args.dry_run:
                 run_command(["git", "checkout", base_branch])
@@ -969,9 +1115,9 @@ def main() -> int:
                 break
 
     print(f"Done. Processed: {processed}, failures: {failures}")
-    if created_prs:
+    if touched_prs:
         print("PRs:")
-        for pr_url in created_prs:
+        for pr_url in touched_prs:
             print(f"- {pr_url}")
     return 1 if failures > 0 else 0
 

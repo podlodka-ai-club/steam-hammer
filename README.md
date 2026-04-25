@@ -51,9 +51,10 @@ Workflow in PR review mode:
 
 1. Loads PR metadata and review threads/comments
 2. Filters out resolved/outdated/empty feedback and builds an actionable prompt with file/line links
-3. Runs AI agent in current branch (or optional follow-up branch)
-4. On changes, creates commit and pushes updates
-5. Optionally posts a summary comment to the PR
+3. Adds PR description and linked issue context (including issue body when available)
+4. Runs AI agent in current branch (or optional follow-up branch)
+5. On changes, creates commit and pushes updates
+6. Optionally posts a summary comment to the PR
 
 Useful options:
 

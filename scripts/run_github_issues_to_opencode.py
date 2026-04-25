@@ -189,6 +189,7 @@ def normalize_review_items(threads: list[dict], reviews: list[dict]) -> tuple[li
     stats = {
         "threads_total": len(threads),
         "threads_resolved": 0,
+        "threads_outdated": 0,
         "comments_total": 0,
         "comments_empty": 0,
         "comments_outdated": 0,
@@ -199,6 +200,9 @@ def normalize_review_items(threads: list[dict], reviews: list[dict]) -> tuple[li
     for thread in threads:
         if thread.get("isResolved"):
             stats["threads_resolved"] += 1
+            continue
+        if thread.get("isOutdated"):
+            stats["threads_outdated"] += 1
             continue
 
         comments = (thread.get("comments") or {}).get("nodes") or []
@@ -251,6 +255,50 @@ def normalize_review_items(threads: list[dict], reviews: list[dict]) -> tuple[li
     return actionable[:MAX_REVIEW_ITEMS], stats
 
 
+def _linked_issue_number(candidate: dict) -> int | None:
+    number = candidate.get("number")
+    return number if isinstance(number, int) and number > 0 else None
+
+
+def load_linked_issue_context(repo: str, pull_request: dict) -> list[dict]:
+    linked = pull_request.get("closingIssuesReferences") or []
+    if not isinstance(linked, list) or not linked:
+        return []
+
+    context_items: list[dict] = []
+    for linked_issue in linked[:5]:
+        number = _linked_issue_number(linked_issue)
+        if number is None:
+            continue
+
+        title = (linked_issue.get("title") or "").strip()
+        body = (linked_issue.get("body") or "").strip()
+        url = (linked_issue.get("url") or "").strip()
+
+        if title and (body or url):
+            context_items.append(
+                {
+                    "number": number,
+                    "title": title,
+                    "body": body,
+                    "url": url,
+                }
+            )
+            continue
+
+        fetched = fetch_issue(repo=repo, number=number)
+        context_items.append(
+            {
+                "number": fetched.get("number", number),
+                "title": (fetched.get("title") or "").strip(),
+                "body": (fetched.get("body") or "").strip(),
+                "url": (fetched.get("url") or "").strip(),
+            }
+        )
+
+    return context_items
+
+
 def current_branch() -> str:
     return run_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"]).strip()
 
@@ -286,7 +334,11 @@ def build_prompt(issue: dict) -> str:
     )
 
 
-def build_pr_review_prompt(pull_request: dict, review_items: list[dict]) -> str:
+def build_pr_review_prompt(
+    pull_request: dict,
+    review_items: list[dict],
+    linked_issues: list[dict] | None = None,
+) -> str:
     pr_number = pull_request["number"]
     lines = [
         "You are working on review feedback for an existing GitHub pull request in the current git branch.",
@@ -300,7 +352,6 @@ def build_pr_review_prompt(pull_request: dict, review_items: list[dict]) -> str:
         (pull_request.get("body") or "").strip() or "(empty)",
     ]
 
-    linked_issues = pull_request.get("closingIssuesReferences") or []
     if linked_issues:
         lines.extend(["", "Linked issues context:"])
         for issue in linked_issues[:5]:
@@ -339,9 +390,11 @@ def print_review_dry_run(pull_request: dict, review_items: list[dict], stats: di
     )
     print(
         "[dry-run] Review scan stats: "
-        f"threads={stats['threads_total']}, resolved={stats['threads_resolved']}, "
-        f"comments_total={stats['comments_total']}, comments_outdated={stats['comments_outdated']}, "
-        f"comments_empty={stats['comments_empty']}, reviews_used={stats['reviews_used']}"
+        f"threads={stats.get('threads_total', 0)}, resolved={stats.get('threads_resolved', 0)}, "
+        f"outdated_threads={stats.get('threads_outdated', 0)}, "
+        f"comments_total={stats.get('comments_total', 0)}, "
+        f"comments_outdated={stats.get('comments_outdated', 0)}, "
+        f"comments_empty={stats.get('comments_empty', 0)}, reviews_used={stats.get('reviews_used', 0)}"
     )
     preview = review_items[:10]
     for item in preview:
@@ -713,6 +766,7 @@ def main() -> int:
             threads = fetch_pr_review_threads(repo=repo, number=args.pr)
             reviews = pull_request.get("reviews") or []
             review_items, review_stats = normalize_review_items(threads=threads, reviews=reviews)
+            linked_issue_context = load_linked_issue_context(repo=repo, pull_request=pull_request)
             if args.dry_run:
                 print_review_dry_run(
                     pull_request=pull_request,
@@ -722,7 +776,11 @@ def main() -> int:
             if not review_items:
                 print(f"No actionable unresolved review feedback found for PR #{args.pr}.")
                 return 0
-            prompt = build_pr_review_prompt(pull_request=pull_request, review_items=review_items)
+            prompt = build_pr_review_prompt(
+                pull_request=pull_request,
+                review_items=review_items,
+                linked_issues=linked_issue_context,
+            )
             followup_branch = ""
             if args.pr_followup_branch_prefix:
                 followup_branch = (

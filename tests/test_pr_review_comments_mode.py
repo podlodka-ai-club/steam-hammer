@@ -76,7 +76,32 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(items[0]["line"], 3)
         self.assertEqual(items[1]["type"], "review_summary")
         self.assertEqual(stats["threads_resolved"], 1)
+        self.assertEqual(stats["threads_outdated"], 0)
         self.assertEqual(stats["comments_outdated"], 1)
+
+    def test_normalize_review_items_skips_outdated_threads(self) -> None:
+        threads = [
+            {
+                "isResolved": False,
+                "isOutdated": True,
+                "comments": {
+                    "nodes": [
+                        {
+                            "body": "obsolete thread",
+                            "path": "a.py",
+                            "line": 1,
+                            "outdated": False,
+                            "author": {"login": "alice"},
+                        }
+                    ]
+                },
+            }
+        ]
+
+        items, stats = self.mod.normalize_review_items(threads=threads, reviews=[])
+
+        self.assertEqual(items, [])
+        self.assertEqual(stats["threads_outdated"], 1)
 
     def test_build_pr_review_prompt_contains_locations_and_links(self) -> None:
         pull_request = {
@@ -104,6 +129,37 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertIn("Pull Request: #23 - Improve parser", prompt)
         self.assertIn("Location: scripts/tool.py:42", prompt)
         self.assertIn("Link: https://example/comment/1", prompt)
+
+    def test_load_linked_issue_context_fetches_missing_issue_body(self) -> None:
+        pull_request = {
+            "closingIssuesReferences": [
+                {
+                    "number": 17,
+                    "title": "",
+                    "body": "",
+                    "url": "",
+                }
+            ]
+        }
+
+        with mock.patch.object(
+            self.mod,
+            "fetch_issue",
+            return_value={
+                "number": 17,
+                "title": "Improve docs",
+                "body": "Issue body context",
+                "url": "https://example/issues/17",
+            },
+        ) as fetch_issue_mock:
+            linked = self.mod.load_linked_issue_context(
+                repo="owner/repo",
+                pull_request=pull_request,
+            )
+
+        fetch_issue_mock.assert_called_once_with(repo="owner/repo", number=17)
+        self.assertEqual(linked[0]["number"], 17)
+        self.assertEqual(linked[0]["body"], "Issue body context")
 
     def test_main_pr_mode_dry_run_handles_empty_actionable_comments(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

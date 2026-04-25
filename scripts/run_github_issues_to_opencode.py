@@ -10,6 +10,23 @@ import sys
 import time
 
 
+LOCAL_CONFIG_RELATIVE_PATH = "local-config.json"
+BUILTIN_DEFAULTS = {
+    "state": "open",
+    "limit": 10,
+    "runner": "claude",
+    "agent": "build",
+    "model": None,
+    "agent_timeout_seconds": 900,
+    "agent_idle_timeout_seconds": None,
+    "opencode_auto_approve": False,
+    "branch_prefix": "issue-fix",
+    "include_empty": False,
+    "stop_on_error": False,
+    "dir": ".",
+}
+
+
 def run_capture(command: list[str]) -> str:
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
@@ -275,7 +292,115 @@ def open_pr(
     return output.strip()
 
 
-def main() -> int:
+def resolve_local_config_path(raw_path: str | None, target_dir: str) -> str:
+    config_path = raw_path or LOCAL_CONFIG_RELATIVE_PATH
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(target_dir, config_path)
+    return os.path.abspath(config_path)
+
+
+def validate_local_config(config: dict, config_path: str) -> dict:
+    supported_keys = {
+        "state",
+        "limit",
+        "runner",
+        "agent",
+        "model",
+        "agent_timeout_seconds",
+        "agent_idle_timeout_seconds",
+        "opencode_auto_approve",
+        "branch_prefix",
+        "include_empty",
+        "stop_on_error",
+    }
+
+    unsupported = sorted(set(config) - supported_keys)
+    if unsupported:
+        unsupported_text = ", ".join(unsupported)
+        raise RuntimeError(
+            f"Unsupported key(s) in local config {config_path}: {unsupported_text}"
+        )
+
+    validated: dict = {}
+
+    if "state" in config:
+        if config["state"] not in {"open", "closed", "all"}:
+            raise RuntimeError("Local config key 'state' must be one of: open, closed, all")
+        validated["state"] = config["state"]
+
+    if "limit" in config:
+        if type(config["limit"]) is not int or config["limit"] <= 0:
+            raise RuntimeError("Local config key 'limit' must be a positive integer")
+        validated["limit"] = config["limit"]
+
+    if "runner" in config:
+        if config["runner"] not in {"claude", "opencode"}:
+            raise RuntimeError(
+                "Local config key 'runner' must be one of: claude, opencode"
+            )
+        validated["runner"] = config["runner"]
+
+    if "agent" in config:
+        if not isinstance(config["agent"], str) or not config["agent"].strip():
+            raise RuntimeError("Local config key 'agent' must be a non-empty string")
+        validated["agent"] = config["agent"]
+
+    if "model" in config:
+        if config["model"] is not None and not isinstance(config["model"], str):
+            raise RuntimeError("Local config key 'model' must be a string or null")
+        validated["model"] = config["model"]
+
+    if "agent_timeout_seconds" in config:
+        value = config["agent_timeout_seconds"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError(
+                "Local config key 'agent_timeout_seconds' must be a positive integer"
+            )
+        validated["agent_timeout_seconds"] = value
+
+    if "agent_idle_timeout_seconds" in config:
+        value = config["agent_idle_timeout_seconds"]
+        if value is not None and (type(value) is not int or value <= 0):
+            raise RuntimeError(
+                "Local config key 'agent_idle_timeout_seconds' must be a positive integer or null"
+            )
+        validated["agent_idle_timeout_seconds"] = value
+
+    for key in ["opencode_auto_approve", "include_empty", "stop_on_error"]:
+        if key in config:
+            if not isinstance(config[key], bool):
+                raise RuntimeError(f"Local config key '{key}' must be a boolean")
+            validated[key] = config[key]
+
+    if "branch_prefix" in config:
+        if not isinstance(config["branch_prefix"], str) or not config["branch_prefix"].strip():
+            raise RuntimeError(
+                "Local config key 'branch_prefix' must be a non-empty string"
+            )
+        validated["branch_prefix"] = config["branch_prefix"]
+
+    return validated
+
+
+def load_local_config(config_path: str) -> dict:
+    if not os.path.exists(config_path):
+        return {}
+
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            data = json.load(config_file)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON in local config {config_path}: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read local config {config_path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Local config {config_path} must contain a JSON object")
+
+    return validate_local_config(config=data, config_path=config_path)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fetch GitHub issues with gh and run an AI agent for each issue body."
     )
@@ -283,24 +408,43 @@ def main() -> int:
         "--repo", help="GitHub repo in owner/name format. Defaults to current gh repo."
     )
     parser.add_argument(
-        "--issue", type=int, help="Process a single issue by number, ignoring --limit and --state."
+        "--issue",
+        type=int,
+        help="Process a single issue by number, ignoring --limit and --state.",
     )
-    parser.add_argument("--state", default="open", choices=["open", "closed", "all"])
     parser.add_argument(
-        "--limit", type=int, default=10, help="Maximum number of issues to process."
+        "--state",
+        default=BUILTIN_DEFAULTS["state"],
+        choices=["open", "closed", "all"],
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=BUILTIN_DEFAULTS["limit"],
+        help="Maximum number of issues to process.",
     )
     parser.add_argument(
         "--runner",
-        default="claude",
+        default=BUILTIN_DEFAULTS["runner"],
         choices=["claude", "opencode"],
         help="AI agent runner to use (default: claude).",
     )
-    parser.add_argument("--agent", default="build", help="Opencode agent name (only used with --runner opencode).")
-    parser.add_argument("--model", help="Optional model override. For Claude: e.g. claude-sonnet-4-6. For OpenCode: e.g. openai/gpt-4o.")
+    parser.add_argument(
+        "--agent",
+        default=BUILTIN_DEFAULTS["agent"],
+        help="Opencode agent name (only used with --runner opencode).",
+    )
+    parser.add_argument(
+        "--model",
+        help=(
+            "Optional model override. For Claude: e.g. claude-sonnet-4-6. "
+            "For OpenCode: e.g. openai/gpt-4o."
+        ),
+    )
     parser.add_argument(
         "--agent-timeout-seconds",
         type=int,
-        default=900,
+        default=BUILTIN_DEFAULTS["agent_timeout_seconds"],
         help="Hard timeout for agent execution in seconds (default: 900).",
     )
     parser.add_argument(
@@ -318,7 +462,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--branch-prefix",
-        default="issue-fix",
+        default=BUILTIN_DEFAULTS["branch_prefix"],
         help="Prefix for per-issue git branches.",
     )
     parser.add_argument(
@@ -333,13 +477,40 @@ def main() -> int:
     )
     parser.add_argument(
         "--dir",
-        default=".",
+        default=BUILTIN_DEFAULTS["dir"],
         help="Path to the local git repository to operate on. Defaults to the current directory.",
+    )
+    parser.add_argument(
+        "--local-config",
+        help=(
+            "Path to local JSON config with user-specific defaults. "
+            "Defaults to local-config.json under --dir."
+        ),
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="Print actions without running the agent."
     )
-    args = parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    bootstrap_parser = argparse.ArgumentParser(add_help=False)
+    bootstrap_parser.add_argument("--dir", default=BUILTIN_DEFAULTS["dir"])
+    bootstrap_parser.add_argument("--local-config")
+    bootstrap_args, _ = bootstrap_parser.parse_known_args(argv)
+
+    target_dir = os.path.abspath(bootstrap_args.dir)
+    local_config_path = resolve_local_config_path(bootstrap_args.local_config, target_dir)
+    local_defaults = load_local_config(local_config_path)
+
+    parser = build_parser()
+    parser.set_defaults(**local_defaults)
+    parser.set_defaults(local_config=local_config_path)
+    return parser.parse_args(argv)
+
+
+def main() -> int:
+    args = parse_args()
 
     try:
         target_dir = os.path.abspath(args.dir)

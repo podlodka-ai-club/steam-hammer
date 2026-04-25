@@ -4,4 +4,6 @@ __pycache__/
 
 .claude/
 .opencode/
+.opencode/local-config.json
 opencode.jsonc
+local-config.json

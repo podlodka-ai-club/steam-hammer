@@ -147,6 +147,49 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         )
         command_succeeds_mock.assert_called_once_with(["git", "rebase", "--abort"])
 
+    @patch("scripts.run_github_issues_to_opencode.command_succeeds", return_value=True)
+    @patch("scripts.run_github_issues_to_opencode.run_command")
+    @patch("scripts.run_github_issues_to_opencode.current_head_sha", return_value="sha-before")
+    def test_sync_reused_branch_with_base_merge_failure_aborts_and_raises(
+        self,
+        _current_head_sha,
+        run_command_mock,
+        command_succeeds_mock,
+    ) -> None:
+        run_command_mock.side_effect = [
+            None,
+            RuntimeError("Command failed: git merge --no-edit origin/main"),
+        ]
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Failed to sync reused branch 'issue-fix/26-rerun' with 'origin/main' using merge",
+        ):
+            sync_reused_branch_with_base(
+                base_branch="main",
+                branch_name="issue-fix/26-rerun",
+                strategy="merge",
+                dry_run=False,
+            )
+
+        self.assertEqual(
+            run_command_mock.call_args_list,
+            [
+                unittest.mock.call(["git", "fetch", "origin", "main"]),
+                unittest.mock.call(["git", "merge", "--no-edit", "origin/main"]),
+            ],
+        )
+        command_succeeds_mock.assert_called_once_with(["git", "merge", "--abort"])
+
+    def test_sync_reused_branch_with_base_rejects_unknown_strategy(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, r"Unsupported sync strategy 'squash'"):
+            sync_reused_branch_with_base(
+                base_branch="main",
+                branch_name="issue-fix/26-rerun",
+                strategy="squash",
+                dry_run=False,
+            )
+
     def test_main_stops_issue_when_reused_branch_sync_fails(self) -> None:
         args = type("Args", (), {
             "repo": "owner/repo",

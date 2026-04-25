@@ -462,6 +462,11 @@ def sync_reused_branch_with_base(
     strategy: str,
     dry_run: bool,
 ) -> bool:
+    if strategy not in {"rebase", "merge"}:
+        raise RuntimeError(
+            f"Unsupported sync strategy '{strategy}'. Use one of: rebase, merge"
+        )
+
     remote_base_ref = f"origin/{base_branch}"
 
     if dry_run:

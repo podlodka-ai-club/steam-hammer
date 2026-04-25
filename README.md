@@ -32,14 +32,14 @@ You can define local defaults without changing repository defaults.
 
 1. Copy the example config and adjust it for your setup:
    ```bash
-   mkdir -p .opencode && cp local-config.example.json .opencode/local-config.json
+   cp local-config.example.json local-config.json
    ```
 2. Keep using CLI flags as usual. Priority is:
    - CLI flags
-   - local config (`.opencode/local-config.json`)
+   - local config (`local-config.json`)
    - built-in defaults in script
 
-`.opencode/local-config.json` is ignored by git and stays local to your machine.
+`local-config.json` is ignored by git and stays local to your machine.
 
 Supported local config keys:
 
@@ -59,6 +59,12 @@ You can also point to a different local config file:
 
 ```bash
 python scripts/run_github_issues_to_opencode.py --local-config path/to/local-config.json
+```
+
+**Use local defaults from repository config (`local-config.json`):**
+```bash
+cp local-config.example.json local-config.json
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --limit 1
 ```
 
 Workflow per issue:
@@ -82,7 +88,7 @@ Useful options:
 - `--agent-timeout-seconds N` hard timeout for agent run (default: `900`)
 - `--agent-idle-timeout-seconds N` fail if agent prints no output for `N` seconds
 - `--opencode-auto-approve` pass `--dangerously-skip-permissions` to OpenCode (use with caution)
-- `--local-config path` use a custom local JSON config path (default: `.opencode/local-config.json` under `--dir`)
+- `--local-config path` load local JSON defaults (default: `local-config.json` under `--dir`)
 
 If `--repo` is not provided, script tries to detect repository from current `gh` context.
 

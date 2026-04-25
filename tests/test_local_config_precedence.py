@@ -19,8 +19,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
     def test_local_config_overrides_built_in_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             os.mkdir(os.path.join(tmpdir, ".git"))
-            os.makedirs(os.path.join(tmpdir, ".opencode"), exist_ok=True)
-            config_path = os.path.join(tmpdir, ".opencode", "local-config.json")
+            config_path = os.path.join(tmpdir, "local-config.json")
             with open(config_path, "w", encoding="utf-8") as config_file:
                 json.dump(
                     {
@@ -40,8 +39,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
     def test_cli_flags_override_local_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             os.mkdir(os.path.join(tmpdir, ".git"))
-            os.makedirs(os.path.join(tmpdir, ".opencode"), exist_ok=True)
-            config_path = os.path.join(tmpdir, ".opencode", "local-config.json")
+            config_path = os.path.join(tmpdir, "local-config.json")
             with open(config_path, "w", encoding="utf-8") as config_file:
                 json.dump(
                     {
@@ -59,6 +57,19 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(args.runner, "claude")
         self.assertEqual(args.limit, 7)
         self.assertEqual(args.branch_prefix, "my-fixes")
+
+    def test_explicit_local_config_path_is_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            config_dir = os.path.join(tmpdir, "configs")
+            os.makedirs(config_dir, exist_ok=True)
+            custom_config = os.path.join(config_dir, "dev.json")
+            with open(custom_config, "w", encoding="utf-8") as config_file:
+                json.dump({"limit": 5}, config_file)
+
+            args = parse_args(["--dir", tmpdir, "--local-config", custom_config])
+
+        self.assertEqual(args.limit, 5)
 
 
 if __name__ == "__main__":

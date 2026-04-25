@@ -10,7 +10,7 @@ import sys
 import time
 
 
-LOCAL_CONFIG_RELATIVE_PATH = ".opencode/local-config.json"
+LOCAL_CONFIG_RELATIVE_PATH = "local-config.json"
 BUILTIN_DEFAULTS = {
     "state": "open",
     "limit": 10,
@@ -484,7 +484,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--local-config",
         help=(
             "Path to local JSON config with user-specific defaults. "
-            "Defaults to .opencode/local-config.json under --dir."
+            "Defaults to local-config.json under --dir."
         ),
     )
     parser.add_argument(

@@ -365,7 +365,6 @@ def normalize_review_items(
                 comment_author = str(author_payload.get("login") or "unknown")
             if author_login and comment_author.lower() == author_login:
                 stats["comments_pr_author"] += 1
-                continue
 
             normalized.append(
                 {
@@ -407,7 +406,6 @@ def normalize_review_items(
 
         if author_login and key == author_login:
             stats["reviews_pr_author"] += 1
-            continue
 
         state = str(review.get("state") or "").strip().upper()
         body = str(review.get("body") or "").strip()
@@ -444,7 +442,6 @@ def normalize_review_items(
         comment_author = str(comment.get("author") or "unknown")
         if author_login and comment_author.lower() == author_login:
             stats["conversation_pr_author"] += 1
-            continue
 
         if not _is_actionable_feedback(body):
             stats["conversation_non_actionable"] += 1
@@ -468,28 +465,25 @@ def format_review_filtering_stats(stats: dict[str, int]) -> str:
     inline_summary = (
         "inline="
         f"total:{stats.get('comments_total', 0)} "
-        f"included:{stats.get('comments_used', 0)} "
+        f"included:{stats.get('comments_used', 0)}(from_pr_author:{stats.get('comments_pr_author', 0)}) "
         f"excluded(outdated:{stats.get('comments_outdated', 0)}, "
         f"empty:{stats.get('comments_empty', 0)}, "
-        f"pr_author:{stats.get('comments_pr_author', 0)}, "
         f"duplicates:{stats.get('comments_duplicates', 0)})"
     )
     summary_review = (
         "review_summaries="
         f"total:{stats.get('reviews_total', 0)} "
-        f"included:{stats.get('reviews_used', 0)} "
+        f"included:{stats.get('reviews_used', 0)}(from_pr_author:{stats.get('reviews_pr_author', 0)}) "
         f"excluded(superseded:{stats.get('reviews_superseded', 0)}, "
         f"empty:{stats.get('reviews_empty', 0)}, "
-        f"pr_author:{stats.get('reviews_pr_author', 0)}, "
         f"non_actionable:{stats.get('reviews_non_actionable', 0)}, "
         f"duplicates:{stats.get('reviews_duplicates', 0)})"
     )
     conversation_summary = (
         "conversation="
         f"total:{stats.get('conversation_total', 0)} "
-        f"included:{stats.get('conversation_used', 0)} "
+        f"included:{stats.get('conversation_used', 0)}(from_pr_author:{stats.get('conversation_pr_author', 0)}) "
         f"excluded(empty:{stats.get('conversation_empty', 0)}, "
-        f"pr_author:{stats.get('conversation_pr_author', 0)}, "
         f"non_actionable:{stats.get('conversation_non_actionable', 0)}, "
         f"duplicates:{stats.get('conversation_duplicates', 0)})"
     )

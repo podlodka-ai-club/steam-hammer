@@ -415,6 +415,56 @@ def remote_branch_exists(branch_name: str) -> bool:
     )
 
 
+def list_conflicted_paths() -> list[str]:
+    output = run_capture(["git", "diff", "--name-only", "--diff-filter=U"])
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def auto_resolve_merge_conflicts_with_base() -> int:
+    conflicted_paths = list_conflicted_paths()
+    if not conflicted_paths:
+        raise RuntimeError("Merge failed, but no conflicted files were detected")
+
+    for path in conflicted_paths:
+        run_command(["git", "checkout", "--theirs", "--", path])
+
+    run_command(["git", "add", "-A"])
+    run_command(["git", "commit", "--no-edit"])
+    return len(conflicted_paths)
+
+
+def merge_sync_with_auto_resolution(remote_base_ref: str, branch_name: str) -> bool:
+    before_sync_sha = current_head_sha()
+
+    try:
+        run_command(["git", "merge", "--no-edit", "-X", "theirs", remote_base_ref])
+    except RuntimeError:
+        print(
+            f"Merge sync for reused branch '{branch_name}' hit conflicts; "
+            "attempting automatic conflict resolution in favor of base branch"
+        )
+        try:
+            resolved_files_count = auto_resolve_merge_conflicts_with_base()
+            print(
+                f"Auto-resolved {resolved_files_count} conflicted file(s) "
+                f"for reused branch '{branch_name}'"
+            )
+        except Exception as resolve_exc:  # noqa: BLE001
+            command_succeeds(["git", "merge", "--abort"])
+            raise RuntimeError(
+                f"Failed to auto-resolve merge conflicts while syncing reused branch "
+                f"'{branch_name}' with '{remote_base_ref}'. "
+                "Resolve conflicts manually or rerun with --no-sync-reused-branch."
+            ) from resolve_exc
+    after_sync_sha = current_head_sha()
+    synced = before_sync_sha != after_sync_sha
+    if synced:
+        print(f"Reused branch '{branch_name}' updated after sync")
+    else:
+        print(f"Reused branch '{branch_name}' already up to date with '{remote_base_ref}'")
+    return synced
+
+
 def prepare_issue_branch(
     base_branch: str,
     branch_name: str,
@@ -481,37 +531,32 @@ def sync_reused_branch_with_base(
         f"using '{strategy}' strategy"
     )
 
-    before_sync_sha = current_head_sha()
-
     run_command(["git", "fetch", "origin", base_branch])
 
-    try:
-        if strategy == "rebase":
-            run_command(["git", "rebase", remote_base_ref])
-        else:
-            run_command(["git", "merge", "--no-edit", remote_base_ref])
-    except RuntimeError as exc:
-        if strategy == "rebase":
-            command_succeeds(["git", "rebase", "--abort"])
-            raise RuntimeError(
-                f"Failed to sync reused branch '{branch_name}' with '{remote_base_ref}' "
-                "using rebase (likely merge conflicts). Rebase was aborted. "
-                "Resolve conflicts manually or rerun with --sync-strategy merge or "
-                "--no-sync-reused-branch."
-            ) from exc
+    if strategy == "merge":
+        return merge_sync_with_auto_resolution(
+            remote_base_ref=remote_base_ref,
+            branch_name=branch_name,
+        )
 
-        command_succeeds(["git", "merge", "--abort"])
-        raise RuntimeError(
-            f"Failed to sync reused branch '{branch_name}' with '{remote_base_ref}' "
-            "using merge (likely merge conflicts). Merge was aborted. "
-            "Resolve conflicts manually or rerun with --sync-strategy rebase or "
-            "--no-sync-reused-branch."
-        ) from exc
+    before_sync_sha = current_head_sha()
+    try:
+        run_command(["git", "rebase", remote_base_ref])
+    except RuntimeError:
+        command_succeeds(["git", "rebase", "--abort"])
+        print(
+            f"Rebase sync for reused branch '{branch_name}' hit conflicts; "
+            "falling back to merge-based auto-resolution"
+        )
+        return merge_sync_with_auto_resolution(
+            remote_base_ref=remote_base_ref,
+            branch_name=branch_name,
+        )
 
     after_sync_sha = current_head_sha()
     synced = before_sync_sha != after_sync_sha
     if synced:
-        print(f"Reused branch '{branch_name}' updated after sync")
+        print(f"Reused branch '{branch_name}' updated after rebase sync")
     else:
         print(f"Reused branch '{branch_name}' already up to date with '{remote_base_ref}'")
     return synced

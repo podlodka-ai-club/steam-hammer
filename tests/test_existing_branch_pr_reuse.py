@@ -115,55 +115,99 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
 
     @patch("scripts.run_github_issues_to_opencode.command_succeeds", return_value=True)
     @patch("scripts.run_github_issues_to_opencode.run_command")
-    @patch("scripts.run_github_issues_to_opencode.current_head_sha", return_value="sha-before")
-    def test_sync_reused_branch_with_base_rebase_failure_aborts_and_raises(
+    @patch("scripts.run_github_issues_to_opencode.current_head_sha")
+    def test_sync_reused_branch_with_base_rebase_conflict_falls_back_to_merge(
         self,
-        _current_head_sha,
+        current_head_sha_mock,
         run_command_mock,
         command_succeeds_mock,
     ) -> None:
+        current_head_sha_mock.side_effect = ["sha-before-rebase", "sha-before-merge", "sha-after"]
         run_command_mock.side_effect = [
             None,
             RuntimeError("Command failed: git rebase origin/main"),
+            None,
         ]
 
-        with self.assertRaisesRegex(
-            RuntimeError,
-            r"Failed to sync reused branch 'issue-fix/26-rerun' with 'origin/main' using rebase",
-        ):
-            sync_reused_branch_with_base(
-                base_branch="main",
-                branch_name="issue-fix/26-rerun",
-                strategy="rebase",
-                dry_run=False,
-            )
+        changed = sync_reused_branch_with_base(
+            base_branch="main",
+            branch_name="issue-fix/26-rerun",
+            strategy="rebase",
+            dry_run=False,
+        )
 
+        self.assertTrue(changed)
         self.assertEqual(
             run_command_mock.call_args_list,
             [
                 unittest.mock.call(["git", "fetch", "origin", "main"]),
                 unittest.mock.call(["git", "rebase", "origin/main"]),
+                unittest.mock.call(["git", "merge", "--no-edit", "-X", "theirs", "origin/main"]),
             ],
         )
         command_succeeds_mock.assert_called_once_with(["git", "rebase", "--abort"])
 
+    @patch("scripts.run_github_issues_to_opencode.run_command")
+    @patch("scripts.run_github_issues_to_opencode.current_head_sha")
+    @patch("scripts.run_github_issues_to_opencode.list_conflicted_paths")
+    def test_sync_reused_branch_with_base_merge_conflict_auto_resolves(
+        self,
+        list_conflicted_paths_mock,
+        current_head_sha_mock,
+        run_command_mock,
+    ) -> None:
+        list_conflicted_paths_mock.return_value = ["README.md", "scripts/run_github_issues_to_opencode.py"]
+        current_head_sha_mock.side_effect = ["sha-before", "sha-after"]
+        run_command_mock.side_effect = [
+            None,
+            RuntimeError("Command failed: git merge --no-edit -X theirs origin/main"),
+            None,
+            None,
+            None,
+            None,
+        ]
+
+        changed = sync_reused_branch_with_base(
+            base_branch="main",
+            branch_name="issue-fix/26-rerun",
+            strategy="merge",
+            dry_run=False,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            run_command_mock.call_args_list,
+            [
+                unittest.mock.call(["git", "fetch", "origin", "main"]),
+                unittest.mock.call(["git", "merge", "--no-edit", "-X", "theirs", "origin/main"]),
+                unittest.mock.call(["git", "checkout", "--theirs", "--", "README.md"]),
+                unittest.mock.call(
+                    ["git", "checkout", "--theirs", "--", "scripts/run_github_issues_to_opencode.py"]
+                ),
+                unittest.mock.call(["git", "add", "-A"]),
+                unittest.mock.call(["git", "commit", "--no-edit"]),
+            ],
+        )
+
     @patch("scripts.run_github_issues_to_opencode.command_succeeds", return_value=True)
     @patch("scripts.run_github_issues_to_opencode.run_command")
     @patch("scripts.run_github_issues_to_opencode.current_head_sha", return_value="sha-before")
-    def test_sync_reused_branch_with_base_merge_failure_aborts_and_raises(
+    @patch("scripts.run_github_issues_to_opencode.list_conflicted_paths", return_value=[])
+    def test_sync_reused_branch_with_base_merge_conflict_auto_resolve_failure_raises(
         self,
+        _list_conflicted_paths,
         _current_head_sha,
         run_command_mock,
         command_succeeds_mock,
     ) -> None:
         run_command_mock.side_effect = [
             None,
-            RuntimeError("Command failed: git merge --no-edit origin/main"),
+            RuntimeError("Command failed: git merge --no-edit -X theirs origin/main"),
         ]
 
         with self.assertRaisesRegex(
             RuntimeError,
-            r"Failed to sync reused branch 'issue-fix/26-rerun' with 'origin/main' using merge",
+            r"Failed to auto-resolve merge conflicts while syncing reused branch",
         ):
             sync_reused_branch_with_base(
                 base_branch="main",
@@ -172,13 +216,6 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 dry_run=False,
             )
 
-        self.assertEqual(
-            run_command_mock.call_args_list,
-            [
-                unittest.mock.call(["git", "fetch", "origin", "main"]),
-                unittest.mock.call(["git", "merge", "--no-edit", "origin/main"]),
-            ],
-        )
         command_succeeds_mock.assert_called_once_with(["git", "merge", "--abort"])
 
     def test_sync_reused_branch_with_base_rejects_unknown_strategy(self) -> None:

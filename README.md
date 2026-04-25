@@ -81,11 +81,12 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --limit 1
 
 Workflow per issue:
 
-1. Creates a new branch from current branch (`--branch-prefix`, default `issue-fix`) or reuses an existing one
-2. Runs the AI agent with issue title/body context
-3. On changes, creates commit
-4. Pushes issue branch to `origin`
-5. Creates PR back to the original base branch, or reuses an existing open PR for the same base/head pair
+1. Chooses a stable base branch (repository default branch from GitHub)
+2. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
+3. Runs the AI agent with issue title/body context
+4. On changes, creates commit
+5. Pushes issue branch to `origin`
+6. Reuses an existing open PR for the issue branch when present; otherwise creates one to the stable base branch
 
 Useful options:
 
@@ -119,8 +120,10 @@ Note: script expects a clean git working tree before run.
 ## Reruns and conflict resolution
 
 - Re-running for an issue now auto-detects existing issue branches and reuses them instead of failing on `git checkout -b`.
-- If an open PR already exists for `base <- issue-branch`, the script reuses that PR and pushes new commits to the same branch.
-- Use `--dry-run` to preview whether each issue will create or reuse branch/PR resources.
+- If an open PR already exists for the issue branch, the script reuses it (even if your currently checked-out local branch is different).
+- PR reuse first checks `base+head`, then falls back to `head`-only lookup to avoid duplicate PR creation when reruns start from another feature branch.
+- Base branch selection is deterministic: issue runs target the repository default branch from GitHub, not your current local branch.
+- Use `--dry-run` to preview selected base branch and whether each issue will create or reuse branch/PR resources.
 - Use `--fail-on-existing` when you want strict behavior and prefer the run to fail if branch/PR already exists.
 
 ## Auto switch to PR-review mode

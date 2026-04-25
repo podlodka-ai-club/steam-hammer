@@ -1,4 +1,5 @@
 import argparse
+import io
 import unittest
 from unittest.mock import call, patch
 
@@ -128,7 +129,11 @@ class IssueBaseBranchResolutionTests(unittest.TestCase):
             patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0),
             patch("scripts.run_github_issues_to_opencode.commit_changes"),
             patch("scripts.run_github_issues_to_opencode.push_branch"),
-            patch("scripts.run_github_issues_to_opencode.ensure_pr", return_value=("reused", "")),
+            patch(
+                "scripts.run_github_issues_to_opencode.ensure_pr",
+                return_value=("reused", "https://github.com/owner/repo/pull/24"),
+            ) as ensure_pr_mock,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
         ):
             exit_code = main()
 
@@ -139,6 +144,25 @@ class IssueBaseBranchResolutionTests(unittest.TestCase):
             branch_name="issue-fix/23-pr-review-comments",
             dry_run=True,
             fail_on_existing=False,
+        )
+        ensure_pr_mock.assert_called_once_with(
+            repo="owner/repo",
+            base_branch="main",
+            branch_name="issue-fix/23-pr-review-comments",
+            issue={
+                "number": 23,
+                "title": "PR review comments",
+                "body": "Fix reruns",
+                "url": "https://github.com/owner/repo/issues/23",
+            },
+            dry_run=True,
+            fail_on_existing=False,
+        )
+        output = stdout_mock.getvalue()
+        self.assertIn("[dry-run] Selected stable base branch: main", output)
+        self.assertIn(
+            "PR status for issue #23: reused (https://github.com/owner/repo/pull/24)",
+            output,
         )
 
 

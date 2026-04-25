@@ -109,6 +109,7 @@ Note: script expects a clean git working tree before run.
 
 - Re-running for an issue now auto-detects existing issue branches and reuses them instead of failing on `git checkout -b`.
 - If an open PR already exists for the issue branch, the script reuses it (even if your currently checked-out local branch is different).
+- PR reuse first checks `base+head`, then falls back to `head`-only lookup to avoid duplicate PR creation when reruns start from another feature branch.
 - Base branch selection is deterministic: issue runs target the repository default branch from GitHub, not your current local branch.
 - Use `--dry-run` to preview selected base branch and whether each issue will create or reuse branch/PR resources.
 - Use `--fail-on-existing` when you want strict behavior and prefer the run to fail if branch/PR already exists.

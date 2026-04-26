@@ -1949,6 +1949,28 @@ def main() -> int:
                 print(f"PR #{pr_number_arg} is not open (state: {pr_state}); skipping.")
                 return 0
 
+            recovered_pr_state: dict | None = None
+            try:
+                pr_comments = fetch_issue_comments(repo=repo, issue_number=pr_number_arg)
+                recovered_pr_state, pr_state_warnings = select_latest_parseable_orchestration_state(
+                    comments=pr_comments,
+                    source_label=f"pr #{pr_number_arg}",
+                )
+                for warning in pr_state_warnings:
+                    print(f"Warning: {warning}", file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    "Warning: unable to recover orchestration state from "
+                    f"PR #{pr_number_arg} comments: {exc}",
+                    file=sys.stderr,
+                )
+            if recovered_pr_state is not None:
+                prefix = "[dry-run] " if args.dry_run else ""
+                print(
+                    f"{prefix}Recovered orchestration state context: "
+                    f"{format_recovered_state_context(recovered_pr_state)}"
+                )
+
             failure_stage = "fetch_review_feedback"
             threads = fetch_pr_review_threads(repo=repo, number=pr_number_arg)
             conversation_comments = fetch_pr_conversation_comments(
@@ -2046,6 +2068,14 @@ def main() -> int:
                 review_items=review_items,
                 linked_issues=linked_issues,
             )
+            if (
+                recovered_pr_state is not None
+                and str(recovered_pr_state.get("status") or "") == "failed"
+            ):
+                prompt = append_recovered_context_to_prompt(
+                    prompt,
+                    build_recovered_failure_context_note(recovered_pr_state),
+                )
 
             failure_stage = "agent_run"
             exit_code = run_agent_with_prompt(
@@ -2179,6 +2209,7 @@ def main() -> int:
             recovered_state: dict | None = None
             mode = "issue-flow"
             mode_reason = "batch issue processing"
+            force_override_applied = False
             skip_agent_run = False
             state_target_type = "issue"
             state_target_number = issue["number"]

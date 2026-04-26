@@ -69,6 +69,58 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("ignoring malformed orchestration state comment", warnings[0])
 
+    def test_main_issue_flow_without_recovered_state_does_not_require_force_override(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=47,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+        )
+        issue = {
+            "number": 47,
+            "title": "Support current-branch or stacked execution mode",
+            "body": "Implement stacked execution",
+            "url": "https://example/issues/47",
+        }
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="created"),
+            patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0),
+            patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False),
+            patch("scripts.run_github_issues_to_opencode.ensure_pr", return_value=("created", "")),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Selected mode: issue-flow", stdout_mock.getvalue())
+
     def test_main_issue_flow_skips_waiting_for_author_by_default(self) -> None:
         args = argparse.Namespace(
             repo="owner/repo",

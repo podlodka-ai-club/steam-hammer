@@ -9,11 +9,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import re
-import selectors
+import queue as _queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 
@@ -2299,62 +2300,72 @@ def run_agent_with_prompt(
         bufsize=1,
     )
 
-    selector = selectors.DefaultSelector()
-    if process.stdout is not None:
-        selector.register(process.stdout, selectors.EVENT_READ)
-    if process.stderr is not None:
-        selector.register(process.stderr, selectors.EVENT_READ)
+    line_queue: _queue.Queue[tuple[str, str]] = _queue.Queue()
 
-    try:
-        while True:
-            now = time.monotonic()
-            elapsed = now - start
-            idle_elapsed = now - last_output
+    def _pipe_reader(stream, tag: str) -> None:
+        try:
+            for line in stream:
+                line_queue.put((tag, line))
+        finally:
+            line_queue.put((tag, ""))
 
-            if timeout_seconds > 0 and elapsed > timeout_seconds:
-                process.kill()
-                process.wait(timeout=10)
-                raise RuntimeError(
-                    f"Agent timed out after {timeout_seconds}s for {item_label}. "
-                    "Possible causes: waiting for interactive approval, network stall, "
-                    "or a long-running task. Try increasing --agent-timeout-seconds, "
-                    "setting --agent-idle-timeout-seconds, or using --opencode-auto-approve "
-                    "for OpenCode if safe in your environment."
-                )
+    stdout_thread = threading.Thread(
+        target=_pipe_reader, args=(process.stdout, "stdout"), daemon=True
+    )
+    stderr_thread = threading.Thread(
+        target=_pipe_reader, args=(process.stderr, "stderr"), daemon=True
+    )
+    stdout_thread.start()
+    stderr_thread.start()
 
-            if idle_timeout_seconds and idle_elapsed > idle_timeout_seconds:
-                process.kill()
-                process.wait(timeout=10)
-                raise RuntimeError(
-                    f"Agent produced no output for {idle_timeout_seconds}s on {item_label}; "
-                    "aborting to avoid indefinite hang. Possible causes: waiting for "
-                    "interactive approval or a stuck process. Try --opencode-auto-approve "
-                    "(if safe) or a larger --agent-idle-timeout-seconds."
-                )
+    while True:
+        now = time.monotonic()
+        elapsed = now - start
+        idle_elapsed = now - last_output
 
-            events = selector.select(timeout=1.0)
-            if events:
-                for key, _ in events:
-                    line = key.fileobj.readline()
-                    if line:
-                        last_output = time.monotonic()
-                        if key.fileobj is process.stderr:
-                            print(line, end="", file=sys.stderr)
-                        else:
-                            print(line, end="")
+        if timeout_seconds > 0 and elapsed > timeout_seconds:
+            process.kill()
+            process.wait(timeout=10)
+            raise RuntimeError(
+                f"Agent timed out after {timeout_seconds}s for {item_label}. "
+                "Possible causes: waiting for interactive approval, network stall, "
+                "or a long-running task. Try increasing --agent-timeout-seconds, "
+                "setting --agent-idle-timeout-seconds, or using --opencode-auto-approve "
+                "for OpenCode if safe in your environment."
+            )
 
-            if process.poll() is not None:
-                if process.stdout is not None:
-                    remainder = process.stdout.read() or ""
-                    if remainder:
-                        print(remainder, end="")
-                if process.stderr is not None:
-                    remainder = process.stderr.read() or ""
-                    if remainder:
-                        print(remainder, end="", file=sys.stderr)
-                return process.returncode
-    finally:
-        selector.close()
+        if idle_timeout_seconds and idle_elapsed > idle_timeout_seconds:
+            process.kill()
+            process.wait(timeout=10)
+            raise RuntimeError(
+                f"Agent produced no output for {idle_timeout_seconds}s on {item_label}; "
+                "aborting to avoid indefinite hang. Possible causes: waiting for "
+                "interactive approval or a stuck process. Try --opencode-auto-approve "
+                "(if safe) or a larger --agent-idle-timeout-seconds."
+            )
+
+        try:
+            tag, line = line_queue.get(timeout=1.0)
+            if line:
+                last_output = time.monotonic()
+                if tag == "stderr":
+                    print(line, end="", file=sys.stderr)
+                else:
+                    print(line, end="")
+        except _queue.Empty:
+            pass
+
+        if process.poll() is not None:
+            stdout_thread.join()
+            stderr_thread.join()
+            while not line_queue.empty():
+                tag, line = line_queue.get_nowait()
+                if line:
+                    if tag == "stderr":
+                        print(line, end="", file=sys.stderr)
+                    else:
+                        print(line, end="")
+            return process.returncode
 
 
 def create_branch(base_branch: str, branch_name: str, dry_run: bool) -> None:

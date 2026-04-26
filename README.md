@@ -113,6 +113,8 @@ Workflow per issue:
 7. Pushes issue branch to `origin`
 8. Reuses an existing open PR for the issue branch when present; otherwise creates one to the selected base branch
 9. Posts append-only orchestration state comments to GitHub issue/PR on key transitions
+10. On per-issue failure (agent, commit/push, PR create, etc.), posts a structured failure report comment to the issue and adds label `auto:agent-failed`
+11. On successful issue completion (or no-op completion), removes label `auto:agent-failed` from that issue if present
 
 Workflow in PR review mode:
 
@@ -135,6 +137,13 @@ State comment format:
 - Marker: `<!-- orchestration-state:v1 -->`
 - Contains a human-readable header and a parseable JSON payload with fields like `status`, `task_type`, `issue`, `pr`, `branch`, `base_branch`, `runner`, `agent`, `model`, `attempt`, `stage`, `next_action`, `error`, `timestamp`
 - Dry-run never posts comments; it prints which state comment would be posted and where
+
+Automation failure reporting:
+
+- Failure label: `auto:agent-failed` (auto-created if missing with color `B60205` and description `Automation run failed for this issue`)
+- Failure issue comment includes: `status`, `stage`, `error`, `branch`, `base_branch`, `runner/agent/model`, `run id`, `timestamp`, and rerun hints
+- Failure comments include marker `<!-- orchestration-agent-failure:v1 -->` and JSON payload for machine-readable context
+- Dry-run prints which failure comment/label operations would run; it does not post or edit labels
 
 Useful options:
 

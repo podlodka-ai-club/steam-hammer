@@ -16,6 +16,10 @@ Session retrospectives live in [`retro/`](retro/). They capture lessons from orc
 - `claude` (Claude Code CLI) — default runner
 - `opencode` — only if using `--runner opencode`
 
+## For QA teams
+
+When filing Jira issues for AI-assisted fixes, use the [Jira issue description template](docs/jira-issue-template.md) so the agent has enough context to generate accurate patches.
+
 ```text
 .
 ├── .gitignore

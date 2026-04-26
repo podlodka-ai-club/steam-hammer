@@ -95,6 +95,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
             dry_run=True,
             pr_followup_branch_prefix=None,
             post_pr_summary=False,
+            isolate_worktree=True,
         )
         issue = {
             "number": 47,
@@ -147,6 +148,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
             dry_run=True,
             pr_followup_branch_prefix=None,
             post_pr_summary=False,
+            isolate_worktree=True,
         )
         issue = {
             "number": 45,
@@ -216,6 +218,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
             dry_run=True,
             pr_followup_branch_prefix=None,
             post_pr_summary=False,
+            isolate_worktree=True,
         )
         issue = {
             "number": 45,
@@ -287,6 +290,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
             dry_run=True,
             pr_followup_branch_prefix=None,
             post_pr_summary=False,
+            isolate_worktree=True,
         )
 
         pr_comments = [
@@ -307,6 +311,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
             "title": "PR title",
             "url": "https://example/pull/12",
             "state": "OPEN",
+            "headRefName": "issue-fix/12-pr",
             "reviews": [],
         }
 

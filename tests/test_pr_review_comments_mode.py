@@ -490,6 +490,7 @@ class PrReviewModeTests(unittest.TestCase):
                 "title": "PR title",
                 "url": "https://example/pr/23",
                 "state": "OPEN",
+                "headRefName": "feature/pr23",
                 "reviews": [],
             }
 
@@ -499,6 +500,7 @@ class PrReviewModeTests(unittest.TestCase):
                 mock.patch.object(self.mod, "current_branch", return_value="feature/pr23"),
                 mock.patch.object(self.mod, "detect_repo", return_value="owner/repo"),
                 mock.patch.object(self.mod, "fetch_pull_request", return_value=pull_request),
+                mock.patch.object(self.mod, "local_branch_exists", return_value=True),
                 mock.patch.object(self.mod, "fetch_pr_review_threads", return_value=[]),
                 mock.patch.object(self.mod, "fetch_pr_conversation_comments", return_value=[]),
                 mock.patch.object(
@@ -516,6 +518,92 @@ class PrReviewModeTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertIn("[dry-run] Would post orchestration state to pr #23", stdout_mock.getvalue())
+
+    def test_main_pr_mode_branch_mismatch_requires_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pathlib.Path(tmpdir, ".git").mkdir()
+            argv = [
+                "runner",
+                "--pr",
+                "23",
+                "--from-review-comments",
+                "--dry-run",
+                "--dir",
+                tmpdir,
+            ]
+            pull_request = {
+                "number": 23,
+                "title": "PR title",
+                "url": "https://example/pr/23",
+                "state": "OPEN",
+                "headRefName": "issue-fix/23",
+                "reviews": [],
+            }
+
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(self.mod, "ensure_clean_worktree"),
+                mock.patch.object(self.mod, "current_branch", return_value="issue-fix/25-issue"),
+                mock.patch.object(self.mod, "detect_repo", return_value="owner/repo"),
+                mock.patch.object(self.mod, "fetch_pull_request", return_value=pull_request),
+                mock.patch("sys.stderr", new_callable=io.StringIO) as stderr_mock,
+            ):
+                previous_cwd = os.getcwd()
+                try:
+                    exit_code = self.mod.main()
+                finally:
+                    os.chdir(previous_cwd)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("--allow-pr-branch-switch", stderr_mock.getvalue())
+
+    def test_main_pr_mode_dry_run_isolate_worktree_reports_execution_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pathlib.Path(tmpdir, ".git").mkdir()
+            argv = [
+                "runner",
+                "--pr",
+                "23",
+                "--from-review-comments",
+                "--dry-run",
+                "--isolate-worktree",
+                "--dir",
+                tmpdir,
+            ]
+            pull_request = {
+                "number": 23,
+                "title": "PR title",
+                "url": "https://example/pr/23",
+                "state": "OPEN",
+                "headRefName": "issue-fix/23",
+                "reviews": [],
+            }
+
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(self.mod, "ensure_clean_worktree"),
+                mock.patch.object(self.mod, "current_branch", return_value="issue-fix/25-issue"),
+                mock.patch.object(self.mod, "detect_repo", return_value="owner/repo"),
+                mock.patch.object(self.mod, "fetch_pull_request", return_value=pull_request),
+                mock.patch.object(self.mod, "fetch_pr_review_threads", return_value=[]),
+                mock.patch.object(self.mod, "fetch_pr_conversation_comments", return_value=[]),
+                mock.patch.object(
+                    self.mod,
+                    "normalize_review_items",
+                    return_value=([], {"threads_total": 0}),
+                ),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+            ):
+                previous_cwd = os.getcwd()
+                try:
+                    exit_code = self.mod.main()
+                finally:
+                    os.chdir(previous_cwd)
+
+        self.assertEqual(exit_code, 0)
+        output = stdout_mock.getvalue()
+        self.assertIn("[dry-run] PR mode target branch: issue-fix/23", output)
+        self.assertIn("[dry-run] PR mode execution: isolated worktree", output)
 
     def test_issue_mode_auto_switch_uses_actionable_conversation_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

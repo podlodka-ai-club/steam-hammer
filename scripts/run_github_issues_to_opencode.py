@@ -13,6 +13,7 @@ import time
 
 
 LOCAL_CONFIG_RELATIVE_PATH = "local-config.json"
+PROJECT_CONFIG_RELATIVE_PATH = "project-config.json"
 BUILTIN_DEFAULTS = {
     "state": "open",
     "limit": 10,
@@ -1956,6 +1957,181 @@ def resolve_local_config_path(raw_path: str | None, target_dir: str) -> str:
     return os.path.abspath(config_path)
 
 
+def resolve_project_config_path(raw_path: str | None, target_dir: str) -> str:
+    config_path = raw_path or PROJECT_CONFIG_RELATIVE_PATH
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(target_dir, config_path)
+    return os.path.abspath(config_path)
+
+
+def _validate_project_workflow(config: dict, config_path: str) -> None:
+    supported_workflow_keys = {"commands"}
+    unsupported_workflow = sorted(set(config) - supported_workflow_keys)
+    if unsupported_workflow:
+        raise RuntimeError(
+            f"Unsupported key(s) in project config {config_path} under 'workflow': "
+            + ", ".join(unsupported_workflow)
+        )
+
+    commands = config.get("commands")
+    if commands is None:
+        return
+    if not isinstance(commands, dict):
+        raise RuntimeError("Project config key 'workflow.commands' must be an object")
+
+    supported_commands = {"test", "lint", "build"}
+    unsupported_commands = sorted(set(commands) - supported_commands)
+    if unsupported_commands:
+        raise RuntimeError(
+            f"Unsupported key(s) in project config {config_path} under 'workflow.commands': "
+            + ", ".join(unsupported_commands)
+        )
+
+    for key in supported_commands:
+        if key in commands and commands[key] is not None and not isinstance(commands[key], str):
+            raise RuntimeError(
+                f"Project config key 'workflow.commands.{key}' must be a string or null"
+            )
+
+
+def _validate_project_defaults(config: dict, config_path: str) -> None:
+    supported_defaults_keys = {"runner", "agent", "model"}
+    unsupported_defaults = sorted(set(config) - supported_defaults_keys)
+    if unsupported_defaults:
+        raise RuntimeError(
+            f"Unsupported key(s) in project config {config_path} under 'defaults': "
+            + ", ".join(unsupported_defaults)
+        )
+
+    if "runner" in config and config["runner"] not in {"claude", "opencode"}:
+        raise RuntimeError("Project config key 'defaults.runner' must be one of: claude, opencode")
+
+    if "agent" in config:
+        value = config["agent"]
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError("Project config key 'defaults.agent' must be a non-empty string")
+
+    if "model" in config and config["model"] is not None and not isinstance(config["model"], str):
+        raise RuntimeError("Project config key 'defaults.model' must be a string or null")
+
+
+def _validate_project_scope(config: dict, config_path: str) -> None:
+    supported_scope_keys = {"defaults"}
+    unsupported_scope = sorted(set(config) - supported_scope_keys)
+    if unsupported_scope:
+        raise RuntimeError(
+            f"Unsupported key(s) in project config {config_path} under 'scope': "
+            + ", ".join(unsupported_scope)
+        )
+
+    if "defaults" in config and not isinstance(config["defaults"], dict):
+        raise RuntimeError("Project config key 'scope.defaults' must be an object")
+
+
+def _validate_project_retry(config: dict, config_path: str) -> None:
+    supported_retry_keys = {"max_attempts"}
+    unsupported_retry = sorted(set(config) - supported_retry_keys)
+    if unsupported_retry:
+        raise RuntimeError(
+            f"Unsupported key(s) in project config {config_path} under 'retry': "
+            + ", ".join(unsupported_retry)
+        )
+
+    if "max_attempts" in config:
+        value = config["max_attempts"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError("Project config key 'retry.max_attempts' must be a positive integer")
+
+
+def _validate_project_communication(config: dict, config_path: str) -> None:
+    supported_communication_keys = {"verbosity"}
+    unsupported_communication = sorted(set(config) - supported_communication_keys)
+    if unsupported_communication:
+        raise RuntimeError(
+            f"Unsupported key(s) in project config {config_path} under 'communication': "
+            + ", ".join(unsupported_communication)
+        )
+
+    if "verbosity" in config and config["verbosity"] not in {"low", "normal", "high"}:
+        raise RuntimeError(
+            "Project config key 'communication.verbosity' must be one of: low, normal, high"
+        )
+
+
+def validate_project_config(config: dict, config_path: str) -> dict:
+    supported_top_level_keys = {
+        "workflow",
+        "defaults",
+        "scope",
+        "retry",
+        "communication",
+        "presets",
+    }
+
+    unsupported = sorted(set(config) - supported_top_level_keys)
+    if unsupported:
+        unsupported_text = ", ".join(unsupported)
+        raise RuntimeError(
+            f"Unsupported key(s) in project config {config_path}: {unsupported_text}"
+        )
+
+    for key in ["workflow", "defaults", "scope", "retry", "communication", "presets"]:
+        if key in config and not isinstance(config[key], dict):
+            raise RuntimeError(f"Project config key '{key}' must be an object")
+
+    workflow = config.get("workflow")
+    if isinstance(workflow, dict):
+        _validate_project_workflow(workflow, config_path)
+
+    defaults = config.get("defaults")
+    if isinstance(defaults, dict):
+        _validate_project_defaults(defaults, config_path)
+
+    scope = config.get("scope")
+    if isinstance(scope, dict):
+        _validate_project_scope(scope, config_path)
+
+    retry = config.get("retry")
+    if isinstance(retry, dict):
+        _validate_project_retry(retry, config_path)
+
+    communication = config.get("communication")
+    if isinstance(communication, dict):
+        _validate_project_communication(communication, config_path)
+
+    return config
+
+
+def load_project_config(config_path: str) -> dict:
+    if not os.path.exists(config_path):
+        return {}
+
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            data = json.load(config_file)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON in project config {config_path}: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read project config {config_path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Project config {config_path} must contain a JSON object")
+
+    return validate_project_config(config=data, config_path=config_path)
+
+
+def project_cli_defaults(project_config: dict) -> dict:
+    defaults = project_config.get("defaults")
+    if not isinstance(defaults, dict):
+        return {}
+
+    cli_defaults: dict = {}
+    for key in ["runner", "agent", "model"]:
+        if key in defaults:
+            cli_defaults[key] = defaults[key]
+    return cli_defaults
+
+
 def validate_local_config(config: dict, config_path: str) -> dict:
     supported_keys = {
         "state",
@@ -2582,6 +2758,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--project-config",
+        help=(
+            "Path to repository project JSON config. "
+            "Defaults to project-config.json under --dir."
+        ),
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="Print actions without running the agent."
     )
     parser.add_argument(
@@ -2604,16 +2787,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     bootstrap_parser = argparse.ArgumentParser(add_help=False)
     bootstrap_parser.add_argument("--dir", default=BUILTIN_DEFAULTS["dir"])
     bootstrap_parser.add_argument("--local-config")
+    bootstrap_parser.add_argument("--project-config")
     bootstrap_parser.add_argument("--doctor", action="store_true")
     bootstrap_args, _ = bootstrap_parser.parse_known_args(argv)
 
     target_dir = os.path.abspath(bootstrap_args.dir)
+    project_config_path = resolve_project_config_path(bootstrap_args.project_config, target_dir)
     local_config_path = resolve_local_config_path(bootstrap_args.local_config, target_dir)
 
     parser = build_parser()
     if not bootstrap_args.doctor:
+        project_config = load_project_config(project_config_path)
+        parser.set_defaults(**project_cli_defaults(project_config))
         local_defaults = load_local_config(local_config_path)
         parser.set_defaults(**local_defaults)
+    parser.set_defaults(project_config=project_config_path)
     parser.set_defaults(local_config=local_config_path)
     return parser.parse_args(argv)
 

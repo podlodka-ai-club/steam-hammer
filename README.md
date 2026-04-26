@@ -78,6 +78,37 @@ Exit codes:
 - `0` when there are no failed checks.
 - non-zero when one or more checks fail.
 
+## Project config scaffold (repository-level)
+
+You can define repository defaults and placeholders for future orchestration policies.
+
+1. Copy the scaffold and adapt it for your project:
+   ```bash
+   cp project-config.example.json project-config.json
+   ```
+2. Keep using CLI flags and local config as usual. Precedence is:
+   - CLI flags
+   - local config (`local-config.json`)
+   - project config (`project-config.json`)
+   - built-in defaults in script
+
+Project config currently supports these sections:
+
+- `workflow.commands.test|lint|build` (string or `null`)
+- `defaults.runner|agent|model` (used as parser defaults)
+- `scope.defaults` (object placeholder)
+- `retry.max_attempts` (positive integer placeholder)
+- `communication.verbosity` (`low`, `normal`, `high`)
+- `presets` (object placeholder)
+
+Validation is strict: unsupported keys or invalid value types fail fast with a config error.
+
+You can also point to a different project config file:
+
+```bash
+python scripts/run_github_issues_to_opencode.py --project-config path/to/project-config.json --repo owner/repo --limit 1
+```
+
 ## Local config preset (per user/per machine)
 
 You can define local defaults without changing repository defaults.
@@ -89,6 +120,7 @@ You can define local defaults without changing repository defaults.
 2. Keep using CLI flags as usual. Priority is:
    - CLI flags
    - local config (`local-config.json`)
+   - project config (`project-config.json`)
    - built-in defaults in script
 
 `local-config.json` is ignored by git and stays local to your machine.
@@ -189,6 +221,7 @@ Useful options:
 - `--agent-idle-timeout-seconds N` fail if agent prints no output for `N` seconds
 - `--opencode-auto-approve` pass `--dangerously-skip-permissions` to OpenCode (use with caution)
 - `--local-config path` load local JSON defaults (default: `local-config.json` under `--dir`)
+- `--project-config path` load repository JSON defaults scaffold (default: `project-config.json` under `--dir`)
 - `--fail-on-existing` strict mode: fail if issue branch or PR already exists
 - `--force-issue-flow` disable auto-switch to PR-review mode for `--issue`
 - `--skip-if-pr-exists` / `--no-skip-if-pr-exists` skip or process batch issues when a linked open PR exists (default: skip; single `--issue` uses state-aware PR-review progression instead of hard-skip)

@@ -49,6 +49,10 @@ func (a *App) SetRunner(r Runner) {
 }
 
 func (a *App) Run(args []string) int {
+	return a.RunContext(context.Background(), args)
+}
+
+func (a *App) RunContext(ctx context.Context, args []string) int {
 	if len(args) == 0 {
 		_, _ = fmt.Fprint(a.err, usage())
 		return 2
@@ -59,16 +63,16 @@ func (a *App) Run(args []string) int {
 		_, _ = fmt.Fprint(a.out, usage())
 		return 0
 	case "doctor":
-		return a.runDoctor(args[1:])
+		return a.runDoctor(ctx, args[1:])
 	case "run":
-		return a.runRun(args[1:])
+		return a.runRun(ctx, args[1:])
 	default:
 		_, _ = fmt.Fprintf(a.err, "unknown command %q\n\n%s", args[0], usage())
 		return 2
 	}
 }
 
-func (a *App) runDoctor(args []string) int {
+func (a *App) runDoctor(ctx context.Context, args []string) int {
 	fs := newFlagSet("doctor", a.err)
 	opts := commonOptions{}
 	addCommonFlags(fs, &opts)
@@ -87,10 +91,10 @@ func (a *App) runDoctor(args []string) int {
 	if *doctorSmokeCheck {
 		pythonArgs = append(pythonArgs, "--doctor-smoke-check")
 	}
-	return a.runPython(pythonArgs)
+	return a.runPython(ctx, pythonArgs)
 }
 
-func (a *App) runRun(args []string) int {
+func (a *App) runRun(ctx context.Context, args []string) int {
 	if len(args) == 0 {
 		_, _ = fmt.Fprint(a.err, runUsage())
 		return 2
@@ -101,23 +105,35 @@ func (a *App) runRun(args []string) int {
 		_, _ = fmt.Fprint(a.out, runUsage())
 		return 0
 	case "issue":
-		return a.runIssue(args[1:])
+		return a.runIssue(ctx, args[1:])
 	case "pr":
-		return a.runPR(args[1:])
+		return a.runPR(ctx, args[1:])
 	default:
 		_, _ = fmt.Fprintf(a.err, "unknown run target %q\n\n%s", args[0], runUsage())
 		return 2
 	}
 }
 
-func (a *App) runIssue(args []string) int {
+func (a *App) runIssue(ctx context.Context, args []string) int {
 	fs := newFlagSet("run issue", a.err)
 	opts := commonOptions{}
 	addCommonFlags(fs, &opts)
 	id := fs.Int("id", 0, "GitHub issue number")
-	base := fs.String("base", "", "base branch mode: default or current")
+	base := ""
+	fs.StringVar(&base, "base", "", "base branch mode: default or current")
+	fs.StringVar(&base, "base-branch", "", "base branch mode: default or current")
+	includeEmpty := fs.Bool("include-empty", false, "process issues even if body is empty")
+	stopOnError := fs.Bool("stop-on-error", false, "stop after first failed agent run")
+	failOnExisting := fs.Bool("fail-on-existing", false, "fail if issue branch or PR already exists")
 	forceIssueFlow := fs.Bool("force-issue-flow", false, "disable auto-switch to PR-review mode")
+	skipIfPRExists := fs.Bool("skip-if-pr-exists", true, "skip issue processing when a linked open PR exists")
+	noSkipIfPRExists := fs.Bool("no-skip-if-pr-exists", false, "do not skip issue processing when a linked open PR exists")
+	skipIfBranchExists := fs.Bool("skip-if-branch-exists", true, "skip issue processing when deterministic issue branch exists on origin")
+	noSkipIfBranchExists := fs.Bool("no-skip-if-branch-exists", false, "do not skip issue processing when deterministic issue branch exists on origin")
 	forceReprocess := fs.Bool("force-reprocess", false, "override skip guards")
+	syncReusedBranch := fs.Bool("sync-reused-branch", true, "sync reused issue branches before running the agent")
+	noSyncReusedBranch := fs.Bool("no-sync-reused-branch", false, "disable sync for reused issue branches before the agent step")
+	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -133,19 +149,40 @@ func (a *App) runIssue(args []string) int {
 
 	pythonArgs := []string{runnerScript, "--issue", strconv.Itoa(*id)}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
-	if *base != "" {
-		pythonArgs = append(pythonArgs, "--base", *base)
+	if base != "" {
+		pythonArgs = append(pythonArgs, "--base", base)
+	}
+	if *includeEmpty {
+		pythonArgs = append(pythonArgs, "--include-empty")
+	}
+	if *stopOnError {
+		pythonArgs = append(pythonArgs, "--stop-on-error")
+	}
+	if *failOnExisting {
+		pythonArgs = append(pythonArgs, "--fail-on-existing")
 	}
 	if *forceIssueFlow {
 		pythonArgs = append(pythonArgs, "--force-issue-flow")
 	}
+	if !*skipIfPRExists || *noSkipIfPRExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
+	}
+	if !*skipIfBranchExists || *noSkipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
+	}
 	if *forceReprocess {
 		pythonArgs = append(pythonArgs, "--force-reprocess")
 	}
-	return a.runPython(pythonArgs)
+	if !*syncReusedBranch || *noSyncReusedBranch {
+		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
+	}
+	if *syncStrategy != "" {
+		pythonArgs = append(pythonArgs, "--sync-strategy", *syncStrategy)
+	}
+	return a.runPython(ctx, pythonArgs)
 }
 
-func (a *App) runPR(args []string) int {
+func (a *App) runPR(ctx context.Context, args []string) int {
 	fs := newFlagSet("run pr", a.err)
 	opts := commonOptions{}
 	addCommonFlags(fs, &opts)
@@ -181,12 +218,30 @@ func (a *App) runPR(args []string) int {
 	if *followupPrefix != "" {
 		pythonArgs = append(pythonArgs, "--pr-followup-branch-prefix", *followupPrefix)
 	}
-	return a.runPython(pythonArgs)
+	return a.runPython(ctx, pythonArgs)
 }
 
-func (a *App) runPython(args []string) int {
-	if err := a.runner.Run(context.Background(), "python3", args...); err != nil {
-		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+func (a *App) runPython(ctx context.Context, args []string) int {
+	if err := a.runner.Run(ctx, "python3", args...); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			_, _ = fmt.Fprintln(a.err, "orchestrator: python runner timed out")
+			return 124
+		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			_, _ = fmt.Fprintln(a.err, "orchestrator: python runner canceled")
+			return 130
+		}
+
+		var exitErr interface{ ExitCode() int }
+		if errors.As(err, &exitErr) {
+			code := exitErr.ExitCode()
+			if code >= 0 {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: python runner exited with code %d\n", code)
+				return code
+			}
+		}
+
+		_, _ = fmt.Fprintf(a.err, "orchestrator: python runner failed: %v\n", err)
 		return 1
 	}
 	return 0
@@ -198,6 +253,8 @@ type commonOptions struct {
 	runner   *string
 	agent    *string
 	model    *string
+	autoYes  *bool
+	branch   *string
 	dryRun   *bool
 	local    *string
 	project  *string
@@ -211,6 +268,8 @@ func addCommonFlags(fs *flag.FlagSet, opts *commonOptions) {
 	opts.runner = fs.String("runner", "", "AI runner: claude or opencode")
 	opts.agent = fs.String("agent", "", "OpenCode agent name")
 	opts.model = fs.String("model", "", "optional model override")
+	opts.autoYes = fs.Bool("opencode-auto-approve", false, "allow OpenCode to skip interactive approvals")
+	opts.branch = fs.String("branch-prefix", "", "prefix for per-issue git branches")
 	opts.dryRun = fs.Bool("dry-run", false, "print actions without running the agent")
 	opts.local = fs.String("local-config", "", "path to local JSON config")
 	opts.project = fs.String("project-config", "", "path to project JSON config")
@@ -233,6 +292,12 @@ func appendCommonPythonArgs(args []string, opts commonOptions) []string {
 	}
 	if *opts.model != "" {
 		args = append(args, "--model", *opts.model)
+	}
+	if *opts.autoYes {
+		args = append(args, "--opencode-auto-approve")
+	}
+	if *opts.branch != "" {
+		args = append(args, "--branch-prefix", *opts.branch)
 	}
 	if *opts.dryRun {
 		args = append(args, "--dry-run")

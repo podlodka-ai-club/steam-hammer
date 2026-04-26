@@ -303,6 +303,10 @@ PR mode notes:
 - `--dry-run` prints selected target branch and whether execution will switch branches or use isolated worktree.
 - If PR is closed/non-open, script exits without changes.
 - If there are no actionable unresolved comments, script exits successfully without running the agent.
+- If recovered state is `waiting-for-ci`, script reads GitHub check-runs and commit statuses for PR `headRefOid`:
+  - pending checks -> emits `waiting-for-ci` (stage `ci_checks`);
+  - successful checks or no checks -> emits `ready-to-merge`;
+  - failing checks -> emits `blocked` and includes failing check names with URLs in state error/details.
 - Prompt input priority is deterministic: unresolved inline comments first, then review summaries, then conversation comments.
 - Review summaries are taken from the latest review per author to avoid reprocessing superseded feedback.
 - Filtering rules are deterministic and backward-compatible:
@@ -379,6 +383,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - It recovers the latest parseable state by comment `created_at` and prints recovered context (including in `--dry-run`).
 - Recovered `waiting-for-author` causes issue processing to skip by default with a clear reason; use `--force-issue-flow` to override.
 - Recovered `ready-for-review` keeps behavior conservative and, when an open linked PR exists, prefers PR-review path (no silent override of existing branch/PR checks).
+- Recovered `waiting-for-ci` now performs a first-slice CI read from GitHub checks for the PR head SHA and updates orchestration state to `waiting-for-ci` / `ready-to-merge` / `blocked` based on pending/success/failure.
 - Recovered `failed` state does not block rerun; previous failure details are logged and appended to the agent prompt as additional context.
 
 ## Verification

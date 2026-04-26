@@ -196,6 +196,18 @@ def run_check_command(command: list[str], cwd: str | None = None) -> tuple[bool,
 
 WORKFLOW_COMMAND_ORDER = ["test", "lint", "build"]
 
+CI_PENDING_CHECK_RUN_STATUSES = {"queued", "in_progress", "requested", "waiting", "pending"}
+CI_SUCCESS_CHECK_RUN_CONCLUSIONS = {"success", "neutral", "skipped"}
+CI_FAILURE_CHECK_RUN_CONCLUSIONS = {
+    "failure",
+    "timed_out",
+    "cancelled",
+    "action_required",
+    "startup_failure",
+    "stale",
+}
+CI_FAILURE_COMMIT_STATES = {"error", "failure"}
+
 
 class WorkflowCheckFailure(RuntimeError):
     def __init__(self, failed_check: dict, checks: list[dict]):
@@ -393,7 +405,7 @@ def fetch_pull_request(repo: str, number: int) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,url,state,mergeStateStatus,headRefName,baseRefName,author,closingIssuesReferences,reviews",
+            "number,title,body,url,state,mergeStateStatus,headRefName,headRefOid,baseRefName,author,closingIssuesReferences,reviews",
         ]
     )
     pull_request = json.loads(output)
@@ -1005,6 +1017,162 @@ def fetch_issue_comments(repo: str, issue_number: int) -> list[dict]:
     return comments
 
 
+def fetch_commit_check_runs(repo: str, head_sha: str) -> list[dict]:
+    output = run_capture(
+        [
+            "gh",
+            "api",
+            f"repos/{repo}/commits/{head_sha}/check-runs",
+            "--method",
+            "GET",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-f",
+            "per_page=100",
+        ]
+    )
+    payload = json.loads(output)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected response from gh api while fetching commit check runs")
+
+    check_runs = payload.get("check_runs")
+    if not isinstance(check_runs, list):
+        raise RuntimeError("Unexpected check_runs payload while fetching commit check runs")
+    return check_runs
+
+
+def fetch_commit_status_contexts(repo: str, head_sha: str) -> list[dict]:
+    output = run_capture(
+        [
+            "gh",
+            "api",
+            f"repos/{repo}/commits/{head_sha}/status",
+            "--method",
+            "GET",
+            "-H",
+            "Accept: application/vnd.github+json",
+        ]
+    )
+    payload = json.loads(output)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected response from gh api while fetching commit status")
+
+    statuses = payload.get("statuses")
+    if not isinstance(statuses, list):
+        raise RuntimeError("Unexpected statuses payload while fetching commit status")
+    return statuses
+
+
+def read_pr_ci_status_for_head_sha(repo: str, head_sha: str) -> dict:
+    normalized_checks: list[dict] = []
+    check_runs = fetch_commit_check_runs(repo=repo, head_sha=head_sha)
+    for check_run in check_runs:
+        if not isinstance(check_run, dict):
+            continue
+        status = str(check_run.get("status") or "").strip().lower()
+        conclusion = str(check_run.get("conclusion") or "").strip().lower()
+        name = str(check_run.get("name") or "check-run").strip() or "check-run"
+        url = str(
+            check_run.get("details_url") or check_run.get("html_url") or ""
+        ).strip()
+
+        if status in CI_PENDING_CHECK_RUN_STATUSES or status != "completed":
+            normalized_state = "pending"
+        elif conclusion in CI_FAILURE_CHECK_RUN_CONCLUSIONS:
+            normalized_state = "failure"
+        elif conclusion in CI_SUCCESS_CHECK_RUN_CONCLUSIONS:
+            normalized_state = "success"
+        else:
+            normalized_state = "failure"
+
+        normalized_checks.append(
+            {
+                "source": "check-run",
+                "name": name,
+                "url": url,
+                "status": status,
+                "conclusion": conclusion or None,
+                "state": normalized_state,
+            }
+        )
+
+    status_contexts = fetch_commit_status_contexts(repo=repo, head_sha=head_sha)
+    for context in status_contexts:
+        if not isinstance(context, dict):
+            continue
+        raw_state = str(context.get("state") or "").strip().lower()
+        name = str(context.get("context") or "status-context").strip() or "status-context"
+        url = str(context.get("target_url") or "").strip()
+
+        if raw_state == "pending":
+            normalized_state = "pending"
+        elif raw_state in CI_FAILURE_COMMIT_STATES:
+            normalized_state = "failure"
+        elif raw_state == "success":
+            normalized_state = "success"
+        else:
+            normalized_state = "pending"
+
+        normalized_checks.append(
+            {
+                "source": "status-context",
+                "name": name,
+                "url": url,
+                "status": raw_state,
+                "conclusion": None,
+                "state": normalized_state,
+            }
+        )
+
+    pending_checks = [check for check in normalized_checks if check.get("state") == "pending"]
+    failing_checks = [check for check in normalized_checks if check.get("state") == "failure"]
+
+    if not normalized_checks:
+        overall = "success"
+    elif failing_checks:
+        overall = "failure"
+    elif pending_checks:
+        overall = "pending"
+    else:
+        overall = "success"
+
+    return {
+        "head_sha": head_sha,
+        "overall": overall,
+        "has_checks": bool(normalized_checks),
+        "checks": normalized_checks,
+        "pending_checks": pending_checks,
+        "failing_checks": failing_checks,
+    }
+
+
+def read_pr_ci_status_for_pull_request(repo: str, pull_request: dict) -> dict:
+    head_sha = str(pull_request.get("headRefOid") or "").strip()
+    if not head_sha:
+        pr_number = pull_request.get("number")
+        raise RuntimeError(
+            f"Unable to read CI status for PR #{pr_number}: missing headRefOid in PR payload"
+        )
+    return read_pr_ci_status_for_head_sha(repo=repo, head_sha=head_sha)
+
+
+def format_failing_ci_checks_summary(failing_checks: list[dict], max_items: int = 5) -> str:
+    if not failing_checks:
+        return "No failing CI checks reported"
+
+    rendered_items: list[str] = []
+    for check in failing_checks[:max_items]:
+        name = str(check.get("name") or "unknown-check")
+        url = str(check.get("url") or "").strip()
+        rendered_items.append(f"{name} ({url})" if url else name)
+
+    remaining = len(failing_checks) - len(rendered_items)
+    if remaining > 0:
+        rendered_items.append(f"and {remaining} more")
+
+    return "CI failing checks: " + "; ".join(rendered_items)
+
+
 def fetch_pr_conversation_comments(repo: str, pr_number: int) -> list[dict]:
     comments = fetch_issue_comments(repo=repo, issue_number=pr_number)
 
@@ -1458,6 +1626,7 @@ def build_orchestration_state(
     next_action: str,
     error: str | None,
     workflow_checks: list[dict] | None = None,
+    ci_checks: list[dict] | None = None,
 ) -> dict:
     if status not in ORCHESTRATION_STATE_STATUSES:
         raise RuntimeError(f"Unsupported orchestration state status: {status}")
@@ -1482,6 +1651,8 @@ def build_orchestration_state(
     }
     if workflow_checks is not None:
         state["workflow_checks"] = workflow_checks
+    if ci_checks is not None:
+        state["ci_checks"] = ci_checks
     return state
 
 
@@ -3396,6 +3567,114 @@ def main() -> int:
             )
 
             if not review_items:
+                recovered_pr_status = ""
+                if isinstance(recovered_pr_state, dict):
+                    recovered_pr_status = str(recovered_pr_state.get("status") or "")
+
+                if recovered_pr_status == "waiting-for-ci":
+                    ci_status = read_pr_ci_status_for_pull_request(
+                        repo=repo,
+                        pull_request=pull_request,
+                    )
+                    ci_overall = str(ci_status.get("overall") or "")
+                    failing_checks = ci_status.get("failing_checks")
+                    failing_checks_list = (
+                        failing_checks if isinstance(failing_checks, list) else []
+                    )
+                    pending_checks = ci_status.get("pending_checks")
+                    pending_checks_count = (
+                        len(pending_checks) if isinstance(pending_checks, list) else 0
+                    )
+
+                    if ci_overall == "pending":
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type="pr",
+                            target_number=pr_number_arg,
+                            dry_run=args.dry_run,
+                            state=build_orchestration_state(
+                                status="waiting-for-ci",
+                                task_type="pr",
+                                issue_number=None,
+                                pr_number=pr_number_arg,
+                                branch=active_branch,
+                                base_branch=str(pr_state_context["base_branch"] or "") or None,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=1,
+                                stage="ci_checks",
+                                next_action="wait_for_ci",
+                                error=None,
+                                ci_checks=ci_status.get("checks")
+                                if isinstance(ci_status.get("checks"), list)
+                                else [],
+                            ),
+                        )
+                        print(
+                            f"CI checks are still pending for PR #{pr_number_arg} "
+                            f"({pending_checks_count} pending); keeping waiting-for-ci state."
+                        )
+                        return 0
+
+                    if ci_overall == "failure":
+                        failing_summary = format_failing_ci_checks_summary(failing_checks_list)
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type="pr",
+                            target_number=pr_number_arg,
+                            dry_run=args.dry_run,
+                            state=build_orchestration_state(
+                                status="blocked",
+                                task_type="pr",
+                                issue_number=None,
+                                pr_number=pr_number_arg,
+                                branch=active_branch,
+                                base_branch=str(pr_state_context["base_branch"] or "") or None,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=1,
+                                stage="ci_checks",
+                                next_action="inspect_failing_ci_checks",
+                                error=short_error_text(failing_summary),
+                                ci_checks=ci_status.get("checks")
+                                if isinstance(ci_status.get("checks"), list)
+                                else [],
+                            ),
+                        )
+                        print(f"PR #{pr_number_arg} has failing CI checks: {failing_summary}")
+                        return 0
+
+                    safe_post_orchestration_state_comment(
+                        repo=repo,
+                        target_type="pr",
+                        target_number=pr_number_arg,
+                        dry_run=args.dry_run,
+                        state=build_orchestration_state(
+                            status="ready-to-merge",
+                            task_type="pr",
+                            issue_number=None,
+                            pr_number=pr_number_arg,
+                            branch=active_branch,
+                            base_branch=str(pr_state_context["base_branch"] or "") or None,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            attempt=1,
+                            stage="ci_checks",
+                            next_action="ready_for_merge",
+                            error=None,
+                            ci_checks=ci_status.get("checks")
+                            if isinstance(ci_status.get("checks"), list)
+                            else [],
+                        ),
+                    )
+                    print(
+                        f"CI checks passed for PR #{pr_number_arg}; marking orchestration state as ready-to-merge."
+                    )
+                    return 0
+
                 safe_post_orchestration_state_comment(
                     repo=repo,
                     target_type="pr",
@@ -3891,7 +4170,127 @@ def main() -> int:
                             f"No actionable review comments for linked PR #{pr_number}; "
                             f"continuing with sync-only rerun because mergeStateStatus={merge_state}"
                         )
-                    elif recovered_status in {"waiting-for-ci", "ready-for-review"}:
+                    elif recovered_status == "waiting-for-ci":
+                        ci_status = read_pr_ci_status_for_pull_request(
+                            repo=repo,
+                            pull_request=pull_request,
+                        )
+                        ci_overall = str(ci_status.get("overall") or "")
+                        failing_checks = ci_status.get("failing_checks")
+                        failing_checks_list = (
+                            failing_checks if isinstance(failing_checks, list) else []
+                        )
+                        pending_checks = ci_status.get("pending_checks")
+                        pending_checks_count = (
+                            len(pending_checks) if isinstance(pending_checks, list) else 0
+                        )
+                        ci_checks_payload = (
+                            ci_status.get("checks") if isinstance(ci_status.get("checks"), list) else []
+                        )
+
+                        if ci_overall == "pending":
+                            safe_post_orchestration_state_comment(
+                                repo=repo,
+                                target_type="pr",
+                                target_number=state_target_number,
+                                dry_run=args.dry_run,
+                                state=build_orchestration_state(
+                                    status="waiting-for-ci",
+                                    task_type="pr",
+                                    issue_number=issue["number"],
+                                    pr_number=state_pr_number,
+                                    branch=issue_branch,
+                                    base_branch=target_base_branch,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    attempt=1,
+                                    stage="ci_checks",
+                                    next_action="wait_for_ci",
+                                    error=None,
+                                    ci_checks=ci_checks_payload,
+                                ),
+                            )
+                            print(
+                                f"No actionable review comments for linked PR #{pr_number}; "
+                                f"CI checks are still pending ({pending_checks_count} pending), "
+                                "keeping waiting-for-ci state."
+                            )
+                            remove_agent_failure_label_from_issue(
+                                repo=repo,
+                                issue_number=issue["number"],
+                                dry_run=args.dry_run,
+                            )
+                            continue
+
+                        if ci_overall == "failure":
+                            failing_summary = format_failing_ci_checks_summary(failing_checks_list)
+                            safe_post_orchestration_state_comment(
+                                repo=repo,
+                                target_type="pr",
+                                target_number=state_target_number,
+                                dry_run=args.dry_run,
+                                state=build_orchestration_state(
+                                    status="blocked",
+                                    task_type="pr",
+                                    issue_number=issue["number"],
+                                    pr_number=state_pr_number,
+                                    branch=issue_branch,
+                                    base_branch=target_base_branch,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    attempt=1,
+                                    stage="ci_checks",
+                                    next_action="inspect_failing_ci_checks",
+                                    error=short_error_text(failing_summary),
+                                    ci_checks=ci_checks_payload,
+                                ),
+                            )
+                            print(
+                                f"No actionable review comments for linked PR #{pr_number}; "
+                                f"CI is failing: {failing_summary}"
+                            )
+                            remove_agent_failure_label_from_issue(
+                                repo=repo,
+                                issue_number=issue["number"],
+                                dry_run=args.dry_run,
+                            )
+                            continue
+
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type="pr",
+                            target_number=state_target_number,
+                            dry_run=args.dry_run,
+                            state=build_orchestration_state(
+                                status="ready-to-merge",
+                                task_type="pr",
+                                issue_number=issue["number"],
+                                pr_number=state_pr_number,
+                                branch=issue_branch,
+                                base_branch=target_base_branch,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=1,
+                                stage="ci_checks",
+                                next_action="ready_for_merge",
+                                error=None,
+                                ci_checks=ci_checks_payload,
+                            ),
+                        )
+                        print(
+                            f"No actionable review comments for linked PR #{pr_number}; "
+                            "CI checks passed, marking ready-to-merge."
+                        )
+                        remove_agent_failure_label_from_issue(
+                            repo=repo,
+                            issue_number=issue["number"],
+                            dry_run=args.dry_run,
+                        )
+                        continue
+                    elif recovered_status == "ready-for-review":
                         print(
                             f"No actionable review comments for linked PR #{pr_number}; "
                             f"keeping recovered state '{recovered_status}' and skipping duplicate issue-flow."

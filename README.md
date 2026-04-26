@@ -207,6 +207,15 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - `--dry-run` prints selected mode (`issue-flow` or `pr-review`) and the reason.
 - Use `--force-issue-flow` to keep legacy issue-flow behavior.
 
+## Orchestration state recovery (first slice)
+
+- For single-item runs (`--issue <n>` or `--pr <n> --from-review-comments`), the script inspects recent issue/PR comments for marker `<!-- orchestration-state:v1 -->`.
+- It parses JSON payloads from those comments, ignores malformed payloads safely, and logs a warning for each malformed comment.
+- It recovers the latest parseable state by comment `created_at` and prints recovered context (including in `--dry-run`).
+- Recovered `waiting-for-author` causes issue processing to skip by default with a clear reason; use `--force-issue-flow` to override.
+- Recovered `ready-for-review` keeps behavior conservative and, when an open linked PR exists, prefers PR-review path (no silent override of existing branch/PR checks).
+- Recovered `failed` state does not block rerun; previous failure details are logged and appended to the agent prompt as additional context.
+
 ## Verification
 
 Run the precedence smoke test:

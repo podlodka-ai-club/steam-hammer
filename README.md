@@ -122,10 +122,13 @@ Workflow in PR review mode:
    - PR conversation comments (issue comments on the PR)
 2. Filters and de-duplicates feedback, then builds an actionable prompt with file/line links
 3. Adds PR description and linked issue context (including issue body when available)
-4. Runs AI agent in current branch (or optional follow-up branch)
-5. On changes, creates commit and pushes updates
-6. Optionally posts a summary comment to the PR
-7. Posts append-only orchestration state comments to the PR (`in-progress`, `waiting-for-ci`, `waiting-for-author`, `failed`)
+4. Selects PR target branch (`headRefName`) as execution branch
+   - by default switches current worktree to target PR branch (with safeguard)
+   - or runs in isolated temporary worktree with `--isolate-worktree`
+5. Runs AI agent on target branch (or optional follow-up branch from target)
+6. On changes, creates commit and pushes updates to the selected branch
+7. Optionally posts a summary comment to the PR
+8. Posts append-only orchestration state comments to the PR (`in-progress`, `waiting-for-ci`, `waiting-for-author`, `failed`)
 
 State comment format:
 
@@ -141,7 +144,9 @@ Useful options:
 - `--stop-on-error` to stop on first failed run
 - `--dry-run` to preview without executing the agent
 - `--pr N --from-review-comments` to run PR review-comments mode
-- `--pr-followup-branch-prefix prefix` to create a follow-up branch in PR mode instead of committing to current branch
+- `--pr-followup-branch-prefix prefix` to create a follow-up branch in PR mode instead of committing to target PR branch
+- `--allow-pr-branch-switch` allow switching current worktree to target PR branch when they differ
+- `--isolate-worktree` run PR mode in a temporary git worktree without touching current branch
 - `--post-pr-summary` to leave a short summary comment in the PR after successful PR mode run
 - `--model model-name` to override model (e.g. `claude-sonnet-4-6` for Claude, `openai/gpt-4o` for OpenCode)
 - `--agent name` agent name for OpenCode (ignored when using Claude)
@@ -166,6 +171,9 @@ Note: script expects a clean git working tree before run.
 PR mode notes:
 
 - `--pr` must be used together with `--from-review-comments`.
+- By default PR mode works on the target PR branch (`headRefName`) rather than the branch you started from.
+- Safeguard: if current branch differs from target PR branch, run fails unless you pass `--allow-pr-branch-switch` (or `--isolate-worktree`).
+- `--dry-run` prints selected target branch and whether execution will switch branches or use isolated worktree.
 - If PR is closed/non-open, script exits without changes.
 - If there are no actionable unresolved comments, script exits successfully without running the agent.
 - Prompt input priority is deterministic: unresolved inline comments first, then review summaries, then conversation comments.
@@ -178,6 +186,16 @@ PR mode notes:
   - Exclude obvious non-actionable noise (`lgtm`, `looks good`, `thanks`, `+1`, punctuation-only text, etc.).
   - De-duplicate across all included sources while preserving priority order.
 - Prompt-generation logs now include per-source counts and included/excluded breakdown.
+
+Examples:
+
+```bash
+# Default PR mode with explicit branch-switch confirmation when needed
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --pr 22 --from-review-comments --allow-pr-branch-switch
+
+# Isolated PR mode: do not switch current branch
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --pr 22 --from-review-comments --isolate-worktree
+```
 
 ## Smoke test
 

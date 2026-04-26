@@ -5,8 +5,10 @@ import json
 import os
 import re
 import selectors
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -849,6 +851,67 @@ def has_changes() -> bool:
     return bool(run_capture(["git", "status", "--porcelain"]).strip())
 
 
+def sanitize_branch_for_path(branch_name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "-", branch_name).strip("-") or "pr-branch"
+
+
+def checkout_pr_target_branch(branch_name: str, dry_run: bool) -> None:
+    local_exists = local_branch_exists(branch_name)
+    remote_exists = remote_branch_exists(branch_name)
+
+    if dry_run:
+        if local_exists:
+            print(f"[dry-run] Would checkout local PR branch '{branch_name}'")
+            return
+        if remote_exists:
+            print(
+                f"[dry-run] Would create and checkout tracking branch '{branch_name}' "
+                f"from 'origin/{branch_name}'"
+            )
+            return
+        raise RuntimeError(
+            f"Target PR branch '{branch_name}' not found locally or on origin "
+            "(based on current refs)."
+        )
+
+    if local_exists:
+        run_command(["git", "checkout", branch_name])
+        return
+
+    run_command(["git", "fetch", "origin", branch_name])
+    run_command(["git", "checkout", "-b", branch_name, "--track", f"origin/{branch_name}"])
+
+
+def create_isolated_worktree_for_branch(branch_name: str, dry_run: bool) -> str | None:
+    safe_branch = sanitize_branch_for_path(branch_name)
+    preview_path = os.path.join(tempfile.gettempdir(), f"opencode-pr-{safe_branch}-<random>")
+    if dry_run:
+        print(
+            f"[dry-run] Would create isolated worktree for '{branch_name}' "
+            f"at '{preview_path}'"
+        )
+        return None
+
+    worktree_dir = tempfile.mkdtemp(prefix=f"opencode-pr-{safe_branch}-")
+    try:
+        local_exists = local_branch_exists(branch_name)
+        if local_exists:
+            run_command(["git", "worktree", "add", worktree_dir, branch_name])
+            return worktree_dir
+
+        run_command(["git", "fetch", "origin", branch_name])
+        run_command(["git", "worktree", "add", "-b", branch_name, worktree_dir, f"origin/{branch_name}"])
+        run_command(["git", "-C", worktree_dir, "branch", "--set-upstream-to", f"origin/{branch_name}", branch_name])
+        return worktree_dir
+    except Exception:
+        shutil.rmtree(worktree_dir, ignore_errors=True)
+        raise
+
+
+def remove_isolated_worktree(path: str) -> None:
+    run_command(["git", "worktree", "remove", "--force", path])
+
+
 def utc_now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -1246,6 +1309,23 @@ def create_branch(base_branch: str, branch_name: str, dry_run: bool) -> None:
         dry_run=dry_run,
         fail_on_existing=False,
     )
+
+
+def create_followup_branch(current_branch_name: str, branch_name: str, dry_run: bool) -> None:
+    if dry_run:
+        print(
+            f"[dry-run] Would create follow-up branch '{branch_name}' "
+            f"from '{current_branch_name}'"
+        )
+        return
+
+    if local_branch_exists(branch_name):
+        run_command(["git", "checkout", branch_name])
+        print(f"Reusing existing follow-up branch: {branch_name}")
+        return
+
+    run_command(["git", "checkout", "-b", branch_name])
+    print(f"Created follow-up branch: {branch_name}")
 
 
 def local_branch_exists(branch_name: str) -> bool:
@@ -1860,7 +1940,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--pr-followup-branch-prefix",
         help=(
             "Optional prefix for follow-up branch in PR review mode. If omitted, "
-            "changes are committed to the current PR branch."
+            "changes are committed to the target PR branch."
+        ),
+    )
+    parser.add_argument(
+        "--allow-pr-branch-switch",
+        action="store_true",
+        help=(
+            "In --pr --from-review-comments mode, allow switching the current worktree "
+            "to the target PR branch when it differs from the current branch."
+        ),
+    )
+    parser.add_argument(
+        "--isolate-worktree",
+        action="store_true",
+        help=(
+            "Run PR review mode in a temporary git worktree bound to the target PR branch "
+            "without switching your current branch."
         ),
     )
     parser.add_argument(
@@ -2015,6 +2111,8 @@ def main() -> int:
     skip_if_branch_exists = bool(getattr(args, "skip_if_branch_exists", False))
     force_reprocess = bool(getattr(args, "force_reprocess", False))
     pr_followup_branch_prefix = getattr(args, "pr_followup_branch_prefix", None)
+    allow_pr_branch_switch = bool(getattr(args, "allow_pr_branch_switch", False))
+    isolate_worktree = bool(getattr(args, "isolate_worktree", False))
     post_pr_summary = bool(getattr(args, "post_pr_summary", False))
     base_branch_mode = str(getattr(args, "base_branch", BUILTIN_DEFAULTS["base_branch"]))
 
@@ -2083,6 +2181,10 @@ def main() -> int:
     if pr_mode_requested:
         try:
             failure_stage = "pr_review_init"
+            original_cwd = os.getcwd()
+            original_branch = current_branch()
+            switched_branch = False
+            isolated_worktree_path: str | None = None
             pr_state_context: dict[str, int | str | None] = {
                 "issue": None,
                 "pr": None,
@@ -2099,6 +2201,50 @@ def main() -> int:
             if pr_state != "OPEN":
                 print(f"PR #{pr_number_arg} is not open (state: {pr_state}); skipping.")
                 return 0
+
+            target_pr_branch = str(pull_request.get("headRefName") or "").strip()
+            if not target_pr_branch:
+                raise RuntimeError(
+                    f"PR #{pr_number_arg} has empty headRefName; cannot select target branch"
+                )
+
+            prefix = "[dry-run] " if args.dry_run else ""
+            print(f"{prefix}PR mode target branch: {target_pr_branch}")
+
+            if isolate_worktree:
+                print(
+                    f"{prefix}PR mode execution: isolated worktree "
+                    "(current branch will not be switched)"
+                )
+                isolated_worktree_path = create_isolated_worktree_for_branch(
+                    branch_name=target_pr_branch,
+                    dry_run=args.dry_run,
+                )
+                if isolated_worktree_path is not None:
+                    os.chdir(isolated_worktree_path)
+                    print(f"Using isolated worktree: {isolated_worktree_path}")
+            else:
+                if original_branch == target_pr_branch:
+                    print(f"{prefix}PR mode execution: current branch already matches target")
+                else:
+                    print(
+                        f"Warning: current branch '{original_branch}' differs from target PR "
+                        f"branch '{target_pr_branch}'",
+                        file=sys.stderr,
+                    )
+                    if not allow_pr_branch_switch:
+                        raise RuntimeError(
+                            "Refusing to modify another PR branch from current branch. "
+                            "Use --allow-pr-branch-switch to switch branches in this worktree "
+                            "or --isolate-worktree to run in a temporary worktree."
+                        )
+                    print(
+                        f"{prefix}PR mode execution: switching worktree branch "
+                        f"to '{target_pr_branch}'"
+                    )
+
+                checkout_pr_target_branch(branch_name=target_pr_branch, dry_run=args.dry_run)
+                switched_branch = (not args.dry_run) and original_branch != target_pr_branch
 
             recovered_pr_state: dict | None = None
             try:
@@ -2148,7 +2294,7 @@ def main() -> int:
                 f"{format_review_filtering_stats(review_stats)}"
             )
 
-            base_branch_for_run = current_branch()
+            base_branch_for_run = target_pr_branch
             active_branch = base_branch_for_run
             if pr_followup_branch_prefix:
                 followup_branch = (
@@ -2278,7 +2424,7 @@ def main() -> int:
                 push_branch(branch_name=active_branch, dry_run=args.dry_run)
                 print(f"Pushed follow-up branch for PR #{pr_number_arg}: {active_branch}")
             else:
-                push_current_branch(dry_run=args.dry_run)
+                push_branch(branch_name=active_branch, dry_run=args.dry_run)
 
             safe_post_orchestration_state_comment(
                 repo=repo,
@@ -2344,6 +2490,27 @@ def main() -> int:
                     )
             print(f"Error: {exc}", file=sys.stderr)
             return 1
+        finally:
+            if isolated_worktree_path is not None:
+                os.chdir(original_cwd)
+                if not args.dry_run:
+                    try:
+                        remove_isolated_worktree(isolated_worktree_path)
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        print(
+                            f"Warning: failed to remove isolated worktree '{isolated_worktree_path}': "
+                            f"{cleanup_exc}",
+                            file=sys.stderr,
+                        )
+            elif switched_branch:
+                try:
+                    run_command(["git", "checkout", original_branch])
+                except Exception as restore_exc:  # noqa: BLE001
+                    print(
+                        f"Warning: failed to restore original branch '{original_branch}': "
+                        f"{restore_exc}",
+                        file=sys.stderr,
+                    )
 
     if not issues:
         print("No issues found.")

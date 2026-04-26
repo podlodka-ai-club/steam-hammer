@@ -53,6 +53,7 @@ JIRA_ENV_VARS = {
     "email": "JIRA_EMAIL",
     "api_token": "JIRA_API_TOKEN",
 }
+JIRA_ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
 
 ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"
 AGENT_FAILURE_REPORT_MARKER = "<!-- orchestration-agent-failure:v1 -->"
@@ -78,6 +79,52 @@ def _normalize_match_list(values: list[str] | None) -> list[str]:
         if item:
             normalized.append(item)
     return normalized
+
+
+def is_trackable_issue_number(value: object) -> bool:
+    if isinstance(value, int):
+        return value > 0
+    if isinstance(value, str):
+        return value.strip().isdigit()
+    return False
+
+
+def normalize_issue_number(value: object, tracker: str) -> int | str:
+    if tracker == TRACKER_GITHUB:
+        if isinstance(value, int):
+            if value <= 0:
+                raise RuntimeError(f"Invalid GitHub issue number: {value}")
+            return value
+        if not isinstance(value, str):
+            raise RuntimeError(f"Invalid GitHub issue value: {value!r}")
+        text = value.strip()
+        if not text.isdigit():
+            raise RuntimeError(f"Invalid GitHub issue number: {text}")
+        number = int(text)
+        if number <= 0:
+            raise RuntimeError(f"Invalid GitHub issue number: {text}")
+        return number
+
+    if tracker == TRACKER_JIRA:
+        if not isinstance(value, str):
+            raise RuntimeError(f"Invalid Jira issue key: {value!r}")
+        text = value.strip()
+        if not JIRA_ISSUE_KEY_RE.match(text):
+            raise RuntimeError(f"Invalid Jira issue key: {text}")
+        return text
+
+    raise RuntimeError(f"Unsupported tracker: {tracker}")
+
+
+def _parse_tracker(tracker: object) -> str:
+    normalized = str(tracker or "").strip().lower()
+    if normalized not in TRACKER_CHOICES:
+        raise RuntimeError(f"Unsupported tracker '{tracker}'. Expected one of: {', '.join(sorted(TRACKER_CHOICES))}")
+    return normalized
+
+
+def format_issue_label(issue_number: object) -> str:
+    return f"issue #{issue_number}"
 
 
 def _issue_author_login(issue: dict) -> str:

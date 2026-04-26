@@ -116,6 +116,30 @@ func TestRunIssueCommandMapsPythonRunnerFlags(t *testing.T) {
 	})
 }
 
+func TestRunIssueBatchCommandMapsREADMEExample(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "issue", "--repo", "owner/repo", "--limit", "1", "--runner", "opencode", "--agent", "build", "--model", "openai/gpt-4o"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--repo", "owner/repo", "--runner", "opencode", "--agent", "build", "--model", "openai/gpt-4o", "--limit", "1"})
+}
+
+func TestRunIssueBatchCommandMapsState(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "issue", "--repo", "owner/repo", "--state", "open", "--limit", "2"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--repo", "owner/repo", "--state", "open", "--limit", "2"})
+}
+
 func TestRunIssueCommandForwardsExplicitDefaultTrueFlags(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -181,13 +205,13 @@ func TestUnsupportedPythonFlagFailsFastWithActionableError(t *testing.T) {
 	app := NewApp(&strings.Builder{}, &errOut)
 	app.SetRunner(runner)
 
-	if code := app.Run([]string{"run", "issue", "--limit", "1"}); code != 2 {
+	if code := app.Run([]string{"run", "issue", "--id", "71", "--from-review-comments"}); code != 2 {
 		t.Fatalf("Run() code = %d, want 2", code)
 	}
 	if runner.calls != 0 {
 		t.Fatalf("runner calls = %d, want 0", runner.calls)
 	}
-	if !strings.Contains(errOut.String(), "unsupported flag --limit") || !strings.Contains(errOut.String(), "--id N") {
+	if !strings.Contains(errOut.String(), "unsupported flag --from-review-comments") || !strings.Contains(errOut.String(), "run pr") {
 		t.Fatalf("stderr = %q, want actionable unsupported flag message", errOut.String())
 	}
 }

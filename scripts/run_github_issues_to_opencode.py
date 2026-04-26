@@ -194,6 +194,112 @@ def run_check_command(command: list[str], cwd: str | None = None) -> tuple[bool,
     )
 
 
+WORKFLOW_COMMAND_ORDER = ["test", "lint", "build"]
+
+
+class WorkflowCheckFailure(RuntimeError):
+    def __init__(self, failed_check: dict, checks: list[dict]):
+        self.failed_check = failed_check
+        self.checks = checks
+
+        check_name = str(failed_check.get("name") or "check")
+        exit_code = failed_check.get("exit_code")
+        error = str(failed_check.get("error") or "")
+        evidence = ""
+        if error:
+            evidence = f": {error}"
+        elif failed_check.get("stderr_excerpt"):
+            evidence = f": {failed_check['stderr_excerpt']}"
+        elif failed_check.get("stdout_excerpt"):
+            evidence = f": {failed_check['stdout_excerpt']}"
+
+        super().__init__(
+            f"Workflow check '{check_name}' failed"
+            f" (exit code {exit_code if exit_code is not None else 'unknown'}){evidence}"
+        )
+
+
+def configured_workflow_commands(project_config: dict) -> list[tuple[str, str]]:
+    workflow = project_config.get("workflow") if isinstance(project_config, dict) else None
+    if not isinstance(workflow, dict):
+        return []
+
+    commands = workflow.get("commands")
+    if not isinstance(commands, dict):
+        return []
+
+    configured: list[tuple[str, str]] = []
+    for check_name in WORKFLOW_COMMAND_ORDER:
+        command = commands.get(check_name)
+        if command is None:
+            continue
+        command_text = str(command).strip()
+        if not command_text:
+            continue
+        configured.append((check_name, command_text))
+    return configured
+
+
+def _workflow_output_excerpt(text: str, max_len: int = 600) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 3] + "..."
+
+
+def run_configured_workflow_checks(
+    checks: list[tuple[str, str]],
+    dry_run: bool,
+    cwd: str | None = None,
+) -> list[dict]:
+    if not checks:
+        return []
+
+    results: list[dict] = []
+    for check_name, command_text in checks:
+        if dry_run:
+            print(f"[dry-run] Would run workflow check '{check_name}': {command_text}")
+            results.append(
+                {
+                    "name": check_name,
+                    "command": command_text,
+                    "status": "dry-run",
+                    "exit_code": None,
+                }
+            )
+            continue
+
+        print(f"Running workflow check '{check_name}': {command_text}")
+        ok, stdout_text, stderr_text, exit_code = run_check_command(
+            ["bash", "-lc", command_text],
+            cwd=cwd,
+        )
+        result = {
+            "name": check_name,
+            "command": command_text,
+            "status": "passed" if ok else "failed",
+            "exit_code": exit_code,
+        }
+        if stdout_text:
+            result["stdout_excerpt"] = _workflow_output_excerpt(stdout_text)
+        if stderr_text:
+            result["stderr_excerpt"] = _workflow_output_excerpt(stderr_text)
+
+        results.append(result)
+
+        if ok:
+            print(f"Workflow check '{check_name}' passed")
+            continue
+
+        print(
+            f"Workflow check '{check_name}' failed with exit code {exit_code}",
+            file=sys.stderr,
+        )
+        raise WorkflowCheckFailure(failed_check=result, checks=results)
+
+    return results
+
+
 def current_head_sha() -> str:
     return run_capture(["git", "rev-parse", "HEAD"]).strip()
 
@@ -1351,13 +1457,14 @@ def build_orchestration_state(
     stage: str,
     next_action: str,
     error: str | None,
+    workflow_checks: list[dict] | None = None,
 ) -> dict:
     if status not in ORCHESTRATION_STATE_STATUSES:
         raise RuntimeError(f"Unsupported orchestration state status: {status}")
     if task_type not in {"issue", "pr"}:
         raise RuntimeError(f"Unsupported orchestration task type: {task_type}")
 
-    return {
+    state = {
         "status": status,
         "task_type": task_type,
         "issue": issue_number,
@@ -1373,6 +1480,9 @@ def build_orchestration_state(
         "error": error,
         "timestamp": utc_now_iso(),
     }
+    if workflow_checks is not None:
+        state["workflow_checks"] = workflow_checks
+    return state
 
 
 def format_orchestration_state_comment(state: dict) -> str:
@@ -2170,6 +2280,10 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
         if key in commands and commands[key] is not None and not isinstance(commands[key], str):
             raise RuntimeError(
                 f"Project config key 'workflow.commands.{key}' must be a string or null"
+            )
+        if key in commands and isinstance(commands[key], str) and not commands[key].strip():
+            raise RuntimeError(
+                f"Project config key 'workflow.commands.{key}' must be a non-empty string or null"
             )
 
 
@@ -3074,6 +3188,12 @@ def main() -> int:
         )
         project_config = load_project_config(project_config_path)
         scope_defaults = project_scope_defaults(project_config)
+        workflow_checks = configured_workflow_commands(project_config)
+
+        if workflow_checks:
+            configured_names = ", ".join(name for name, _ in workflow_checks)
+            prefix = "[dry-run] " if args.dry_run else ""
+            print(f"{prefix}Configured workflow checks: {configured_names}")
 
         if issue_number_arg is not None and pr_number_arg is not None:
             raise RuntimeError("Use either --issue or --pr, not both.")
@@ -3124,6 +3244,7 @@ def main() -> int:
     if pr_mode_requested:
         try:
             failure_stage = "pr_review_init"
+            workflow_check_results: list[dict] | None = None
             original_cwd = os.getcwd()
             original_branch = current_branch()
             switched_branch = False
@@ -3363,6 +3484,15 @@ def main() -> int:
 
             failure_stage = "commit_push"
             commit_pr_review_changes(pull_request=pull_request, dry_run=args.dry_run)
+
+            failure_stage = "workflow_checks"
+            workflow_check_results = run_configured_workflow_checks(
+                checks=workflow_checks,
+                dry_run=args.dry_run,
+                cwd=os.getcwd(),
+            )
+
+            failure_stage = "commit_push"
             if pr_followup_branch_prefix:
                 push_branch(branch_name=active_branch, dry_run=args.dry_run)
                 print(f"Pushed follow-up branch for PR #{pr_number_arg}: {active_branch}")
@@ -3388,6 +3518,7 @@ def main() -> int:
                     stage="changes_pushed",
                     next_action="wait_for_ci",
                     error=None,
+                    workflow_checks=workflow_check_results,
                 ),
             )
 
@@ -3410,13 +3541,22 @@ def main() -> int:
             if pr_number_arg is not None:
                 failed_pr_number = pr_state_context.get("pr")
                 if type(failed_pr_number) is int:
+                    failure_status = "blocked" if failure_stage == "workflow_checks" else "failed"
+                    next_action = (
+                        "fix_workflow_checks_and_retry"
+                        if failure_stage == "workflow_checks"
+                        else "inspect_error_and_retry"
+                    )
+                    workflow_results = (
+                        exc.checks if isinstance(exc, WorkflowCheckFailure) else None
+                    )
                     safe_post_orchestration_state_comment(
                         repo=repo,
                         target_type="pr",
                         target_number=failed_pr_number,
                         dry_run=args.dry_run,
                         state=build_orchestration_state(
-                            status="failed",
+                            status=failure_status,
                             task_type="pr",
                             issue_number=None,
                             pr_number=failed_pr_number,
@@ -3427,8 +3567,9 @@ def main() -> int:
                             model=args.model,
                             attempt=1,
                             stage=failure_stage,
-                            next_action="inspect_error_and_retry",
+                            next_action=next_action,
                             error=short_error_text(str(exc)),
+                            workflow_checks=workflow_results,
                         ),
                     )
             print(f"Error: {exc}", file=sys.stderr)
@@ -3471,6 +3612,7 @@ def main() -> int:
     for issue in issues:
         try:
             failure_stage = "issue_setup"
+            workflow_check_results: list[dict] | None = None
             linked_open_pr: dict | None = None
             recovered_state: dict | None = None
             recovered_status = ""
@@ -4061,6 +4203,15 @@ def main() -> int:
 
             failure_stage = "commit_push"
             commit_changes(issue=issue, dry_run=args.dry_run)
+
+            failure_stage = "workflow_checks"
+            workflow_check_results = run_configured_workflow_checks(
+                checks=workflow_checks,
+                dry_run=args.dry_run,
+                cwd=os.getcwd(),
+            )
+
+            failure_stage = "commit_push"
             push_branch(
                 branch_name=issue_branch,
                 dry_run=args.dry_run,
@@ -4103,6 +4254,7 @@ def main() -> int:
                             stage="pr_ready",
                             next_action="wait_for_review",
                             error=None,
+                            workflow_checks=workflow_check_results,
                         ),
                     )
                 else:
@@ -4125,6 +4277,7 @@ def main() -> int:
                             stage="changes_pushed",
                             next_action="wait_for_ci",
                             error=None,
+                            workflow_checks=workflow_check_results,
                         ),
                     )
 
@@ -4137,13 +4290,20 @@ def main() -> int:
             )
         except Exception as exc:  # noqa: BLE001
             failures += 1
+            failure_status = "blocked" if failure_stage == "workflow_checks" else "failed"
+            next_action = (
+                "fix_workflow_checks_and_retry"
+                if failure_stage == "workflow_checks"
+                else "inspect_error_and_retry"
+            )
+            workflow_results = exc.checks if isinstance(exc, WorkflowCheckFailure) else None
             safe_post_orchestration_state_comment(
                 repo=repo,
                 target_type=state_target_type,
                 target_number=state_target_number,
                 dry_run=args.dry_run,
                 state=build_orchestration_state(
-                    status="failed",
+                    status=failure_status,
                     task_type="issue" if mode == "issue-flow" else "pr",
                     issue_number=issue["number"],
                     pr_number=state_pr_number,
@@ -4154,8 +4314,9 @@ def main() -> int:
                     model=args.model,
                     attempt=1,
                     stage=failure_stage,
-                    next_action="inspect_error_and_retry",
+                    next_action=next_action,
                     error=short_error_text(str(exc)),
+                    workflow_checks=workflow_results,
                 ),
             )
             safe_report_issue_automation_failure(

@@ -116,6 +116,41 @@ func TestRunIssueCommandMapsPythonRunnerFlags(t *testing.T) {
 	})
 }
 
+func TestRunIssueCommandForwardsExplicitDefaultTrueFlags(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{
+		"run", "issue",
+		"--id", "71",
+		"--skip-if-pr-exists",
+		"--skip-if-branch-exists",
+		"--sync-reused-branch",
+	})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{
+		runnerScript, "--issue", "71",
+		"--skip-if-pr-exists",
+		"--skip-if-branch-exists",
+		"--sync-reused-branch",
+	})
+}
+
+func TestRunIssueCommandAcceptsIssueAlias(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "issue", "--issue", "71"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--issue", "71"})
+}
+
 func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -126,6 +161,35 @@ func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments", "--dry-run", "--isolate-worktree"})
+}
+
+func TestRunPRCommandAcceptsPythonPRFlags(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "pr", "--pr", "72", "--from-review-comments"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments"})
+}
+
+func TestUnsupportedPythonFlagFailsFastWithActionableError(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+
+	if code := app.Run([]string{"run", "issue", "--limit", "1"}); code != 2 {
+		t.Fatalf("Run() code = %d, want 2", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "unsupported flag --limit") || !strings.Contains(errOut.String(), "--id N") {
+		t.Fatalf("stderr = %q, want actionable unsupported flag message", errOut.String())
+	}
 }
 
 func TestRunIssueRequiresID(t *testing.T) {

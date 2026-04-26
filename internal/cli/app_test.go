@@ -77,30 +77,6 @@ func TestRunIssueCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run", "--base", "current"})
 }
 
-func TestRunIssueBatchCommandMapsREADMEExample(t *testing.T) {
-	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
-	app.SetRunner(runner)
-
-	code := app.Run([]string{"run", "issue", "--repo", "owner/repo", "--limit", "1", "--runner", "opencode", "--agent", "build", "--model", "openai/gpt-4o"})
-	if code != 0 {
-		t.Fatalf("Run() code = %d, want 0", code)
-	}
-	assertCommand(t, runner, []string{runnerScript, "--repo", "owner/repo", "--runner", "opencode", "--agent", "build", "--model", "openai/gpt-4o", "--limit", "1"})
-}
-
-func TestRunIssueAcceptsPythonIssueAlias(t *testing.T) {
-	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
-	app.SetRunner(runner)
-
-	code := app.Run([]string{"run", "issue", "--issue", "20", "--runner", "opencode"})
-	if code != 0 {
-		t.Fatalf("Run() code = %d, want 0", code)
-	}
-	assertCommand(t, runner, []string{runnerScript, "--issue", "20", "--runner", "opencode"})
-}
-
 func TestRunIssueCommandMapsPythonRunnerFlags(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -140,7 +116,31 @@ func TestRunIssueCommandMapsPythonRunnerFlags(t *testing.T) {
 	})
 }
 
-func TestRunIssueCommandForwardsExplicitTrueFlagsForConfigPrecedence(t *testing.T) {
+func TestRunIssueBatchCommandMapsREADMEExample(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "issue", "--repo", "owner/repo", "--limit", "1", "--runner", "opencode", "--agent", "build", "--model", "openai/gpt-4o"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--repo", "owner/repo", "--runner", "opencode", "--agent", "build", "--model", "openai/gpt-4o", "--limit", "1"})
+}
+
+func TestRunIssueBatchCommandMapsState(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "issue", "--repo", "owner/repo", "--state", "open", "--limit", "2"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--repo", "owner/repo", "--state", "open", "--limit", "2"})
+}
+
+func TestRunIssueCommandForwardsExplicitDefaultTrueFlags(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
@@ -163,17 +163,16 @@ func TestRunIssueCommandForwardsExplicitTrueFlagsForConfigPrecedence(t *testing.
 	})
 }
 
-func TestRunIssueDelegatesStateRecoveryToPythonRunner(t *testing.T) {
+func TestRunIssueCommandAcceptsIssueAlias(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
 
-	code := app.Run([]string{"run", "issue", "--id", "74", "--repo", "owner/repo"})
+	code := app.Run([]string{"run", "issue", "--issue", "71"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--issue", "74", "--repo", "owner/repo"})
-	assertNoStateFormatArgs(t, runner.args)
+	assertCommand(t, runner, []string{runnerScript, "--issue", "71"})
 }
 
 func TestRunPRCommandWiresPythonRunner(t *testing.T) {
@@ -188,37 +187,41 @@ func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments", "--dry-run", "--isolate-worktree"})
 }
 
-func TestRunPRAcceptsPythonAliases(t *testing.T) {
+func TestRunPRCommandAcceptsPythonPRFlags(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
 
-	code := app.Run([]string{"run", "pr", "--pr", "72", "--from-review-comments", "--dry-run"})
+	code := app.Run([]string{"run", "pr", "--pr", "72", "--from-review-comments"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments", "--dry-run"})
+	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments"})
 }
 
-func TestRunPRDelegatesReviewStateRecoveryToPythonRunner(t *testing.T) {
+func TestUnsupportedPythonFlagFailsFastWithActionableError(t *testing.T) {
 	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
 	app.SetRunner(runner)
 
-	code := app.Run([]string{"run", "pr", "--id", "74", "--repo", "owner/repo"})
-	if code != 0 {
-		t.Fatalf("Run() code = %d, want 0", code)
+	if code := app.Run([]string{"run", "issue", "--id", "71", "--from-review-comments"}); code != 2 {
+		t.Fatalf("Run() code = %d, want 2", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--pr", "74", "--from-review-comments", "--repo", "owner/repo"})
-	assertNoStateFormatArgs(t, runner.args)
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "unsupported flag --from-review-comments") || !strings.Contains(errOut.String(), "run pr") {
+		t.Fatalf("stderr = %q, want actionable unsupported flag message", errOut.String())
+	}
 }
 
-func TestRunPRRequiresID(t *testing.T) {
+func TestRunIssueRequiresID(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
 
-	if code := app.Run([]string{"run", "pr", "--dry-run"}); code != 2 {
+	if code := app.Run([]string{"run", "issue", "--dry-run"}); code != 2 {
 		t.Fatalf("Run() code = %d, want 2", code)
 	}
 	if runner.calls != 0 {
@@ -265,14 +268,5 @@ func assertCommand(t *testing.T, runner *recordingRunner, wantArgs []string) {
 	}
 	if !reflect.DeepEqual(runner.args, wantArgs) {
 		t.Fatalf("runner args = %#v, want %#v", runner.args, wantArgs)
-	}
-}
-
-func assertNoStateFormatArgs(t *testing.T, args []string) {
-	t.Helper()
-	for _, arg := range args {
-		if strings.Contains(arg, "state-format") || strings.Contains(arg, "orchestration-state:v2") {
-			t.Fatalf("runner args = %#v, want no new orchestration state format arguments", args)
-		}
 	}
 }

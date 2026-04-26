@@ -73,9 +73,15 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 }
 
 func (a *App) runDoctor(ctx context.Context, args []string) int {
+	if unsupported := firstUnsupportedFlag(args, unsupportedDoctorFlags); unsupported != "" {
+		_, _ = fmt.Fprintln(a.err, unsupported)
+		return 2
+	}
+
 	fs := newFlagSet("doctor", a.err)
 	opts := commonOptions{}
 	addCommonFlags(fs, &opts)
+	_ = fs.Bool("doctor", false, "compatibility no-op; doctor mode is selected by the command")
 	doctorSmokeCheck := fs.Bool("doctor-smoke-check", false, "run a lightweight runner CLI smoke check")
 
 	if err := fs.Parse(args); err != nil {
@@ -115,11 +121,16 @@ func (a *App) runRun(ctx context.Context, args []string) int {
 }
 
 func (a *App) runIssue(ctx context.Context, args []string) int {
+	if unsupported := firstUnsupportedFlag(args, unsupportedRunIssueFlags); unsupported != "" {
+		_, _ = fmt.Fprintln(a.err, unsupported)
+		return 2
+	}
+
 	fs := newFlagSet("run issue", a.err)
 	opts := commonOptions{}
 	addCommonFlags(fs, &opts)
 	id := fs.Int("id", 0, "GitHub issue number")
-	issue := fs.Int("issue", 0, "GitHub issue number (alias for --id)")
+	issue := fs.Int("issue", 0, "compatibility alias for --id")
 	state := fs.String("state", "", "issue state for batch runs: open, closed, or all")
 	limit := fs.Int("limit", 0, "maximum number of issues to process for batch runs")
 	base := ""
@@ -145,15 +156,21 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintf(a.err, "unexpected run issue argument: %s\n", fs.Arg(0))
 		return 2
 	}
-	issueID := selectedID(*id, *issue)
-	if issueID < 0 {
-		_, _ = fmt.Fprintln(a.err, "use only one of --id or --issue")
+	if *id > 0 && *issue > 0 && *id != *issue {
+		_, _ = fmt.Fprintln(a.err, "run issue received conflicting --id and --issue values")
+		return 2
+	}
+	if *id == 0 {
+		*id = *issue
+	}
+	if *id <= 0 && *state == "" && *limit <= 0 {
+		_, _ = fmt.Fprintln(a.err, "run issue requires --id N, --issue N, --state, or --limit")
 		return 2
 	}
 
 	pythonArgs := []string{runnerScript}
-	if issueID > 0 {
-		pythonArgs = append(pythonArgs, "--issue", strconv.Itoa(issueID))
+	if *id > 0 {
+		pythonArgs = append(pythonArgs, "--issue", strconv.Itoa(*id))
 	}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
 	if *state != "" {
@@ -177,22 +194,28 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 	if *forceIssueFlow {
 		pythonArgs = append(pythonArgs, "--force-issue-flow")
 	}
-	if flagPassed(fs, "skip-if-pr-exists") {
+	if *noSkipIfPRExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
+	} else if flagWasPassed(fs, "skip-if-pr-exists") && *skipIfPRExists {
 		pythonArgs = append(pythonArgs, "--skip-if-pr-exists")
-	} else if !*skipIfPRExists || *noSkipIfPRExists {
+	} else if !*skipIfPRExists {
 		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
 	}
-	if flagPassed(fs, "skip-if-branch-exists") {
+	if *noSkipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
+	} else if flagWasPassed(fs, "skip-if-branch-exists") && *skipIfBranchExists {
 		pythonArgs = append(pythonArgs, "--skip-if-branch-exists")
-	} else if !*skipIfBranchExists || *noSkipIfBranchExists {
+	} else if !*skipIfBranchExists {
 		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
 	}
 	if *forceReprocess {
 		pythonArgs = append(pythonArgs, "--force-reprocess")
 	}
-	if flagPassed(fs, "sync-reused-branch") {
+	if *noSyncReusedBranch {
+		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
+	} else if flagWasPassed(fs, "sync-reused-branch") && *syncReusedBranch {
 		pythonArgs = append(pythonArgs, "--sync-reused-branch")
-	} else if !*syncReusedBranch || *noSyncReusedBranch {
+	} else if !*syncReusedBranch {
 		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
 	}
 	if *syncStrategy != "" {
@@ -202,12 +225,17 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 }
 
 func (a *App) runPR(ctx context.Context, args []string) int {
+	if unsupported := firstUnsupportedFlag(args, unsupportedRunPRFlags); unsupported != "" {
+		_, _ = fmt.Fprintln(a.err, unsupported)
+		return 2
+	}
+
 	fs := newFlagSet("run pr", a.err)
 	opts := commonOptions{}
 	addCommonFlags(fs, &opts)
 	id := fs.Int("id", 0, "GitHub pull request number")
-	pr := fs.Int("pr", 0, "GitHub pull request number (alias for --id)")
-	fs.Bool("from-review-comments", false, "accepted for compatibility; run pr always uses review comments")
+	pr := fs.Int("pr", 0, "compatibility alias for --id")
+	_ = fs.Bool("from-review-comments", false, "compatibility no-op; PR review-comments mode is selected by the command")
 	allowBranchSwitch := fs.Bool("allow-pr-branch-switch", false, "allow switching to the target PR branch")
 	isolateWorktree := fs.Bool("isolate-worktree", false, "run in a temporary git worktree")
 	postSummary := fs.Bool("post-pr-summary", false, "post a summary comment after success")
@@ -220,16 +248,19 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintf(a.err, "unexpected run pr argument: %s\n", fs.Arg(0))
 		return 2
 	}
-	prID := selectedID(*id, *pr)
-	if prID < 0 {
-		_, _ = fmt.Fprintln(a.err, "use only one of --id or --pr")
+	if *id > 0 && *pr > 0 && *id != *pr {
+		_, _ = fmt.Fprintln(a.err, "run pr received conflicting --id and --pr values")
 		return 2
 	}
-	if prID <= 0 {
+	if *id == 0 {
+		*id = *pr
+	}
+	if *id <= 0 {
 		_, _ = fmt.Fprintln(a.err, "run pr requires --id N")
 		return 2
 	}
-	pythonArgs := []string{runnerScript, "--pr", strconv.Itoa(prID), "--from-review-comments"}
+
+	pythonArgs := []string{runnerScript, "--pr", strconv.Itoa(*id), "--from-review-comments"}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
 	if *allowBranchSwitch {
 		pythonArgs = append(pythonArgs, "--allow-pr-branch-switch")
@@ -342,26 +373,6 @@ func appendCommonPythonArgs(args []string, opts commonOptions) []string {
 	return args
 }
 
-func selectedID(primary, alias int) int {
-	if primary > 0 && alias > 0 {
-		return -1
-	}
-	if primary > 0 {
-		return primary
-	}
-	return alias
-}
-
-func flagPassed(fs *flag.FlagSet, name string) bool {
-	found := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == name {
-			found = true
-		}
-	})
-	return found
-}
-
 func newFlagSet(name string, err io.Writer) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(err)
@@ -373,6 +384,71 @@ func flagExitCode(err error) int {
 		return 0
 	}
 	return 2
+}
+
+func flagWasPassed(fs *flag.FlagSet, name string) bool {
+	passed := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			passed = true
+		}
+	})
+	return passed
+}
+
+var unsupportedDoctorFlags = map[string]string{
+	"issue":                "use `orchestrator run issue --id N` instead",
+	"pr":                   "use `orchestrator run pr --id N` instead",
+	"from-review-comments": "PR review-comments mode is selected by `orchestrator run pr`",
+	"limit":                "batch issue selection is not exposed by the Go wrapper yet",
+	"state":                "batch issue selection is not exposed by the Go wrapper yet",
+}
+
+var unsupportedRunIssueFlags = map[string]string{
+	"pr":                   "use `orchestrator run pr --id N` instead",
+	"from-review-comments": "use `orchestrator run pr --id N` instead",
+	"doctor":               "use `orchestrator doctor` instead",
+	"doctor-smoke-check":   "use `orchestrator doctor --doctor-smoke-check` instead",
+}
+
+var unsupportedRunPRFlags = map[string]string{
+	"issue":              "use `orchestrator run issue --id N` instead",
+	"doctor":             "use `orchestrator doctor` instead",
+	"doctor-smoke-check": "use `orchestrator doctor --doctor-smoke-check` instead",
+	"limit":              "batch issue selection is not exposed by the Go wrapper yet",
+	"state":              "batch issue selection is not exposed by the Go wrapper yet",
+	"base":               "issue-flow base selection only applies to `orchestrator run issue`",
+	"base-branch":        "issue-flow base selection only applies to `orchestrator run issue`",
+}
+
+func firstUnsupportedFlag(args []string, unsupported map[string]string) string {
+	for _, arg := range args {
+		if arg == "--" {
+			return ""
+		}
+		name, ok := flagName(arg)
+		if !ok {
+			continue
+		}
+		if message, found := unsupported[name]; found {
+			return fmt.Sprintf("unsupported flag --%s for this command: %s", name, message)
+		}
+	}
+	return ""
+}
+
+func flagName(arg string) (string, bool) {
+	if len(arg) < 3 || arg[0:2] != "--" {
+		return "", false
+	}
+	name := arg[2:]
+	for i, r := range name {
+		if r == '=' {
+			name = name[:i]
+			break
+		}
+	}
+	return name, name != ""
 }
 
 func usage() string {

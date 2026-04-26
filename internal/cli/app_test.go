@@ -20,6 +20,26 @@ func (r *recordingRunner) Run(_ context.Context, name string, args ...string) er
 	return nil
 }
 
+type failingRunner struct {
+	err error
+}
+
+func (r failingRunner) Run(_ context.Context, _ string, _ ...string) error {
+	return r.err
+}
+
+type contextRunner struct{}
+
+func (contextRunner) Run(ctx context.Context, _ string, _ ...string) error {
+	return ctx.Err()
+}
+
+type exitCodeError int
+
+func (e exitCodeError) Error() string { return "exit" }
+
+func (e exitCodeError) ExitCode() int { return int(e) }
+
 func TestHelpDoesNotInvokeRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -57,6 +77,45 @@ func TestRunIssueCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run", "--base", "current"})
 }
 
+func TestRunIssueCommandMapsPythonRunnerFlags(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{
+		"run", "issue",
+		"--id", "71",
+		"--opencode-auto-approve",
+		"--branch-prefix", "fix",
+		"--include-empty",
+		"--stop-on-error",
+		"--fail-on-existing",
+		"--force-issue-flow",
+		"--no-skip-if-pr-exists",
+		"--no-skip-if-branch-exists",
+		"--force-reprocess",
+		"--no-sync-reused-branch",
+		"--sync-strategy", "merge",
+	})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{
+		runnerScript, "--issue", "71",
+		"--opencode-auto-approve",
+		"--branch-prefix", "fix",
+		"--include-empty",
+		"--stop-on-error",
+		"--fail-on-existing",
+		"--force-issue-flow",
+		"--no-skip-if-pr-exists",
+		"--no-skip-if-branch-exists",
+		"--force-reprocess",
+		"--no-sync-reused-branch",
+		"--sync-strategy", "merge",
+	})
+}
+
 func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -79,6 +138,35 @@ func TestRunIssueRequiresID(t *testing.T) {
 	}
 	if runner.calls != 0 {
 		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+}
+
+func TestPythonRunnerExitCodeIsPreserved(t *testing.T) {
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(failingRunner{err: exitCodeError(17)})
+
+	if code := app.Run([]string{"run", "issue", "--id", "71"}); code != 17 {
+		t.Fatalf("Run() code = %d, want 17", code)
+	}
+	if !strings.Contains(errOut.String(), "python runner exited with code 17") {
+		t.Fatalf("stderr = %q, want exit code message", errOut.String())
+	}
+}
+
+func TestPythonRunnerContextCancellation(t *testing.T) {
+	var errOut strings.Builder
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(contextRunner{})
+
+	if code := app.RunContext(ctx, []string{"run", "issue", "--id", "71"}); code != 130 {
+		t.Fatalf("RunContext() code = %d, want 130", code)
+	}
+	if !strings.Contains(errOut.String(), "python runner canceled") {
+		t.Fatalf("stderr = %q, want cancellation message", errOut.String())
 	}
 }
 

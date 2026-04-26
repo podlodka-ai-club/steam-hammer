@@ -1482,6 +1482,25 @@ def has_changes() -> bool:
     return bool(run_capture(["git", "status", "--porcelain"]).strip())
 
 
+def list_untracked_files() -> set[str]:
+    status_output = run_capture(["git", "ls-files", "--others", "--exclude-standard"]).strip()
+    if not status_output:
+        return set()
+    return {line for line in status_output.splitlines() if line.strip()}
+
+
+def stage_worktree_changes(pre_run_untracked_files: set[str] | None = None) -> None:
+    run_command(["git", "add", "-u"])
+
+    if pre_run_untracked_files is None:
+        return
+
+    post_run_untracked_files = list_untracked_files()
+    new_untracked_files = sorted(post_run_untracked_files - set(pre_run_untracked_files))
+    if new_untracked_files:
+        run_command(["git", "add", "--", *new_untracked_files])
+
+
 def sanitize_branch_for_path(branch_name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "-", branch_name).strip("-") or "pr-branch"
 
@@ -2466,12 +2485,16 @@ def sync_reused_branch_with_base(
     return synced
 
 
-def commit_changes(issue: dict, dry_run: bool) -> str:
+def commit_changes(
+    issue: dict,
+    dry_run: bool,
+    pre_run_untracked_files: set[str] | None = None,
+) -> str:
     message = f"Fix issue #{issue['number']}: {issue['title']}"
     if dry_run:
         print(f"[dry-run] Would commit with message: {message}")
         return message
-    run_command(["git", "add", "-u"])
+    stage_worktree_changes(pre_run_untracked_files)
     run_command(["git", "commit", "-m", message])
     return message
 
@@ -2499,12 +2522,16 @@ def push_current_branch(dry_run: bool) -> None:
     run_command(["git", "push"])
 
 
-def commit_pr_review_changes(pull_request: dict, dry_run: bool) -> str:
+def commit_pr_review_changes(
+    pull_request: dict,
+    dry_run: bool,
+    pre_run_untracked_files: set[str] | None = None,
+) -> str:
     message = f"Address review comments for PR #{pull_request['number']}"
     if dry_run:
         print(f"[dry-run] Would commit with message: {message}")
         return message
-    run_command(["git", "add", "-A"])
+    stage_worktree_changes(pre_run_untracked_files)
     run_command(["git", "commit", "-m", message])
     return message
 
@@ -4010,6 +4037,9 @@ def main() -> int:
                 )
 
             failure_stage = "agent_run"
+            pre_run_untracked_files: set[str] | None = None
+            if not args.dry_run:
+                pre_run_untracked_files = list_untracked_files()
             exit_code = run_agent_with_prompt(
                 prompt=prompt,
                 item_label=f"PR #{pr_number_arg}",
@@ -4054,7 +4084,11 @@ def main() -> int:
                 return 0
 
             failure_stage = "commit_push"
-            commit_pr_review_changes(pull_request=pull_request, dry_run=args.dry_run)
+            commit_pr_review_changes(
+                pull_request=pull_request,
+                dry_run=args.dry_run,
+                pre_run_untracked_files=pre_run_untracked_files,
+            )
 
             failure_stage = "workflow_checks"
             workflow_check_results = run_configured_workflow_checks(
@@ -4778,6 +4812,10 @@ def main() -> int:
                         f"strategy: '{args.sync_strategy}')"
                     )
 
+                pre_run_untracked_files: set[str] | None = None
+                if not skip_agent_run and not args.dry_run:
+                    pre_run_untracked_files = list_untracked_files()
+
                 if skip_agent_run:
                     print(
                         f"Skipping agent run for issue #{issue['number']} in pr-review mode: "
@@ -4801,7 +4839,6 @@ def main() -> int:
                         raise RuntimeError(
                             f"Agent failed for issue #{issue['number']} with exit code {exit_code}"
                         )
-
                 if not args.dry_run and not has_changes():
                     if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:
                         print(
@@ -4923,7 +4960,11 @@ def main() -> int:
                     continue
 
                 failure_stage = "commit_push"
-                commit_changes(issue=issue, dry_run=args.dry_run)
+                commit_changes(
+                    issue=issue,
+                    dry_run=args.dry_run,
+                    pre_run_untracked_files=pre_run_untracked_files,
+                )
 
                 failure_stage = "workflow_checks"
                 workflow_check_results = run_configured_workflow_checks(

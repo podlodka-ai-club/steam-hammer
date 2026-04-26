@@ -4,6 +4,9 @@ import unittest
 from unittest.mock import patch
 
 from scripts.run_github_issues_to_opencode import (
+    ORCHESTRATION_STATE_MARKER,
+    build_orchestration_state,
+    format_orchestration_state_comment,
     main,
     parse_orchestration_state_comment_body,
     select_latest_parseable_orchestration_state,
@@ -24,6 +27,35 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
 
         self.assertIsNone(error)
         self.assertEqual(payload, {"status": "ready-for-review", "summary": "done"})
+
+    def test_formatted_state_comment_round_trips_through_current_recovery_parser(self) -> None:
+        state = build_orchestration_state(
+            status="in-progress",
+            task_type="issue",
+            issue_number=74,
+            pr_number=None,
+            branch="issue-fix/74-state-v1",
+            base_branch="main",
+            runner="opencode",
+            agent="build",
+            model=None,
+            attempt=1,
+            stage="agent_run",
+            next_action="wait_for_agent_result",
+            error=None,
+        )
+
+        body = format_orchestration_state_comment(state)
+        payload, error = parse_orchestration_state_comment_body(body)
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertIn(ORCHESTRATION_STATE_MARKER, body)
+        self.assertEqual(payload["status"], "in-progress")
+        self.assertEqual(payload["task_type"], "issue")
+        self.assertEqual(payload["issue"], 74)
+        self.assertEqual(payload["branch"], "issue-fix/74-state-v1")
 
     def test_select_latest_parseable_state_ignores_malformed_comments(self) -> None:
         comments = [

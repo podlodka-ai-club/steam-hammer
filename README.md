@@ -12,6 +12,10 @@ Memo link: https://www.notion.so/Hacker-Sprint-1-33f2db4c860e8064a657e199b4578f6
 - `claude` (Claude Code CLI) — default runner
 - `opencode` — only if using `--runner opencode`
 
+## For QA teams
+
+When filing Jira issues for AI-assisted fixes, use the [Jira issue description template](docs/jira-issue-template.md) so the agent has enough context to generate accurate patches.
+
 ```text
 .
 ├── .gitignore

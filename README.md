@@ -96,12 +96,40 @@ Project config currently supports these sections:
 
 - `workflow.commands.test|lint|build` (string or `null`)
 - `defaults.runner|agent|model` (used as parser defaults)
-- `scope.defaults` (object placeholder)
+- `scope.defaults.labels.allow|deny` (arrays of label names)
+- `scope.defaults.authors.allow|deny` (arrays of GitHub logins; optional placeholder)
 - `retry.max_attempts` (positive integer placeholder)
 - `communication.verbosity` (`low`, `normal`, `high`)
 - `presets` (object placeholder)
 
 Validation is strict: unsupported keys or invalid value types fail fast with a config error.
+
+Scope rules are evaluated before any issue-mode agent execution:
+
+- deny labels always win;
+- if allow labels are configured, issue must match at least one allow label;
+- optional author allow/deny rules use the same semantics;
+- out-of-scope issues get a `blocked` orchestration state and a dedicated scope decision comment;
+- out-of-scope issues do not run the agent unless explicitly forced with `--force-reprocess`.
+
+Example `project-config.json` scope block:
+
+```json
+{
+  "scope": {
+    "defaults": {
+      "labels": {
+        "allow": ["autonomous", "bug"],
+        "deny": ["manual-only", "needs-product-decision"]
+      },
+      "authors": {
+        "allow": [],
+        "deny": ["dependabot[bot]"]
+      }
+    }
+  }
+}
+```
 
 You can also point to a different project config file:
 
@@ -161,17 +189,19 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --limit 1
 
 Workflow per issue:
 
-1. Pre-checks whether issue should be skipped (linked open PR and/or existing deterministic remote branch)
-2. Chooses a base branch (`default`: repository default branch from GitHub; `current`: currently checked-out branch)
-3. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
-4. For reused branches, syncs with the latest selected base branch before agent run (default: `rebase`)
-5. Runs the AI agent with issue title/body context
-6. On changes, creates commit
-7. Pushes issue branch to `origin`
-8. Reuses an existing open PR for the issue branch when present; otherwise creates one to the selected base branch
-9. Posts append-only orchestration state comments to GitHub issue/PR on key transitions
-10. On per-issue failure (agent, commit/push, PR create, etc.), posts a structured failure report comment to the issue and adds label `auto:agent-failed`
-11. On successful issue completion (or no-op completion), removes label `auto:agent-failed` from that issue if present
+1. Evaluates scope eligibility from project rules (`scope.defaults`) and prints decision (also in `--dry-run`)
+2. Out-of-scope issues are blocked (`status=blocked`, stage=`scope_check`) and get a dedicated scope comment; agent run is skipped unless `--force-reprocess` is set
+3. Pre-checks whether issue should be skipped (linked open PR and/or existing deterministic remote branch)
+4. Chooses a base branch (`default`: repository default branch from GitHub; `current`: currently checked-out branch)
+5. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
+6. For reused branches, syncs with the latest selected base branch before agent run (default: `rebase`)
+7. Runs the AI agent with issue title/body context
+8. On changes, creates commit
+9. Pushes issue branch to `origin`
+10. Reuses an existing open PR for the issue branch when present; otherwise creates one to the selected base branch
+11. Posts append-only orchestration state comments to GitHub issue/PR on key transitions
+12. On per-issue failure (agent, commit/push, PR create, etc.), posts a structured failure report comment to the issue and adds label `auto:agent-failed`
+13. On successful issue completion (or no-op completion), removes label `auto:agent-failed` from that issue if present
 
 Workflow in PR review mode:
 
@@ -202,13 +232,19 @@ Automation failure reporting:
 - Failure comments include marker `<!-- orchestration-agent-failure:v1 -->` and JSON payload for machine-readable context
 - Dry-run prints which failure comment/label operations would run; it does not post or edit labels
 
+Scope decision comments:
+
+- Marker: `<!-- orchestration-scope:v1 -->`
+- Out-of-scope comment includes decision, reason, forced flag, and timestamp in machine-readable JSON
+- Dry-run prints where scope decision comment would be posted
+
 Useful options:
 
 - `--runner claude|opencode` to select the AI agent runner (default: `claude`)
 - `--state open|closed|all`
 - `--include-empty` to process issues with empty body
 - `--stop-on-error` to stop on first failed run
-- `--dry-run` to preview without executing the agent
+- `--dry-run` to preview without executing the agent (includes scope decision per issue)
 - `--pr N --from-review-comments` to run PR review-comments mode
 - `--pr-followup-branch-prefix prefix` to create a follow-up branch in PR mode instead of committing to target PR branch
 - `--allow-pr-branch-switch` allow switching current worktree to target PR branch when they differ
@@ -226,7 +262,7 @@ Useful options:
 - `--force-issue-flow` disable auto-switch to PR-review mode for `--issue`
 - `--skip-if-pr-exists` / `--no-skip-if-pr-exists` skip or process batch issues when a linked open PR exists (default: skip; single `--issue` uses state-aware PR-review progression instead of hard-skip)
 - `--skip-if-branch-exists` / `--no-skip-if-branch-exists` skip or process issues when deterministic issue branch exists on `origin` (default: skip)
-- `--force-reprocess` override both skip guards and process anyway
+- `--force-reprocess` override skip guards and out-of-scope gating (scope decision is still logged/commented)
 - `--sync-reused-branch` / `--no-sync-reused-branch` enable or disable reused-branch sync before agent run (default: enabled)
 - `--sync-strategy rebase|merge` choose how to sync a reused branch with selected base (default: `rebase`)
 - `--base default|current` (`--base-branch` alias) choose issue-flow base mode; `current` enables stacked execution from your current branch (opt-in)

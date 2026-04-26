@@ -39,6 +39,7 @@ BUILTIN_DEFAULTS = {
 
 ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"
 AGENT_FAILURE_REPORT_MARKER = "<!-- orchestration-agent-failure:v1 -->"
+SCOPE_DECISION_MARKER = "<!-- orchestration-scope:v1 -->"
 AGENT_FAILURE_LABEL_NAME = "auto:agent-failed"
 AGENT_FAILURE_LABEL_COLOR = "B60205"
 AGENT_FAILURE_LABEL_DESCRIPTION = "Automation run failed for this issue"
@@ -51,6 +52,114 @@ ORCHESTRATION_STATE_STATUSES = {
     "waiting-for-ci",
     "ready-to-merge",
 }
+
+
+def _normalize_match_list(values: list[str] | None) -> list[str]:
+    normalized: list[str] = []
+    for value in values or []:
+        item = str(value or "").strip().lower()
+        if item:
+            normalized.append(item)
+    return normalized
+
+
+def _issue_author_login(issue: dict) -> str:
+    author_payload = issue.get("author") if isinstance(issue, dict) else None
+    if isinstance(author_payload, dict):
+        return str(author_payload.get("login") or "").strip().lower()
+    return ""
+
+
+def _issue_label_names(issue: dict) -> list[str]:
+    labels_payload = issue.get("labels") if isinstance(issue, dict) else None
+    if not isinstance(labels_payload, list):
+        return []
+
+    labels: list[str] = []
+    for label in labels_payload:
+        if not isinstance(label, dict):
+            continue
+        name = str(label.get("name") or "").strip().lower()
+        if name:
+            labels.append(name)
+    return labels
+
+
+def project_scope_defaults(project_config: dict) -> dict:
+    scope = project_config.get("scope") if isinstance(project_config, dict) else None
+    if not isinstance(scope, dict):
+        return {}
+
+    defaults = scope.get("defaults")
+    if not isinstance(defaults, dict):
+        return {}
+    return defaults
+
+
+def evaluate_issue_scope(issue: dict, scope_defaults: dict) -> dict:
+    labels_config = scope_defaults.get("labels") if isinstance(scope_defaults, dict) else None
+    authors_config = scope_defaults.get("authors") if isinstance(scope_defaults, dict) else None
+
+    allow_labels = _normalize_match_list(
+        labels_config.get("allow") if isinstance(labels_config, dict) else None
+    )
+    deny_labels = _normalize_match_list(
+        labels_config.get("deny") if isinstance(labels_config, dict) else None
+    )
+    allow_authors = _normalize_match_list(
+        authors_config.get("allow") if isinstance(authors_config, dict) else None
+    )
+    deny_authors = _normalize_match_list(
+        authors_config.get("deny") if isinstance(authors_config, dict) else None
+    )
+
+    issue_labels = set(_issue_label_names(issue))
+    issue_author = _issue_author_login(issue)
+
+    matched_deny_labels = sorted(label for label in deny_labels if label in issue_labels)
+    if matched_deny_labels:
+        return {
+            "eligible": False,
+            "reason": f"matched deny label(s): {', '.join(matched_deny_labels)}",
+            "matched": {"labels_deny": matched_deny_labels},
+        }
+
+    if allow_labels:
+        matched_allow_labels = sorted(label for label in allow_labels if label in issue_labels)
+        if not matched_allow_labels:
+            return {
+                "eligible": False,
+                "reason": (
+                    "missing required allow label "
+                    f"(expected one of: {', '.join(sorted(allow_labels))})"
+                ),
+                "matched": {"labels_allow": []},
+            }
+
+    if issue_author and issue_author in deny_authors:
+        return {
+            "eligible": False,
+            "reason": f"author '{issue_author}' is denied by scope authors.deny",
+            "matched": {"author_deny": [issue_author]},
+        }
+
+    if allow_authors:
+        if issue_author not in allow_authors:
+            allow_text = ", ".join(sorted(allow_authors))
+            author_text = issue_author or "unknown"
+            return {
+                "eligible": False,
+                "reason": (
+                    f"author '{author_text}' is not in scope authors.allow ({allow_text})"
+                ),
+                "matched": {"author_allow": []},
+            }
+
+    return {
+        "eligible": True,
+        "reason": "scope rules passed",
+        "matched": {},
+    }
 
 
 def run_capture(command: list[str]) -> str:
@@ -133,7 +242,7 @@ def fetch_issues(repo: str, state: str, limit: int) -> list[dict]:
             "--limit",
             str(limit),
             "--json",
-            "number,title,body,url",
+            "number,title,body,url,labels,author",
         ]
     )
     issues = json.loads(output)
@@ -152,7 +261,7 @@ def fetch_issue(repo: str, number: int) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,url",
+            "number,title,body,url,labels,author",
         ]
     )
     issue = json.loads(output)
@@ -1148,6 +1257,76 @@ def safe_report_issue_automation_failure(
         )
 
 
+def build_issue_scope_skip_comment(issue_number: int, reason: str, forced: bool) -> str:
+    payload = {
+        "status": "forced-in-scope" if forced else "out-of-scope",
+        "issue": issue_number,
+        "reason": short_error_text(reason),
+        "forced": forced,
+        "timestamp": utc_now_iso(),
+    }
+
+    if forced:
+        headline = "Autonomous scope check: forced override applied"
+        next_action = "Proceeding because --force-reprocess is set."
+    else:
+        headline = "Autonomous scope check: out of scope"
+        next_action = (
+            "No agent run started. Update issue labels/author scope rules or rerun with "
+            "--force-reprocess to override explicitly."
+        )
+
+    return (
+        f"{headline}\n\n"
+        f"- decision: `{payload['status']}`\n"
+        f"- reason: `{payload['reason']}`\n"
+        f"- forced: `{'yes' if forced else 'no'}`\n"
+        f"- timestamp: `{payload['timestamp']}`\n\n"
+        f"{next_action}\n\n"
+        f"{SCOPE_DECISION_MARKER}\n"
+        f"```json\n{json.dumps(payload, ensure_ascii=True, indent=2)}\n```"
+    )
+
+
+def safe_post_issue_scope_skip_comment(
+    repo: str,
+    issue_number: int,
+    reason: str,
+    forced: bool,
+    dry_run: bool,
+) -> None:
+    try:
+        body = build_issue_scope_skip_comment(
+            issue_number=issue_number,
+            reason=reason,
+            forced=forced,
+        )
+        if dry_run:
+            print(
+                f"[dry-run] Would post scope decision comment to issue #{issue_number}: "
+                f"decision={'forced-in-scope' if forced else 'out-of-scope'}"
+            )
+            return
+
+        run_command(
+            [
+                "gh",
+                "issue",
+                "comment",
+                str(issue_number),
+                "--repo",
+                repo,
+                "--body",
+                body,
+            ]
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Warning: failed to post scope decision comment for issue #{issue_number}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def parse_pr_number_from_url(pr_url: str) -> int | None:
     match = re.search(r"/pull/(\d+)(?:$|[/?#])", pr_url)
     if match is None:
@@ -2027,6 +2206,49 @@ def _validate_project_scope(config: dict, config_path: str) -> None:
     if "defaults" in config and not isinstance(config["defaults"], dict):
         raise RuntimeError("Project config key 'scope.defaults' must be an object")
 
+    defaults = config.get("defaults")
+    if not isinstance(defaults, dict):
+        return
+
+    supported_defaults_keys = {"labels", "authors"}
+    unsupported_defaults = sorted(set(defaults) - supported_defaults_keys)
+    if unsupported_defaults:
+        raise RuntimeError(
+            f"Unsupported key(s) in project config {config_path} under 'scope.defaults': "
+            + ", ".join(unsupported_defaults)
+        )
+
+    for section_key in ["labels", "authors"]:
+        section = defaults.get(section_key)
+        if section is None:
+            continue
+        if not isinstance(section, dict):
+            raise RuntimeError(
+                f"Project config key 'scope.defaults.{section_key}' must be an object"
+            )
+
+        supported_section_keys = {"allow", "deny"}
+        unsupported_section = sorted(set(section) - supported_section_keys)
+        if unsupported_section:
+            raise RuntimeError(
+                f"Unsupported key(s) in project config {config_path} under 'scope.defaults.{section_key}': "
+                + ", ".join(unsupported_section)
+            )
+
+        for rule_key in ["allow", "deny"]:
+            values = section.get(rule_key)
+            if values is None:
+                continue
+            if not isinstance(values, list):
+                raise RuntimeError(
+                    f"Project config key 'scope.defaults.{section_key}.{rule_key}' must be an array of strings"
+                )
+            for value in values:
+                if not isinstance(value, str) or not value.strip():
+                    raise RuntimeError(
+                        f"Project config key 'scope.defaults.{section_key}.{rule_key}' must contain non-empty strings"
+                    )
+
 
 def _validate_project_retry(config: dict, config_path: str) -> None:
     supported_retry_keys = {"max_attempts"}
@@ -2843,6 +3065,16 @@ def main() -> int:
         return 1
 
     try:
+        project_config_path = str(
+            getattr(
+                args,
+                "project_config",
+                resolve_project_config_path(None, os.path.abspath(getattr(args, "dir", "."))),
+            )
+        )
+        project_config = load_project_config(project_config_path)
+        scope_defaults = project_scope_defaults(project_config)
+
         if issue_number_arg is not None and pr_number_arg is not None:
             raise RuntimeError("Use either --issue or --pr, not both.")
         pr_mode_requested = pr_number_arg is not None or from_review_comments
@@ -3232,6 +3464,7 @@ def main() -> int:
     processed = 0
     skipped_existing_pr = 0
     skipped_existing_branch = 0
+    skipped_out_of_scope = 0
     touched_prs: list[str] = []
     reported_issue_failures: set[int] = set()
 
@@ -3249,6 +3482,65 @@ def main() -> int:
             state_target_type = "issue"
             state_target_number = issue["number"]
             state_pr_number: int | None = None
+
+            scope_decision = evaluate_issue_scope(issue=issue, scope_defaults=scope_defaults)
+            scope_eligible = bool(scope_decision.get("eligible", True))
+            scope_reason = str(scope_decision.get("reason") or "scope rules passed")
+            scope_prefix = "[dry-run] " if args.dry_run else ""
+            print(
+                f"{scope_prefix}Scope decision for issue #{issue['number']}: "
+                f"{'eligible' if scope_eligible else 'out-of-scope'} ({scope_reason})"
+            )
+
+            if not scope_eligible:
+                if force_reprocess:
+                    print(
+                        f"Continuing issue #{issue['number']} despite out-of-scope decision "
+                        "because --force-reprocess is set."
+                    )
+                    safe_post_issue_scope_skip_comment(
+                        repo=repo,
+                        issue_number=issue["number"],
+                        reason=scope_reason,
+                        forced=True,
+                        dry_run=args.dry_run,
+                    )
+                else:
+                    skipped_out_of_scope += 1
+                    safe_post_orchestration_state_comment(
+                        repo=repo,
+                        target_type="issue",
+                        target_number=issue["number"],
+                        dry_run=args.dry_run,
+                        state=build_orchestration_state(
+                            status="blocked",
+                            task_type="issue",
+                            issue_number=issue["number"],
+                            pr_number=None,
+                            branch=issue_branch,
+                            base_branch=base_branch if base_branch else None,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            attempt=1,
+                            stage="scope_check",
+                            next_action="adjust_scope_or_force_reprocess",
+                            error=short_error_text(scope_reason),
+                        ),
+                    )
+                    safe_post_issue_scope_skip_comment(
+                        repo=repo,
+                        issue_number=issue["number"],
+                        reason=scope_reason,
+                        forced=False,
+                        dry_run=args.dry_run,
+                    )
+                    print(
+                        f"Skipping issue #{issue['number']}: out-of-scope for autonomous run "
+                        "(--force-reprocess to override)."
+                    )
+                    continue
+
             if skip_if_pr_exists:
                 linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
                 if linked_open_pr is not None:
@@ -3889,6 +4181,7 @@ def main() -> int:
         f"Processed: {processed}, "
         f"skipped_existing_pr: {skipped_existing_pr}, "
         f"skipped_existing_branch: {skipped_existing_branch}, "
+        f"skipped_out_of_scope: {skipped_out_of_scope}, "
         f"failures: {failures}"
     )
     if touched_prs:

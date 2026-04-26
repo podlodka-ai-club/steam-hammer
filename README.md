@@ -94,7 +94,7 @@ You can define repository defaults and placeholders for future orchestration pol
 
 Project config currently supports these sections:
 
-- `workflow.commands.test|lint|build` (string or `null`)
+- `workflow.commands.test|lint|build` (non-empty string shell command or `null`)
 - `defaults.runner|agent|model` (used as parser defaults)
 - `scope.defaults.labels.allow|deny` (arrays of label names)
 - `scope.defaults.authors.allow|deny` (arrays of GitHub logins; optional placeholder)
@@ -111,6 +111,28 @@ Scope rules are evaluated before any issue-mode agent execution:
 - optional author allow/deny rules use the same semantics;
 - out-of-scope issues get a `blocked` orchestration state and a dedicated scope decision comment;
 - out-of-scope issues do not run the agent unless explicitly forced with `--force-reprocess`.
+
+Workflow checks are evaluated after agent changes are committed and before final PR-ready states are posted:
+
+- commands run in this order when configured: `test`, `lint`, `build`;
+- each command is executed via `bash -lc "<command>"` from repository `--dir`;
+- in `--dry-run`, checks are not executed and the script prints which checks would run;
+- on failure, orchestration posts a state update with `stage=workflow_checks` and a `workflow_checks` payload containing command, exit code, and output excerpts;
+- workflow-check failures block readiness transitions (`ready-for-review` / `waiting-for-ci`) and follow existing stop policy (`--stop-on-error`).
+
+Example `project-config.json` workflow block:
+
+```json
+{
+  "workflow": {
+    "commands": {
+      "test": "python -m unittest",
+      "lint": "ruff check .",
+      "build": null
+    }
+  }
+}
+```
 
 Example `project-config.json` scope block:
 

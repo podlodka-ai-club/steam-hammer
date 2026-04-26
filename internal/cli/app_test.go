@@ -163,6 +163,19 @@ func TestRunIssueCommandForwardsExplicitTrueFlagsForConfigPrecedence(t *testing.
 	})
 }
 
+func TestRunIssueDelegatesStateRecoveryToPythonRunner(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "issue", "--id", "74", "--repo", "owner/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--issue", "74", "--repo", "owner/repo"})
+	assertNoStateFormatArgs(t, runner.args)
+}
+
 func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -185,6 +198,19 @@ func TestRunPRAcceptsPythonAliases(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments", "--dry-run"})
+}
+
+func TestRunPRDelegatesReviewStateRecoveryToPythonRunner(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "pr", "--id", "74", "--repo", "owner/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--pr", "74", "--from-review-comments", "--repo", "owner/repo"})
+	assertNoStateFormatArgs(t, runner.args)
 }
 
 func TestRunPRRequiresID(t *testing.T) {
@@ -239,5 +265,14 @@ func assertCommand(t *testing.T, runner *recordingRunner, wantArgs []string) {
 	}
 	if !reflect.DeepEqual(runner.args, wantArgs) {
 		t.Fatalf("runner args = %#v, want %#v", runner.args, wantArgs)
+	}
+}
+
+func assertNoStateFormatArgs(t *testing.T, args []string) {
+	t.Helper()
+	for _, arg := range args {
+		if strings.Contains(arg, "state-format") || strings.Contains(arg, "orchestration-state:v2") {
+			t.Fatalf("runner args = %#v, want no new orchestration state format arguments", args)
+		}
 	}
 }

@@ -78,6 +78,24 @@ Exit codes:
 - `0` when there are no failed checks.
 - non-zero when one or more checks fail.
 
+## Go orchestrator CLI
+
+Phase 1 includes a Go CLI wrapper around the existing Python runner. Build or run it with Go:
+
+```bash
+go run ./cmd/orchestrator --help
+```
+
+Available commands:
+
+```bash
+go run ./cmd/orchestrator doctor --repo owner/repo
+go run ./cmd/orchestrator run issue --id 71 --repo owner/repo --dry-run
+go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --dry-run
+```
+
+The Go handlers only translate CLI intent into the current Python runner arguments. Use `--help` on any command to inspect flags without invoking the runner, and use `--dry-run` for issue/PR runs to avoid starting agents.
+
 ## Project config scaffold (repository-level)
 
 You can define repository defaults and placeholders for future orchestration policies.

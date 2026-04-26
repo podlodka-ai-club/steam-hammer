@@ -188,7 +188,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         output = stdout_mock.getvalue()
         self.assertIn("Recovered orchestration state context", output)
         self.assertIn("waiting-for-author", output)
-        self.assertIn("Skipping issue #45 due to recovered orchestration state", output)
+        self.assertIn("Skipping issue #45: recovered orchestration state is waiting-for-author", output)
 
     def test_main_issue_flow_failed_state_passes_context_to_prompt(self) -> None:
         args = argparse.Namespace(
@@ -329,6 +329,221 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         output = stdout_mock.getvalue()
         self.assertIn("[dry-run] Recovered orchestration state context", output)
         self.assertIn("status=ready-for-review", output)
+
+    def test_single_issue_with_linked_pr_actionable_feedback_runs_pr_review_mode(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=52,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+        )
+
+        issue = {
+            "number": 52,
+            "title": "Prevent duplicate processing",
+            "body": "Implement duplicate guards",
+            "url": "https://example/issues/52",
+        }
+        linked_pr = {
+            "number": 120,
+            "url": "https://example/pull/120",
+            "headRefName": "issue-fix/52-prevent-duplicate-processing",
+            "baseRefName": "main",
+        }
+        pull_request = {
+            "number": 120,
+            "title": "Fix duplicate processing",
+            "body": "PR body",
+            "url": "https://example/pull/120",
+            "state": "OPEN",
+            "mergeStateStatus": "CLEAN",
+            "reviews": [],
+            "author": {"login": "pr-owner"},
+        }
+
+        issue_state_comments = [
+            {
+                "id": 10,
+                "created_at": "2026-04-26T12:00:00Z",
+                "html_url": "https://example/issues/52#issuecomment-10",
+                "body": (
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"ready-for-review"}\n'
+                    "```"
+                ),
+            }
+        ]
+        pr_state_comments = [
+            {
+                "id": 11,
+                "created_at": "2026-04-26T13:00:00Z",
+                "html_url": "https://example/pull/120#issuecomment-11",
+                "body": (
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"ready-for-review"}\n'
+                    "```"
+                ),
+            }
+        ]
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=linked_pr),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_issue_comments",
+                side_effect=[issue_state_comments, pr_state_comments],
+            ),
+            patch("scripts.run_github_issues_to_opencode.fetch_pull_request", return_value=pull_request),
+            patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments",
+                return_value=[
+                    {
+                        "author": "reviewer",
+                        "body": "Please adjust skip logic for waiting-for-ci",
+                        "url": "https://example/pull/120#issuecomment-20",
+                    }
+                ],
+            ),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
+            patch("scripts.run_github_issues_to_opencode.sync_reused_branch_with_base", return_value=False),
+            patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0) as run_agent_mock,
+            patch("scripts.run_github_issues_to_opencode.ensure_pr", return_value=("reused", "")),
+            patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(run_agent_mock.called)
+        self.assertIn("Selected mode: pr-review", stdout_mock.getvalue())
+
+    def test_single_issue_waiting_for_ci_without_actionable_feedback_skips_cleanly(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=52,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+        )
+
+        issue = {
+            "number": 52,
+            "title": "Prevent duplicate processing",
+            "body": "Implement duplicate guards",
+            "url": "https://example/issues/52",
+        }
+        linked_pr = {
+            "number": 120,
+            "url": "https://example/pull/120",
+            "headRefName": "issue-fix/52-prevent-duplicate-processing",
+            "baseRefName": "main",
+        }
+        pull_request = {
+            "number": 120,
+            "title": "Fix duplicate processing",
+            "body": "PR body",
+            "url": "https://example/pull/120",
+            "state": "OPEN",
+            "mergeStateStatus": "CLEAN",
+            "reviews": [],
+            "author": {"login": "pr-owner"},
+        }
+
+        issue_state_comments = []
+        pr_state_comments = [
+            {
+                "id": 21,
+                "created_at": "2026-04-26T14:00:00Z",
+                "html_url": "https://example/pull/120#issuecomment-21",
+                "body": (
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"waiting-for-ci"}\n'
+                    "```"
+                ),
+            }
+        ]
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=linked_pr),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_issue_comments",
+                side_effect=[issue_state_comments, pr_state_comments],
+            ),
+            patch("scripts.run_github_issues_to_opencode.fetch_pull_request", return_value=pull_request),
+            patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]),
+            patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[]),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch") as prepare_issue_branch_mock,
+            patch("scripts.run_github_issues_to_opencode.run_agent") as run_agent_mock,
+            patch(
+                "scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"
+            ) as state_post_mock,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        prepare_issue_branch_mock.assert_not_called()
+        run_agent_mock.assert_not_called()
+        state_post_mock.assert_not_called()
+        self.assertIn("keeping recovered state 'waiting-for-ci'", stdout_mock.getvalue())
 
 
 if __name__ == "__main__":

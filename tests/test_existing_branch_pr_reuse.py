@@ -711,10 +711,10 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 fail_on_existing=True,
             )
 
-    def test_main_skips_issue_when_linked_open_pr_exists(self) -> None:
+    def test_main_skips_issue_when_linked_open_pr_exists_in_batch_mode(self) -> None:
         args = type("Args", (), {
             "repo": "owner/repo",
-            "issue": 33,
+            "issue": None,
             "pr": None,
             "from_review_comments": False,
             "state": "open",
@@ -746,13 +746,15 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
             patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
             patch(
-                "scripts.run_github_issues_to_opencode.fetch_issue",
-                return_value={
-                    "number": 33,
-                    "title": "Do not duplicate",
-                    "body": "non-empty",
-                    "url": "https://github.com/owner/repo/issues/33",
-                },
+                "scripts.run_github_issues_to_opencode.fetch_issues",
+                return_value=[
+                    {
+                        "number": 33,
+                        "title": "Do not duplicate",
+                        "body": "non-empty",
+                        "url": "https://github.com/owner/repo/issues/33",
+                    }
+                ],
             ),
             patch(
                 "scripts.run_github_issues_to_opencode.find_open_pr_for_issue",

@@ -166,7 +166,7 @@ Useful options:
 - `--local-config path` load local JSON defaults (default: `local-config.json` under `--dir`)
 - `--fail-on-existing` strict mode: fail if issue branch or PR already exists
 - `--force-issue-flow` disable auto-switch to PR-review mode for `--issue`
-- `--skip-if-pr-exists` / `--no-skip-if-pr-exists` skip or process issues when a linked open PR exists (default: skip)
+- `--skip-if-pr-exists` / `--no-skip-if-pr-exists` skip or process batch issues when a linked open PR exists (default: skip; single `--issue` uses state-aware PR-review progression instead of hard-skip)
 - `--skip-if-branch-exists` / `--no-skip-if-branch-exists` skip or process issues when deterministic issue branch exists on `origin` (default: skip)
 - `--force-reprocess` override both skip guards and process anyway
 - `--sync-reused-branch` / `--no-sync-reused-branch` enable or disable reused-branch sync before agent run (default: enabled)
@@ -247,8 +247,9 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 ## Auto switch to PR-review mode
 
 - When you run with `--issue <n>`, the script checks whether this issue has a linked open PR.
-- If `--skip-if-pr-exists` is enabled (default), the issue is skipped before mode selection.
-- If found, it automatically switches to PR-review mode and builds the agent prompt from issue + PR + review comments context.
+- For single-issue runs, a linked open PR does not hard-skip the task; it enters state-aware PR-review/check progression so actionable review feedback can still be addressed.
+- In batch issue runs, `--skip-if-pr-exists` remains enabled by default and skips issues that already have linked open PRs.
+- If PR-review is selected, it builds the agent prompt from issue + PR + review comments context.
 - The script logs that auto-switch happened and why (including the PR number).
 - `--dry-run` prints selected mode (`issue-flow` or `pr-review`) and the reason.
 - Use `--force-issue-flow` to keep legacy issue-flow behavior.

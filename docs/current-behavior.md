@@ -15,6 +15,7 @@
 - [9. Важные флаги и наблюдаемое поведение](#9-важные-флаги-и-наблюдаемое-поведение)
 - [10. Ограничения и ранние выходы](#10-ограничения-и-ранние-выходы)
 - [11. Recovery контекста из orchestration-state](#11-recovery-контекста-из-orchestration-state)
+- [12. Failure reporting и label](#12-failure-reporting-и-label)
 
 ## 1. Назначение и зона ответственности
 
@@ -24,6 +25,7 @@
 - формирует промпт и запускает агент (`claude` или `opencode`);
 - при наличии изменений делает commit/push и создает или переиспользует PR.
 - публикует append-only state-комментарии в issue/PR с маркером `<!-- orchestration-state:v1 -->`.
+- при per-issue ошибках публикует структурированный failure report и ставит label `auto:agent-failed`.
 
 Факт: скрипт сам выполняет git-операции и ожидает чистое состояние рабочего дерева до старта.
 
@@ -54,19 +56,25 @@
    - по умолчанию (`--base default`) берется default branch репозитория из GitHub;
    - в opt-in stacked режиме (`--base current` / `--base-branch current`) берется текущая локальная ветка.
 2. Загружается одна issue (`--issue`) или список (`--state` + `--limit`).
-3. Для issue с пустым body выполняется пропуск, если не включен `--include-empty`.
-4. Выбирается/создается рабочая ветка по шаблону `<prefix>/<issue-number>-<slug-title>` (по умолчанию prefix: `issue-fix`).
-5. Для переиспользованной ветки может выполняться синхронизация с базой (по умолчанию включена).
-6. Запускается агент с issue-контекстом.
-7. Если изменений нет:
+3. Выполняются pre-checks идемпотентности:
+   - в batch-режиме issue с linked open PR пропускается по умолчанию (`--skip-if-pr-exists`);
+   - issue с deterministic remote branch пропускается по умолчанию (`--skip-if-branch-exists`);
+   - `--force-reprocess` отключает оба skip guard;
+   - для одиночного `--issue` linked open PR не hard-skip'ается, а используется state-aware mode selection / PR-review progression.
+4. Для issue с пустым body выполняется пропуск, если не включен `--include-empty`.
+5. Выбирается/создается рабочая ветка по шаблону `<prefix>/<issue-number>-<slug-title>` (по умолчанию prefix: `issue-fix`).
+6. Для переиспользованной ветки может выполняться синхронизация с базой (по умолчанию включена).
+7. Запускается агент с issue-контекстом.
+8. Если изменений нет:
    - обычно commit/PR пропускаются;
    - исключение: если ветка была синхронизирована и изменена только синком, эти изменения пушатся и PR обновляется.
-8. Если изменения есть: commit `Fix issue #N: <title>`, push, затем создание или переиспользование PR.
-9. На ключевых переходах публикуются state-комментарии в issue:
-   - `in-progress` перед запуском агента (когда известен branch context);
-   - `ready-for-review` после создания/переиспользования PR;
-   - `failed` при ошибках (stage/error/next_action);
-   - `waiting-for-author`, если изменений нет.
+9. Если изменения есть: commit `Fix issue #N: <title>`, push, затем создание или переиспользование PR.
+10. На ключевых переходах публикуются state-комментарии в issue:
+    - `in-progress` перед запуском агента (когда известен branch context);
+    - `ready-for-review` после создания/переиспользования PR;
+    - `failed` при ошибках (stage/error/next_action);
+    - `waiting-for-author`, если изменений нет.
+11. После успешного/no-op завершения для processed issue скрипт пытается снять label `auto:agent-failed`, если он был поставлен раньше.
 
 После обработки issue скрипт возвращается на базовую ветку (кроме `dry-run`).
 
@@ -86,14 +94,19 @@
    - review summary со state, отличным от `CHANGES_REQUESTED` и `COMMENTED`.
 4. Для review summary берется только последняя запись каждого автора.
 5. Строится единый промпт: PR + связанный issue-контекст + отфильтрованные пункты фидбека.
-6. Агент запускается в текущей ветке PR или во временной follow-up ветке (`--pr-followup-branch-prefix`).
-7. При наличии изменений выполняется commit `Address review comments for PR #N` и push.
-8. Опционально публикуется короткий комментарий в PR (`--post-pr-summary`).
-9. На ключевых переходах публикуются state-комментарии в PR:
-   - `in-progress` при старте обработки;
-   - `waiting-for-ci` после push изменений;
-   - `waiting-for-author`, если нет actionable-комментариев или агент не дал изменений;
-   - `failed` при ошибках.
+6. Рабочая ветка выбирается по `headRefName` целевого PR:
+   - если текущая ветка отличается от target branch, запуск по умолчанию останавливается safeguard'ом;
+   - `--allow-pr-branch-switch` разрешает переключить текущий worktree на target branch;
+   - `--isolate-worktree` выполняет PR-mode во временном worktree и не переключает основную рабочую ветку;
+   - `--pr-followup-branch-prefix` создает follow-up branch от target branch.
+7. Агент запускается на target/follow-up branch.
+8. При наличии изменений выполняется commit `Address review comments for PR #N` и push выбранной ветки.
+9. Опционально публикуется короткий комментарий в PR (`--post-pr-summary`).
+10. На ключевых переходах публикуются state-комментарии в PR:
+    - `in-progress` при старте обработки;
+    - `waiting-for-ci` после push изменений;
+    - `waiting-for-author`, если нет actionable-комментариев или агент не дал изменений;
+    - `failed` при ошибках.
 
 Если actionable комментариев нет, скрипт завершает работу успешно без запуска агента.
 
@@ -101,9 +114,11 @@
 
 Только при запуске с `--issue` (одна задача) скрипт проверяет, есть ли связанный открытый PR.
 
-- если PR найден, выбирается режим `pr-review`;
+- если PR найден, одиночный запуск выбирает state-aware `pr-review`/check path вместо duplicate issue-flow;
 - если не найден, остается `issue-flow`;
 - если задан `--force-issue-flow`, автопереключение отключается.
+
+В batch-режиме linked open PR по умолчанию является причиной skip (`--skip-if-pr-exists`), чтобы не тратить agent runs на задачи, которые уже находятся в работе. Это отличается от одиночного `--issue`, где existing PR может означать необходимость review/CI progression.
 
 Причина выбранного режима печатается в лог (включая `dry-run`).
 
@@ -114,6 +129,9 @@
 - существующая локальная/удаленная issue-ветка переиспользуется;
 - при `--fail-on-existing` повторный запуск с существующей веткой или PR завершится ошибкой;
 - синхронизация переиспользованной ветки включена по умолчанию (`--sync-reused-branch`).
+- по умолчанию batch-runs пропускают issue с linked open PR (`--skip-if-pr-exists`) или deterministic remote branch (`--skip-if-branch-exists`);
+- `--force-reprocess` отключает оба skip guard и разрешает intentional rerun;
+- run summary содержит отдельные счетчики `processed`, `skipped_existing_pr`, `skipped_existing_branch`, `failures`.
 
 Стратегии синхронизации (`--sync-strategy`):
 
@@ -149,9 +167,14 @@
 - `--include-empty`: не пропускать issue с пустым body;
 - `--stop-on-error`: остановка после первой ошибки;
 - `--fail-on-existing`: строгий режим без переиспользования существующих branch/PR;
+- `--skip-if-pr-exists` / `--no-skip-if-pr-exists`: skip guard для linked open PR;
+- `--skip-if-branch-exists` / `--no-skip-if-branch-exists`: skip guard для deterministic remote branch;
+- `--force-reprocess`: отключает оба skip guard;
 - `--sync-reused-branch` / `--no-sync-reused-branch`: включить/выключить синхронизацию переиспользованных веток;
 - `--sync-strategy rebase|merge`: стратегия синхронизации переиспользованной ветки;
 - `--base default|current` (`--base-branch`): выбор базовой ветки для issue-flow (стабильная default-ветка или stacked запуск от текущей ветки);
+- `--allow-pr-branch-switch`: в PR-mode разрешает переключить текущий worktree на target PR branch;
+- `--isolate-worktree`: в PR-mode запускает работу во временном worktree без переключения текущей ветки;
 - `--dry-run`: печать планируемых действий без выполнения.
 - `--dry-run`: state-комментарии не публикуются, только печатается план публикации (куда и с каким статусом).
 
@@ -164,6 +187,8 @@
 - PR в состоянии не `OPEN` -> выход без изменений;
 - отсутствуют actionable review comments -> успешный выход без запуска агента;
 - issue body пустой и нет `--include-empty` -> issue пропускается;
+- batch issue с linked open PR или deterministic remote branch -> skip по умолчанию;
+- PR-mode из нецелевой ветки без `--allow-pr-branch-switch` или `--isolate-worktree` -> ошибка safeguard;
 - если агент не внес изменения и не было sync-only обновления -> commit/push/PR пропускаются.
 
 ## 11. Recovery контекста из orchestration-state
@@ -174,8 +199,19 @@
 - из найденных комментариев выбирается **последний корректно распарсенный JSON** по `created_at`;
 - некорректные state-комментарии безопасно игнорируются, в лог печатается warning;
 - найденный recovery-контекст печатается в лог, включая `dry-run`;
-- если recovered status = `waiting-for-author`, issue по умолчанию пропускается (можно переопределить через `--force-issue-flow`);
-- если recovered status = `ready-for-review` и есть открытый связанный PR, предпочтение отдается существующему PR-review пути;
+- если recovered status = `waiting-for-author` или `blocked`, issue по умолчанию пропускается (можно переопределить через `--force-issue-flow`);
+- если recovered status = `ready-for-review` или `waiting-for-ci` и есть открытый связанный PR, предпочтение отдается существующему PR-review/check пути;
 - если recovered status = `failed`, повторный запуск разрешен, а контекст прошлой ошибки добавляется в лог и в prompt агента.
+
+## 12. Failure reporting и label
+
+Для per-issue ошибок реализован отдельный failure-reporting слой поверх state comments:
+
+- при ошибке скрипт публикует обычный orchestration state `failed` с маркером `<!-- orchestration-state:v1 -->`;
+- дополнительно публикуется structured failure report с маркером `<!-- orchestration-agent-failure:v1 -->`;
+- failure report содержит stage, error, branch/base branch, runner, agent, model, run id, timestamp и hints для rerun/debug;
+- issue получает label `auto:agent-failed`; label создается автоматически, если отсутствует;
+- при успешном/no-op завершении processed issue скрипт пытается снять `auto:agent-failed`, если он был ранее поставлен;
+- в `--dry-run` комментарии и labels не меняются, но печатается план действий.
 
 Документ фиксирует текущее поведение по коду и тестам в репозитории на момент создания, без описания будущих изменений.

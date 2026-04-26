@@ -37,6 +37,10 @@ BUILTIN_DEFAULTS = {
 }
 
 ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"
+AGENT_FAILURE_REPORT_MARKER = "<!-- orchestration-agent-failure:v1 -->"
+AGENT_FAILURE_LABEL_NAME = "auto:agent-failed"
+AGENT_FAILURE_LABEL_COLOR = "B60205"
+AGENT_FAILURE_LABEL_DESCRIPTION = "Automation run failed for this issue"
 ORCHESTRATION_STATE_STATUSES = {
     "in-progress",
     "ready-for-review",
@@ -921,6 +925,213 @@ def short_error_text(error: str, max_len: int = 280) -> str:
     if len(compact) <= max_len:
         return compact
     return f"{compact[: max_len - 3].rstrip()}..."
+
+
+def generate_run_id() -> str:
+    return f"{int(time.time() * 1000)}-{os.getpid()}"
+
+
+def build_issue_failure_report_comment(
+    issue_number: int,
+    run_id: str,
+    stage: str,
+    error: str,
+    branch: str | None,
+    base_branch: str | None,
+    runner: str,
+    agent: str,
+    model: str | None,
+) -> str:
+    payload = {
+        "status": "failed",
+        "issue": issue_number,
+        "run_id": run_id,
+        "stage": stage,
+        "error": short_error_text(error),
+        "branch": branch,
+        "base_branch": base_branch,
+        "runner": runner,
+        "agent": agent,
+        "model": model,
+        "timestamp": utc_now_iso(),
+    }
+    next_actions = (
+        "Next actions: rerun with --dry-run for preview, rerun with --force-reprocess "
+        "to override skip guards, or take over manually from the branch above."
+    )
+    return (
+        "Automation failure report\n\n"
+        f"- status: `{payload['status']}`\n"
+        f"- stage: `{payload['stage']}`\n"
+        f"- error: `{payload['error']}`\n"
+        f"- branch: `{payload['branch'] or 'n/a'}`\n"
+        f"- base branch: `{payload['base_branch'] or 'n/a'}`\n"
+        f"- runner: `{payload['runner']}`\n"
+        f"- agent: `{payload['agent']}`\n"
+        f"- model: `{payload['model'] or 'default'}`\n"
+        f"- run id: `{payload['run_id']}`\n"
+        f"- timestamp: `{payload['timestamp']}`\n\n"
+        f"{next_actions}\n\n"
+        f"{AGENT_FAILURE_REPORT_MARKER}\n"
+        f"```json\n{json.dumps(payload, ensure_ascii=True, indent=2)}\n```"
+    )
+
+
+def ensure_agent_failure_label(repo: str, dry_run: bool) -> None:
+    if command_succeeds(["gh", "label", "view", AGENT_FAILURE_LABEL_NAME, "--repo", repo]):
+        return
+
+    if dry_run:
+        print(
+            f"[dry-run] Would create missing label '{AGENT_FAILURE_LABEL_NAME}' "
+            f"(color={AGENT_FAILURE_LABEL_COLOR}, description='{AGENT_FAILURE_LABEL_DESCRIPTION}')"
+        )
+        return
+
+    run_command(
+        [
+            "gh",
+            "label",
+            "create",
+            AGENT_FAILURE_LABEL_NAME,
+            "--repo",
+            repo,
+            "--color",
+            AGENT_FAILURE_LABEL_COLOR,
+            "--description",
+            AGENT_FAILURE_LABEL_DESCRIPTION,
+        ]
+    )
+
+
+def add_agent_failure_label_to_issue(repo: str, issue_number: int, dry_run: bool) -> None:
+    ensure_agent_failure_label(repo=repo, dry_run=dry_run)
+    if dry_run:
+        print(
+            f"[dry-run] Would add label '{AGENT_FAILURE_LABEL_NAME}' to issue #{issue_number}"
+        )
+        return
+    run_command(
+        [
+            "gh",
+            "issue",
+            "edit",
+            str(issue_number),
+            "--repo",
+            repo,
+            "--add-label",
+            AGENT_FAILURE_LABEL_NAME,
+        ]
+    )
+
+
+def issue_has_label(repo: str, issue_number: int, label_name: str) -> bool:
+    labels_output = run_capture(
+        [
+            "gh",
+            "issue",
+            "view",
+            str(issue_number),
+            "--repo",
+            repo,
+            "--json",
+            "labels",
+            "--jq",
+            ".labels[].name",
+        ]
+    )
+    labels = [line.strip() for line in labels_output.splitlines() if line.strip()]
+    return label_name in labels
+
+
+def remove_agent_failure_label_from_issue(repo: str, issue_number: int, dry_run: bool) -> None:
+    if dry_run:
+        print(
+            f"[dry-run] Would remove label '{AGENT_FAILURE_LABEL_NAME}' from issue #{issue_number} if present"
+        )
+        return
+
+    try:
+        if not issue_has_label(repo=repo, issue_number=issue_number, label_name=AGENT_FAILURE_LABEL_NAME):
+            return
+
+        run_command(
+            [
+                "gh",
+                "issue",
+                "edit",
+                str(issue_number),
+                "--repo",
+                repo,
+                "--remove-label",
+                AGENT_FAILURE_LABEL_NAME,
+            ]
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Warning: failed to remove label '{AGENT_FAILURE_LABEL_NAME}' from issue #{issue_number}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def safe_report_issue_automation_failure(
+    repo: str,
+    issue_number: int,
+    run_id: str,
+    stage: str,
+    error: str,
+    branch: str | None,
+    base_branch: str | None,
+    runner: str,
+    agent: str,
+    model: str | None,
+    dry_run: bool,
+    already_reported_issue_numbers: set[int],
+) -> None:
+    if issue_number in already_reported_issue_numbers:
+        return
+
+    try:
+        body = build_issue_failure_report_comment(
+            issue_number=issue_number,
+            run_id=run_id,
+            stage=stage,
+            error=error,
+            branch=branch,
+            base_branch=base_branch,
+            runner=runner,
+            agent=agent,
+            model=model,
+        )
+        if dry_run:
+            print(
+                f"[dry-run] Would post agent failure report comment to issue #{issue_number}: "
+                f"stage={stage} run_id={run_id}"
+            )
+        else:
+            run_command(
+                [
+                    "gh",
+                    "issue",
+                    "comment",
+                    str(issue_number),
+                    "--repo",
+                    repo,
+                    "--body",
+                    body,
+                ]
+            )
+        add_agent_failure_label_to_issue(
+            repo=repo,
+            issue_number=issue_number,
+            dry_run=dry_run,
+        )
+        already_reported_issue_numbers.add(issue_number)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Warning: failed to report automation failure for issue #{issue_number}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def parse_pr_number_from_url(pr_url: str) -> int | None:
@@ -2516,11 +2727,13 @@ def main() -> int:
         print("No issues found.")
         return 0
 
+    run_id = generate_run_id()
     failures = 0
     processed = 0
     skipped_existing_pr = 0
     skipped_existing_branch = 0
     touched_prs: list[str] = []
+    reported_issue_failures: set[int] = set()
 
     for issue in issues:
         try:
@@ -2749,6 +2962,11 @@ def main() -> int:
                             f"No actionable review comments for linked PR #{pr_number}; "
                             f"keeping recovered state '{recovered_status}' and skipping duplicate issue-flow."
                         )
+                        remove_agent_failure_label_from_issue(
+                            repo=repo,
+                            issue_number=issue["number"],
+                            dry_run=args.dry_run,
+                        )
                         continue
                     else:
                         safe_post_orchestration_state_comment(
@@ -2775,6 +2993,11 @@ def main() -> int:
                         print(
                             f"No actionable review comments for linked PR #{pr_number}; "
                             "skipping issue run."
+                        )
+                        remove_agent_failure_label_from_issue(
+                            repo=repo,
+                            issue_number=issue["number"],
+                            dry_run=args.dry_run,
                         )
                         continue
 
@@ -3004,6 +3227,11 @@ def main() -> int:
                                 error=None,
                             ),
                         )
+                    remove_agent_failure_label_from_issue(
+                        repo=repo,
+                        issue_number=issue["number"],
+                        dry_run=args.dry_run,
+                    )
                     run_command(["git", "checkout", base_branch])
                     continue
 
@@ -3030,6 +3258,11 @@ def main() -> int:
                         next_action="await_more_context",
                         error="No changes produced",
                     ),
+                )
+                remove_agent_failure_label_from_issue(
+                    repo=repo,
+                    issue_number=issue["number"],
+                    dry_run=args.dry_run,
                 )
                 run_command(["git", "checkout", base_branch])
                 continue
@@ -3105,6 +3338,11 @@ def main() -> int:
 
             if not args.dry_run:
                 run_command(["git", "checkout", base_branch])
+            remove_agent_failure_label_from_issue(
+                repo=repo,
+                issue_number=issue["number"],
+                dry_run=args.dry_run,
+            )
         except Exception as exc:  # noqa: BLE001
             failures += 1
             safe_post_orchestration_state_comment(
@@ -3127,6 +3365,20 @@ def main() -> int:
                     next_action="inspect_error_and_retry",
                     error=short_error_text(str(exc)),
                 ),
+            )
+            safe_report_issue_automation_failure(
+                repo=repo,
+                issue_number=issue["number"],
+                run_id=run_id,
+                stage=failure_stage,
+                error=str(exc),
+                branch=locals().get("issue_branch", None),
+                base_branch=locals().get("target_base_branch", None),
+                runner=args.runner,
+                agent=args.agent,
+                model=args.model,
+                dry_run=args.dry_run,
+                already_reported_issue_numbers=reported_issue_failures,
             )
             print(f"Issue #{issue['number']} failed: {exc}", file=sys.stderr)
             if args.stop_on_error:

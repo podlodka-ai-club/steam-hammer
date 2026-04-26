@@ -1359,7 +1359,7 @@ def commit_changes(issue: dict, dry_run: bool) -> str:
     if dry_run:
         print(f"[dry-run] Would commit with message: {message}")
         return message
-    run_command(["git", "add", "-A"])
+    run_command(["git", "add", "-u"])
     run_command(["git", "commit", "-m", message])
     return message
 

@@ -25,6 +25,9 @@ BUILTIN_DEFAULTS = {
     "stop_on_error": False,
     "fail_on_existing": False,
     "force_issue_flow": False,
+    "skip_if_pr_exists": True,
+    "skip_if_branch_exists": True,
+    "force_reprocess": False,
     "sync_reused_branch": True,
     "sync_strategy": "rebase",
     "base_branch": "default",
@@ -1651,6 +1654,9 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "stop_on_error",
         "fail_on_existing",
         "force_issue_flow",
+        "skip_if_pr_exists",
+        "skip_if_branch_exists",
+        "force_reprocess",
         "sync_reused_branch",
         "sync_strategy",
         "base_branch",
@@ -1714,6 +1720,9 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "stop_on_error",
         "fail_on_existing",
         "force_issue_flow",
+        "skip_if_pr_exists",
+        "skip_if_branch_exists",
+        "force_reprocess",
         "sync_reused_branch",
     ]:
         if key in config:
@@ -1873,6 +1882,45 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--skip-if-pr-exists",
+        dest="skip_if_pr_exists",
+        action="store_true",
+        default=BUILTIN_DEFAULTS["skip_if_pr_exists"],
+        help=(
+            "Skip issue processing when a linked open PR already exists. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-skip-if-pr-exists",
+        dest="skip_if_pr_exists",
+        action="store_false",
+        help="Do not skip issue processing when a linked open PR exists.",
+    )
+    parser.add_argument(
+        "--skip-if-branch-exists",
+        dest="skip_if_branch_exists",
+        action="store_true",
+        default=BUILTIN_DEFAULTS["skip_if_branch_exists"],
+        help=(
+            "Skip issue processing when deterministic issue branch already exists on origin. "
+            "Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-skip-if-branch-exists",
+        dest="skip_if_branch_exists",
+        action="store_false",
+        help="Do not skip issue processing when deterministic issue branch exists on origin.",
+    )
+    parser.add_argument(
+        "--force-reprocess",
+        action="store_true",
+        help=(
+            "Override skip guards for existing linked PR and existing remote branch. "
+            "Useful for intentional reruns."
+        ),
+    )
+    parser.add_argument(
         "--sync-reused-branch",
         dest="sync_reused_branch",
         action="store_true",
@@ -1950,9 +1998,16 @@ def main() -> int:
     from_review_comments = bool(getattr(args, "from_review_comments", False))
     force_issue_flow = bool(getattr(args, "force_issue_flow", False))
     has_force_issue_flow_flag = hasattr(args, "force_issue_flow")
+    skip_if_pr_exists = bool(getattr(args, "skip_if_pr_exists", False))
+    skip_if_branch_exists = bool(getattr(args, "skip_if_branch_exists", False))
+    force_reprocess = bool(getattr(args, "force_reprocess", False))
     pr_followup_branch_prefix = getattr(args, "pr_followup_branch_prefix", None)
     post_pr_summary = bool(getattr(args, "post_pr_summary", False))
     base_branch_mode = str(getattr(args, "base_branch", BUILTIN_DEFAULTS["base_branch"]))
+
+    if force_reprocess:
+        skip_if_pr_exists = False
+        skip_if_branch_exists = False
 
     try:
         target_dir = os.path.abspath(args.dir)
@@ -2283,6 +2338,8 @@ def main() -> int:
 
     failures = 0
     processed = 0
+    skipped_existing_pr = 0
+    skipped_existing_branch = 0
     touched_prs: list[str] = []
 
     for issue in issues:
@@ -2294,11 +2351,40 @@ def main() -> int:
             mode_reason = "batch issue processing"
             force_override_applied = False
             skip_agent_run = False
+            issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
             state_target_type = "issue"
             state_target_number = issue["number"]
             state_pr_number: int | None = None
-            if issue_number_arg is not None and has_force_issue_flow_flag:
+            if skip_if_pr_exists:
                 linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
+                if linked_open_pr is not None:
+                    skipped_existing_pr += 1
+                    linked_pr_number = linked_open_pr.get("number")
+                    linked_pr_url = str(linked_open_pr.get("url") or "").strip()
+                    linked_pr_context = (
+                        f"PR #{linked_pr_number}"
+                        if type(linked_pr_number) is int
+                        else "a linked open PR"
+                    )
+                    if linked_pr_url:
+                        linked_pr_context = f"{linked_pr_context} ({linked_pr_url})"
+                    print(
+                        f"Skipping issue #{issue['number']}: {linked_pr_context} already exists "
+                        "(--force-reprocess or --no-skip-if-pr-exists to override)."
+                    )
+                    continue
+
+            if skip_if_branch_exists and remote_branch_exists(issue_branch):
+                skipped_existing_branch += 1
+                print(
+                    f"Skipping issue #{issue['number']}: branch '{issue_branch}' already exists on origin "
+                    "(--force-reprocess or --no-skip-if-branch-exists to override)."
+                )
+                continue
+
+            if issue_number_arg is not None and has_force_issue_flow_flag:
+                if linked_open_pr is None:
+                    linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
 
                 recovered_issue_state: dict | None = None
                 try:
@@ -2552,7 +2638,6 @@ def main() -> int:
                         print(
                             "Proceeding despite waiting-for-author state because --force-issue-flow is set."
                         )
-                issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
                 target_base_branch = base_branch
 
             stacked_base_context = (
@@ -2846,7 +2931,13 @@ def main() -> int:
             if args.stop_on_error:
                 break
 
-    print(f"Done. Processed: {processed}, failures: {failures}")
+    print(
+        "Done. "
+        f"Processed: {processed}, "
+        f"skipped_existing_pr: {skipped_existing_pr}, "
+        f"skipped_existing_branch: {skipped_existing_branch}, "
+        f"failures: {failures}"
+    )
     if touched_prs:
         print("PRs:")
         for pr_url in touched_prs:

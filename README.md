@@ -83,6 +83,9 @@ Supported local config keys:
 - `stop_on_error` (boolean)
 - `fail_on_existing` (boolean)
 - `force_issue_flow` (boolean)
+- `skip_if_pr_exists` (boolean)
+- `skip_if_branch_exists` (boolean)
+- `force_reprocess` (boolean)
 - `sync_reused_branch` (boolean)
 - `sync_strategy` (`rebase` or `merge`)
 - `base_branch` (`default` or `current`)
@@ -101,14 +104,15 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --limit 1
 
 Workflow per issue:
 
-1. Chooses a base branch (`default`: repository default branch from GitHub; `current`: currently checked-out branch)
-2. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
-3. For reused branches, syncs with the latest selected base branch before agent run (default: `rebase`)
-4. Runs the AI agent with issue title/body context
-5. On changes, creates commit
-6. Pushes issue branch to `origin`
-7. Reuses an existing open PR for the issue branch when present; otherwise creates one to the selected base branch
-8. Posts append-only orchestration state comments to GitHub issue/PR on key transitions
+1. Pre-checks whether issue should be skipped (linked open PR and/or existing deterministic remote branch)
+2. Chooses a base branch (`default`: repository default branch from GitHub; `current`: currently checked-out branch)
+3. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
+4. For reused branches, syncs with the latest selected base branch before agent run (default: `rebase`)
+5. Runs the AI agent with issue title/body context
+6. On changes, creates commit
+7. Pushes issue branch to `origin`
+8. Reuses an existing open PR for the issue branch when present; otherwise creates one to the selected base branch
+9. Posts append-only orchestration state comments to GitHub issue/PR on key transitions
 
 Workflow in PR review mode:
 
@@ -148,6 +152,9 @@ Useful options:
 - `--local-config path` load local JSON defaults (default: `local-config.json` under `--dir`)
 - `--fail-on-existing` strict mode: fail if issue branch or PR already exists
 - `--force-issue-flow` disable auto-switch to PR-review mode for `--issue`
+- `--skip-if-pr-exists` / `--no-skip-if-pr-exists` skip or process issues when a linked open PR exists (default: skip)
+- `--skip-if-branch-exists` / `--no-skip-if-branch-exists` skip or process issues when deterministic issue branch exists on `origin` (default: skip)
+- `--force-reprocess` override both skip guards and process anyway
 - `--sync-reused-branch` / `--no-sync-reused-branch` enable or disable reused-branch sync before agent run (default: enabled)
 - `--sync-strategy rebase|merge` choose how to sync a reused branch with selected base (default: `rebase`)
 - `--base default|current` (`--base-branch` alias) choose issue-flow base mode; `current` enables stacked execution from your current branch (opt-in)
@@ -188,8 +195,11 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 ## Reruns and conflict resolution
 
-- Re-running for an issue now auto-detects existing issue branches and reuses them instead of failing on `git checkout -b`.
-- If an open PR already exists for the issue branch, the script reuses it (even if your currently checked-out local branch is different).
+- Re-running is idempotent by default: issues are skipped when a linked open PR already exists.
+- Re-running is also skipped by default when deterministic issue branch already exists on `origin`.
+- Use `--force-reprocess` (or `--no-skip-if-pr-exists` / `--no-skip-if-branch-exists`) for intentional reruns.
+- When rerun skip guards are disabled, the script auto-detects existing issue branches and reuses them instead of failing on `git checkout -b`.
+- If an open PR already exists for the issue branch, the script reuses it (even if your currently checked-out local branch is different) when rerun skip guards are disabled.
 - PR reuse first checks `base+head`, then falls back to `head`-only lookup to avoid duplicate PR creation when reruns start from another feature branch.
 - Base branch selection is deterministic: by default issue runs target the repository default branch from GitHub; use `--base current` to stack on your current local branch.
 - On rerun with a reused branch, the script syncs that branch with the selected base before running the agent (`--sync-strategy rebase` by default).
@@ -210,6 +220,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 ## Auto switch to PR-review mode
 
 - When you run with `--issue <n>`, the script checks whether this issue has a linked open PR.
+- If `--skip-if-pr-exists` is enabled (default), the issue is skipped before mode selection.
 - If found, it automatically switches to PR-review mode and builds the agent prompt from issue + PR + review comments context.
 - The script logs that auto-switch happened and why (including the PR number).
 - `--dry-run` prints selected mode (`issue-flow` or `pr-review`) and the reason.

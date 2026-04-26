@@ -7,6 +7,9 @@
   "opencode_auto_approve": true,
   "fail_on_existing": false,
   "force_issue_flow": false,
+  "skip_if_pr_exists": true,
+  "skip_if_branch_exists": true,
+  "force_reprocess": false,
   "sync_reused_branch": true,
   "sync_strategy": "rebase",
   "base_branch": "default"

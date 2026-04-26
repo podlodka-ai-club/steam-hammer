@@ -524,6 +524,7 @@ class PrReviewModeTests(unittest.TestCase):
                 "runner",
                 "--issue",
                 "37",
+                "--no-skip-if-pr-exists",
                 "--dry-run",
                 "--dir",
                 tmpdir,

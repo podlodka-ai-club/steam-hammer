@@ -16,6 +16,9 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(args.limit, BUILTIN_DEFAULTS["limit"])
         self.assertEqual(args.branch_prefix, BUILTIN_DEFAULTS["branch_prefix"])
         self.assertEqual(args.fail_on_existing, BUILTIN_DEFAULTS["fail_on_existing"])
+        self.assertEqual(args.skip_if_pr_exists, BUILTIN_DEFAULTS["skip_if_pr_exists"])
+        self.assertEqual(args.skip_if_branch_exists, BUILTIN_DEFAULTS["skip_if_branch_exists"])
+        self.assertEqual(args.force_reprocess, BUILTIN_DEFAULTS["force_reprocess"])
         self.assertEqual(args.sync_reused_branch, BUILTIN_DEFAULTS["sync_reused_branch"])
         self.assertEqual(args.sync_strategy, BUILTIN_DEFAULTS["sync_strategy"])
         self.assertEqual(args.base_branch, BUILTIN_DEFAULTS["base_branch"])
@@ -31,6 +34,9 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
                         "limit": 3,
                         "branch_prefix": "my-fixes",
                         "fail_on_existing": True,
+                        "skip_if_pr_exists": False,
+                        "skip_if_branch_exists": False,
+                        "force_reprocess": True,
                         "sync_reused_branch": False,
                         "sync_strategy": "merge",
                         "base_branch": "current",
@@ -44,6 +50,9 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(args.limit, 3)
         self.assertEqual(args.branch_prefix, "my-fixes")
         self.assertTrue(args.fail_on_existing)
+        self.assertFalse(args.skip_if_pr_exists)
+        self.assertFalse(args.skip_if_branch_exists)
+        self.assertTrue(args.force_reprocess)
         self.assertFalse(args.sync_reused_branch)
         self.assertEqual(args.sync_strategy, "merge")
         self.assertEqual(args.base_branch, "current")

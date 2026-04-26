@@ -711,6 +711,132 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 fail_on_existing=True,
             )
 
+    def test_main_skips_issue_when_linked_open_pr_exists_in_batch_mode(self) -> None:
+        args = type("Args", (), {
+            "repo": "owner/repo",
+            "issue": None,
+            "pr": None,
+            "from_review_comments": False,
+            "state": "open",
+            "limit": 10,
+            "runner": "opencode",
+            "agent": "build",
+            "model": None,
+            "agent_timeout_seconds": 900,
+            "agent_idle_timeout_seconds": None,
+            "opencode_auto_approve": False,
+            "branch_prefix": "issue-fix",
+            "include_empty": False,
+            "stop_on_error": False,
+            "fail_on_existing": False,
+            "force_issue_flow": False,
+            "skip_if_pr_exists": True,
+            "skip_if_branch_exists": True,
+            "force_reprocess": False,
+            "sync_reused_branch": True,
+            "sync_strategy": "rebase",
+            "base_branch": "default",
+            "dir": ".",
+            "local_config": "local-config.json",
+            "dry_run": True,
+        })()
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_issues",
+                return_value=[
+                    {
+                        "number": 33,
+                        "title": "Do not duplicate",
+                        "body": "non-empty",
+                        "url": "https://github.com/owner/repo/issues/33",
+                    }
+                ],
+            ),
+            patch(
+                "scripts.run_github_issues_to_opencode.find_open_pr_for_issue",
+                return_value={
+                    "number": 44,
+                    "url": "https://github.com/owner/repo/pull/44",
+                },
+            ),
+            patch("scripts.run_github_issues_to_opencode.remote_branch_exists") as remote_branch_exists_mock,
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch") as prepare_issue_branch_mock,
+            patch("scripts.run_github_issues_to_opencode.run_agent") as run_agent_mock,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        remote_branch_exists_mock.assert_not_called()
+        prepare_issue_branch_mock.assert_not_called()
+        run_agent_mock.assert_not_called()
+        self.assertIn("Skipping issue #33: PR #44", stdout_mock.getvalue())
+        self.assertIn("Processed: 0", stdout_mock.getvalue())
+        self.assertIn("skipped_existing_pr: 1", stdout_mock.getvalue())
+
+    def test_main_skips_issue_when_deterministic_remote_branch_exists(self) -> None:
+        args = type("Args", (), {
+            "repo": "owner/repo",
+            "issue": 33,
+            "pr": None,
+            "from_review_comments": False,
+            "state": "open",
+            "limit": 10,
+            "runner": "opencode",
+            "agent": "build",
+            "model": None,
+            "agent_timeout_seconds": 900,
+            "agent_idle_timeout_seconds": None,
+            "opencode_auto_approve": False,
+            "branch_prefix": "issue-fix",
+            "include_empty": False,
+            "stop_on_error": False,
+            "fail_on_existing": False,
+            "force_issue_flow": False,
+            "skip_if_pr_exists": False,
+            "skip_if_branch_exists": True,
+            "force_reprocess": False,
+            "sync_reused_branch": True,
+            "sync_strategy": "rebase",
+            "base_branch": "default",
+            "dir": ".",
+            "local_config": "local-config.json",
+            "dry_run": True,
+        })()
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_issue",
+                return_value={
+                    "number": 33,
+                    "title": "Do not duplicate",
+                    "body": "non-empty",
+                    "url": "https://github.com/owner/repo/issues/33",
+                },
+            ),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue") as find_open_pr_mock,
+            patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=True),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch") as prepare_issue_branch_mock,
+            patch("scripts.run_github_issues_to_opencode.run_agent") as run_agent_mock,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        find_open_pr_mock.assert_not_called()
+        prepare_issue_branch_mock.assert_not_called()
+        run_agent_mock.assert_not_called()
+        self.assertIn("branch 'issue-fix/33-do-not-duplicate' already exists on origin", stdout_mock.getvalue())
+        self.assertIn("Processed: 0", stdout_mock.getvalue())
+        self.assertIn("skipped_existing_branch: 1", stdout_mock.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

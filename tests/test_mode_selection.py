@@ -46,6 +46,39 @@ class ModeSelectionTests(unittest.TestCase):
         self.assertIn("ready-for-review", reason)
         self.assertIn("#144", reason)
 
+    def test_waiting_for_author_state_skips_unless_forced(self) -> None:
+        mode, reason = choose_execution_mode(
+            issue_number=45,
+            linked_open_pr={"number": 144},
+            force_issue_flow=False,
+            recovered_state={"status": "waiting-for-author"},
+        )
+
+        self.assertEqual(mode, "skip")
+        self.assertIn("waiting-for-author", reason)
+
+    def test_blocked_state_skips_unless_forced(self) -> None:
+        mode, reason = choose_execution_mode(
+            issue_number=45,
+            linked_open_pr={"number": 144},
+            force_issue_flow=False,
+            recovered_state={"status": "blocked"},
+        )
+
+        self.assertEqual(mode, "skip")
+        self.assertIn("blocked", reason)
+
+    def test_waiting_for_ci_state_prefers_pr_review_when_open_pr_exists(self) -> None:
+        mode, reason = choose_execution_mode(
+            issue_number=45,
+            linked_open_pr={"number": 144},
+            force_issue_flow=False,
+            recovered_state={"status": "waiting-for-ci"},
+        )
+
+        self.assertEqual(mode, "pr-review")
+        self.assertIn("waiting-for-ci", reason)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2135,6 +2135,48 @@ def run_agent(
     )
 
 
+def build_agent_command(
+    runner: str,
+    prompt: str,
+    agent: str,
+    model: str | None,
+    image_paths: list[str] | None = None,
+    opencode_auto_approve: bool = False,
+) -> list[str]:
+    if runner == "claude":
+        command = ["claude", "--dangerously-skip-permissions"]
+        for image_path in image_paths or []:
+            command.extend(["--image", image_path])
+        command.extend(["-p", prompt])
+        if model:
+            command.extend(["--model", model])
+        return command
+
+    command = ["opencode", "run", "--agent", agent]
+    if model:
+        command.extend(["--model", model])
+    if opencode_auto_approve:
+        command.append("--dangerously-skip-permissions")
+    command.append(prompt)
+    return command
+
+
+def should_skip_issue_for_empty_body(
+    mode: str,
+    include_empty: bool,
+    has_issue_text: bool,
+    issue_image_urls: list[str] | None = None,
+) -> bool:
+    if mode != "issue-flow":
+        return False
+
+    return (
+        not has_issue_text
+        and not include_empty
+        and not issue_image_urls
+    )
+
+
 def run_agent_with_prompt(
     prompt: str,
     item_label: str,
@@ -2147,20 +2189,14 @@ def run_agent_with_prompt(
     opencode_auto_approve: bool,
     image_paths: list[str] | None = None,
 ) -> int:
-    if runner == "claude":
-        command = ["claude", "--dangerously-skip-permissions"]
-        for image_path in image_paths or []:
-            command.extend(["--image", image_path])
-        command.extend(["-p", prompt])
-        if model:
-            command.extend(["--model", model])
-    else:
-        command = ["opencode", "run", "--agent", agent]
-        if model:
-            command.extend(["--model", model])
-        if opencode_auto_approve:
-            command.append("--dangerously-skip-permissions")
-        command.append(prompt)
+    command = build_agent_command(
+        runner=runner,
+        prompt=prompt,
+        agent=agent,
+        model=model,
+        image_paths=image_paths,
+        opencode_auto_approve=opencode_auto_approve,
+    )
 
     if dry_run:
         image_count = len(image_paths or [])
@@ -4348,7 +4384,12 @@ def main() -> int:
                 else ""
             )
 
-            if mode == "issue-flow" and not has_issue_text and not args.include_empty and not issue_image_urls:
+            if should_skip_issue_for_empty_body(
+                mode=mode,
+                include_empty=args.include_empty,
+                has_issue_text=has_issue_text,
+                issue_image_urls=issue_image_urls,
+            ):
                 print(f"Skipping issue #{issue['number']} (empty body)")
                 continue
 

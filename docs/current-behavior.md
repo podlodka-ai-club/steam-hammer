@@ -61,7 +61,10 @@
    - issue с deterministic remote branch пропускается по умолчанию (`--skip-if-branch-exists`);
    - `--force-reprocess` отключает оба skip guard;
    - для одиночного `--issue` linked open PR не hard-skip'ается, а используется state-aware mode selection / PR-review progression.
-4. Для issue с пустым body выполняется пропуск, если не включен `--include-empty`.
+4. Для issue с пустым body выполняется пропуск, если не включен `--include-empty` **и** нет найденных ссылок на изображения.
+   - Изображения извлекаются из тел issue (`![](...)`, `<img src=...>`, прямые URL).
+   - По найденным ссылкам создаются локальные файлы в временной директории и добавляются в prompt как входные изображения для Claude через `--image`.
+   - Если загрузка изображения падает, это логируется, и обработка продолжается в text-only режиме.
 5. Выбирается/создается рабочая ветка по шаблону `<prefix>/<issue-number>-<slug-title>` (по умолчанию prefix: `issue-fix`).
 6. Для переиспользованной ветки может выполняться синхронизация с базой (по умолчанию включена).
 7. Запускается агент с issue-контекстом.
@@ -164,7 +167,7 @@
 - `--agent-timeout-seconds`: жесткий таймаут выполнения агента;
 - `--agent-idle-timeout-seconds`: аварийный останов при отсутствии вывода агента;
 - `--opencode-auto-approve`: добавляет `--dangerously-skip-permissions` для OpenCode;
-- `--include-empty`: не пропускать issue с пустым body;
+- `--include-empty`: не пропускать issue с пустым body; image-only issue теперь обрабатывается автоматически при обнаружении приложений.
 - `--stop-on-error`: остановка после первой ошибки;
 - `--fail-on-existing`: строгий режим без переиспользования существующих branch/PR;
 - `--skip-if-pr-exists` / `--no-skip-if-pr-exists`: skip guard для linked open PR;
@@ -186,10 +189,12 @@
 - `--pr` без `--from-review-comments` (или наоборот) -> ошибка валидации аргументов;
 - PR в состоянии не `OPEN` -> выход без изменений;
 - отсутствуют actionable review comments -> успешный выход без запуска агента;
-- issue body пустой и нет `--include-empty` -> issue пропускается;
+- issue body пустой и нет `--include-empty` и нет распознанных image-ссылок -> issue пропускается;
 - batch issue с linked open PR или deterministic remote branch -> skip по умолчанию;
 - PR-mode из нецелевой ветки без `--allow-pr-branch-switch` или `--isolate-worktree` -> ошибка safeguard;
 - если агент не внес изменения и не было sync-only обновления -> commit/push/PR пропускаются.
+
+- Текущая поддержка изображений покрывает ссылки/вложения из GitHub issue bodies и generic attachment metadata. Явная Jira attachment API интеграция пока остается follow-up.
 
 ## 11. Recovery контекста из orchestration-state
 

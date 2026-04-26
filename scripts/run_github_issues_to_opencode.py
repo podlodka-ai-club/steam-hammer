@@ -30,6 +30,17 @@ BUILTIN_DEFAULTS = {
     "dir": ".",
 }
 
+ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"
+ORCHESTRATION_STATE_STATUSES = {
+    "in-progress",
+    "ready-for-review",
+    "failed",
+    "blocked",
+    "waiting-for-author",
+    "waiting-for-ci",
+    "ready-to-merge",
+}
+
 
 def run_capture(command: list[str]) -> str:
     result = subprocess.run(command, capture_output=True, text=True)
@@ -428,8 +439,6 @@ def normalize_review_items(
             }
         )
         stats["reviews_used"] += 1
-        if is_pr_author_feedback:
-            stats["reviews_pr_author"] += 1
 
     for comment in conversation_comments or []:
         if not isinstance(comment, dict):
@@ -663,6 +672,134 @@ def branch_name_for_issue(issue: dict, prefix: str) -> str:
 
 def has_changes() -> bool:
     return bool(run_capture(["git", "status", "--porcelain"]).strip())
+
+
+def utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def short_error_text(error: str, max_len: int = 280) -> str:
+    compact = " ".join(str(error).split())
+    if len(compact) <= max_len:
+        return compact
+    return f"{compact[: max_len - 3].rstrip()}..."
+
+
+def parse_pr_number_from_url(pr_url: str) -> int | None:
+    match = re.search(r"/pull/(\d+)(?:$|[/?#])", pr_url)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def build_orchestration_state(
+    status: str,
+    task_type: str,
+    issue_number: int | None,
+    pr_number: int | None,
+    branch: str | None,
+    base_branch: str | None,
+    runner: str,
+    agent: str,
+    model: str | None,
+    attempt: int,
+    stage: str,
+    next_action: str,
+    error: str | None,
+) -> dict:
+    if status not in ORCHESTRATION_STATE_STATUSES:
+        raise RuntimeError(f"Unsupported orchestration state status: {status}")
+    if task_type not in {"issue", "pr"}:
+        raise RuntimeError(f"Unsupported orchestration task type: {task_type}")
+
+    return {
+        "status": status,
+        "task_type": task_type,
+        "issue": issue_number,
+        "pr": pr_number,
+        "branch": branch,
+        "base_branch": base_branch,
+        "runner": runner,
+        "agent": agent,
+        "model": model,
+        "attempt": attempt,
+        "stage": stage,
+        "next_action": next_action,
+        "error": error,
+        "timestamp": utc_now_iso(),
+    }
+
+
+def format_orchestration_state_comment(state: dict) -> str:
+    status = str(state.get("status") or "unknown")
+    task_type = str(state.get("task_type") or "unknown")
+    stage = str(state.get("stage") or "unknown")
+    next_action = str(state.get("next_action") or "unknown")
+    readable_header = (
+        f"Orchestration state update: {status} ({task_type}, stage={stage}, next={next_action})."
+    )
+    return (
+        f"{readable_header}\n\n"
+        f"{ORCHESTRATION_STATE_MARKER}\n"
+        f"```json\n{json.dumps(state, ensure_ascii=True, indent=2)}\n```"
+    )
+
+
+def post_orchestration_state_comment(
+    repo: str,
+    target_type: str,
+    target_number: int,
+    state: dict,
+    dry_run: bool,
+) -> None:
+    if target_type not in {"issue", "pr"}:
+        raise RuntimeError(f"Unsupported state comment target type: {target_type}")
+
+    body = format_orchestration_state_comment(state)
+    if dry_run:
+        print(
+            f"[dry-run] Would post orchestration state to {target_type} #{target_number}: "
+            f"status={state.get('status')} stage={state.get('stage')}"
+        )
+        return
+
+    run_command(
+        [
+            "gh",
+            target_type,
+            "comment",
+            str(target_number),
+            "--repo",
+            repo,
+            "--body",
+            body,
+        ]
+    )
+
+
+def safe_post_orchestration_state_comment(
+    repo: str,
+    target_type: str,
+    target_number: int,
+    state: dict,
+    dry_run: bool,
+) -> None:
+    try:
+        post_orchestration_state_comment(
+            repo=repo,
+            target_type=target_type,
+            target_number=target_number,
+            state=state,
+            dry_run=dry_run,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Warning: failed to post orchestration state to {target_type} #{target_number}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def build_prompt(issue: dict) -> str:
@@ -1649,15 +1786,25 @@ def main() -> int:
 
     if pr_mode_requested:
         try:
+            failure_stage = "pr_review_init"
+            pr_state_context: dict[str, int | str | None] = {
+                "issue": None,
+                "pr": None,
+                "branch": None,
+                "base_branch": None,
+            }
             if type(pr_number_arg) is not int:
                 raise RuntimeError("--pr must be an integer pull request number")
 
+            failure_stage = "fetch_pr"
             pull_request = fetch_pull_request(repo=repo, number=pr_number_arg)
+            pr_state_context["pr"] = pr_number_arg
             pr_state = str(pull_request.get("state") or "").strip().upper()
             if pr_state != "OPEN":
                 print(f"PR #{pr_number_arg} is not open (state: {pr_state}); skipping.")
                 return 0
 
+            failure_stage = "fetch_review_feedback"
             threads = fetch_pr_review_threads(repo=repo, number=pr_number_arg)
             conversation_comments = fetch_pr_conversation_comments(
                 repo=repo,
@@ -1682,19 +1829,6 @@ def main() -> int:
                 "Review prompt sources: "
                 f"{format_review_filtering_stats(review_stats)}"
             )
-            if not review_items:
-                print(
-                    "No actionable review comments found "
-                    f"for PR #{pr_number_arg}; nothing to do."
-                )
-                return 0
-
-            linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
-            prompt = build_pr_review_prompt(
-                pull_request=pull_request,
-                review_items=review_items,
-                linked_issues=linked_issues,
-            )
 
             base_branch_for_run = current_branch()
             active_branch = base_branch_for_run
@@ -1709,6 +1843,66 @@ def main() -> int:
                 )
                 active_branch = followup_branch
 
+            pr_state_context["branch"] = active_branch
+            pr_state_context["base_branch"] = str(pull_request.get("baseRefName") or "").strip() or None
+            safe_post_orchestration_state_comment(
+                repo=repo,
+                target_type="pr",
+                target_number=pr_number_arg,
+                dry_run=args.dry_run,
+                state=build_orchestration_state(
+                    status="in-progress",
+                    task_type="pr",
+                    issue_number=None,
+                    pr_number=pr_number_arg,
+                    branch=active_branch,
+                    base_branch=str(pr_state_context["base_branch"] or "") or None,
+                    runner=args.runner,
+                    agent=args.agent,
+                    model=args.model,
+                    attempt=1,
+                    stage="agent_run",
+                    next_action="wait_for_agent_result",
+                    error=None,
+                ),
+            )
+
+            if not review_items:
+                safe_post_orchestration_state_comment(
+                    repo=repo,
+                    target_type="pr",
+                    target_number=pr_number_arg,
+                    dry_run=args.dry_run,
+                    state=build_orchestration_state(
+                        status="waiting-for-author",
+                        task_type="pr",
+                        issue_number=None,
+                        pr_number=pr_number_arg,
+                        branch=active_branch,
+                        base_branch=str(pr_state_context["base_branch"] or "") or None,
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        attempt=1,
+                        stage="review_feedback",
+                        next_action="await_new_review_comments",
+                        error="No actionable review comments found",
+                    ),
+                )
+                print(
+                    "No actionable review comments found "
+                    f"for PR #{pr_number_arg}; nothing to do."
+                )
+                return 0
+
+            linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+            prompt = build_pr_review_prompt(
+                pull_request=pull_request,
+                review_items=review_items,
+                linked_issues=linked_issues,
+            )
+
+            failure_stage = "agent_run"
             exit_code = run_agent_with_prompt(
                 prompt=prompt,
                 item_label=f"PR #{pr_number_arg}",
@@ -1726,17 +1920,61 @@ def main() -> int:
                 )
 
             if not args.dry_run and not has_changes():
+                safe_post_orchestration_state_comment(
+                    repo=repo,
+                    target_type="pr",
+                    target_number=pr_number_arg,
+                    dry_run=False,
+                    state=build_orchestration_state(
+                        status="waiting-for-author",
+                        task_type="pr",
+                        issue_number=None,
+                        pr_number=pr_number_arg,
+                        branch=active_branch,
+                        base_branch=str(pr_state_context["base_branch"] or "") or None,
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        attempt=1,
+                        stage="post_agent_check",
+                        next_action="await_more_feedback_or_manual_changes",
+                        error="Agent produced no repository changes",
+                    ),
+                )
                 print(f"No changes detected for PR #{pr_number_arg}; skipping commit and push")
                 if pr_followup_branch_prefix:
                     run_command(["git", "checkout", base_branch_for_run])
                 return 0
 
+            failure_stage = "commit_push"
             commit_pr_review_changes(pull_request=pull_request, dry_run=args.dry_run)
             if pr_followup_branch_prefix:
                 push_branch(branch_name=active_branch, dry_run=args.dry_run)
                 print(f"Pushed follow-up branch for PR #{pr_number_arg}: {active_branch}")
             else:
                 push_current_branch(dry_run=args.dry_run)
+
+            safe_post_orchestration_state_comment(
+                repo=repo,
+                target_type="pr",
+                target_number=pr_number_arg,
+                dry_run=args.dry_run,
+                state=build_orchestration_state(
+                    status="waiting-for-ci",
+                    task_type="pr",
+                    issue_number=None,
+                    pr_number=pr_number_arg,
+                    branch=active_branch,
+                    base_branch=str(pr_state_context["base_branch"] or "") or None,
+                    runner=args.runner,
+                    agent=args.agent,
+                    model=args.model,
+                    attempt=1,
+                    stage="changes_pushed",
+                    next_action="wait_for_ci",
+                    error=None,
+                ),
+            )
 
             if post_pr_summary:
                 leave_pr_summary_comment(
@@ -1754,6 +1992,30 @@ def main() -> int:
             )
             return 0
         except Exception as exc:  # noqa: BLE001
+            if pr_number_arg is not None:
+                failed_pr_number = pr_state_context.get("pr")
+                if type(failed_pr_number) is int:
+                    safe_post_orchestration_state_comment(
+                        repo=repo,
+                        target_type="pr",
+                        target_number=failed_pr_number,
+                        dry_run=args.dry_run,
+                        state=build_orchestration_state(
+                            status="failed",
+                            task_type="pr",
+                            issue_number=None,
+                            pr_number=failed_pr_number,
+                            branch=str(pr_state_context.get("branch") or "") or None,
+                            base_branch=str(pr_state_context.get("base_branch") or "") or None,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            attempt=1,
+                            stage=failure_stage,
+                            next_action="inspect_error_and_retry",
+                            error=short_error_text(str(exc)),
+                        ),
+                    )
             print(f"Error: {exc}", file=sys.stderr)
             return 1
 
@@ -1767,10 +2029,14 @@ def main() -> int:
 
     for issue in issues:
         try:
+            failure_stage = "issue_setup"
             linked_open_pr: dict | None = None
             mode = "issue-flow"
             mode_reason = "batch issue processing"
             skip_agent_run = False
+            state_target_type = "issue"
+            state_target_number = issue["number"]
+            state_pr_number: int | None = None
             if issue_number_arg is not None and has_force_issue_flow_flag:
                 linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
                 mode, mode_reason = choose_execution_mode(
@@ -1799,6 +2065,9 @@ def main() -> int:
                         f"Linked PR for issue #{issue['number']} has invalid number: {pr_number_raw}"
                     )
                 pr_number = pr_number_raw
+                state_target_type = "pr"
+                state_target_number = pr_number
+                state_pr_number = pr_number
 
                 print(
                     f"Auto-switch to PR-review mode for issue #{issue['number']}: {mode_reason}."
@@ -1843,6 +2112,28 @@ def main() -> int:
                 if not target_base_branch:
                     target_base_branch = base_branch
 
+                safe_post_orchestration_state_comment(
+                    repo=repo,
+                    target_type=state_target_type,
+                    target_number=state_target_number,
+                    dry_run=args.dry_run,
+                    state=build_orchestration_state(
+                        status="in-progress",
+                        task_type="pr",
+                        issue_number=issue["number"],
+                        pr_number=state_pr_number,
+                        branch=issue_branch,
+                        base_branch=target_base_branch,
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        attempt=1,
+                        stage="agent_run",
+                        next_action="wait_for_agent_result",
+                        error=None,
+                    ),
+                )
+
                 if not review_items:
                     if should_force_sync_rerun:
                         skip_agent_run = True
@@ -1851,6 +2142,27 @@ def main() -> int:
                             f"continuing with sync-only rerun because mergeStateStatus={merge_state}"
                         )
                     else:
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type=state_target_type,
+                            target_number=state_target_number,
+                            dry_run=args.dry_run,
+                            state=build_orchestration_state(
+                                status="waiting-for-author",
+                                task_type="pr",
+                                issue_number=issue["number"],
+                                pr_number=state_pr_number,
+                                branch=issue_branch,
+                                base_branch=target_base_branch,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=1,
+                                stage="review_feedback",
+                                next_action="await_new_review_comments",
+                                error="No actionable review comments found",
+                            ),
+                        )
                         print(
                             f"No actionable review comments for linked PR #{pr_number}; "
                             "skipping issue run."
@@ -1887,6 +2199,30 @@ def main() -> int:
                 issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
                 target_base_branch = base_branch
 
+            if mode == "issue-flow":
+                safe_post_orchestration_state_comment(
+                    repo=repo,
+                    target_type=state_target_type,
+                    target_number=state_target_number,
+                    dry_run=args.dry_run,
+                    state=build_orchestration_state(
+                        status="in-progress",
+                        task_type="issue",
+                        issue_number=issue["number"],
+                        pr_number=None,
+                        branch=issue_branch,
+                        base_branch=target_base_branch,
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        attempt=1,
+                        stage="agent_run",
+                        next_action="wait_for_agent_result",
+                        error=None,
+                    ),
+                )
+
+            failure_stage = "prepare_branch"
             branch_status = prepare_issue_branch(
                 base_branch=target_base_branch,
                 branch_name=issue_branch,
@@ -1899,6 +2235,7 @@ def main() -> int:
 
             if branch_status == "reused":
                 if args.sync_reused_branch:
+                    failure_stage = "sync_branch"
                     reused_branch_sync_changed = sync_reused_branch_with_base(
                         base_branch=target_base_branch,
                         branch_name=issue_branch,
@@ -1924,6 +2261,7 @@ def main() -> int:
                     "no actionable review comments; running sync-only path"
                 )
             else:
+                failure_stage = "agent_run"
                 exit_code = run_agent(
                     issue=issue,
                     runner=args.runner,
@@ -1975,15 +2313,81 @@ def main() -> int:
                     if pr_url:
                         touched_prs.append(pr_url)
                         print(f"PR status for issue #{issue['number']}: {pr_status} ({pr_url})")
+                    if mode == "pr-review":
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type="pr",
+                            target_number=state_target_number,
+                            dry_run=False,
+                            state=build_orchestration_state(
+                                status="waiting-for-ci",
+                                task_type="pr",
+                                issue_number=issue["number"],
+                                pr_number=state_pr_number,
+                                branch=issue_branch,
+                                base_branch=target_base_branch,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=1,
+                                stage="changes_pushed",
+                                next_action="wait_for_ci",
+                                error=None,
+                            ),
+                        )
+                    elif mode == "issue-flow":
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type="issue",
+                            target_number=issue["number"],
+                            dry_run=False,
+                            state=build_orchestration_state(
+                                status="ready-for-review",
+                                task_type="issue",
+                                issue_number=issue["number"],
+                                pr_number=parse_pr_number_from_url(pr_url),
+                                branch=issue_branch,
+                                base_branch=target_base_branch,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=1,
+                                stage="pr_ready",
+                                next_action="wait_for_review",
+                                error=None,
+                            ),
+                        )
                     run_command(["git", "checkout", base_branch])
                     continue
 
                 print(
                     f"No changes detected for issue #{issue['number']}; skipping commit and PR"
                 )
+                safe_post_orchestration_state_comment(
+                    repo=repo,
+                    target_type=state_target_type,
+                    target_number=state_target_number,
+                    dry_run=False,
+                    state=build_orchestration_state(
+                        status="waiting-for-author",
+                        task_type="issue" if mode == "issue-flow" else "pr",
+                        issue_number=issue["number"],
+                        pr_number=state_pr_number,
+                        branch=issue_branch,
+                        base_branch=target_base_branch,
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        attempt=1,
+                        stage="post_agent_check",
+                        next_action="await_more_context",
+                        error="No changes produced",
+                    ),
+                )
                 run_command(["git", "checkout", base_branch])
                 continue
 
+            failure_stage = "commit_push"
             commit_changes(issue=issue, dry_run=args.dry_run)
             push_branch(
                 branch_name=issue_branch,
@@ -2006,11 +2410,76 @@ def main() -> int:
             if pr_url:
                 touched_prs.append(pr_url)
                 print(f"PR status for issue #{issue['number']}: {pr_status} ({pr_url})")
+                if mode == "issue-flow":
+                    safe_post_orchestration_state_comment(
+                        repo=repo,
+                        target_type="issue",
+                        target_number=issue["number"],
+                        dry_run=args.dry_run,
+                        state=build_orchestration_state(
+                            status="ready-for-review",
+                            task_type="issue",
+                            issue_number=issue["number"],
+                            pr_number=parse_pr_number_from_url(pr_url),
+                            branch=issue_branch,
+                            base_branch=target_base_branch,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            attempt=1,
+                            stage="pr_ready",
+                            next_action="wait_for_review",
+                            error=None,
+                        ),
+                    )
+                else:
+                    safe_post_orchestration_state_comment(
+                        repo=repo,
+                        target_type="pr",
+                        target_number=state_target_number,
+                        dry_run=args.dry_run,
+                        state=build_orchestration_state(
+                            status="waiting-for-ci",
+                            task_type="pr",
+                            issue_number=issue["number"],
+                            pr_number=state_pr_number,
+                            branch=issue_branch,
+                            base_branch=target_base_branch,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            attempt=1,
+                            stage="changes_pushed",
+                            next_action="wait_for_ci",
+                            error=None,
+                        ),
+                    )
 
             if not args.dry_run:
                 run_command(["git", "checkout", base_branch])
         except Exception as exc:  # noqa: BLE001
             failures += 1
+            safe_post_orchestration_state_comment(
+                repo=repo,
+                target_type=state_target_type,
+                target_number=state_target_number,
+                dry_run=args.dry_run,
+                state=build_orchestration_state(
+                    status="failed",
+                    task_type="issue" if mode == "issue-flow" else "pr",
+                    issue_number=issue["number"],
+                    pr_number=state_pr_number,
+                    branch=locals().get("issue_branch", None),
+                    base_branch=locals().get("target_base_branch", None),
+                    runner=args.runner,
+                    agent=args.agent,
+                    model=args.model,
+                    attempt=1,
+                    stage=failure_stage,
+                    next_action="inspect_error_and_retry",
+                    error=short_error_text(str(exc)),
+                ),
+            )
             print(f"Issue #{issue['number']} failed: {exc}", file=sys.stderr)
             if args.stop_on_error:
                 break

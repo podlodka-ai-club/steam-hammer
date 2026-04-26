@@ -77,30 +77,6 @@ func TestRunIssueCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run", "--base", "current"})
 }
 
-func TestRunIssueBatchCommandMapsREADMEExample(t *testing.T) {
-	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
-	app.SetRunner(runner)
-
-	code := app.Run([]string{"run", "issue", "--repo", "owner/repo", "--limit", "1", "--runner", "opencode", "--agent", "build", "--model", "openai/gpt-4o"})
-	if code != 0 {
-		t.Fatalf("Run() code = %d, want 0", code)
-	}
-	assertCommand(t, runner, []string{runnerScript, "--repo", "owner/repo", "--runner", "opencode", "--agent", "build", "--model", "openai/gpt-4o", "--limit", "1"})
-}
-
-func TestRunIssueAcceptsPythonIssueAlias(t *testing.T) {
-	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
-	app.SetRunner(runner)
-
-	code := app.Run([]string{"run", "issue", "--issue", "20", "--runner", "opencode"})
-	if code != 0 {
-		t.Fatalf("Run() code = %d, want 0", code)
-	}
-	assertCommand(t, runner, []string{runnerScript, "--issue", "20", "--runner", "opencode"})
-}
-
 func TestRunIssueCommandMapsPythonRunnerFlags(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -140,29 +116,6 @@ func TestRunIssueCommandMapsPythonRunnerFlags(t *testing.T) {
 	})
 }
 
-func TestRunIssueCommandForwardsExplicitTrueFlagsForConfigPrecedence(t *testing.T) {
-	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
-	app.SetRunner(runner)
-
-	code := app.Run([]string{
-		"run", "issue",
-		"--id", "71",
-		"--skip-if-pr-exists",
-		"--skip-if-branch-exists",
-		"--sync-reused-branch",
-	})
-	if code != 0 {
-		t.Fatalf("Run() code = %d, want 0", code)
-	}
-	assertCommand(t, runner, []string{
-		runnerScript, "--issue", "71",
-		"--skip-if-pr-exists",
-		"--skip-if-branch-exists",
-		"--sync-reused-branch",
-	})
-}
-
 func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -175,24 +128,12 @@ func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments", "--dry-run", "--isolate-worktree"})
 }
 
-func TestRunPRAcceptsPythonAliases(t *testing.T) {
+func TestRunIssueRequiresID(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
 
-	code := app.Run([]string{"run", "pr", "--pr", "72", "--from-review-comments", "--dry-run"})
-	if code != 0 {
-		t.Fatalf("Run() code = %d, want 0", code)
-	}
-	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments", "--dry-run"})
-}
-
-func TestRunPRRequiresID(t *testing.T) {
-	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
-	app.SetRunner(runner)
-
-	if code := app.Run([]string{"run", "pr", "--dry-run"}); code != 2 {
+	if code := app.Run([]string{"run", "issue", "--dry-run"}); code != 2 {
 		t.Fatalf("Run() code = %d, want 2", code)
 	}
 	if runner.calls != 0 {

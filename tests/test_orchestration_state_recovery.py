@@ -386,6 +386,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
             "url": "https://example/pull/120",
             "state": "OPEN",
             "mergeStateStatus": "CLEAN",
+            "headRefOid": "abc123",
             "reviews": [],
             "author": {"login": "pr-owner"},
         }
@@ -535,6 +536,16 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
             patch("scripts.run_github_issues_to_opencode.fetch_pull_request", return_value=pull_request),
             patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]),
             patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[]),
+            patch(
+                "scripts.run_github_issues_to_opencode.read_pr_ci_status_for_pull_request",
+                return_value={
+                    "head_sha": "abc123",
+                    "overall": "pending",
+                    "checks": [{"name": "ci/test", "state": "pending", "url": "https://example/checks/1"}],
+                    "pending_checks": [{"name": "ci/test"}],
+                    "failing_checks": [],
+                },
+            ),
             patch("scripts.run_github_issues_to_opencode.prepare_issue_branch") as prepare_issue_branch_mock,
             patch("scripts.run_github_issues_to_opencode.run_agent") as run_agent_mock,
             patch(
@@ -547,8 +558,11 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         prepare_issue_branch_mock.assert_not_called()
         run_agent_mock.assert_not_called()
-        state_post_mock.assert_not_called()
-        self.assertIn("keeping recovered state 'waiting-for-ci'", stdout_mock.getvalue())
+        state_post_mock.assert_called_once()
+        posted_state = state_post_mock.call_args.kwargs["state"]
+        self.assertEqual(posted_state["status"], "waiting-for-ci")
+        self.assertEqual(posted_state["stage"], "ci_checks")
+        self.assertIn("CI checks are still pending", stdout_mock.getvalue())
 
 
 if __name__ == "__main__":

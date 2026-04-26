@@ -353,6 +353,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             },
             dry_run=False,
             fail_on_existing=False,
+            stacked_base_context=None,
         )
         run_command_mock.assert_called_once_with(["git", "checkout", "main"])
 
@@ -489,6 +490,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             },
             dry_run=False,
             fail_on_existing=False,
+            stacked_base_context=None,
         )
 
         output = stdout_mock.getvalue()
@@ -607,6 +609,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             },
             dry_run=False,
             fail_on_existing=False,
+            stacked_base_context=None,
         )
         run_command_mock.assert_called_once_with(["git", "checkout", "main"])
 

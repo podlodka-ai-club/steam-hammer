@@ -48,6 +48,11 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --r
 python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --force-issue-flow
 ```
 
+**Issue run stacked on current branch (opt-in):**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 45 --base current --runner opencode --agent build
+```
+
 ## Local config preset (per user/per machine)
 
 You can define local defaults without changing repository defaults.
@@ -80,6 +85,7 @@ Supported local config keys:
 - `force_issue_flow` (boolean)
 - `sync_reused_branch` (boolean)
 - `sync_strategy` (`rebase` or `merge`)
+- `base_branch` (`default` or `current`)
 
 You can also point to a different local config file:
 
@@ -95,13 +101,13 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --limit 1
 
 Workflow per issue:
 
-1. Chooses a stable base branch (repository default branch from GitHub)
+1. Chooses a base branch (`default`: repository default branch from GitHub; `current`: currently checked-out branch)
 2. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
 3. For reused branches, syncs with the latest selected base branch before agent run (default: `rebase`)
 4. Runs the AI agent with issue title/body context
 5. On changes, creates commit
 6. Pushes issue branch to `origin`
-7. Reuses an existing open PR for the issue branch when present; otherwise creates one to the stable base branch
+7. Reuses an existing open PR for the issue branch when present; otherwise creates one to the selected base branch
 8. Posts append-only orchestration state comments to GitHub issue/PR on key transitions
 
 Workflow in PR review mode:
@@ -144,6 +150,7 @@ Useful options:
 - `--force-issue-flow` disable auto-switch to PR-review mode for `--issue`
 - `--sync-reused-branch` / `--no-sync-reused-branch` enable or disable reused-branch sync before agent run (default: enabled)
 - `--sync-strategy rebase|merge` choose how to sync a reused branch with selected base (default: `rebase`)
+- `--base default|current` (`--base-branch` alias) choose issue-flow base mode; `current` enables stacked execution from your current branch (opt-in)
 
 If `--repo` is not provided, script tries to detect repository from current `gh` context.
 
@@ -184,7 +191,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - Re-running for an issue now auto-detects existing issue branches and reuses them instead of failing on `git checkout -b`.
 - If an open PR already exists for the issue branch, the script reuses it (even if your currently checked-out local branch is different).
 - PR reuse first checks `base+head`, then falls back to `head`-only lookup to avoid duplicate PR creation when reruns start from another feature branch.
-- Base branch selection is deterministic: issue runs target the repository default branch from GitHub, not your current local branch.
+- Base branch selection is deterministic: by default issue runs target the repository default branch from GitHub; use `--base current` to stack on your current local branch.
 - On rerun with a reused branch, the script syncs that branch with the selected base before running the agent (`--sync-strategy rebase` by default).
 - If rebase sync for a reused branch conflicts, the script now automatically falls back to merge-based sync and resolves conflicted files in favor of the selected base branch.
 - In auto-switched `pr-review` runs (`--issue <n>` with linked open PR), the same conflict flow is applied so routine sync conflicts do not block unattended reruns.
@@ -195,8 +202,9 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - For rebase-based sync that rewrites branch history, push uses `--force-with-lease` automatically.
 - Use `--sync-strategy merge` if you prefer merge-based sync instead of rebase.
 - Use `--no-sync-reused-branch` only when you intentionally want to skip auto-sync.
-- Use `--dry-run` to preview selected base branch and whether each issue will create or reuse branch/PR resources.
+- Use `--dry-run` to preview selected base branch mode (`default` vs `current`), selected base branch name, and whether each issue will create or reuse branch/PR resources.
 - `--dry-run` also shows whether reused-branch sync will run and which strategy will be used.
+- In `--base current` mode, the runner warns when the current branch is dirty, has no upstream tracking branch, or is ahead of upstream.
 - Use `--fail-on-existing` when you want strict behavior and prefer the run to fail if branch/PR already exists.
 
 ## Auto switch to PR-review mode

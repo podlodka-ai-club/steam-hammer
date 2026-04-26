@@ -8,5 +8,6 @@
   "fail_on_existing": false,
   "force_issue_flow": false,
   "sync_reused_branch": true,
-  "sync_strategy": "rebase"
+  "sync_strategy": "rebase",
+  "base_branch": "default"
 }

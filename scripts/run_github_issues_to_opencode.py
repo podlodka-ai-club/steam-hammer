@@ -27,6 +27,7 @@ BUILTIN_DEFAULTS = {
     "force_issue_flow": False,
     "sync_reused_branch": True,
     "sync_strategy": "rebase",
+    "base_branch": "default",
     "dir": ".",
 }
 
@@ -794,6 +795,44 @@ def ensure_clean_worktree() -> None:
         raise RuntimeError("Git working tree must be clean before running this script.")
 
 
+def current_branch_stack_warnings() -> list[str]:
+    warnings: list[str] = []
+
+    if has_changes():
+        warnings.append(
+            "current branch has uncommitted changes; stacked mode expects a clean branch"
+        )
+
+    try:
+        upstream_ref = run_capture(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]
+        ).strip()
+    except RuntimeError:
+        warnings.append(
+            "current branch has no upstream tracking branch; stacked base may not be visible remotely"
+        )
+        return warnings
+
+    if not upstream_ref:
+        warnings.append(
+            "current branch has empty upstream tracking ref; stacked base may not be visible remotely"
+        )
+        return warnings
+
+    ahead_count_raw = run_capture(["git", "rev-list", "--count", f"{upstream_ref}..HEAD"]).strip()
+    try:
+        ahead_count = int(ahead_count_raw)
+    except ValueError:
+        ahead_count = 0
+
+    if ahead_count > 0:
+        warnings.append(
+            f"current branch is ahead of {upstream_ref} by {ahead_count} commit(s); push it before stacked run"
+        )
+
+    return warnings
+
+
 def slugify(text: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", text.lower()).strip("-")
     return cleaned[:40] or "issue"
@@ -1431,6 +1470,7 @@ def open_pr(
     branch_name: str,
     issue: dict,
     dry_run: bool,
+    stacked_base_context: str | None = None,
 ) -> str:
     title = f"Fix issue #{issue['number']}: {issue['title']}"
     body = (
@@ -1439,6 +1479,12 @@ def open_pr(
         f"- Source issue: {issue['url']}\n\n"
         f"Closes #{issue['number']}\n"
     )
+    if stacked_base_context:
+        body += (
+            "\n## Stack Context\n"
+            f"- Stacked on current branch: `{stacked_base_context}`\n"
+            f"- Base for this PR is `{stacked_base_context}` (not repository default branch)\n"
+        )
     if dry_run:
         print(
             f"[dry-run] Would create PR '{title}' from '{branch_name}' to '{base_branch}'"
@@ -1533,6 +1579,7 @@ def ensure_pr(
     issue: dict,
     dry_run: bool,
     fail_on_existing: bool,
+    stacked_base_context: str | None = None,
 ) -> tuple[str, str]:
     existing_pr = find_existing_pr(repo=repo, base_branch=base_branch, branch_name=branch_name)
     if existing_pr is not None:
@@ -1577,6 +1624,7 @@ def ensure_pr(
         branch_name=branch_name,
         issue=issue,
         dry_run=dry_run,
+        stacked_base_context=stacked_base_context,
     )
     return "created", pr_url
 
@@ -1605,6 +1653,7 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "force_issue_flow",
         "sync_reused_branch",
         "sync_strategy",
+        "base_branch",
     }
 
     unsupported = sorted(set(config) - supported_keys)
@@ -1683,6 +1732,11 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         if config["sync_strategy"] not in {"rebase", "merge"}:
             raise RuntimeError("Local config key 'sync_strategy' must be one of: rebase, merge")
         validated["sync_strategy"] = config["sync_strategy"]
+
+    if "base_branch" in config:
+        if config["base_branch"] not in {"default", "current"}:
+            raise RuntimeError("Local config key 'base_branch' must be one of: default, current")
+        validated["base_branch"] = config["base_branch"]
 
     return validated
 
@@ -1844,6 +1898,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--base",
+        "--base-branch",
+        dest="base_branch",
+        default=BUILTIN_DEFAULTS["base_branch"],
+        choices=["default", "current"],
+        help=(
+            "Issue-flow base branch mode: 'default' uses repository default branch, "
+            "'current' stacks new issue branches on the currently checked out branch."
+        ),
+    )
+    parser.add_argument(
         "--dir",
         default=BUILTIN_DEFAULTS["dir"],
         help="Path to the local git repository to operate on. Defaults to the current directory.",
@@ -1887,6 +1952,7 @@ def main() -> int:
     has_force_issue_flow_flag = hasattr(args, "force_issue_flow")
     pr_followup_branch_prefix = getattr(args, "pr_followup_branch_prefix", None)
     post_pr_summary = bool(getattr(args, "post_pr_summary", False))
+    base_branch_mode = str(getattr(args, "base_branch", BUILTIN_DEFAULTS["base_branch"]))
 
     try:
         target_dir = os.path.abspath(args.dir)
@@ -1908,18 +1974,35 @@ def main() -> int:
         if pr_number_arg is not None and not from_review_comments:
             raise RuntimeError("--pr requires --from-review-comments.")
 
+        if not pr_mode_requested and base_branch_mode == "current":
+            for warning in current_branch_stack_warnings():
+                print(f"Warning: {warning}", file=sys.stderr)
+
         ensure_clean_worktree()
         repo = args.repo or detect_repo()
         if pr_mode_requested:
             base_branch = ""
             issues = []
         else:
-            base_branch = detect_default_branch(repo)
-            mode_label = "[dry-run]" if args.dry_run else ""
-            if mode_label:
-                print(f"{mode_label} Selected stable base branch: {base_branch}")
+            if base_branch_mode == "current":
+                base_branch = current_branch()
             else:
-                print(f"Selected stable base branch: {base_branch}")
+                base_branch = detect_default_branch(repo)
+            mode_label = "[dry-run]" if args.dry_run else ""
+            if base_branch_mode == "current":
+                if mode_label:
+                    print(f"{mode_label} Selected current base branch: {base_branch}")
+                    print(f"{mode_label} Base mode: current (stack on current branch: yes)")
+                else:
+                    print(f"Selected current base branch: {base_branch}")
+                    print("Base mode: current (stack on current branch: yes)")
+            else:
+                if mode_label:
+                    print(f"{mode_label} Selected stable base branch: {base_branch}")
+                    print(f"{mode_label} Base mode: default (stack on current branch: no)")
+                else:
+                    print(f"Selected stable base branch: {base_branch}")
+                    print("Base mode: default (stack on current branch: no)")
 
             if issue_number_arg is not None:
                 issues = [fetch_issue(repo=repo, number=issue_number_arg)]
@@ -2472,6 +2555,10 @@ def main() -> int:
                 issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
                 target_base_branch = base_branch
 
+            stacked_base_context = (
+                target_base_branch if mode == "issue-flow" and base_branch_mode == "current" else None
+            )
+
             if mode == "issue-flow":
                 safe_post_orchestration_state_comment(
                     repo=repo,
@@ -2582,6 +2669,7 @@ def main() -> int:
                         issue=issue,
                         dry_run=False,
                         fail_on_existing=args.fail_on_existing,
+                        stacked_base_context=stacked_base_context,
                     )
                     if pr_url:
                         touched_prs.append(pr_url)
@@ -2679,6 +2767,7 @@ def main() -> int:
                 issue=issue,
                 dry_run=args.dry_run,
                 fail_on_existing=args.fail_on_existing,
+                stacked_base_context=stacked_base_context,
             )
             if pr_url:
                 touched_prs.append(pr_url)

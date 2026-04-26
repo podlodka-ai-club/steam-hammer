@@ -217,7 +217,7 @@ Workflow per issue:
 4. Chooses a base branch (`default`: repository default branch from GitHub; `current`: currently checked-out branch)
 5. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
 6. For reused branches, syncs with the latest selected base branch before agent run (default: `rebase`)
-7. Runs the AI agent with issue title/body context
+7. Extracts image attachment references from issue content (or attachment metadata), downloads available images, and runs the AI agent with title/body context plus image files when present.
 8. On changes, creates commit
 9. Pushes issue branch to `origin`
 10. Reuses an existing open PR for the issue branch when present; otherwise creates one to the selected base branch
@@ -264,7 +264,10 @@ Useful options:
 
 - `--runner claude|opencode` to select the AI agent runner (default: `claude`)
 - `--state open|closed|all`
-- `--include-empty` to process issues with empty body
+- `--include-empty` to process issues with empty body; image-only issues are now processed automatically when image attachments are detected.
+- Image attachment handling: when issue content includes image URLs or attachment metadata, the script downloads images to a temp directory and passes them to Claude as `--image <path>` arguments.
+- If image download fails for a specific attachment, processing continues with text prompt only and logs a warning.
+- Jira attachment API support is out of scope for this slice; current behavior relies on GitHub body image extraction and generic attachment metadata fallback.
 - `--stop-on-error` to stop on first failed run
 - `--dry-run` to preview without executing the agent (includes scope decision per issue)
 - `--pr N --from-review-comments` to run PR review-comments mode

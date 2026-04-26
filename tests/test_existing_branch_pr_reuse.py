@@ -254,6 +254,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         with (
             patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
             patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"),
             patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
             patch(
                 "scripts.run_github_issues_to_opencode.fetch_issue",
@@ -306,6 +307,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         with (
             patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
             patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"),
             patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
             patch(
                 "scripts.run_github_issues_to_opencode.fetch_issue",
@@ -387,6 +389,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         with (
             patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
             patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"),
             patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
             patch(
                 "scripts.run_github_issues_to_opencode.fetch_issue",
@@ -527,6 +530,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         with (
             patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
             patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"),
             patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
             patch(
                 "scripts.run_github_issues_to_opencode.fetch_issue",

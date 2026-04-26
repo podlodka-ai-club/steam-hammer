@@ -1,5 +1,9 @@
 import importlib.util
+import io
+import json
+import os
 import pathlib
+import re
 import sys
 import tempfile
 import types
@@ -362,6 +366,65 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertIn("Location: scripts/tool.py:42", prompt)
         self.assertIn("Link: https://example/comment/1", prompt)
 
+    def test_format_orchestration_state_comment_contains_marker_and_parseable_json(self) -> None:
+        state = self.mod.build_orchestration_state(
+            status="in-progress",
+            task_type="issue",
+            issue_number=43,
+            pr_number=None,
+            branch="issue-fix/43-state-comments",
+            base_branch="main",
+            runner="opencode",
+            agent="build",
+            model=None,
+            attempt=1,
+            stage="agent_run",
+            next_action="wait_for_agent_result",
+            error=None,
+        )
+
+        body = self.mod.format_orchestration_state_comment(state)
+
+        self.assertIn("<!-- orchestration-state:v1 -->", body)
+        json_match = re.search(r"```json\n(.*?)\n```", body, re.DOTALL)
+        self.assertIsNotNone(json_match)
+        payload = json.loads(json_match.group(1))
+        self.assertEqual(payload["status"], "in-progress")
+        self.assertEqual(payload["issue"], 43)
+        self.assertEqual(payload["branch"], "issue-fix/43-state-comments")
+
+    def test_post_orchestration_state_comment_dry_run_does_not_call_gh(self) -> None:
+        state = self.mod.build_orchestration_state(
+            status="ready-for-review",
+            task_type="issue",
+            issue_number=43,
+            pr_number=120,
+            branch="issue-fix/43-state-comments",
+            base_branch="main",
+            runner="opencode",
+            agent="build",
+            model="openai/gpt-5.3-codex",
+            attempt=1,
+            stage="pr_ready",
+            next_action="wait_for_review",
+            error=None,
+        )
+
+        with (
+            mock.patch.object(self.mod, "run_command") as run_command_mock,
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            self.mod.post_orchestration_state_comment(
+                repo="owner/repo",
+                target_type="issue",
+                target_number=43,
+                state=state,
+                dry_run=True,
+            )
+
+        run_command_mock.assert_not_called()
+        self.assertIn("[dry-run] Would post orchestration state to issue #43", stdout_mock.getvalue())
+
     def test_load_linked_issue_context_fetches_missing_issue_body(self) -> None:
         pull_request = {
             "closingIssuesReferences": [
@@ -443,10 +506,16 @@ class PrReviewModeTests(unittest.TestCase):
                     "normalize_review_items",
                     return_value=([], {"threads_total": 0, "threads_resolved": 0, "comments_total": 0, "comments_outdated": 0, "comments_empty": 0, "reviews_used": 0}),
                 ),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
             ):
-                exit_code = self.mod.main()
+                previous_cwd = os.getcwd()
+                try:
+                    exit_code = self.mod.main()
+                finally:
+                    os.chdir(previous_cwd)
 
         self.assertEqual(exit_code, 0)
+        self.assertIn("[dry-run] Would post orchestration state to pr #23", stdout_mock.getvalue())
 
     def test_issue_mode_auto_switch_uses_actionable_conversation_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -506,7 +575,11 @@ class PrReviewModeTests(unittest.TestCase):
                 mock.patch.object(self.mod, "push_branch"),
                 mock.patch.object(self.mod, "commit_changes"),
             ):
-                exit_code = self.mod.main()
+                previous_cwd = os.getcwd()
+                try:
+                    exit_code = self.mod.main()
+                finally:
+                    os.chdir(previous_cwd)
 
         self.assertEqual(exit_code, 0)
         self.assertTrue(run_agent_mock.called)

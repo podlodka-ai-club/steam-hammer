@@ -102,6 +102,7 @@ Workflow per issue:
 5. On changes, creates commit
 6. Pushes issue branch to `origin`
 7. Reuses an existing open PR for the issue branch when present; otherwise creates one to the stable base branch
+8. Posts append-only orchestration state comments to GitHub issue/PR on key transitions
 
 Workflow in PR review mode:
 
@@ -114,6 +115,13 @@ Workflow in PR review mode:
 4. Runs AI agent in current branch (or optional follow-up branch)
 5. On changes, creates commit and pushes updates
 6. Optionally posts a summary comment to the PR
+7. Posts append-only orchestration state comments to the PR (`in-progress`, `waiting-for-ci`, `waiting-for-author`, `failed`)
+
+State comment format:
+
+- Marker: `<!-- orchestration-state:v1 -->`
+- Contains a human-readable header and a parseable JSON payload with fields like `status`, `task_type`, `issue`, `pr`, `branch`, `base_branch`, `runner`, `agent`, `model`, `attempt`, `stage`, `next_action`, `error`, `timestamp`
+- Dry-run never posts comments; it prints which state comment would be posted and where
 
 Useful options:
 

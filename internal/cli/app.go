@@ -119,6 +119,9 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 	opts := commonOptions{}
 	addCommonFlags(fs, &opts)
 	id := fs.Int("id", 0, "GitHub issue number")
+	issue := fs.Int("issue", 0, "GitHub issue number (alias for --id)")
+	state := fs.String("state", "", "issue state for batch runs: open, closed, or all")
+	limit := fs.Int("limit", 0, "maximum number of issues to process for batch runs")
 	base := ""
 	fs.StringVar(&base, "base", "", "base branch mode: default or current")
 	fs.StringVar(&base, "base-branch", "", "base branch mode: default or current")
@@ -142,13 +145,23 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintf(a.err, "unexpected run issue argument: %s\n", fs.Arg(0))
 		return 2
 	}
-	if *id <= 0 {
-		_, _ = fmt.Fprintln(a.err, "run issue requires --id N")
+	issueID := selectedID(*id, *issue)
+	if issueID < 0 {
+		_, _ = fmt.Fprintln(a.err, "use only one of --id or --issue")
 		return 2
 	}
 
-	pythonArgs := []string{runnerScript, "--issue", strconv.Itoa(*id)}
+	pythonArgs := []string{runnerScript}
+	if issueID > 0 {
+		pythonArgs = append(pythonArgs, "--issue", strconv.Itoa(issueID))
+	}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
+	if *state != "" {
+		pythonArgs = append(pythonArgs, "--state", *state)
+	}
+	if *limit > 0 {
+		pythonArgs = append(pythonArgs, "--limit", strconv.Itoa(*limit))
+	}
 	if base != "" {
 		pythonArgs = append(pythonArgs, "--base", base)
 	}
@@ -164,16 +177,22 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 	if *forceIssueFlow {
 		pythonArgs = append(pythonArgs, "--force-issue-flow")
 	}
-	if !*skipIfPRExists || *noSkipIfPRExists {
+	if flagPassed(fs, "skip-if-pr-exists") {
+		pythonArgs = append(pythonArgs, "--skip-if-pr-exists")
+	} else if !*skipIfPRExists || *noSkipIfPRExists {
 		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
 	}
-	if !*skipIfBranchExists || *noSkipIfBranchExists {
+	if flagPassed(fs, "skip-if-branch-exists") {
+		pythonArgs = append(pythonArgs, "--skip-if-branch-exists")
+	} else if !*skipIfBranchExists || *noSkipIfBranchExists {
 		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
 	}
 	if *forceReprocess {
 		pythonArgs = append(pythonArgs, "--force-reprocess")
 	}
-	if !*syncReusedBranch || *noSyncReusedBranch {
+	if flagPassed(fs, "sync-reused-branch") {
+		pythonArgs = append(pythonArgs, "--sync-reused-branch")
+	} else if !*syncReusedBranch || *noSyncReusedBranch {
 		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
 	}
 	if *syncStrategy != "" {
@@ -187,6 +206,8 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	opts := commonOptions{}
 	addCommonFlags(fs, &opts)
 	id := fs.Int("id", 0, "GitHub pull request number")
+	pr := fs.Int("pr", 0, "GitHub pull request number (alias for --id)")
+	fs.Bool("from-review-comments", false, "accepted for compatibility; run pr always uses review comments")
 	allowBranchSwitch := fs.Bool("allow-pr-branch-switch", false, "allow switching to the target PR branch")
 	isolateWorktree := fs.Bool("isolate-worktree", false, "run in a temporary git worktree")
 	postSummary := fs.Bool("post-pr-summary", false, "post a summary comment after success")
@@ -199,12 +220,16 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintf(a.err, "unexpected run pr argument: %s\n", fs.Arg(0))
 		return 2
 	}
-	if *id <= 0 {
+	prID := selectedID(*id, *pr)
+	if prID < 0 {
+		_, _ = fmt.Fprintln(a.err, "use only one of --id or --pr")
+		return 2
+	}
+	if prID <= 0 {
 		_, _ = fmt.Fprintln(a.err, "run pr requires --id N")
 		return 2
 	}
-
-	pythonArgs := []string{runnerScript, "--pr", strconv.Itoa(*id), "--from-review-comments"}
+	pythonArgs := []string{runnerScript, "--pr", strconv.Itoa(prID), "--from-review-comments"}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
 	if *allowBranchSwitch {
 		pythonArgs = append(pythonArgs, "--allow-pr-branch-switch")
@@ -315,6 +340,26 @@ func appendCommonPythonArgs(args []string, opts commonOptions) []string {
 		args = append(args, "--agent-idle-timeout-seconds", strconv.Itoa(*opts.idleTime))
 	}
 	return args
+}
+
+func selectedID(primary, alias int) int {
+	if primary > 0 && alias > 0 {
+		return -1
+	}
+	if primary > 0 {
+		return primary
+	}
+	return alias
+}
+
+func flagPassed(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 func newFlagSet(name string, err io.Writer) *flag.FlagSet {

@@ -214,6 +214,18 @@ CI_FAILURE_CHECK_RUN_CONCLUSIONS = {
 CI_FAILURE_COMMIT_STATES = {"error", "failure"}
 
 
+def failure_state_for_stage(failure_stage: str) -> str:
+    return "blocked" if failure_stage in {"workflow_checks", "residual_untracked_validation"} else "failed"
+
+
+def failure_next_action_for_stage(failure_stage: str) -> str:
+    if failure_stage == "workflow_checks":
+        return "fix_workflow_checks_and_retry"
+    if failure_stage == "residual_untracked_validation":
+        return "stage_or-remove-residual-untracked-files"
+    return "inspect_error_and_retry"
+
+
 class WorkflowCheckFailure(RuntimeError):
     def __init__(self, failed_check: dict, checks: list[dict]):
         self.failed_check = failed_check
@@ -233,6 +245,16 @@ class WorkflowCheckFailure(RuntimeError):
         super().__init__(
             f"Workflow check '{check_name}' failed"
             f" (exit code {exit_code if exit_code is not None else 'unknown'}){evidence}"
+        )
+
+
+class ResidualUntrackedFilesError(RuntimeError):
+    def __init__(self, files: list[str], stage: str):
+        self.files = files
+        self.stage = stage
+        super().__init__(
+            "Residual untracked files detected during"
+            f" {stage}: {', '.join(sorted(files))}"
         )
 
 
@@ -1482,6 +1504,16 @@ def has_changes() -> bool:
     return bool(run_capture(["git", "status", "--porcelain"]).strip())
 
 
+def residual_untracked_files_after_baseline(
+    pre_run_untracked_files: set[str] | None,
+) -> list[str]:
+    if pre_run_untracked_files is None:
+        return []
+
+    post_run_untracked_files = list_untracked_files()
+    return sorted(post_run_untracked_files - set(pre_run_untracked_files))
+
+
 def list_untracked_files() -> set[str]:
     status_output = run_capture(["git", "ls-files", "--others", "--exclude-standard"]).strip()
     if not status_output:
@@ -1495,8 +1527,7 @@ def stage_worktree_changes(pre_run_untracked_files: set[str] | None = None) -> N
     if pre_run_untracked_files is None:
         return
 
-    post_run_untracked_files = list_untracked_files()
-    new_untracked_files = sorted(post_run_untracked_files - set(pre_run_untracked_files))
+    new_untracked_files = residual_untracked_files_after_baseline(pre_run_untracked_files)
     if new_untracked_files:
         run_command(["git", "add", "--", *new_untracked_files])
 
@@ -1587,6 +1618,8 @@ def build_issue_failure_report_comment(
     runner: str,
     agent: str,
     model: str | None,
+    residual_untracked_files: list[str] | None = None,
+    next_action: str | None = None,
 ) -> str:
     payload = {
         "status": "failed",
@@ -1601,10 +1634,26 @@ def build_issue_failure_report_comment(
         "model": model,
         "timestamp": utc_now_iso(),
     }
-    next_actions = (
+    if residual_untracked_files:
+        payload["residual_untracked_files"] = sorted(residual_untracked_files)
+        payload["residual_untracked_count"] = len(residual_untracked_files)
+        payload["residual_validation_stage"] = stage
+
+    next_actions = next_action or (
         "Next actions: rerun with --dry-run for preview, rerun with --force-reprocess "
         "to override skip guards, or take over manually from the branch above."
     )
+
+    evidence = ""
+    if payload.get("residual_untracked_files"):
+        files = payload["residual_untracked_files"]
+        file_lines = "\n".join(f"  - `{item}`" for item in files)
+        evidence = (
+            f"\nFailure evidence:\n"
+            f"- stage: `{payload.get('residual_validation_stage') or 'unknown'}`\n"
+            f"- residual untracked files:\n{file_lines}"
+        )
+
     return (
         "Automation failure report\n\n"
         f"- status: `{payload['status']}`\n"
@@ -1617,6 +1666,7 @@ def build_issue_failure_report_comment(
         f"- model: `{payload['model'] or 'default'}`\n"
         f"- run id: `{payload['run_id']}`\n"
         f"- timestamp: `{payload['timestamp']}`\n\n"
+        f"{evidence}\n"
         f"{next_actions}\n\n"
         f"{AGENT_FAILURE_REPORT_MARKER}\n"
         f"```json\n{json.dumps(payload, ensure_ascii=True, indent=2)}\n```"
@@ -1733,6 +1783,8 @@ def safe_report_issue_automation_failure(
     model: str | None,
     dry_run: bool,
     already_reported_issue_numbers: set[int],
+    residual_untracked_files: list[str] | None = None,
+    next_action: str | None = None,
 ) -> None:
     if issue_number in already_reported_issue_numbers:
         return
@@ -1748,6 +1800,8 @@ def safe_report_issue_automation_failure(
             runner=runner,
             agent=agent,
             model=model,
+            residual_untracked_files=residual_untracked_files,
+            next_action=next_action,
         )
         if dry_run:
             print(
@@ -1876,6 +1930,7 @@ def build_orchestration_state(
     error: str | None,
     workflow_checks: list[dict] | None = None,
     ci_checks: list[dict] | None = None,
+    residual_untracked_files: list[str] | None = None,
 ) -> dict:
     if status not in ORCHESTRATION_STATE_STATUSES:
         raise RuntimeError(f"Unsupported orchestration state status: {status}")
@@ -1902,6 +1957,10 @@ def build_orchestration_state(
         state["workflow_checks"] = workflow_checks
     if ci_checks is not None:
         state["ci_checks"] = ci_checks
+    if residual_untracked_files is not None:
+        sorted_residual = sorted(residual_untracked_files)
+        state["residual_untracked_files"] = sorted_residual
+        state["residual_untracked_count"] = len(sorted_residual)
     return state
 
 
@@ -2496,6 +2555,14 @@ def commit_changes(
         return message
     stage_worktree_changes(pre_run_untracked_files)
     run_command(["git", "commit", "-m", message])
+
+    residual_untracked_files = residual_untracked_files_after_baseline(pre_run_untracked_files)
+    if residual_untracked_files:
+        raise ResidualUntrackedFilesError(
+            files=residual_untracked_files,
+            stage="issue_commit_validation",
+        )
+
     return message
 
 
@@ -2533,6 +2600,14 @@ def commit_pr_review_changes(
         return message
     stage_worktree_changes(pre_run_untracked_files)
     run_command(["git", "commit", "-m", message])
+
+    residual_untracked_files = residual_untracked_files_after_baseline(pre_run_untracked_files)
+    if residual_untracked_files:
+        raise ResidualUntrackedFilesError(
+            files=residual_untracked_files,
+            stage="pr_review_commit_validation",
+        )
+
     return message
 
 
@@ -4146,14 +4221,16 @@ def main() -> int:
             if pr_number_arg is not None:
                 failed_pr_number = pr_state_context.get("pr")
                 if type(failed_pr_number) is int:
-                    failure_status = "blocked" if failure_stage == "workflow_checks" else "failed"
-                    next_action = (
-                        "fix_workflow_checks_and_retry"
-                        if failure_stage == "workflow_checks"
-                        else "inspect_error_and_retry"
-                    )
+                    if isinstance(exc, ResidualUntrackedFilesError):
+                        failure_stage = "residual_untracked_validation"
+
+                    failure_status = failure_state_for_stage(failure_stage)
+                    next_action = failure_next_action_for_stage(failure_stage)
                     workflow_results = (
                         exc.checks if isinstance(exc, WorkflowCheckFailure) else None
+                    )
+                    residual_untracked_files = (
+                        exc.files if isinstance(exc, ResidualUntrackedFilesError) else None
                     )
                     safe_post_orchestration_state_comment(
                         repo=repo,
@@ -4175,6 +4252,7 @@ def main() -> int:
                             next_action=next_action,
                             error=short_error_text(str(exc)),
                             workflow_checks=workflow_results,
+                            residual_untracked_files=residual_untracked_files,
                         ),
                     )
             print(f"Error: {exc}", file=sys.stderr)
@@ -5052,13 +5130,15 @@ def main() -> int:
                 )
         except Exception as exc:  # noqa: BLE001
             failures += 1
-            failure_status = "blocked" if failure_stage == "workflow_checks" else "failed"
-            next_action = (
-                "fix_workflow_checks_and_retry"
-                if failure_stage == "workflow_checks"
-                else "inspect_error_and_retry"
-            )
+            if isinstance(exc, ResidualUntrackedFilesError):
+                failure_stage = "residual_untracked_validation"
+
+            failure_status = failure_state_for_stage(failure_stage)
+            next_action = failure_next_action_for_stage(failure_stage)
             workflow_results = exc.checks if isinstance(exc, WorkflowCheckFailure) else None
+            residual_untracked_files = (
+                exc.files if isinstance(exc, ResidualUntrackedFilesError) else None
+            )
             safe_post_orchestration_state_comment(
                 repo=repo,
                 target_type=state_target_type,
@@ -5079,6 +5159,7 @@ def main() -> int:
                     next_action=next_action,
                     error=short_error_text(str(exc)),
                     workflow_checks=workflow_results,
+                    residual_untracked_files=residual_untracked_files,
                 ),
             )
             safe_report_issue_automation_failure(
@@ -5092,6 +5173,8 @@ def main() -> int:
                 runner=args.runner,
                 agent=args.agent,
                 model=args.model,
+                residual_untracked_files=residual_untracked_files,
+                next_action=next_action,
                 dry_run=args.dry_run,
                 already_reported_issue_numbers=reported_issue_failures,
             )

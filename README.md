@@ -53,6 +53,31 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --f
 python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 45 --base current --runner opencode --agent build
 ```
 
+## Doctor diagnostics
+
+Run environment diagnostics without starting an agent run:
+
+```bash
+python scripts/run_github_issues_to_opencode.py --doctor --repo owner/repo
+```
+
+Optional: include a lightweight runner CLI smoke check:
+
+```bash
+python scripts/run_github_issues_to_opencode.py --doctor --doctor-smoke-check --runner opencode --model openai/gpt-5.3-codex
+```
+
+Doctor output uses `[PASS]`, `[WARN]`, `[FAIL]` per check and prints a final summary.
+
+- `PASS`: check is healthy.
+- `WARN`: non-blocking issue or optional check skipped.
+- `FAIL`: blocking readiness issue.
+
+Exit codes:
+
+- `0` when there are no failed checks.
+- non-zero when one or more checks fail.
+
 ## Local config preset (per user/per machine)
 
 You can define local defaults without changing repository defaults.
@@ -172,6 +197,8 @@ Useful options:
 - `--sync-reused-branch` / `--no-sync-reused-branch` enable or disable reused-branch sync before agent run (default: enabled)
 - `--sync-strategy rebase|merge` choose how to sync a reused branch with selected base (default: `rebase`)
 - `--base default|current` (`--base-branch` alias) choose issue-flow base mode; `current` enables stacked execution from your current branch (opt-in)
+- `--doctor` run preflight diagnostics only (no agent run)
+- `--doctor-smoke-check` in doctor mode, run a lightweight runner CLI smoke check
 
 If `--repo` is not provided, script tries to detect repository from current `gh` context.
 

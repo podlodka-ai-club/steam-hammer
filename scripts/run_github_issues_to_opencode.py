@@ -71,6 +71,19 @@ def command_succeeds(command: list[str]) -> bool:
     return result.returncode == 0
 
 
+def run_check_command(command: list[str], cwd: str | None = None) -> tuple[bool, str, str, int]:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, cwd=cwd)
+    except FileNotFoundError as exc:
+        return False, "", str(exc), 127
+    return (
+        result.returncode == 0,
+        (result.stdout or "").strip(),
+        (result.stderr or "").strip(),
+        result.returncode,
+    )
+
+
 def current_head_sha() -> str:
     return run_capture(["git", "rev-parse", "HEAD"]).strip()
 
@@ -2072,6 +2085,286 @@ def load_local_config(config_path: str) -> dict:
     return validate_local_config(config=data, config_path=config_path)
 
 
+def _doctor_record(checks: list[dict[str, str]], status: str, name: str, detail: str) -> None:
+    checks.append({"status": status, "name": name, "detail": detail})
+
+
+def _doctor_has_flag(argv: list[str], flag: str) -> bool:
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv)
+
+
+def run_doctor(args: argparse.Namespace, raw_argv: list[str] | None = None) -> int:
+    argv = raw_argv or []
+    checks: list[dict[str, str]] = []
+
+    target_dir = os.path.abspath(getattr(args, "dir", BUILTIN_DEFAULTS["dir"]))
+    repo_arg = getattr(args, "repo", None)
+    runner = str(getattr(args, "runner", BUILTIN_DEFAULTS["runner"]))
+    model = getattr(args, "model", None)
+    agent = str(getattr(args, "agent", BUILTIN_DEFAULTS["agent"]))
+    base_branch_mode = str(getattr(args, "base_branch", BUILTIN_DEFAULTS["base_branch"]))
+    smoke_enabled = bool(getattr(args, "doctor_smoke_check", False))
+    explicit_local_config = _doctor_has_flag(argv, "--local-config")
+
+    print("Doctor diagnostics")
+    print(f"- Directory: {target_dir}")
+    print(f"- Runner: {runner}")
+
+    if not os.path.isdir(target_dir):
+        _doctor_record(
+            checks,
+            "FAIL",
+            "Repository directory",
+            f"directory does not exist: {target_dir}",
+        )
+    elif not os.path.isdir(os.path.join(target_dir, ".git")):
+        _doctor_record(
+            checks,
+            "FAIL",
+            "Repository directory",
+            f"not a git repository: {target_dir}",
+        )
+    else:
+        ok_repo, stdout_repo, stderr_repo, _ = run_check_command(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=target_dir,
+        )
+        if ok_repo and stdout_repo == "true":
+            _doctor_record(checks, "PASS", "Git repository", "inside a git work tree")
+        else:
+            detail = stderr_repo or stdout_repo or "unable to verify git work tree"
+            _doctor_record(checks, "FAIL", "Git repository", detail)
+
+        ok_clean, stdout_clean, stderr_clean, _ = run_check_command(
+            ["git", "status", "--porcelain"],
+            cwd=target_dir,
+        )
+        if not ok_clean:
+            _doctor_record(
+                checks,
+                "FAIL",
+                "Clean worktree",
+                stderr_clean or "failed to query git status",
+            )
+        elif stdout_clean:
+            _doctor_record(
+                checks,
+                "FAIL",
+                "Clean worktree",
+                "working tree has uncommitted changes",
+            )
+        else:
+            _doctor_record(checks, "PASS", "Clean worktree", "working tree is clean")
+
+    gh_path = shutil.which("gh")
+    if gh_path:
+        _doctor_record(checks, "PASS", "GitHub CLI", f"found at {gh_path}")
+    else:
+        _doctor_record(checks, "FAIL", "GitHub CLI", "gh is not installed or not in PATH")
+
+    if gh_path:
+        ok_auth, _stdout_auth, stderr_auth, _ = run_check_command(
+            ["gh", "auth", "status"],
+            cwd=target_dir,
+        )
+        if ok_auth:
+            _doctor_record(checks, "PASS", "gh auth", "authenticated")
+        else:
+            _doctor_record(
+                checks,
+                "FAIL",
+                "gh auth",
+                stderr_auth or "not authenticated (run gh auth login)",
+            )
+
+    resolved_repo = ""
+    if gh_path:
+        repo_command = ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]
+        if repo_arg:
+            repo_command = [
+                "gh",
+                "repo",
+                "view",
+                repo_arg,
+                "--json",
+                "nameWithOwner",
+                "--jq",
+                ".nameWithOwner",
+            ]
+        ok_repo_access, stdout_repo_access, stderr_repo_access, _ = run_check_command(
+            repo_command,
+            cwd=target_dir,
+        )
+        resolved_repo = stdout_repo_access.strip()
+        if ok_repo_access and resolved_repo:
+            _doctor_record(
+                checks,
+                "PASS",
+                "Repository access",
+                f"resolved repository: {resolved_repo}",
+            )
+        else:
+            _doctor_record(
+                checks,
+                "FAIL",
+                "Repository access",
+                stderr_repo_access
+                or "unable to detect/access repository (pass --repo owner/name if needed)",
+            )
+
+    if gh_path and resolved_repo:
+        ok_default, stdout_default, stderr_default, _ = run_check_command(
+            [
+                "gh",
+                "repo",
+                "view",
+                resolved_repo,
+                "--json",
+                "defaultBranchRef",
+                "--jq",
+                ".defaultBranchRef.name",
+            ],
+            cwd=target_dir,
+        )
+        if ok_default and stdout_default:
+            _doctor_record(
+                checks,
+                "PASS",
+                "Default branch",
+                f"default branch is '{stdout_default}'",
+            )
+        else:
+            _doctor_record(
+                checks,
+                "FAIL",
+                "Default branch",
+                stderr_default or "unable to read repository default branch",
+            )
+
+    claude_path = shutil.which("claude")
+    opencode_path = shutil.which("opencode")
+
+    if runner == "claude":
+        if claude_path:
+            _doctor_record(checks, "PASS", "Selected runner (claude)", f"found at {claude_path}")
+        else:
+            _doctor_record(checks, "FAIL", "Selected runner (claude)", "claude CLI not found")
+    else:
+        if opencode_path:
+            _doctor_record(checks, "PASS", "Selected runner (opencode)", f"found at {opencode_path}")
+        else:
+            _doctor_record(checks, "FAIL", "Selected runner (opencode)", "opencode CLI not found")
+
+    if claude_path:
+        _doctor_record(checks, "PASS", "Runner availability (claude)", "installed")
+    else:
+        _doctor_record(checks, "WARN", "Runner availability (claude)", "not installed")
+
+    if opencode_path:
+        _doctor_record(checks, "PASS", "Runner availability (opencode)", "installed")
+    else:
+        _doctor_record(checks, "WARN", "Runner availability (opencode)", "not installed")
+
+    if smoke_enabled:
+        smoke_command: list[str]
+        if runner == "claude":
+            smoke_command = ["claude"]
+            if model:
+                smoke_command.extend(["--model", str(model)])
+            smoke_command.append("--help")
+        else:
+            smoke_command = ["opencode", "run", "--agent", agent]
+            if model:
+                smoke_command.extend(["--model", str(model)])
+            smoke_command.append("--help")
+
+        ok_smoke, _stdout_smoke, stderr_smoke, _ = run_check_command(smoke_command, cwd=target_dir)
+        if ok_smoke:
+            _doctor_record(checks, "PASS", "Runner smoke check", "CLI invocation succeeded")
+        else:
+            _doctor_record(
+                checks,
+                "FAIL",
+                "Runner smoke check",
+                stderr_smoke or "runner smoke check failed",
+            )
+    else:
+        _doctor_record(
+            checks,
+            "WARN",
+            "Runner smoke check",
+            "skipped (use --doctor-smoke-check to enable)",
+        )
+
+    local_config_path = resolve_local_config_path(getattr(args, "local_config", None), target_dir)
+    if os.path.exists(local_config_path):
+        try:
+            config = load_local_config(local_config_path)
+            _doctor_record(
+                checks,
+                "PASS",
+                "Local config",
+                f"valid: {local_config_path} ({len(config)} key(s))",
+            )
+        except Exception as exc:  # noqa: BLE001
+            _doctor_record(checks, "FAIL", "Local config", str(exc))
+    else:
+        if explicit_local_config:
+            _doctor_record(
+                checks,
+                "FAIL",
+                "Local config",
+                f"configured path does not exist: {local_config_path}",
+            )
+        else:
+            _doctor_record(
+                checks,
+                "WARN",
+                "Local config",
+                f"optional config not found: {local_config_path}",
+            )
+
+    if base_branch_mode == "current":
+        try:
+            stack_warnings = current_branch_stack_warnings()
+        except Exception as exc:  # noqa: BLE001
+            _doctor_record(checks, "FAIL", "Stacked branch sanity", str(exc))
+        else:
+            if stack_warnings:
+                _doctor_record(
+                    checks,
+                    "WARN",
+                    "Stacked branch sanity",
+                    "; ".join(stack_warnings),
+                )
+            else:
+                _doctor_record(
+                    checks,
+                    "PASS",
+                    "Stacked branch sanity",
+                    "upstream tracking looks healthy for --base current",
+                )
+    else:
+        _doctor_record(
+            checks,
+            "PASS",
+            "Stacked branch sanity",
+            "not required (base mode is default)",
+        )
+
+    print()
+    for check in checks:
+        print(f"[{check['status']}] {check['name']}: {check['detail']}")
+
+    fail_count = sum(1 for check in checks if check["status"] == "FAIL")
+    warn_count = sum(1 for check in checks if check["status"] == "WARN")
+    pass_count = sum(1 for check in checks if check["status"] == "PASS")
+    print()
+    print(f"Doctor summary: {pass_count} pass, {warn_count} warn, {fail_count} fail")
+
+    return 1 if fail_count > 0 else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fetch GitHub issues with gh and run an AI agent for each issue body."
@@ -2291,6 +2584,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run", action="store_true", help="Print actions without running the agent."
     )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run environment diagnostics and exit without running any agent.",
+    )
+    parser.add_argument(
+        "--doctor-smoke-check",
+        action="store_true",
+        help=(
+            "In doctor mode, run a lightweight runner CLI smoke check "
+            "(still does not start an agent run)."
+        ),
+    )
     return parser
 
 
@@ -2298,20 +2604,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     bootstrap_parser = argparse.ArgumentParser(add_help=False)
     bootstrap_parser.add_argument("--dir", default=BUILTIN_DEFAULTS["dir"])
     bootstrap_parser.add_argument("--local-config")
+    bootstrap_parser.add_argument("--doctor", action="store_true")
     bootstrap_args, _ = bootstrap_parser.parse_known_args(argv)
 
     target_dir = os.path.abspath(bootstrap_args.dir)
     local_config_path = resolve_local_config_path(bootstrap_args.local_config, target_dir)
-    local_defaults = load_local_config(local_config_path)
 
     parser = build_parser()
-    parser.set_defaults(**local_defaults)
+    if not bootstrap_args.doctor:
+        local_defaults = load_local_config(local_config_path)
+        parser.set_defaults(**local_defaults)
     parser.set_defaults(local_config=local_config_path)
     return parser.parse_args(argv)
 
 
 def main() -> int:
-    args = parse_args()
+    raw_argv = sys.argv[1:]
+    args = parse_args(raw_argv)
+
+    if bool(getattr(args, "doctor", False)):
+        return run_doctor(args=args, raw_argv=raw_argv)
 
     issue_number_arg = getattr(args, "issue", None)
     pr_number_arg = getattr(args, "pr", None)

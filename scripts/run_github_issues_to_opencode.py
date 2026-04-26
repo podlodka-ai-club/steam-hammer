@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ import time
 LOCAL_CONFIG_RELATIVE_PATH = "local-config.json"
 PROJECT_CONFIG_RELATIVE_PATH = "project-config.json"
 BUILTIN_DEFAULTS = {
+    "tracker": "github",
     "state": "open",
     "limit": 10,
     "runner": "claude",
@@ -40,6 +42,16 @@ BUILTIN_DEFAULTS = {
     "sync_strategy": "rebase",
     "base_branch": "default",
     "dir": ".",
+}
+
+TRACKER_GITHUB = "github"
+TRACKER_JIRA = "jira"
+TRACKER_CHOICES = {TRACKER_GITHUB, TRACKER_JIRA}
+
+JIRA_ENV_VARS = {
+    "base_url": "JIRA_BASE_URL",
+    "email": "JIRA_EMAIL",
+    "api_token": "JIRA_API_TOKEN",
 }
 
 ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"

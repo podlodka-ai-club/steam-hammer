@@ -7,6 +7,10 @@ Script can run in two modes:
 
 Memo link: https://www.notion.so/Hacker-Sprint-1-33f2db4c860e8064a657e199b4578f66
 
+## Retrospectives
+
+Session retrospectives live in [`retro/`](retro/). They capture lessons from orchestration runs, including worker behavior, blocker handling, PR validation gaps, and follow-up improvements for the autonomous orchestrator loop.
+
 - `gh` (GitHub CLI) authenticated (`gh auth status`)
 - Python 3.10+
 - `claude` (Claude Code CLI) — default runner

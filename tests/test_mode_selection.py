@@ -34,6 +34,18 @@ class ModeSelectionTests(unittest.TestCase):
         self.assertEqual(mode, "issue-flow")
         self.assertIn("--force-issue-flow", reason)
 
+    def test_ready_for_review_state_prefers_pr_review_when_open_pr_exists(self) -> None:
+        mode, reason = choose_execution_mode(
+            issue_number=45,
+            linked_open_pr={"number": 144},
+            force_issue_flow=False,
+            recovered_state={"status": "ready-for-review"},
+        )
+
+        self.assertEqual(mode, "pr-review")
+        self.assertIn("ready-for-review", reason)
+        self.assertIn("#144", reason)
+
 
 if __name__ == "__main__":
     unittest.main()

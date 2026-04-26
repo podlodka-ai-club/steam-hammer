@@ -30,6 +30,13 @@ BUILTIN_DEFAULTS = {
     "dir": ".",
 }
 
+ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"
+RECOVERABLE_STATE_STATUSES = {
+    "ready-for-review",
+    "waiting-for-author",
+    "failed",
+}
+
 
 def run_capture(command: list[str]) -> str:
     result = subprocess.run(command, capture_output=True, text=True)
@@ -219,6 +226,134 @@ def _submitted_at_key(review: dict) -> str:
     if not isinstance(value, str):
         return ""
     return value
+
+
+def _first_json_object(raw: str) -> dict:
+    start = raw.find("{")
+    if start < 0:
+        raise ValueError("state payload is missing JSON object")
+    payload, _offset = json.JSONDecoder().raw_decode(raw[start:])
+    if not isinstance(payload, dict):
+        raise ValueError("state payload JSON must be an object")
+    return payload
+
+
+def parse_orchestration_state_comment_body(body: str) -> tuple[dict | None, str | None]:
+    if ORCHESTRATION_STATE_MARKER not in body:
+        return None, None
+
+    after_marker = body.split(ORCHESTRATION_STATE_MARKER, maxsplit=1)[1].strip()
+    if not after_marker:
+        return None, "marker found but payload is empty"
+
+    fenced_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", after_marker, flags=re.DOTALL)
+    candidates = fenced_matches if fenced_matches else [after_marker]
+
+    parse_errors: list[str] = []
+    for candidate in candidates:
+        try:
+            return _first_json_object(candidate), None
+        except (ValueError, json.JSONDecodeError) as exc:
+            parse_errors.append(str(exc))
+
+    if parse_errors:
+        return None, parse_errors[-1]
+    return None, "unable to parse state payload"
+
+
+def normalize_orchestration_state_status(state_payload: dict) -> str:
+    status_raw = state_payload.get("status")
+    if not isinstance(status_raw, str):
+        status_raw = state_payload.get("state")
+    return str(status_raw or "").strip().lower()
+
+
+def select_latest_parseable_orchestration_state(
+    comments: list[dict],
+    source_label: str,
+) -> tuple[dict | None, list[str]]:
+    latest: dict | None = None
+    warnings: list[str] = []
+
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+
+        body = str(comment.get("body") or "")
+        payload, error = parse_orchestration_state_comment_body(body)
+        if payload is None:
+            if error:
+                created_at = str(comment.get("created_at") or "unknown-time")
+                url = str(comment.get("html_url") or "")
+                context = f" at {url}" if url else ""
+                warnings.append(
+                    f"ignoring malformed orchestration state comment in {source_label}"
+                    f" ({created_at}){context}: {error}"
+                )
+            continue
+
+        created_at = str(comment.get("created_at") or "")
+        candidate = {
+            "source": source_label,
+            "created_at": created_at,
+            "url": str(comment.get("html_url") or ""),
+            "comment_id": comment.get("id"),
+            "payload": payload,
+            "status": normalize_orchestration_state_status(payload),
+        }
+        if latest is None or created_at >= str(latest.get("created_at") or ""):
+            latest = candidate
+
+    return latest, warnings
+
+
+def merge_latest_recovered_state(states: list[dict | None]) -> dict | None:
+    latest: dict | None = None
+    for state in states:
+        if state is None:
+            continue
+        if latest is None or str(state.get("created_at") or "") >= str(latest.get("created_at") or ""):
+            latest = state
+    return latest
+
+
+def format_recovered_state_context(state: dict) -> str:
+    status = str(state.get("status") or "unknown")
+    source = str(state.get("source") or "unknown")
+    created_at = str(state.get("created_at") or "unknown-time")
+    url = str(state.get("url") or "")
+    details = f"status={status}; source={source}; created_at={created_at}"
+    if url:
+        details += f"; comment={url}"
+    return details
+
+
+def build_recovered_failure_context_note(state: dict) -> str:
+    payload = state.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+
+    reason = str(
+        payload.get("failure")
+        or payload.get("error")
+        or payload.get("reason")
+        or payload.get("summary")
+        or ""
+    ).strip()
+    if not reason:
+        reason = "No explicit failure details were provided in prior state comment."
+
+    return (
+        "Recovered previous orchestration failure context:\n"
+        f"- {format_recovered_state_context(state)}\n"
+        f"- failure-context: {reason}"
+    )
+
+
+def append_recovered_context_to_prompt(prompt: str, note: str | None) -> str:
+    if not note:
+        return prompt
+    return f"{prompt.rstrip()}\n\n{note}\n"
 
 
 def _canonical_feedback_text(body: str) -> str:
@@ -428,8 +563,6 @@ def normalize_review_items(
             }
         )
         stats["reviews_used"] += 1
-        if is_pr_author_feedback:
-            stats["reviews_pr_author"] += 1
 
     for comment in conversation_comments or []:
         if not isinstance(comment, dict):
@@ -611,12 +744,12 @@ def fetch_pr_review_comments(repo: str, pr_number: int) -> list[dict]:
     return normalized_comments
 
 
-def fetch_pr_conversation_comments(repo: str, pr_number: int) -> list[dict]:
+def fetch_issue_comments(repo: str, issue_number: int) -> list[dict]:
     output = run_capture(
         [
             "gh",
             "api",
-            f"repos/{repo}/issues/{pr_number}/comments",
+            f"repos/{repo}/issues/{issue_number}/comments",
             "--method",
             "GET",
             "-f",
@@ -625,7 +758,12 @@ def fetch_pr_conversation_comments(repo: str, pr_number: int) -> list[dict]:
     )
     comments = json.loads(output)
     if not isinstance(comments, list):
-        raise RuntimeError("Unexpected response from gh api while fetching PR conversation comments")
+        raise RuntimeError("Unexpected response from gh api while fetching issue comments")
+    return comments
+
+
+def fetch_pr_conversation_comments(repo: str, pr_number: int) -> list[dict]:
+    comments = fetch_issue_comments(repo=repo, issue_number=pr_number)
 
     normalized_comments: list[dict] = []
     for comment in comments:
@@ -769,9 +907,21 @@ def choose_execution_mode(
     issue_number: int,
     linked_open_pr: dict | None,
     force_issue_flow: bool,
+    recovered_state: dict | None = None,
 ) -> tuple[str, str]:
     if force_issue_flow:
         return "issue-flow", "--force-issue-flow is set"
+
+    recovered_status = ""
+    if isinstance(recovered_state, dict):
+        recovered_status = str(recovered_state.get("status") or "")
+
+    if recovered_status == "ready-for-review" and linked_open_pr is not None:
+        pr_number = linked_open_pr.get("number")
+        return (
+            "pr-review",
+            f"recovered orchestration state is ready-for-review and linked open PR #{pr_number} exists",
+        )
 
     if linked_open_pr is None:
         return "issue-flow", f"no open PR linked to issue #{issue_number}"
@@ -1652,6 +1802,28 @@ def main() -> int:
             if type(pr_number_arg) is not int:
                 raise RuntimeError("--pr must be an integer pull request number")
 
+            recovered_pr_state: dict | None = None
+            try:
+                pr_comments = fetch_issue_comments(repo=repo, issue_number=pr_number_arg)
+                recovered_pr_state, pr_state_warnings = select_latest_parseable_orchestration_state(
+                    comments=pr_comments,
+                    source_label=f"pr #{pr_number_arg}",
+                )
+                for warning in pr_state_warnings:
+                    print(f"Warning: {warning}", file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    "Warning: unable to recover orchestration state from "
+                    f"PR #{pr_number_arg} comments: {exc}",
+                    file=sys.stderr,
+                )
+            if recovered_pr_state is not None:
+                prefix = "[dry-run] " if args.dry_run else ""
+                print(
+                    f"{prefix}Recovered orchestration state context: "
+                    f"{format_recovered_state_context(recovered_pr_state)}"
+                )
+
             pull_request = fetch_pull_request(repo=repo, number=pr_number_arg)
             pr_state = str(pull_request.get("state") or "").strip().upper()
             if pr_state != "OPEN":
@@ -1695,6 +1867,16 @@ def main() -> int:
                 review_items=review_items,
                 linked_issues=linked_issues,
             )
+            if (
+                recovered_pr_state is not None
+                and str(recovered_pr_state.get("status") or "") == "failed"
+            ):
+                failure_note = build_recovered_failure_context_note(recovered_pr_state)
+                print(
+                    "Recovered failed orchestration state for rerun: "
+                    f"{format_recovered_state_context(recovered_pr_state)}"
+                )
+                prompt = append_recovered_context_to_prompt(prompt, failure_note)
 
             base_branch_for_run = current_branch()
             active_branch = base_branch_for_run
@@ -1768,15 +1950,89 @@ def main() -> int:
     for issue in issues:
         try:
             linked_open_pr: dict | None = None
+            recovered_state: dict | None = None
             mode = "issue-flow"
             mode_reason = "batch issue processing"
             skip_agent_run = False
+            force_override_applied = False
             if issue_number_arg is not None and has_force_issue_flow_flag:
                 linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
+
+                recovered_issue_state: dict | None = None
+                try:
+                    issue_comments = fetch_issue_comments(repo=repo, issue_number=issue["number"])
+                    (
+                        recovered_issue_state,
+                        issue_state_warnings,
+                    ) = select_latest_parseable_orchestration_state(
+                        comments=issue_comments,
+                        source_label=f"issue #{issue['number']}",
+                    )
+                    for warning in issue_state_warnings:
+                        print(f"Warning: {warning}", file=sys.stderr)
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        "Warning: unable to recover orchestration state from "
+                        f"issue #{issue['number']} comments: {exc}",
+                        file=sys.stderr,
+                    )
+
+                recovered_pr_state: dict | None = None
+                if linked_open_pr is not None:
+                    linked_pr_number = linked_open_pr.get("number")
+                    if type(linked_pr_number) is int:
+                        try:
+                            linked_pr_comments = fetch_issue_comments(
+                                repo=repo,
+                                issue_number=linked_pr_number,
+                            )
+                            (
+                                recovered_pr_state,
+                                pr_state_warnings,
+                            ) = select_latest_parseable_orchestration_state(
+                                comments=linked_pr_comments,
+                                source_label=f"pr #{linked_pr_number}",
+                            )
+                            for warning in pr_state_warnings:
+                                print(f"Warning: {warning}", file=sys.stderr)
+                        except Exception as exc:  # noqa: BLE001
+                            print(
+                                "Warning: unable to recover orchestration state from "
+                                f"PR #{linked_pr_number} comments: {exc}",
+                                file=sys.stderr,
+                            )
+
+                recovered_state = merge_latest_recovered_state(
+                    [recovered_issue_state, recovered_pr_state]
+                )
+                if recovered_state is not None:
+                    prefix = "[dry-run] " if args.dry_run else ""
+                    print(
+                        f"{prefix}Recovered orchestration state context: "
+                        f"{format_recovered_state_context(recovered_state)}"
+                    )
+
+                recovered_status = ""
+                if recovered_state is not None:
+                    recovered_status = str(recovered_state.get("status") or "")
+                if recovered_status == "waiting-for-author" and not force_issue_flow:
+                    print(
+                        f"Skipping issue #{issue['number']} due to recovered orchestration state "
+                        "waiting-for-author (use --force-issue-flow to override)."
+                    )
+                    continue
+                if recovered_status == "waiting-for-author" and force_issue_flow:
+                    force_override_applied = True
+                    print(
+                        "Recovered state is waiting-for-author, but continuing because "
+                        "--force-issue-flow is set."
+                    )
+
                 mode, mode_reason = choose_execution_mode(
                     issue_number=issue["number"],
                     linked_open_pr=linked_open_pr,
                     force_issue_flow=force_issue_flow,
+                    recovered_state=recovered_state,
                 )
 
             body = (issue.get("body") or "").strip()
@@ -1787,6 +2043,18 @@ def main() -> int:
             processed += 1
 
             prompt_override: str | None = None
+            if (
+                recovered_state is not None
+                and str(recovered_state.get("status") or "") == "failed"
+            ):
+                print(
+                    "Recovered failed orchestration state for rerun: "
+                    f"{format_recovered_state_context(recovered_state)}"
+                )
+                prompt_override = append_recovered_context_to_prompt(
+                    build_prompt(issue),
+                    build_recovered_failure_context_note(recovered_state),
+                )
             if mode == "pr-review":
                 if linked_open_pr is None:
                     raise RuntimeError(
@@ -1864,6 +2132,14 @@ def main() -> int:
                         review_items=review_items,
                         linked_issues=linked_issues,
                     )
+                    if (
+                        recovered_state is not None
+                        and str(recovered_state.get("status") or "") == "failed"
+                    ):
+                        prompt_override = append_recovered_context_to_prompt(
+                            prompt_override,
+                            build_recovered_failure_context_note(recovered_state),
+                        )
 
                 review_comment_count = len(review_items)
                 if args.dry_run:
@@ -1884,6 +2160,10 @@ def main() -> int:
                         )
                     else:
                         print(f"Selected mode: issue-flow (reason: {mode_reason})")
+                    if force_override_applied:
+                        print(
+                            "Proceeding despite waiting-for-author state because --force-issue-flow is set."
+                        )
                 issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
                 target_base_branch = base_branch
 

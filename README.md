@@ -243,6 +243,7 @@ Supported local config keys:
 - `sync_reused_branch` (boolean)
 - `sync_strategy` (`rebase` or `merge`)
 - `base_branch` (`default` or `current`)
+- `create_child_issues` (boolean)
 
 You can also point to a different local config file:
 
@@ -314,6 +315,7 @@ Planning-only decomposition comments:
 - `--decompose auto` proposes a decomposition plan for large/epic/multi-step issues before starting the agent
 - `--decompose always` forces plan-only behavior for an issue, useful for manual planning
 - `--decompose never` bypasses decomposition preflight and keeps the legacy issue-flow path
+- `--create-child-issues` when a decomposition plan is approved, creates child issues and records created child links in the plan payload
 - Existing parseable decomposition comments are treated idempotently and are not duplicated on rerun
 
 Useful options:
@@ -348,6 +350,7 @@ Useful options:
 - `--sync-strategy rebase|merge` choose how to sync a reused branch with selected base (default: `rebase`)
 - `--base default|current` (`--base-branch` alias) choose issue-flow base mode; `current` enables stacked execution from your current branch (opt-in)
 - `--decompose auto|never|always` control planning-only decomposition preflight before issue-flow agent execution (default: `auto`)
+- `--create-child-issues` create missing approved/decomposition child issues and mark plan as `children_created` when all children are linked
 - `--doctor` run preflight diagnostics only (no agent run)
 - `--doctor-smoke-check` in doctor mode, run a lightweight runner CLI smoke check
 

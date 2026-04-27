@@ -43,7 +43,7 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --limit 1 --ru
 
 **With OpenCode auto-approval + explicit timeout (non-interactive friendly):**
 ```bash
-python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 20 --runner opencode --model openai/gpt-5.3-codex --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
+   python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 20 --runner opencode --model openai/gpt-4o --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
 ```
 
 **Issue run with automatic PR-review mode (when linked open PR exists):**
@@ -403,6 +403,8 @@ python3 -m unittest discover -s tests -p 'test_*.py'
   - `--agent-timeout-seconds 900`
   - `--agent-idle-timeout-seconds 180`
 - If OpenCode may be waiting for interactive permission approvals, try `--opencode-auto-approve` only in trusted environments.
+- If OpenCode exits with `-9`, treat it as SIGKILL by environment/runner (resource exhaustion or hard stop) rather than a model syntax issue. For predictable stability, start with:
+  - `--runner opencode --agent build --model openai/gpt-4o`
 - On timeout/idle-timeout the script now exits with a clear error so normal failure handling (`--stop-on-error`) can proceed.
 
 ## Reruns and conflict resolution

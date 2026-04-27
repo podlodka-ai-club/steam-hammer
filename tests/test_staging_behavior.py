@@ -123,6 +123,10 @@ class StagingBehaviorTests(unittest.TestCase):
         with (
             patch("scripts.run_github_issues_to_opencode.run_command") as run_command_mock,
             patch("scripts.run_github_issues_to_opencode.stage_worktree_changes") as stage_mock,
+            patch(
+                "scripts.run_github_issues_to_opencode.list_untracked_files",
+                side_effect=[pre_run_untracked, pre_run_untracked],
+            ),
         ):
             commit_changes(
                 issue={"number": 12, "title": "Add Jira template"},

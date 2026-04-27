@@ -62,6 +62,35 @@ ORCHESTRATION_STATE_STATUSES = {
     "waiting-for-ci",
     "ready-to-merge",
 }
+DECOMPOSITION_CHILD_STATUSES = ("planned", "created", "in-progress", "done", "blocked")
+
+
+def _as_positive_int(value: object) -> int | None:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return None
+    if normalized < 1:
+        return None
+    return normalized
+
+
+def _normalize_child_status(value: object) -> str:
+    status = str(value or "").strip().lower()
+    if status in DECOMPOSITION_CHILD_STATUSES:
+        return status
+    return "planned"
+
+
+def _safe_join_sorted(values: object) -> str:
+    if not isinstance(values, list):
+        return ""
+    normalized: list[str] = []
+    for value in values:
+        item = str(value or "").strip()
+        if item:
+            normalized.append(item)
+    return ", ".join(sorted(normalized))
 
 
 def _normalize_match_list(values: list[str] | None) -> list[str]:
@@ -881,6 +910,214 @@ def select_latest_parseable_decomposition_plan(
     return latest, warnings
 
 
+def build_decomposition_rollup_from_plan_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {
+            "parent_issue": None,
+            "counts": {status: 0 for status in DECOMPOSITION_CHILD_STATUSES},
+            "children": [],
+            "blockers": [],
+            "progress": {"completed": 0, "total": 0, "percent": 0},
+            "next_child": None,
+            "next_action_hint": "no_children",
+            "source": "plan",
+        }
+
+    plan_parent_issue = _as_positive_int(payload.get("parent_issue"))
+    proposed_children = normalize_decomposition_proposed_children(payload)
+    created_children = _normalize_created_children(payload.get("created_children") or [])
+    created_by_order = {
+        child.get("order"): child for child in created_children if isinstance(child.get("order"), int)
+    }
+
+    blockers_raw = payload.get("blockers")
+    blockers = [str(blocker).strip() for blocker in blockers_raw if str(blocker).strip()] if isinstance(blockers_raw, list) else []
+
+    rollup_children: list[dict] = []
+    counts = {status: 0 for status in DECOMPOSITION_CHILD_STATUSES}
+    next_child: dict | None = None
+    total_children = len(proposed_children)
+
+    for child in proposed_children:
+        order = child.get("order")
+        if type(order) is not int:
+            continue
+
+        created = created_by_order.get(order)
+        created = created if isinstance(created, dict) else {}
+
+        issue_number = created.get("issue_number")
+        issue_url = str(created.get("issue_url") or "").strip()
+        child_status = _normalize_child_status(created.get("status") or child.get("status"))
+        if child_status == "planned" and isinstance(issue_number, int):
+            child_status = "created"
+
+        rollup_child: dict = {
+            "order": order,
+            "title": str(child.get("title") or f"Child task {order}"),
+            "status": child_status,
+            "issue_number": issue_number if isinstance(issue_number, int) else None,
+        }
+        if issue_url:
+            rollup_child["issue_url"] = issue_url
+        rollup_children.append(rollup_child)
+
+        counts[child_status] += 1
+
+        if child_status in {"planned", "created", "in-progress", "blocked"} and next_child is None:
+            next_child = {
+                "order": order,
+                "title": str(child.get("title") or f"Child task {order}"),
+                "status": child_status,
+            }
+            if isinstance(issue_number, int):
+                next_child["issue_number"] = issue_number
+            if issue_url:
+                next_child["issue_url"] = issue_url
+
+    completed_children = counts["done"]
+    percent_done = 0 if total_children == 0 else int((completed_children / total_children) * 100)
+    next_action_hint = str(payload.get("next_action") or "").strip() or (
+        "execute_next_child" if next_child is not None else "all_children_complete"
+    )
+
+    return {
+        "parent_issue": plan_parent_issue,
+        "counts": counts,
+        "children": rollup_children,
+        "total_children": total_children,
+        "blockers": blockers,
+        "progress": {
+            "completed": completed_children,
+            "total": total_children,
+            "percent": percent_done,
+        },
+        "next_child": next_child,
+        "next_action_hint": next_action_hint,
+        "source": "plan_payload",
+    }
+
+
+def build_decomposition_rollup_from_recovered_state(
+    recovered_state: dict | None,
+    parent_issue: int | None,
+) -> dict | None:
+    if not isinstance(recovered_state, dict):
+        return None
+
+    state_payload = recovered_state.get("payload") if isinstance(recovered_state, dict) else None
+    if not isinstance(state_payload, dict):
+        return None
+
+    decomposition = state_payload.get("decomposition")
+    if not isinstance(decomposition, dict):
+        decomposition = recovered_state.get("decomposition")
+    if not isinstance(decomposition, dict):
+        return None
+
+    if "counts" in decomposition and isinstance(decomposition.get("children"), list):
+        rollup = dict(decomposition)
+    elif "proposed_children" in decomposition:
+        rollup = build_decomposition_rollup_from_plan_payload(decomposition)
+    else:
+        return None
+
+    if parent_issue is not None:
+        rollup["parent_issue"] = parent_issue
+
+    if "resume_context" not in rollup:
+        rollup["resume_context"] = {
+            "task_type": str(state_payload.get("task_type") or ""),
+            "status": str(recovered_state.get("status") or state_payload.get("status") or ""),
+            "stage": str(state_payload.get("stage") or ""),
+            "branch": str(state_payload.get("branch") or ""),
+        }
+    resume_context = rollup.get("resume_context")
+    if isinstance(resume_context, dict):
+        if str(resume_context.get("branch") or "") == "":
+            resume_context["branch"] = str(state_payload.get("branch") or "")
+        if str(resume_context.get("base_branch") or "") == "":
+            resume_context["base_branch"] = str(state_payload.get("base_branch") or "")
+        if str(resume_context.get("task_type") or "") == "":
+            resume_context["task_type"] = str(state_payload.get("task_type") or "")
+        resolved_pr = state_payload.get("pr")
+        if "pr" not in resume_context:
+            resume_context["pr"] = resolved_pr if isinstance(resolved_pr, int) else None
+
+    return rollup
+
+
+def format_decomposition_rollup_context(decomposition: dict) -> str:
+    if not isinstance(decomposition, dict):
+        return ""
+
+    parent_issue = decomposition.get("parent_issue")
+    parent_text = str(parent_issue) if isinstance(parent_issue, int) else "?"
+
+    counts = decomposition.get("counts")
+    counts_dict = counts if isinstance(counts, dict) else {}
+    total_children = 0
+    try:
+        total_children = int(decomposition.get("total_children") or 0)
+    except (TypeError, ValueError):
+        total_children = 0
+
+    count_bits: list[str] = []
+    for status in DECOMPOSITION_CHILD_STATUSES:
+        try:
+            count_bits.append(f"{status}={int(counts_dict.get(status) or 0)}")
+        except (TypeError, ValueError):
+            count_bits.append(f"{status}=0")
+
+    next_child_payload = decomposition.get("next_child")
+    next_child_text = "none"
+    if isinstance(next_child_payload, dict):
+        next_order = next_child_payload.get("order")
+        next_title = str(next_child_payload.get("title") or "").strip()
+        next_status = str(next_child_payload.get("status") or "").strip()
+        issue_number = next_child_payload.get("issue_number")
+        if isinstance(issue_number, int):
+            next_child_text = f"{next_order}:{next_title} (#{issue_number}, {next_status})"
+        else:
+            next_child_text = f"{next_order}:{next_title} ({next_status})"
+
+    blockers = decomposition.get("blockers")
+    blockers_text = _safe_join_sorted(blockers) if blockers else ""
+    blockers_suffix = f"; blockers={blockers_text}" if blockers_text else ""
+
+    resume_context = decomposition.get("resume_context")
+    resume_bits: list[str] = []
+    if isinstance(resume_context, dict):
+        branch = str(resume_context.get("branch") or "").strip()
+        pr = resume_context.get("pr")
+        if isinstance(pr, int) and pr > 0:
+            resume_bits.append(f"pr={pr}")
+        if branch:
+            resume_bits.append(f"branch={branch}")
+        base_branch = str(resume_context.get("base_branch") or "").strip()
+        if base_branch:
+            resume_bits.append(f"base={base_branch}")
+    resume_suffix = f"; resume={'; '.join(resume_bits)}" if resume_bits else ""
+
+    progress = decomposition.get("progress")
+    completed = 0
+    percent = 0
+    if isinstance(progress, dict):
+        completed = int(progress.get("completed") or 0)
+        percent = int(progress.get("percent") or 0)
+
+    return (
+        "decomposition(" \
+        f"parent=#{parent_text}, "
+        f"children={total_children}, "
+        f"counts=({', '.join(count_bits)}), "
+        f"done={completed}/{total_children} ({percent}%), "
+        f"next={next_child_text}" \
+        f"{blockers_suffix}{resume_suffix}"
+        ")"
+    )
+
+
 def _normalize_decomposition_plan_child(child: dict, fallback_order: int) -> dict | None:
     if not isinstance(child, dict):
         return None
@@ -912,12 +1149,23 @@ def _normalize_decomposition_plan_child(child: dict, fallback_order: int) -> dic
     if not acceptance:
         acceptance = [f"{title} is completed and validated."]
 
-    return {
+    status = _normalize_child_status(child.get("status"))
+    issue_number = _as_positive_int(child.get("issue_number"))
+    if issue_number is None:
+        issue_number = _as_positive_int(child.get("issue"))
+    issue_url = str(child.get("issue_url") or "").strip()
+
+    normalized_child = {
         "title": title,
         "order": order,
         "depends_on": sorted(set(depends_on)),
         "acceptance": acceptance,
+        "status": status,
+        "issue_number": issue_number,
     }
+    if issue_url:
+        normalized_child["issue_url"] = issue_url
+    return normalized_child
 
 
 def normalize_decomposition_proposed_children(plan_payload: dict) -> list[dict]:
@@ -1162,7 +1410,18 @@ def format_recovered_state_context(state: dict) -> str:
     source = str(state.get("source") or "unknown")
     created_at = str(state.get("created_at") or "unknown-time")
     url = str(state.get("url") or "")
+    state_payload = state.get("payload") if isinstance(state, dict) else None
+    decomposition_payload = state.get("decomposition") if isinstance(state, dict) else None
+    if decomposition_payload is None and isinstance(state_payload, dict):
+        decomposition_payload = state_payload.get("decomposition")
+
     details = f"status={status}; source={source}; created_at={created_at}"
+
+    if isinstance(decomposition_payload, dict):
+        decomposition_context = format_decomposition_rollup_context(decomposition_payload)
+        if decomposition_context:
+            details += f"; {decomposition_context}"
+
     if url:
         details += f"; comment={url}"
     return details
@@ -2524,6 +2783,7 @@ def build_orchestration_state(
     workflow_checks: list[dict] | None = None,
     ci_checks: list[dict] | None = None,
     residual_untracked_files: list[str] | None = None,
+    decomposition: dict | None = None,
 ) -> dict:
     if status not in ORCHESTRATION_STATE_STATUSES:
         raise RuntimeError(f"Unsupported orchestration state status: {status}")
@@ -2554,6 +2814,8 @@ def build_orchestration_state(
         sorted_residual = sorted(residual_untracked_files)
         state["residual_untracked_files"] = sorted_residual
         state["residual_untracked_count"] = len(sorted_residual)
+    if decomposition is not None:
+        state["decomposition"] = decomposition
     return state
 
 
@@ -4440,6 +4702,7 @@ def main() -> int:
     if pr_mode_requested:
         try:
             failure_stage = "pr_review_init"
+            pr_recovered_decomposition_rollup: dict | None = None
             workflow_check_results: list[dict] | None = None
             original_cwd = os.getcwd()
             original_branch = current_branch()
@@ -4527,6 +4790,10 @@ def main() -> int:
                     f"{prefix}Recovered orchestration state context: "
                     f"{format_recovered_state_context(recovered_pr_state)}"
                 )
+                pr_recovered_decomposition_rollup = build_decomposition_rollup_from_recovered_state(
+                    recovered_state=recovered_pr_state,
+                    parent_issue=None,
+                )
 
             failure_stage = "fetch_review_feedback"
             threads = fetch_pr_review_threads(repo=repo, number=pr_number_arg)
@@ -4585,11 +4852,12 @@ def main() -> int:
                     agent=args.agent,
                     model=args.model,
                     attempt=1,
-                    stage="agent_run",
-                    next_action="wait_for_agent_result",
-                    error=None,
-                ),
-            )
+                                 stage="agent_run",
+                                 next_action="wait_for_agent_result",
+                                 error=None,
+                                 decomposition=pr_recovered_decomposition_rollup,
+                             ),
+                         )
 
             if not review_items:
                 recovered_pr_status = ""
@@ -4629,13 +4897,14 @@ def main() -> int:
                                 model=args.model,
                                 attempt=1,
                                 stage="ci_checks",
-                                next_action="wait_for_ci",
-                                error=None,
-                                ci_checks=ci_status.get("checks")
-                                if isinstance(ci_status.get("checks"), list)
-                                else [],
-                            ),
-                        )
+                                 next_action="wait_for_ci",
+                                 error=None,
+                                 ci_checks=ci_status.get("checks")
+                                 if isinstance(ci_status.get("checks"), list)
+                                 else [],
+                                 decomposition=pr_recovered_decomposition_rollup,
+                             ),
+                         )
                         print(
                             f"CI checks are still pending for PR #{pr_number_arg} "
                             f"({pending_checks_count} pending); keeping waiting-for-ci state."
@@ -4661,13 +4930,14 @@ def main() -> int:
                                 model=args.model,
                                 attempt=1,
                                 stage="ci_checks",
-                                next_action="inspect_failing_ci_checks",
-                                error=short_error_text(failing_summary),
-                                ci_checks=ci_status.get("checks")
-                                if isinstance(ci_status.get("checks"), list)
-                                else [],
-                            ),
-                        )
+                                 next_action="inspect_failing_ci_checks",
+                                 error=short_error_text(failing_summary),
+                                 ci_checks=ci_status.get("checks")
+                                 if isinstance(ci_status.get("checks"), list)
+                                 else [],
+                                 decomposition=pr_recovered_decomposition_rollup,
+                             ),
+                         )
                         print(f"PR #{pr_number_arg} has failing CI checks: {failing_summary}")
                         return 0
 
@@ -4688,13 +4958,14 @@ def main() -> int:
                             model=args.model,
                             attempt=1,
                             stage="ci_checks",
-                            next_action="ready_for_merge",
-                            error=None,
-                            ci_checks=ci_status.get("checks")
-                            if isinstance(ci_status.get("checks"), list)
-                            else [],
-                        ),
-                    )
+                                 next_action="ready_for_merge",
+                                 error=None,
+                                 ci_checks=ci_status.get("checks")
+                                 if isinstance(ci_status.get("checks"), list)
+                                 else [],
+                                 decomposition=pr_recovered_decomposition_rollup,
+                             ),
+                         )
                     print(
                         f"CI checks passed for PR #{pr_number_arg}; marking orchestration state as ready-to-merge."
                     )
@@ -4716,11 +4987,12 @@ def main() -> int:
                         agent=args.agent,
                         model=args.model,
                         attempt=1,
-                        stage="review_feedback",
-                        next_action="await_new_review_comments",
-                        error="No actionable review comments found",
-                    ),
-                )
+                                 stage="review_feedback",
+                                 next_action="await_new_review_comments",
+                                 error="No actionable review comments found",
+                                 decomposition=pr_recovered_decomposition_rollup,
+                             ),
+                         )
                 print(
                     "No actionable review comments found "
                     f"for PR #{pr_number_arg}; nothing to do."
@@ -4779,11 +5051,12 @@ def main() -> int:
                         agent=args.agent,
                         model=args.model,
                         attempt=1,
-                        stage="post_agent_check",
-                        next_action="await_more_feedback_or_manual_changes",
-                        error="Agent produced no repository changes",
-                    ),
-                )
+                                 stage="post_agent_check",
+                                 next_action="await_more_feedback_or_manual_changes",
+                                 error="Agent produced no repository changes",
+                                 decomposition=pr_recovered_decomposition_rollup,
+                             ),
+                         )
                 print(f"No changes detected for PR #{pr_number_arg}; skipping commit and push")
                 if pr_followup_branch_prefix:
                     run_command(["git", "checkout", base_branch_for_run])
@@ -4826,12 +5099,13 @@ def main() -> int:
                     agent=args.agent,
                     model=args.model,
                     attempt=1,
-                    stage="changes_pushed",
-                    next_action="wait_for_ci",
-                    error=None,
-                    workflow_checks=workflow_check_results,
-                ),
-            )
+                                 stage="changes_pushed",
+                                 next_action="wait_for_ci",
+                                 error=None,
+                                 workflow_checks=workflow_check_results,
+                                 decomposition=pr_recovered_decomposition_rollup,
+                             ),
+                         )
 
             if post_pr_summary:
                 leave_pr_summary_comment(
@@ -4870,22 +5144,23 @@ def main() -> int:
                         dry_run=args.dry_run,
                         state=build_orchestration_state(
                             status=failure_status,
-                            task_type="pr",
-                            issue_number=None,
-                            pr_number=failed_pr_number,
+                                  task_type="pr",
+                                  issue_number=None,
+                                  pr_number=failed_pr_number,
                             branch=str(pr_state_context.get("branch") or "") or None,
                             base_branch=str(pr_state_context.get("base_branch") or "") or None,
                             runner=args.runner,
                             agent=args.agent,
                             model=args.model,
                             attempt=1,
-                            stage=failure_stage,
-                            next_action=next_action,
-                            error=short_error_text(str(exc)),
-                            workflow_checks=workflow_results,
-                            residual_untracked_files=residual_untracked_files,
-                        ),
-                    )
+                                  stage=failure_stage,
+                                  next_action=next_action,
+                                  error=short_error_text(str(exc)),
+                                  workflow_checks=workflow_results,
+                                  residual_untracked_files=residual_untracked_files,
+                                  decomposition=pr_recovered_decomposition_rollup,
+                              ),
+                          )
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         finally:
@@ -4938,6 +5213,7 @@ def main() -> int:
             state_target_type = "issue"
             state_target_number = issue["number"]
             state_pr_number: int | None = None
+            decomposition_rollup: dict | None = None
 
             scope_decision = evaluate_issue_scope(issue=issue, scope_defaults=scope_defaults)
             scope_eligible = bool(scope_decision.get("eligible", True))
@@ -4979,11 +5255,12 @@ def main() -> int:
                             agent=args.agent,
                             model=args.model,
                             attempt=1,
-                            stage="scope_check",
-                            next_action="adjust_scope_or_force_reprocess",
-                            error=short_error_text(scope_reason),
-                        ),
-                    )
+                             stage="scope_check",
+                             next_action="adjust_scope_or_force_reprocess",
+                             error=short_error_text(scope_reason),
+                             decomposition=decomposition_rollup,
+                         ),
+                     )
                     safe_post_issue_scope_skip_comment(
                         repo=repo,
                         issue_number=issue["number"],
@@ -5089,6 +5366,10 @@ def main() -> int:
 
                 recovered_state = merge_latest_recovered_state(
                     [recovered_issue_state, recovered_pr_state]
+                )
+                decomposition_rollup = build_decomposition_rollup_from_recovered_state(
+                    recovered_state=recovered_state,
+                    parent_issue=issue["number"],
                 )
                 if recovered_state is not None:
                     prefix = "[dry-run] " if args.dry_run else ""
@@ -5264,6 +5545,7 @@ def main() -> int:
                         payload=payload,
                         dry_run=args.dry_run,
                     )
+                    decomposition_rollup = build_decomposition_rollup_from_plan_payload(payload=payload)
                     safe_post_orchestration_state_comment(
                         repo=repo,
                         target_type="issue",
@@ -5283,6 +5565,7 @@ def main() -> int:
                             stage="decomposition_plan",
                             next_action="approve_plan_or_rerun_with_decompose_never",
                             error="Task requires planning-only decomposition before implementation",
+                            decomposition=decomposition_rollup,
                         ),
                     )
                     processed += 1
@@ -5422,12 +5705,13 @@ def main() -> int:
                                         agent=args.agent,
                                         model=args.model,
                                         attempt=1,
-                                        stage="ci_checks",
-                                        next_action="wait_for_ci",
-                                        error=None,
-                                        ci_checks=ci_checks_payload,
-                                    ),
-                                )
+                                         stage="ci_checks",
+                                         next_action="wait_for_ci",
+                                         error=None,
+                                         ci_checks=ci_checks_payload,
+                                         decomposition=decomposition_rollup,
+                                     ),
+                                 )
                                 print(
                                     f"No actionable review comments for linked PR #{pr_number}; "
                                     f"CI checks are still pending ({pending_checks_count} pending), "
@@ -5462,6 +5746,7 @@ def main() -> int:
                                         next_action="inspect_failing_ci_checks",
                                         error=short_error_text(failing_summary),
                                         ci_checks=ci_checks_payload,
+                                        decomposition=decomposition_rollup,
                                     ),
                                 )
                                 print(
@@ -5491,12 +5776,13 @@ def main() -> int:
                                     agent=args.agent,
                                     model=args.model,
                                     attempt=1,
-                                    stage="ci_checks",
-                                    next_action="ready_for_merge",
-                                    error=None,
-                                    ci_checks=ci_checks_payload,
-                                ),
-                            )
+                                         stage="ci_checks",
+                                         next_action="ready_for_merge",
+                                         error=None,
+                                         ci_checks=ci_checks_payload,
+                                         decomposition=decomposition_rollup,
+                                     ),
+                                 )
                             print(
                                 f"No actionable review comments for linked PR #{pr_number}; "
                                 "CI checks passed, marking ready-to-merge."
@@ -5535,11 +5821,12 @@ def main() -> int:
                                     agent=args.agent,
                                     model=args.model,
                                     attempt=1,
-                                    stage="review_feedback",
-                                    next_action="await_new_review_comments",
-                                    error="No actionable review comments found",
-                                ),
-                            )
+                                     stage="review_feedback",
+                                     next_action="await_new_review_comments",
+                                     error="No actionable review comments found",
+                                     decomposition=decomposition_rollup,
+                                 ),
+                             )
                             print(
                                 f"No actionable review comments for linked PR #{pr_number}; "
                                 "skipping issue run."
@@ -5557,21 +5844,22 @@ def main() -> int:
                         target_number=state_target_number,
                         dry_run=args.dry_run,
                         state=build_orchestration_state(
-                            status="in-progress",
-                            task_type="pr",
-                            issue_number=issue["number"],
-                            pr_number=state_pr_number,
+                                status="in-progress",
+                                task_type="pr",
+                                issue_number=issue["number"],
+                                pr_number=state_pr_number,
                             branch=issue_branch,
                             base_branch=target_base_branch,
                             runner=args.runner,
                             agent=args.agent,
                             model=args.model,
                             attempt=1,
-                            stage="agent_run",
-                            next_action="wait_for_agent_result",
-                            error=None,
-                        ),
-                    )
+                                stage="agent_run",
+                                next_action="wait_for_agent_result",
+                                error=None,
+                                decomposition=decomposition_rollup,
+                            ),
+                        )
 
                     if review_items:
                         linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
@@ -5638,6 +5926,7 @@ def main() -> int:
                             stage="agent_run",
                             next_action="wait_for_agent_result",
                             error=None,
+                            decomposition=decomposition_rollup,
                         ),
                     )
 
@@ -5757,6 +6046,7 @@ def main() -> int:
                                     stage="changes_pushed",
                                     next_action="wait_for_ci",
                                     error=None,
+                                    decomposition=decomposition_rollup,
                                 ),
                             )
                         elif mode == "issue-flow":
@@ -5779,6 +6069,7 @@ def main() -> int:
                                     stage="pr_ready",
                                     next_action="wait_for_review",
                                     error=None,
+                                    decomposition=decomposition_rollup,
                                 ),
                             )
                         remove_agent_failure_label_from_issue(
@@ -5811,6 +6102,7 @@ def main() -> int:
                             stage="post_agent_check",
                             next_action="await_more_context",
                             error="No changes produced",
+                            decomposition=decomposition_rollup,
                         ),
                     )
                     remove_agent_failure_label_from_issue(
@@ -5879,6 +6171,7 @@ def main() -> int:
                                 next_action="wait_for_review",
                                 error=None,
                                 workflow_checks=workflow_check_results,
+                                decomposition=decomposition_rollup,
                             ),
                         )
                     else:
@@ -5902,6 +6195,7 @@ def main() -> int:
                                 next_action="wait_for_ci",
                                 error=None,
                                 workflow_checks=workflow_check_results,
+                                decomposition=decomposition_rollup,
                             ),
                         )
 
@@ -5939,13 +6233,14 @@ def main() -> int:
                     agent=args.agent,
                     model=args.model,
                     attempt=1,
-                    stage=failure_stage,
-                    next_action=next_action,
-                    error=short_error_text(str(exc)),
-                    workflow_checks=workflow_results,
-                    residual_untracked_files=residual_untracked_files,
-                ),
-            )
+                                stage=failure_stage,
+                                next_action=next_action,
+                                error=short_error_text(str(exc)),
+                                workflow_checks=workflow_results,
+                                residual_untracked_files=residual_untracked_files,
+                                decomposition=decomposition_rollup,
+                            ),
+                        )
             safe_report_issue_automation_failure(
                 repo=repo,
                 issue_number=issue["number"],

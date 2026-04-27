@@ -5,7 +5,11 @@ from unittest.mock import patch
 
 from scripts.run_github_issues_to_opencode import (
     ORCHESTRATION_STATE_MARKER,
+    build_decomposition_rollup_from_plan_payload,
+    build_decomposition_rollup_from_recovered_state,
     build_orchestration_state,
+    format_recovered_state_context,
+    format_decomposition_rollup_context,
     format_orchestration_state_comment,
     main,
     parse_orchestration_state_comment_body,
@@ -56,6 +60,86 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertEqual(payload["task_type"], "issue")
         self.assertEqual(payload["issue"], 74)
         self.assertEqual(payload["branch"], "issue-fix/74-state-v1")
+
+    def test_formatted_state_with_decomposition_round_trips(self) -> None:
+        decomposition = build_decomposition_rollup_from_plan_payload(
+            {
+                "parent_issue": 74,
+                "proposed_children": [
+                    {
+                        "order": 1,
+                        "title": "Child task",
+                        "status": "in-progress",
+                        "issue": 75,
+                    }
+                ],
+                "blockers": ["external"],
+            }
+        )
+        state = build_orchestration_state(
+            status="waiting-for-author",
+            task_type="issue",
+            issue_number=74,
+            pr_number=None,
+            branch="issue-fix/74-state-v1",
+            base_branch="main",
+            runner="opencode",
+            agent="build",
+            model=None,
+            attempt=1,
+            stage="review_feedback",
+            next_action="await_new_review_comments",
+            error="waiting on subtasks",
+            decomposition=decomposition,
+        )
+
+        body = format_orchestration_state_comment(state)
+        payload, error = parse_orchestration_state_comment_body(body)
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertIn("decomposition", payload)
+        self.assertEqual(payload["decomposition"]["counts"]["in-progress"], 1)
+        self.assertIn("decomposition(", format_recovered_state_context(payload))
+
+    def test_recovered_state_context_renders_rollup_with_next_child_and_blockers(self) -> None:
+        recovered_payload = {
+            "status": "waiting-for-author",
+            "parent_issue": 210,
+            "branch": "issue-fix/210",
+            "task_type": "issue",
+            "stage": "decomposition_plan",
+            "decomposition": {
+                "parent_issue": 210,
+                "proposed_children": [
+                    {"order": 1, "title": "First", "status": "done", "issue_number": 301},
+                    {"order": 2, "title": "Second", "status": "blocked", "issue_number": 302},
+                    {"order": 3, "title": "Third", "status": "created"},
+                ],
+                "blockers": ["external dependency", "qa review"],
+            },
+        }
+        recovered_state = {
+            "status": "waiting-for-author",
+            "payload": recovered_payload,
+            "created_at": "2026-04-26T12:00:00Z",
+        }
+
+        decomposition = build_decomposition_rollup_from_recovered_state(
+            recovered_state=recovered_state,
+            parent_issue=210,
+        )
+
+        self.assertIsNotNone(decomposition)
+        assert decomposition is not None
+        self.assertEqual(decomposition["counts"]["blocked"], 1)
+        self.assertEqual(decomposition["next_child"]["order"], 2)
+        summary = format_decomposition_rollup_context(decomposition)
+        self.assertIn("decomposition(", summary)
+        self.assertIn("parent=#210", summary)
+        self.assertIn("next=2:Second", summary)
+        self.assertIn("blockers=external dependency, qa review", summary)
 
     def test_select_latest_parseable_state_ignores_malformed_comments(self) -> None:
         comments = [

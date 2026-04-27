@@ -10,6 +10,8 @@ from scripts.run_github_issues_to_opencode import (
     _normalize_created_children,
     assess_issue_decomposition_need,
     build_decomposition_plan_payload,
+    build_decomposition_rollup_from_plan_payload,
+    format_decomposition_rollup_context,
     format_decomposition_plan_comment,
     is_decomposition_plan_approved,
     merge_created_children_into_plan_payload,
@@ -258,6 +260,36 @@ class DecompositionPlanningTests(unittest.TestCase):
         self.assertEqual(created_children[0]["order"], 1)
         self.assertEqual(created_children[1]["order"], 2)
         self.assertEqual(merged["created_children"][1]["issue_number"], 20)
+
+    def test_rollup_build_includes_counts_next_child_and_progress(self) -> None:
+        payload = {
+            "parent_issue": 150,
+            "status": "children_created",
+            "proposed_children": [
+                {"order": 1, "title": "Collect context", "status": "done", "issue_number": 301},
+                {"order": 2, "title": "Build plan", "issue_number": 302},
+                {"order": 3, "title": "Validate", "status": "blocked"},
+            ],
+            "created_children": [
+                {"order": 2, "issue_number": 302, "status": "created", "title": "Build plan"},
+            ],
+            "blockers": ["waiting on API token"],
+        }
+        rollup = build_decomposition_rollup_from_plan_payload(payload)
+
+        self.assertEqual(rollup["parent_issue"], 150)
+        self.assertEqual(rollup["counts"]["done"], 1)
+        self.assertEqual(rollup["counts"]["created"], 1)
+        self.assertEqual(rollup["counts"]["blocked"], 1)
+        self.assertEqual(rollup["total_children"], 3)
+        self.assertEqual(rollup["next_child"]["order"], 2)
+        self.assertEqual(rollup["next_child"]["issue_number"], 302)
+        self.assertEqual(rollup["progress"]["percent"], 33)
+
+        summary = format_decomposition_rollup_context(rollup)
+        self.assertIn("decomposition(parent=#150", summary)
+        self.assertIn("next=2:Build plan", summary)
+        self.assertIn("blockers=waiting on API token", summary)
 
 
 

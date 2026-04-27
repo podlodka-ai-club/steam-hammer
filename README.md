@@ -113,6 +113,7 @@ go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode 
 go run ./cmd/orchestrator run issue --id 31 --repo owner/repo --force-issue-flow
 go run ./cmd/orchestrator run issue --id 45 --repo owner/repo --base current --runner opencode --agent build
 go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --allow-pr-branch-switch
+go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --runner opencode --agent review --model openai/gpt-4o --opencode-auto-approve --agent-timeout-seconds 900 --dry-run
 ```
 
 The Go handlers only translate CLI intent into the current Python runner arguments. Use `--help` on any command to inspect flags without invoking the runner, and use `--dry-run` for issue/PR runs to avoid starting agents.

@@ -2489,10 +2489,47 @@ DECOMPOSITION_EXCLUDED_HEADINGS = {
     "out of scope",
 }
 
+AUTO_DECOMPOSITION_HARD_TITLE_PREFIXES = (
+    "epic:",
+    "roadmap:",
+)
+
+CONCRETE_IMPLEMENTATION_TITLE_PREFIXES = (
+    "fix",
+    "add",
+    "implement",
+    "update",
+    "refine",
+    "improve",
+    "roll out",
+    "support",
+    "allow",
+    "track",
+    "record",
+)
+
+CONCRETE_IMPLEMENTATION_HEADINGS = {
+    "feature request",
+    "proposed behavior",
+    "proposed behaviour",
+    "implementation notes",
+    "acceptance criteria",
+    "success criteria",
+}
+
 
 def _issue_body_lines(issue: dict) -> list[str]:
     body = str(issue.get("body") or "")
     return [line.strip() for line in body.splitlines() if line.strip()]
+
+
+def _issue_headings(issue: dict) -> list[str]:
+    headings: list[str] = []
+    for line in _issue_body_lines(issue):
+        heading = _normalize_heading(line)
+        if heading is not None:
+            headings.append(heading)
+    return headings
 
 
 def _normalize_heading(line: str) -> str | None:
@@ -2546,22 +2583,36 @@ def _child_acceptance_criteria(title: str) -> list[str]:
     ]
 
 
+def _looks_like_concrete_implementation_issue(issue: dict) -> bool:
+    title = str(issue.get("title") or "").strip().lower()
+    if not any(title.startswith(prefix) for prefix in CONCRETE_IMPLEMENTATION_TITLE_PREFIXES):
+        return False
+
+    headings = set(_issue_headings(issue))
+    body = str(issue.get("body") or "")
+    return bool(headings & CONCRETE_IMPLEMENTATION_HEADINGS) or "`" in body
+
+
 def assess_issue_decomposition_need(issue: dict) -> dict:
     title = str(issue.get("title") or "")
     body = str(issue.get("body") or "")
     combined = f"{title}\n{body}".lower()
     bullets = _issue_scope_bullets(issue)
     decomposition_source_bullets = _issue_decomposition_source_bullets(issue)
-    reasons: list[str] = []
-    explicit_epic_title = title.strip().lower().startswith("epic:")
+    title_lower = title.strip().lower()
+    hard_reasons: list[str] = []
+    soft_hints: list[str] = []
 
-    if explicit_epic_title:
-        reasons.append("explicit_epic_title")
+    if title_lower.startswith(AUTO_DECOMPOSITION_HARD_TITLE_PREFIXES):
+        if title_lower.startswith("epic:"):
+            hard_reasons.append("explicit_epic_title")
+        else:
+            hard_reasons.append("explicit_roadmap_title")
 
     if len(body) >= 1200:
-        reasons.append("long_body")
+        soft_hints.append("long_body")
     if len(decomposition_source_bullets) >= 5:
-        reasons.append("many_implementation_areas")
+        soft_hints.append("many_implementation_areas")
 
     matched_keywords = sorted(keyword for keyword in DECOMPOSITION_KEYWORDS if keyword in combined)
 
@@ -2570,17 +2621,30 @@ def assess_issue_decomposition_need(issue: dict) -> dict:
         for line in _issue_body_lines(issue)
         if any(token in line.lower() for token in ["acceptance", "success criteria", "scope", "goal"])
     )
-    if acceptance_like >= 3 and (explicit_epic_title or len(body) >= 900 or len(decomposition_source_bullets) >= 4):
-        reasons.append("multiple_planning_sections")
+    if acceptance_like >= 3 and (hard_reasons or len(body) >= 900 or len(decomposition_source_bullets) >= 4):
+        soft_hints.append("multiple_planning_sections")
+
+    concrete_implementation = _looks_like_concrete_implementation_issue(issue)
+    soft_hint_threshold = 3 if concrete_implementation else 2
+    needs_decomposition = bool(hard_reasons) or len(soft_hints) >= soft_hint_threshold
+    reasons = hard_reasons + (soft_hints if needs_decomposition else [])
 
     return {
-        "needs_decomposition": bool(reasons),
+        "needs_decomposition": needs_decomposition,
         "reasons": reasons,
+        "hard_reasons": hard_reasons,
+        "soft_hints": soft_hints,
+        "concrete_implementation": concrete_implementation,
         "matched_keywords": matched_keywords,
         "body_length": len(body),
         "bullet_count": len(bullets),
         "implementation_area_count": len(decomposition_source_bullets),
     }
+
+
+def should_issue_decompose(issue: dict, decompose_mode: str) -> tuple[bool, dict]:
+    assessment = assess_issue_decomposition_need(issue)
+    return decompose_mode == "always" or bool(assessment.get("needs_decomposition")), assessment
 
 
 def build_decomposition_plan_payload(issue: dict, assessment: dict) -> dict:
@@ -5422,10 +5486,7 @@ def main() -> int:
 
             if mode == "issue-flow" and decompose_mode != "never":
                 failure_stage = "decomposition_preflight"
-                assessment = assess_issue_decomposition_need(issue)
-                should_plan = decompose_mode == "always" or bool(
-                    assessment.get("needs_decomposition")
-                )
+                should_plan, assessment = should_issue_decompose(issue, decompose_mode)
                 if should_plan:
                     issue_comments = fetch_issue_comments(repo=repo, issue_number=issue["number"])
                     latest_plan, plan_warnings = select_latest_parseable_decomposition_plan(

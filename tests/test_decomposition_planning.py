@@ -18,6 +18,7 @@ from scripts.run_github_issues_to_opencode import (
     parse_args,
     parse_decomposition_plan_comment_body,
     select_latest_parseable_decomposition_plan,
+    should_issue_decompose,
 )
 
 
@@ -83,7 +84,7 @@ class DecompositionPlanningTests(unittest.TestCase):
         self.assertEqual(assessment["reasons"], [])
         self.assertIn("decomposition", assessment["matched_keywords"])
 
-    def test_many_implementation_areas_trigger_decomposition_without_epic_title(self) -> None:
+    def test_many_implementation_areas_do_not_trigger_decomposition_on_their_own(self) -> None:
         issue = {
             "number": 120,
             "title": "Roll out orchestration recovery improvements",
@@ -101,8 +102,72 @@ class DecompositionPlanningTests(unittest.TestCase):
 
         assessment = assess_issue_decomposition_need(issue)
 
-        self.assertTrue(assessment["needs_decomposition"])
-        self.assertIn("many_implementation_areas", assessment["reasons"])
+        self.assertFalse(assessment["needs_decomposition"])
+        self.assertEqual(assessment["reasons"], [])
+        self.assertIn("many_implementation_areas", assessment["soft_hints"])
+
+    def test_issue_90_shape_does_not_auto_decompose(self) -> None:
+        issue = {
+            "number": 90,
+            "title": "Add per-run statistics: elapsed time and token/cost usage",
+            "body": "\n".join(
+                [
+                    "## Feature Request",
+                    "After each issue or PR-review run, the orchestrator should print (and optionally include in the state comment) how long the agent took and how many tokens / how much it cost.",
+                    "## Why",
+                    "Right now there is no feedback on run cost or speed. Over time, teams want to know:",
+                    "- Which issues are expensive to fix automatically",
+                    "- Whether token usage is trending up as prompts grow",
+                    "- How long to expect a run to take for planning purposes",
+                    "## Proposed behaviour",
+                    "After a successful (or failed) agent run, print a summary line and include the same data in the orchestration state comment.",
+                    "## Implementation notes",
+                    "Elapsed time is already tracked internally and token tracking should not block the issue.",
+                ]
+            ),
+        }
+
+        assessment = assess_issue_decomposition_need(issue)
+
+        self.assertFalse(assessment["needs_decomposition"])
+        self.assertTrue(assessment["concrete_implementation"])
+
+    def test_issue_105_shape_does_not_auto_decompose(self) -> None:
+        issue = {
+            "number": 105,
+            "title": "Decomposition MVP: execute child tasks in dependency order",
+            "body": "\n".join(
+                [
+                    "Parent epic: #99",
+                    "## Goal",
+                    "Allow the orchestrator to advance decomposed work one child task at a time in a safe order.",
+                    "## Scope",
+                    "- Select the next unblocked child issue from parent state.",
+                    "- Respect dependency order.",
+                    "- Run the existing issue flow for the selected child.",
+                    "- Update parent roll-up after each child result.",
+                    "## Success criteria",
+                    "- A decomposed parent task can be progressed through child issues without losing ordering or context.",
+                ]
+            ),
+        }
+
+        assessment = assess_issue_decomposition_need(issue)
+
+        self.assertFalse(assessment["needs_decomposition"])
+        self.assertEqual(assessment["reasons"], [])
+
+    def test_decompose_always_overrides_auto_assessment(self) -> None:
+        issue = {
+            "number": 90,
+            "title": "Add per-run statistics: elapsed time and token/cost usage",
+            "body": "Implement elapsed time reporting after each run.",
+        }
+
+        should_plan, assessment = should_issue_decompose(issue, decompose_mode="always")
+
+        self.assertTrue(should_plan)
+        self.assertFalse(assessment["needs_decomposition"])
 
     def test_plan_comment_round_trips_machine_payload(self) -> None:
         issue = {

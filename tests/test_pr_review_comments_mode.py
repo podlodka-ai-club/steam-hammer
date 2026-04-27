@@ -177,6 +177,34 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(stats["reviews_used"], 1)
         self.assertEqual(stats["reviews_superseded"], 1)
 
+    def test_evaluate_pr_merge_readiness_requires_approval_when_review_decision_demands_it(self) -> None:
+        readiness = self.mod.evaluate_pr_merge_readiness(
+            pull_request={
+                "mergeStateStatus": "CLEAN",
+                "mergeable": "MERGEABLE",
+                "reviewDecision": "REVIEW_REQUIRED",
+                "isDraft": False,
+            },
+            merge_policy={"auto": True, "method": "squash"},
+        )
+
+        self.assertEqual(readiness["status"], "waiting-for-author")
+        self.assertEqual(readiness["next_action"], "await_required_approval")
+
+    def test_evaluate_pr_merge_readiness_blocks_conflicts(self) -> None:
+        readiness = self.mod.evaluate_pr_merge_readiness(
+            pull_request={
+                "mergeStateStatus": "DIRTY",
+                "mergeable": "CONFLICTING",
+                "reviewDecision": "APPROVED",
+                "isDraft": False,
+            },
+            merge_policy={"auto": False, "method": "merge"},
+        )
+
+        self.assertEqual(readiness["status"], "blocked")
+        self.assertEqual(readiness["next_action"], "resolve_merge_conflicts")
+
     def test_normalize_review_items_includes_actionable_approved_review_summary(self) -> None:
         reviews = [
             {

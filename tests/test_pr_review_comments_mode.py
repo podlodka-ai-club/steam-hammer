@@ -677,5 +677,54 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertIn("review summaries", prompt_override)
 
 
+class RequiredFileValidationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = load_script_module()
+
+    def test_validate_required_files_not_applicable_when_none_mentioned(self) -> None:
+        pull_request = {
+            "body": "Refactor the scheduler pipeline and improve logs.",
+            "files": [{"path": "scheduler/pipeline.py"}],
+        }
+
+        result = self.mod.validate_required_files_in_pr(pull_request=pull_request)
+
+        self.assertEqual(result.get("status"), "not-applicable")
+        self.assertEqual(result.get("required_file_count"), 0)
+        self.assertEqual(result.get("matched_files"), [])
+        self.assertEqual(result.get("missing_files"), [])
+
+    def test_validate_required_files_collects_from_pr_body_and_issue(self) -> None:
+        pull_request = {
+            "body": "## Required Files\n- `src/main.py`\n- service/README.md\n",
+            "files": [{"path": "src/main.py"}],
+        }
+        linked_issue = {"body": "Need to update `service/config.yaml` for release."}
+
+        result = self.mod.validate_required_files_in_pr(
+            pull_request=pull_request,
+            linked_issues=[linked_issue],
+        )
+
+        self.assertEqual(result.get("status"), "blocked")
+        self.assertEqual(result.get("required_file_count"), 3)
+        self.assertEqual(result.get("matched_files"), ["src/main.py"])
+        self.assertEqual(result.get("missing_files"), ["service/README.md", "service/config.yaml"])
+        self.assertEqual(result.get("changed_file_count"), 1)
+
+    def test_validate_required_files_matches_by_basename(self) -> None:
+        pull_request = {
+            "body": "Please ensure required files: `config/settings.yaml`",
+            "files": [{"path": "service/config/settings.yaml"}],
+        }
+
+        result = self.mod.validate_required_files_in_pr(pull_request=pull_request)
+
+        self.assertEqual(result.get("status"), "passed")
+        self.assertEqual(result.get("matched_files"), ["config/settings.yaml"])
+        self.assertEqual(result.get("missing_files"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

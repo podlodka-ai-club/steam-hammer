@@ -90,6 +90,41 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertEqual(payload["stats"].get("elapsed_seconds"), 125)
         self.assertEqual(payload["stats"].get("tokens_in"), 1000)
 
+    def test_formatted_state_comment_keeps_required_file_validation(self) -> None:
+        state = build_orchestration_state(
+            status="blocked",
+            task_type="pr",
+            issue_number=99,
+            pr_number=201,
+            branch="pr-review/201",
+            base_branch="main",
+            runner="opencode",
+            agent="build",
+            model=None,
+            attempt=1,
+            stage="ci_checks",
+            next_action="update_pr_with_required_files",
+            error="Missing required file evidence: docs/README.md",
+            required_file_validation={
+                "status": "blocked",
+                "required_file_count": 2,
+                "required_files": ["src/main.py", "docs/README.md"],
+                "matched_files": ["src/main.py"],
+                "missing_files": ["docs/README.md"],
+                "changed_file_count": 1,
+            },
+        )
+
+        body = format_orchestration_state_comment(state)
+        payload, error = parse_orchestration_state_comment_body(body)
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertIn("required_file_validation", payload)
+        self.assertEqual(payload["required_file_validation"].get("status"), "blocked")
+        self.assertEqual(payload["required_file_validation"].get("missing_files"), ["docs/README.md"])
+
     def test_formatted_state_with_decomposition_round_trips(self) -> None:
         decomposition = build_decomposition_rollup_from_plan_payload(
             {

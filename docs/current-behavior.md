@@ -65,19 +65,20 @@
    - Изображения извлекаются из тел issue (`![](...)`, `<img src=...>`, прямые URL).
    - По найденным ссылкам создаются локальные файлы в временной директории и добавляются в prompt как входные изображения для Claude через `--image`.
    - Если загрузка изображения падает, это логируется, и обработка продолжается в text-only режиме.
-5. Выбирается/создается рабочая ветка по шаблону `<prefix>/<issue-number>-<slug-title>` (по умолчанию prefix: `issue-fix`).
-6. Для переиспользованной ветки может выполняться синхронизация с базой (по умолчанию включена).
-7. Запускается агент с issue-контекстом.
-8. Если изменений нет:
+5. Выполняется planning-only decomposition preflight (`--decompose auto` по умолчанию): большие/epic/multi-step задачи получают proposed plan comment и останавливаются до запуска агента.
+6. Выбирается/создается рабочая ветка по шаблону `<prefix>/<issue-number>-<slug-title>` (по умолчанию prefix: `issue-fix`).
+7. Для переиспользованной ветки может выполняться синхронизация с базой (по умолчанию включена).
+8. Запускается агент с issue-контекстом.
+9. Если изменений нет:
    - обычно commit/PR пропускаются;
    - исключение: если ветка была синхронизирована и изменена только синком, эти изменения пушатся и PR обновляется.
-9. Если изменения есть: commit `Fix issue #N: <title>`, push, затем создание или переиспользование PR.
-10. На ключевых переходах публикуются state-комментарии в issue:
+10. Если изменения есть: commit `Fix issue #N: <title>`, push, затем создание или переиспользование PR.
+11. На ключевых переходах публикуются state-комментарии в issue:
     - `in-progress` перед запуском агента (когда известен branch context);
     - `ready-for-review` после создания/переиспользования PR;
     - `failed` при ошибках (stage/error/next_action);
     - `waiting-for-author`, если изменений нет.
-11. После успешного/no-op завершения для processed issue скрипт пытается снять label `auto:agent-failed`, если он был поставлен раньше.
+12. После успешного/no-op завершения для processed issue скрипт пытается снять label `auto:agent-failed`, если он был поставлен раньше.
 
 После обработки issue скрипт возвращается на базовую ветку (кроме `dry-run`).
 
@@ -176,6 +177,7 @@
 - `--sync-reused-branch` / `--no-sync-reused-branch`: включить/выключить синхронизацию переиспользованных веток;
 - `--sync-strategy rebase|merge`: стратегия синхронизации переиспользованной ветки;
 - `--base default|current` (`--base-branch`): выбор базовой ветки для issue-flow (стабильная default-ветка или stacked запуск от текущей ветки);
+- `--decompose auto|never|always`: planning-only decomposition preflight перед issue-flow agent run; `auto` предлагает план для больших задач, `always` форсирует plan-only режим, `never` отключает preflight;
 - `--allow-pr-branch-switch`: в PR-mode разрешает переключить текущий worktree на target PR branch;
 - `--isolate-worktree`: в PR-mode запускает работу во временном worktree без переключения текущей ветки;
 - `--dry-run`: печать планируемых действий без выполнения.
@@ -191,6 +193,7 @@
 - отсутствуют actionable review comments -> успешный выход без запуска агента;
 - issue body пустой и нет `--include-empty` и нет распознанных image-ссылок -> issue пропускается;
 - batch issue с linked open PR или deterministic remote branch -> skip по умолчанию;
+- issue-flow с найденной большой/epic/multi-step задачей при `--decompose auto|always` -> публикуется `<!-- orchestration-decomposition:v1 -->` plan comment, state `waiting-for-author` stage `decomposition_plan`, агент не запускается;
 - PR-mode из нецелевой ветки без `--allow-pr-branch-switch` или `--isolate-worktree` -> ошибка safeguard;
 - если агент не внес изменения и не было sync-only обновления -> commit/push/PR пропускаются.
 

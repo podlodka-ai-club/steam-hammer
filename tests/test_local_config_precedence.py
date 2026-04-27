@@ -22,6 +22,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(args.sync_reused_branch, BUILTIN_DEFAULTS["sync_reused_branch"])
         self.assertEqual(args.sync_strategy, BUILTIN_DEFAULTS["sync_strategy"])
         self.assertEqual(args.base_branch, BUILTIN_DEFAULTS["base_branch"])
+        self.assertEqual(args.decompose, BUILTIN_DEFAULTS["decompose"])
 
     def test_local_config_overrides_built_in_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -40,6 +41,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
                         "sync_reused_branch": False,
                         "sync_strategy": "merge",
                         "base_branch": "current",
+                        "decompose": "never",
                     },
                     config_file,
                 )
@@ -56,6 +58,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
         self.assertFalse(args.sync_reused_branch)
         self.assertEqual(args.sync_strategy, "merge")
         self.assertEqual(args.base_branch, "current")
+        self.assertEqual(args.decompose, "never")
 
     def test_cli_flags_override_local_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

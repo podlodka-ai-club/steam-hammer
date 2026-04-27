@@ -40,12 +40,14 @@ BUILTIN_DEFAULTS = {
     "sync_reused_branch": True,
     "sync_strategy": "rebase",
     "base_branch": "default",
+    "decompose": "auto",
     "dir": ".",
 }
 
 ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"
 AGENT_FAILURE_REPORT_MARKER = "<!-- orchestration-agent-failure:v1 -->"
 SCOPE_DECISION_MARKER = "<!-- orchestration-scope:v1 -->"
+DECOMPOSITION_PLAN_MARKER = "<!-- orchestration-decomposition:v1 -->"
 AGENT_FAILURE_LABEL_NAME = "auto:agent-failed"
 AGENT_FAILURE_LABEL_COLOR = "B60205"
 AGENT_FAILURE_LABEL_DESCRIPTION = "Automation run failed for this issue"
@@ -808,6 +810,68 @@ def select_latest_parseable_orchestration_state(
             "comment_id": comment.get("id"),
             "payload": payload,
             "status": normalize_orchestration_state_status(payload),
+        }
+        if latest is None or created_at >= str(latest.get("created_at") or ""):
+            latest = candidate
+
+    return latest, warnings
+
+
+def parse_decomposition_plan_comment_body(body: str) -> tuple[dict | None, str | None]:
+    if DECOMPOSITION_PLAN_MARKER not in body:
+        return None, None
+
+    after_marker = body.split(DECOMPOSITION_PLAN_MARKER, maxsplit=1)[1].strip()
+    if not after_marker:
+        return None, "marker found but payload is empty"
+
+    fenced_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", after_marker, flags=re.DOTALL)
+    candidates = fenced_matches if fenced_matches else [after_marker]
+
+    parse_errors: list[str] = []
+    for candidate in candidates:
+        try:
+            return _first_json_object(candidate), None
+        except (ValueError, json.JSONDecodeError) as exc:
+            parse_errors.append(str(exc))
+
+    if parse_errors:
+        return None, parse_errors[-1]
+    return None, "unable to parse decomposition payload"
+
+
+def select_latest_parseable_decomposition_plan(
+    comments: list[dict],
+    source_label: str,
+) -> tuple[dict | None, list[str]]:
+    latest: dict | None = None
+    warnings: list[str] = []
+
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+
+        body = str(comment.get("body") or "")
+        payload, error = parse_decomposition_plan_comment_body(body)
+        if payload is None:
+            if error:
+                created_at = str(comment.get("created_at") or "unknown-time")
+                url = str(comment.get("html_url") or "")
+                context = f" at {url}" if url else ""
+                warnings.append(
+                    f"ignoring malformed decomposition comment in {source_label}"
+                    f" ({created_at}){context}: {error}"
+                )
+            continue
+
+        created_at = str(comment.get("created_at") or "")
+        candidate = {
+            "source": source_label,
+            "created_at": created_at,
+            "url": str(comment.get("html_url") or ""),
+            "comment_id": comment.get("id"),
+            "payload": payload,
+            "status": str(payload.get("status") or "").strip().lower(),
         }
         if latest is None or created_at >= str(latest.get("created_at") or ""):
             latest = candidate
@@ -1863,6 +1927,162 @@ def build_issue_scope_skip_comment(issue_number: int, reason: str, forced: bool)
         f"{next_action}\n\n"
         f"{SCOPE_DECISION_MARKER}\n"
         f"```json\n{json.dumps(payload, ensure_ascii=True, indent=2)}\n```"
+    )
+
+
+DECOMPOSITION_KEYWORDS = {
+    "epic",
+    "roadmap",
+    "architecture",
+    "daemon",
+    "multi-provider",
+    "decomposition",
+    "linked subtask",
+    "subtask",
+    "multiple pr",
+    "multi-step",
+    "large",
+}
+
+
+def _issue_body_lines(issue: dict) -> list[str]:
+    body = str(issue.get("body") or "")
+    return [line.strip() for line in body.splitlines() if line.strip()]
+
+
+def _issue_scope_bullets(issue: dict) -> list[str]:
+    bullets: list[str] = []
+    for line in _issue_body_lines(issue):
+        normalized = line.strip()
+        if normalized.startswith(('-', '*')):
+            item = normalized[1:].strip()
+            if item:
+                bullets.append(item)
+    return bullets
+
+
+def assess_issue_decomposition_need(issue: dict) -> dict:
+    title = str(issue.get("title") or "")
+    body = str(issue.get("body") or "")
+    combined = f"{title}\n{body}".lower()
+    bullets = _issue_scope_bullets(issue)
+    reasons: list[str] = []
+
+    if len(body) >= 1200:
+        reasons.append("long_body")
+    if len(bullets) >= 6:
+        reasons.append("many_bullets")
+
+    matched_keywords = sorted(keyword for keyword in DECOMPOSITION_KEYWORDS if keyword in combined)
+    if matched_keywords:
+        reasons.append("large_scope_keywords")
+
+    acceptance_like = sum(
+        1
+        for line in _issue_body_lines(issue)
+        if any(token in line.lower() for token in ["acceptance", "success criteria", "scope", "goal"])
+    )
+    if acceptance_like >= 3:
+        reasons.append("multiple_planning_sections")
+
+    return {
+        "needs_decomposition": bool(reasons),
+        "reasons": reasons,
+        "matched_keywords": matched_keywords,
+        "body_length": len(body),
+        "bullet_count": len(bullets),
+    }
+
+
+def build_decomposition_plan_payload(issue: dict, assessment: dict) -> dict:
+    bullets = _issue_scope_bullets(issue)
+    proposed_children: list[dict] = []
+    source_items = bullets[:5]
+    if not source_items:
+        source_items = [
+            "Clarify scope and acceptance criteria",
+            "Implement the smallest safe slice",
+            "Validate behavior and update tracker state",
+        ]
+
+    for index, item in enumerate(source_items, start=1):
+        title = item.rstrip(".")
+        proposed_children.append(
+            {
+                "title": title[:120],
+                "order": index,
+                "depends_on": [] if index == 1 else [index - 1],
+                "acceptance": [f"{title} is completed and validated."],
+            }
+        )
+
+    return {
+        "status": "proposed",
+        "parent_issue": issue.get("number"),
+        "reason": assessment.get("reasons", []),
+        "matched_keywords": assessment.get("matched_keywords", []),
+        "proposed_children": proposed_children,
+        "next_action": "approve_plan_or_rerun_with_decompose_never",
+        "timestamp": utc_now_iso(),
+    }
+
+
+def format_decomposition_plan_comment(payload: dict) -> str:
+    reasons = payload.get("reason") if isinstance(payload.get("reason"), list) else []
+    children = payload.get("proposed_children")
+    if not isinstance(children, list):
+        children = []
+
+    reason_lines = "\n".join(f"- `{reason}`" for reason in reasons) or "- `manual`"
+    child_lines: list[str] = []
+    for child in children:
+        if not isinstance(child, dict):
+            continue
+        order = child.get("order")
+        title = str(child.get("title") or "Untitled child task")
+        deps = child.get("depends_on") if isinstance(child.get("depends_on"), list) else []
+        deps_text = f"; depends on: {', '.join(str(dep) for dep in deps)}" if deps else ""
+        child_lines.append(f"{order}. {title}{deps_text}")
+    children_text = "\n".join(child_lines) or "No child tasks proposed."
+
+    return (
+        "Decomposition plan proposed\n\n"
+        "Status: `needs-decomposition`\n\n"
+        "Reason:\n"
+        f"{reason_lines}\n\n"
+        "Proposed child tasks:\n"
+        f"{children_text}\n\n"
+        "Recommended next action: approve/edit this plan, or rerun with `--decompose never` "
+        "to intentionally bypass planning-only decomposition.\n\n"
+        f"{DECOMPOSITION_PLAN_MARKER}\n"
+        f"```json\n{json.dumps(payload, ensure_ascii=True, indent=2)}\n```"
+    )
+
+
+def post_decomposition_plan_comment(
+    repo: str,
+    issue_number: int,
+    payload: dict,
+    dry_run: bool,
+) -> None:
+    if dry_run:
+        print(
+            f"[dry-run] Would post decomposition plan to issue #{issue_number}: "
+            f"children={len(payload.get('proposed_children') or [])}"
+        )
+        return
+
+    run_command(
+        [
+            "gh",
+            "issue",
+            "comment",
+            str(issue_number),
+            "--repo",
+            repo,
+            "--body",
+            format_decomposition_plan_comment(payload),
+        ]
     )
 
 
@@ -3065,6 +3285,7 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "sync_reused_branch",
         "sync_strategy",
         "base_branch",
+        "decompose",
     }
 
     unsupported = sorted(set(config) - supported_keys)
@@ -3151,6 +3372,11 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         if config["base_branch"] not in {"default", "current"}:
             raise RuntimeError("Local config key 'base_branch' must be one of: default, current")
         validated["base_branch"] = config["base_branch"]
+
+    if "decompose" in config:
+        if config["decompose"] not in {"auto", "never", "always"}:
+            raise RuntimeError("Local config key 'decompose' must be one of: auto, never, always")
+        validated["decompose"] = config["decompose"]
 
     return validated
 
@@ -3658,6 +3884,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--decompose",
+        default=BUILTIN_DEFAULTS["decompose"],
+        choices=["auto", "never", "always"],
+        help=(
+            "Planning-only decomposition preflight for issue-flow: 'auto' proposes a plan "
+            "for large tasks before agent execution, 'never' disables it, and 'always' "
+            "forces a plan-only run."
+        ),
+    )
+    parser.add_argument(
         "--dir",
         default=BUILTIN_DEFAULTS["dir"],
         help="Path to the local git repository to operate on. Defaults to the current directory.",
@@ -3738,6 +3974,7 @@ def main() -> int:
     isolate_worktree = bool(getattr(args, "isolate_worktree", False))
     post_pr_summary = bool(getattr(args, "post_pr_summary", False))
     base_branch_mode = str(getattr(args, "base_branch", BUILTIN_DEFAULTS["base_branch"]))
+    decompose_mode = str(getattr(args, "decompose", BUILTIN_DEFAULTS["decompose"]))
 
     if force_reprocess:
         skip_if_pr_exists = False
@@ -4518,6 +4755,65 @@ def main() -> int:
 
             if body_image_reason:
                 print(f"Issue #{issue['number']} {body_image_reason}")
+
+            if mode == "issue-flow" and decompose_mode != "never":
+                failure_stage = "decomposition_preflight"
+                assessment = assess_issue_decomposition_need(issue)
+                should_plan = decompose_mode == "always" or bool(
+                    assessment.get("needs_decomposition")
+                )
+                if should_plan:
+                    issue_comments = fetch_issue_comments(repo=repo, issue_number=issue["number"])
+                    latest_plan, plan_warnings = select_latest_parseable_decomposition_plan(
+                        comments=issue_comments,
+                        source_label=f"issue #{issue['number']}",
+                    )
+                    for warning in plan_warnings:
+                        print(f"Warning: {warning}", file=sys.stderr)
+
+                    if latest_plan is not None:
+                        prefix = "[dry-run] " if args.dry_run else ""
+                        print(
+                            f"{prefix}Decomposition plan already exists for issue #{issue['number']} "
+                            f"({latest_plan.get('url') or 'no url'}); skipping duplicate plan."
+                        )
+                        processed += 1
+                        continue
+
+                    payload = build_decomposition_plan_payload(issue=issue, assessment=assessment)
+                    post_decomposition_plan_comment(
+                        repo=repo,
+                        issue_number=issue["number"],
+                        payload=payload,
+                        dry_run=args.dry_run,
+                    )
+                    safe_post_orchestration_state_comment(
+                        repo=repo,
+                        target_type="issue",
+                        target_number=issue["number"],
+                        dry_run=args.dry_run,
+                        state=build_orchestration_state(
+                            status="waiting-for-author",
+                            task_type="issue",
+                            issue_number=issue["number"],
+                            pr_number=None,
+                            branch=issue_branch,
+                            base_branch=base_branch if base_branch else None,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            attempt=1,
+                            stage="decomposition_plan",
+                            next_action="approve_plan_or_rerun_with_decompose_never",
+                            error="Task requires planning-only decomposition before implementation",
+                        ),
+                    )
+                    processed += 1
+                    print(
+                        f"Issue #{issue['number']} needs decomposition; posted planning-only plan "
+                        "and stopped before agent execution."
+                    )
+                    continue
 
             processed += 1
 

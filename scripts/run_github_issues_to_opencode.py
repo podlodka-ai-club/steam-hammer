@@ -30,6 +30,7 @@ BUILTIN_DEFAULTS = {
     "agent_timeout_seconds": 900,
     "agent_idle_timeout_seconds": None,
     "opencode_auto_approve": False,
+    "track_tokens": False,
     "branch_prefix": "issue-fix",
     "include_empty": False,
     "stop_on_error": False,
@@ -2895,6 +2896,7 @@ def build_orchestration_state(
     ci_checks: list[dict] | None = None,
     residual_untracked_files: list[str] | None = None,
     decomposition: dict | None = None,
+    stats: dict[str, object] | None = None,
 ) -> dict:
     if status not in ORCHESTRATION_STATE_STATUSES:
         raise RuntimeError(f"Unsupported orchestration state status: {status}")
@@ -2925,6 +2927,8 @@ def build_orchestration_state(
         sorted_residual = sorted(residual_untracked_files)
         state["residual_untracked_files"] = sorted_residual
         state["residual_untracked_count"] = len(sorted_residual)
+    if stats is not None:
+        state["stats"] = stats
     if decomposition is not None:
         state["decomposition"] = decomposition
     return state
@@ -3149,6 +3153,162 @@ def choose_execution_mode(
     return "pr-review", f"found linked open PR #{pr_number}"
 
 
+_TOKEN_LINE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)\binput(?:\s+tokens?)\b[:\s=]*([0-9][0-9, _]*)"), "tokens_in"),
+    (re.compile(r"(?i)\bin(?:\s+tokens?)\b[:\s=]*([0-9][0-9, _]*)"), "tokens_in"),
+    (re.compile(r"(?i)\boutput(?:\s+tokens?)\b[:\s=]*([0-9][0-9, _]*)"), "tokens_out"),
+    (re.compile(r"(?i)\bout(?:\s+tokens?)\b[:\s=]*([0-9][0-9, _]*)"), "tokens_out"),
+)
+
+
+_COMBINED_TOKEN_LINE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)~?\s*([0-9][0-9, _]*)\s+in\s*/\s*~?\s*([0-9][0-9, _]*)\s+out"),
+)
+
+
+def _parse_int_value(value: str) -> int | None:
+    normalized = re.sub(r"[ ,_]", "", value)
+    try:
+        return int(normalized)
+    except ValueError:
+        return None
+
+
+def _parse_cost_value(value: str) -> float | None:
+    normalized = value.replace(",", "").strip()
+    normalized = normalized.lstrip("~$ ")
+    if not normalized:
+        return None
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _update_agent_run_stats(
+    line: str,
+    track_tokens: bool,
+    tokens_in: int | None,
+    tokens_out: int | None,
+    cost_usd: float | None,
+) -> tuple[int | None, int | None, float | None]:
+    if not track_tokens:
+        return tokens_in, tokens_out, cost_usd
+
+    for pattern in _COMBINED_TOKEN_LINE_PATTERNS:
+        combined_match = pattern.search(line)
+        if combined_match:
+            if combined_match.group(1):
+                parsed = _parse_int_value(combined_match.group(1))
+                if parsed is not None:
+                    tokens_in = parsed
+            if combined_match.group(2):
+                parsed = _parse_int_value(combined_match.group(2))
+                if parsed is not None:
+                    tokens_out = parsed
+            return tokens_in, tokens_out, cost_usd
+
+    for pattern, metric in _TOKEN_LINE_PATTERNS:
+        match = pattern.search(line)
+        if not match:
+            continue
+
+        parsed = _parse_int_value(match.group(1))
+        if parsed is None:
+            continue
+
+        if metric == "tokens_in":
+            tokens_in = parsed
+        else:
+            tokens_out = parsed
+
+    cost_match = re.search(r"\$([0-9]+(?:\.[0-9]{1,4})?)", line)
+    if cost_match:
+        parsed_cost = _parse_cost_value(cost_match.group(0))
+        if parsed_cost is not None:
+            cost_usd = parsed_cost
+
+    return tokens_in, tokens_out, cost_usd
+
+
+def _build_agent_run_stats(
+    elapsed_seconds: float,
+    tokens_in: int | None,
+    tokens_out: int | None,
+    cost_usd: float | None,
+) -> dict[str, object]:
+    elapsed = format_elapsed_duration(elapsed_seconds)
+    stats: dict[str, object] = {
+        "elapsed_seconds": int(elapsed_seconds),
+        "elapsed": elapsed,
+    }
+    if tokens_in is not None:
+        stats["tokens_in"] = tokens_in
+    if tokens_out is not None:
+        stats["tokens_out"] = tokens_out
+    if cost_usd is not None:
+        stats["cost_usd"] = cost_usd
+    return stats
+
+
+def _format_token_count(value: int | str | None) -> str | None:
+    if not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return f"{value:,}"
+
+
+def format_elapsed_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    minutes, secs = divmod(total_seconds, 60)
+    if minutes > 0:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def print_agent_run_summary(item_label: str, stats: dict[str, object]) -> None:
+    elapsed = str(stats.get("elapsed") or "unknown")
+    if not isinstance(elapsed, str):
+        elapsed = "unknown"
+
+    tokens_in = _format_token_count(stats.get("tokens_in"))
+    tokens_out = _format_token_count(stats.get("tokens_out"))
+    if tokens_in is not None and tokens_out is not None:
+        token_text = f"tokens: ~{tokens_in} in / ~{tokens_out} out"
+    else:
+        token_text = "tokens: unavailable"
+
+    cost_text = "cost: unavailable"
+    cost = stats.get("cost_usd")
+    if isinstance(cost, int | float):
+        cost_text = f"cost: ~${cost:.2f}"
+
+    print(f"[{item_label}] elapsed: {elapsed} | {token_text} | {cost_text}")
+
+
+def _record_agent_run_stats(
+    run_stats: dict[str, object] | None,
+    start: float,
+    tokens_in: int | None,
+    tokens_out: int | None,
+    cost_usd: float | None,
+) -> dict[str, object] | None:
+    if run_stats is None:
+        return None
+
+    run_stats.clear()
+    run_stats.update(
+        _build_agent_run_stats(
+            elapsed_seconds=(time.monotonic() - start),
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+        )
+    )
+    return run_stats
+
+
 def run_agent(
     issue: dict,
     runner: str,
@@ -3160,6 +3320,8 @@ def run_agent(
     opencode_auto_approve: bool,
     image_paths: list[str] | None = None,
     prompt_override: str | None = None,
+    track_tokens: bool = False,
+    run_stats: dict[str, object] | None = None,
 ) -> int:
     prompt = prompt_override if prompt_override is not None else build_prompt(
         issue=issue,
@@ -3176,6 +3338,8 @@ def run_agent(
         timeout_seconds=timeout_seconds,
         idle_timeout_seconds=idle_timeout_seconds,
         opencode_auto_approve=opencode_auto_approve,
+        track_tokens=track_tokens,
+        run_stats=run_stats,
     )
 
 
@@ -3232,6 +3396,8 @@ def run_agent_with_prompt(
     idle_timeout_seconds: int | None,
     opencode_auto_approve: bool,
     image_paths: list[str] | None = None,
+    track_tokens: bool = False,
+    run_stats: dict[str, object] | None = None,
 ) -> int:
     command = build_agent_command(
         runner=runner,
@@ -3253,9 +3419,12 @@ def run_agent_with_prompt(
             print(f"[dry-run] Would run: {' '.join(command[:4])} ... for {item_label}")
         return 0
 
-    print(f"Running agent for {item_label}")
     start = time.monotonic()
+    print(f"Running agent for {item_label}")
     last_output = start
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    cost_usd: float | None = None
 
     process = subprocess.Popen(  # noqa: S603
         command,
@@ -3291,6 +3460,13 @@ def run_agent_with_prompt(
         if timeout_seconds > 0 and elapsed > timeout_seconds:
             process.kill()
             process.wait(timeout=10)
+            _record_agent_run_stats(
+                run_stats=run_stats,
+                start=start,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost_usd=cost_usd,
+            )
             raise RuntimeError(
                 f"Agent timed out after {timeout_seconds}s for {item_label}. "
                 "Possible causes: waiting for interactive approval, network stall, "
@@ -3302,6 +3478,13 @@ def run_agent_with_prompt(
         if idle_timeout_seconds and idle_elapsed > idle_timeout_seconds:
             process.kill()
             process.wait(timeout=10)
+            _record_agent_run_stats(
+                run_stats=run_stats,
+                start=start,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost_usd=cost_usd,
+            )
             raise RuntimeError(
                 f"Agent produced no output for {idle_timeout_seconds}s on {item_label}; "
                 "aborting to avoid indefinite hang. Possible causes: waiting for "
@@ -3313,6 +3496,14 @@ def run_agent_with_prompt(
             tag, line = line_queue.get(timeout=1.0)
             if line:
                 last_output = time.monotonic()
+                if track_tokens:
+                    tokens_in, tokens_out, cost_usd = _update_agent_run_stats(
+                        line=line,
+                        track_tokens=track_tokens,
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                        cost_usd=cost_usd,
+                    )
                 if tag == "stderr":
                     print(line, end="", file=sys.stderr)
                 else:
@@ -3326,10 +3517,28 @@ def run_agent_with_prompt(
             while not line_queue.empty():
                 tag, line = line_queue.get_nowait()
                 if line:
+                    if track_tokens:
+                        tokens_in, tokens_out, cost_usd = _update_agent_run_stats(
+                            line=line,
+                            track_tokens=track_tokens,
+                            tokens_in=tokens_in,
+                            tokens_out=tokens_out,
+                            cost_usd=cost_usd,
+                        )
                     if tag == "stderr":
                         print(line, end="", file=sys.stderr)
                     else:
                         print(line, end="")
+
+            recorded_stats = _record_agent_run_stats(
+                run_stats=run_stats,
+                start=start,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost_usd=cost_usd,
+            )
+            if recorded_stats is not None:
+                print_agent_run_summary(item_label=item_label, stats=recorded_stats)
             return process.returncode
 
 
@@ -3829,7 +4038,7 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
 
 
 def _validate_project_defaults(config: dict, config_path: str) -> None:
-    supported_defaults_keys = {"runner", "agent", "model"}
+    supported_defaults_keys = {"runner", "agent", "model", "track_tokens"}
     unsupported_defaults = sorted(set(config) - supported_defaults_keys)
     if unsupported_defaults:
         raise RuntimeError(
@@ -3847,6 +4056,9 @@ def _validate_project_defaults(config: dict, config_path: str) -> None:
 
     if "model" in config and config["model"] is not None and not isinstance(config["model"], str):
         raise RuntimeError("Project config key 'defaults.model' must be a string or null")
+
+    if "track_tokens" in config and not isinstance(config["track_tokens"], bool):
+        raise RuntimeError("Project config key 'defaults.track_tokens' must be a boolean")
 
 
 def _validate_project_scope(config: dict, config_path: str) -> None:
@@ -4003,7 +4215,7 @@ def project_cli_defaults(project_config: dict) -> dict:
         return {}
 
     cli_defaults: dict = {}
-    for key in ["runner", "agent", "model"]:
+    for key in ["runner", "agent", "model", "track_tokens"]:
         if key in defaults:
             cli_defaults[key] = defaults[key]
     return cli_defaults
@@ -4032,6 +4244,7 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "base_branch",
         "decompose",
         "create_child_issues",
+        "track_tokens",
     }
 
     unsupported = sorted(set(config) - supported_keys)
@@ -4102,6 +4315,11 @@ def validate_local_config(config: dict, config_path: str) -> dict:
             if not isinstance(config[key], bool):
                 raise RuntimeError(f"Local config key '{key}' must be a boolean")
             validated[key] = config[key]
+
+    if "track_tokens" in config and "track_tokens" not in validated:
+        if not isinstance(config["track_tokens"], bool):
+            raise RuntimeError("Local config key 'track_tokens' must be a boolean")
+        validated["track_tokens"] = config["track_tokens"]
 
     if "branch_prefix" in config:
         if not isinstance(config["branch_prefix"], str) or not config["branch_prefix"].strip():
@@ -4497,6 +4715,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--track-tokens",
+        action="store_true",
+        help="Track token usage from runner output and include it in orchestration state.",
+    )
+    parser.add_argument(
         "--branch-prefix",
         default=BUILTIN_DEFAULTS["branch_prefix"],
         help="Prefix for per-issue git branches.",
@@ -4728,6 +4951,7 @@ def main() -> int:
     allow_pr_branch_switch = bool(getattr(args, "allow_pr_branch_switch", False))
     isolate_worktree = bool(getattr(args, "isolate_worktree", False))
     post_pr_summary = bool(getattr(args, "post_pr_summary", False))
+    track_tokens = bool(getattr(args, "track_tokens", False))
     base_branch_mode = str(getattr(args, "base_branch", BUILTIN_DEFAULTS["base_branch"]))
     decompose_mode = str(getattr(args, "decompose", BUILTIN_DEFAULTS["decompose"]))
     create_child_issues = bool(getattr(args, "create_child_issues", BUILTIN_DEFAULTS["create_child_issues"]))
@@ -4814,6 +5038,7 @@ def main() -> int:
         try:
             failure_stage = "pr_review_init"
             pr_recovered_decomposition_rollup: dict | None = None
+            pr_agent_run_stats: dict[str, object] | None = None
             workflow_check_results: list[dict] | None = None
             original_cwd = os.getcwd()
             original_branch = current_branch()
@@ -4963,12 +5188,12 @@ def main() -> int:
                     agent=args.agent,
                     model=args.model,
                     attempt=1,
-                                 stage="agent_run",
-                                 next_action="wait_for_agent_result",
-                                 error=None,
-                                 decomposition=pr_recovered_decomposition_rollup,
-                             ),
-                         )
+                    stage="agent_run",
+                    next_action="wait_for_agent_result",
+                    error=None,
+                    decomposition=pr_recovered_decomposition_rollup,
+                ),
+            )
 
             if not review_items:
                 recovered_pr_status = ""
@@ -5008,14 +5233,16 @@ def main() -> int:
                                 model=args.model,
                                 attempt=1,
                                 stage="ci_checks",
-                                 next_action="wait_for_ci",
-                                 error=None,
-                                 ci_checks=ci_status.get("checks")
-                                 if isinstance(ci_status.get("checks"), list)
-                                 else [],
-                                 decomposition=pr_recovered_decomposition_rollup,
-                             ),
-                         )
+                                next_action="wait_for_ci",
+                                error=None,
+                                ci_checks=(
+                                    ci_status.get("checks")
+                                    if isinstance(ci_status.get("checks"), list)
+                                    else []
+                                ),
+                                decomposition=pr_recovered_decomposition_rollup,
+                            ),
+                        )
                         print(
                             f"CI checks are still pending for PR #{pr_number_arg} "
                             f"({pending_checks_count} pending); keeping waiting-for-ci state."
@@ -5129,6 +5356,7 @@ def main() -> int:
             pre_run_untracked_files: set[str] | None = None
             if not args.dry_run:
                 pre_run_untracked_files = list_untracked_files()
+            pr_agent_run_stats: dict[str, object] = {}
             exit_code = run_agent_with_prompt(
                 prompt=prompt,
                 item_label=f"PR #{pr_number_arg}",
@@ -5139,6 +5367,8 @@ def main() -> int:
                 timeout_seconds=args.agent_timeout_seconds,
                 idle_timeout_seconds=args.agent_idle_timeout_seconds,
                 opencode_auto_approve=args.opencode_auto_approve,
+                track_tokens=track_tokens,
+                run_stats=pr_agent_run_stats,
             )
             if exit_code != 0:
                 exit_summary = describe_exit_code(exit_code)
@@ -5170,12 +5400,13 @@ def main() -> int:
                         agent=args.agent,
                         model=args.model,
                         attempt=1,
-                                 stage="post_agent_check",
-                                 next_action="await_more_feedback_or_manual_changes",
-                                 error="Agent produced no repository changes",
-                                 decomposition=pr_recovered_decomposition_rollup,
-                             ),
-                         )
+                        stage="post_agent_check",
+                        next_action="await_more_feedback_or_manual_changes",
+                        error="Agent produced no repository changes",
+                        stats=pr_agent_run_stats,
+                        decomposition=pr_recovered_decomposition_rollup,
+                    ),
+                )
                 print(f"No changes detected for PR #{pr_number_arg}; skipping commit and push")
                 if pr_followup_branch_prefix:
                     run_command(["git", "checkout", base_branch_for_run])
@@ -5202,29 +5433,30 @@ def main() -> int:
             else:
                 push_branch(branch_name=active_branch, dry_run=args.dry_run)
 
-            safe_post_orchestration_state_comment(
-                repo=repo,
-                target_type="pr",
-                target_number=pr_number_arg,
-                dry_run=args.dry_run,
-                state=build_orchestration_state(
-                    status="waiting-for-ci",
-                    task_type="pr",
-                    issue_number=None,
-                    pr_number=pr_number_arg,
-                    branch=active_branch,
-                    base_branch=str(pr_state_context["base_branch"] or "") or None,
-                    runner=args.runner,
-                    agent=args.agent,
-                    model=args.model,
-                    attempt=1,
-                                 stage="changes_pushed",
-                                 next_action="wait_for_ci",
-                                 error=None,
-                                 workflow_checks=workflow_check_results,
-                                 decomposition=pr_recovered_decomposition_rollup,
-                             ),
-                         )
+                safe_post_orchestration_state_comment(
+                    repo=repo,
+                    target_type="pr",
+                    target_number=pr_number_arg,
+                    dry_run=args.dry_run,
+                    state=build_orchestration_state(
+                        status="waiting-for-ci",
+                        task_type="pr",
+                        issue_number=None,
+                        pr_number=pr_number_arg,
+                        branch=active_branch,
+                        base_branch=str(pr_state_context["base_branch"] or "") or None,
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        attempt=1,
+                        stage="changes_pushed",
+                        next_action="wait_for_ci",
+                        error=None,
+                        workflow_checks=workflow_check_results,
+                        stats=pr_agent_run_stats,
+                        decomposition=pr_recovered_decomposition_rollup,
+                    ),
+                )
 
             if post_pr_summary:
                 leave_pr_summary_comment(
@@ -5263,23 +5495,24 @@ def main() -> int:
                         dry_run=args.dry_run,
                         state=build_orchestration_state(
                             status=failure_status,
-                                  task_type="pr",
-                                  issue_number=None,
-                                  pr_number=failed_pr_number,
+                            task_type="pr",
+                            issue_number=None,
+                            pr_number=failed_pr_number,
                             branch=str(pr_state_context.get("branch") or "") or None,
                             base_branch=str(pr_state_context.get("base_branch") or "") or None,
                             runner=args.runner,
                             agent=args.agent,
                             model=args.model,
                             attempt=1,
-                                  stage=failure_stage,
-                                  next_action=next_action,
-                                  error=short_error_text(str(exc)),
-                                  workflow_checks=workflow_results,
-                                  residual_untracked_files=residual_untracked_files,
-                                  decomposition=pr_recovered_decomposition_rollup,
-                              ),
-                          )
+                            stage=failure_stage,
+                            next_action=next_action,
+                            error=short_error_text(str(exc)),
+                            workflow_checks=workflow_results,
+                            residual_untracked_files=residual_untracked_files,
+                            stats=pr_agent_run_stats,
+                            decomposition=pr_recovered_decomposition_rollup,
+                        ),
+                    )
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         finally:
@@ -5333,6 +5566,7 @@ def main() -> int:
             state_target_number = issue["number"]
             state_pr_number: int | None = None
             decomposition_rollup: dict | None = None
+            issue_agent_run_stats: dict[str, object] | None = None
 
             scope_decision = evaluate_issue_scope(issue=issue, scope_defaults=scope_defaults)
             scope_eligible = bool(scope_decision.get("eligible", True))
@@ -6090,6 +6324,7 @@ def main() -> int:
                     )
                 else:
                     failure_stage = "agent_run"
+                    issue_agent_run_stats = {}
                     exit_code = run_agent(
                         issue=issue,
                         runner=args.runner,
@@ -6101,6 +6336,8 @@ def main() -> int:
                         opencode_auto_approve=args.opencode_auto_approve,
                         image_paths=issue_image_paths,
                         prompt_override=prompt_override,
+                        track_tokens=track_tokens,
+                        run_stats=issue_agent_run_stats,
                     )
                     if exit_code != 0:
                         exit_summary = describe_exit_code(exit_code)
@@ -6169,6 +6406,7 @@ def main() -> int:
                                     stage="changes_pushed",
                                     next_action="wait_for_ci",
                                     error=None,
+                                    stats=issue_agent_run_stats,
                                     decomposition=decomposition_rollup,
                                 ),
                             )
@@ -6192,6 +6430,7 @@ def main() -> int:
                                     stage="pr_ready",
                                     next_action="wait_for_review",
                                     error=None,
+                                    stats=issue_agent_run_stats,
                                     decomposition=decomposition_rollup,
                                 ),
                             )
@@ -6225,6 +6464,7 @@ def main() -> int:
                             stage="post_agent_check",
                             next_action="await_more_context",
                             error="No changes produced",
+                            stats=issue_agent_run_stats,
                             decomposition=decomposition_rollup,
                         ),
                     )
@@ -6294,6 +6534,7 @@ def main() -> int:
                                 next_action="wait_for_review",
                                 error=None,
                                 workflow_checks=workflow_check_results,
+                                stats=issue_agent_run_stats,
                                 decomposition=decomposition_rollup,
                             ),
                         )
@@ -6318,6 +6559,7 @@ def main() -> int:
                                 next_action="wait_for_ci",
                                 error=None,
                                 workflow_checks=workflow_check_results,
+                                stats=issue_agent_run_stats,
                                 decomposition=decomposition_rollup,
                             ),
                         )
@@ -6361,6 +6603,7 @@ def main() -> int:
                                 error=short_error_text(str(exc)),
                                 workflow_checks=workflow_results,
                                 residual_untracked_files=residual_untracked_files,
+                                stats=issue_agent_run_stats,
                                 decomposition=decomposition_rollup,
                             ),
                         )

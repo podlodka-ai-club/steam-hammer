@@ -123,8 +123,179 @@ def _parse_tracker(tracker: object) -> str:
     return normalized
 
 
-def format_issue_label(issue_number: object) -> str:
-    return f"issue #{issue_number}"
+def issue_tracker(issue: dict) -> str:
+    return _parse_tracker(issue.get("tracker") or TRACKER_GITHUB)
+
+
+def format_issue_ref(issue_number: object, tracker: str = TRACKER_GITHUB) -> str:
+    normalized_tracker = _parse_tracker(tracker)
+    if normalized_tracker == TRACKER_JIRA:
+        return str(issue_number)
+    return f"#{issue_number}"
+
+
+def format_issue_label(issue_number: object, tracker: str = TRACKER_GITHUB) -> str:
+    return f"issue {format_issue_ref(issue_number, tracker=tracker)}"
+
+
+def format_issue_ref_from_issue(issue: dict) -> str:
+    return format_issue_ref(issue.get("number"), tracker=issue_tracker(issue))
+
+
+def format_issue_label_from_issue(issue: dict) -> str:
+    return format_issue_label(issue.get("number"), tracker=issue_tracker(issue))
+
+
+def issue_commit_title(issue: dict) -> str:
+    issue_ref = format_issue_ref_from_issue(issue)
+    if issue_tracker(issue) == TRACKER_JIRA:
+        return f"Fix {issue_ref}: {issue['title']}"
+    return f"Fix issue {issue_ref}: {issue['title']}"
+
+
+def _jira_credentials_from_env() -> dict[str, str]:
+    credentials: dict[str, str] = {}
+    missing: list[str] = []
+    for key, env_var in JIRA_ENV_VARS.items():
+        value = str(os.environ.get(env_var) or "").strip()
+        if not value:
+            missing.append(env_var)
+            continue
+        credentials[key] = value
+
+    if missing:
+        raise RuntimeError(
+            "Missing required Jira environment variables: " + ", ".join(missing)
+        )
+
+    credentials["base_url"] = credentials["base_url"].rstrip("/")
+    return credentials
+
+
+def validate_tracker_requirements(tracker: str, pr_mode_requested: bool) -> None:
+    normalized_tracker = _parse_tracker(tracker)
+    if pr_mode_requested and normalized_tracker != TRACKER_GITHUB:
+        raise RuntimeError("--pr / --from-review-comments mode only supports --tracker github")
+    if normalized_tracker == TRACKER_JIRA:
+        _jira_credentials_from_env()
+
+
+def _jira_text_fragments(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        fragments: list[str] = []
+        for item in value:
+            fragments.extend(_jira_text_fragments(item))
+        return fragments
+    if not isinstance(value, dict):
+        return []
+
+    node_type = str(value.get("type") or "")
+    text_value = str(value.get("text") or "")
+    content = value.get("content")
+    fragments: list[str] = []
+
+    if text_value:
+        fragments.append(text_value)
+    if isinstance(content, list):
+        child_parts = _jira_text_fragments(content)
+        if child_parts:
+            separator = "\n" if node_type in {"paragraph", "heading", "bulletList", "orderedList", "listItem"} else ""
+            child_text = separator.join(part for part in child_parts if part)
+            if child_text:
+                fragments.append(child_text)
+
+    if node_type in {"paragraph", "heading", "listItem"} and fragments:
+        return ["".join(fragments).strip(), "\n"]
+    if node_type in {"bulletList", "orderedList"} and fragments:
+        return ["\n".join(part.strip() for part in fragments if str(part).strip()), "\n"]
+    return fragments
+
+
+def jira_description_to_text(description: object) -> str:
+    if isinstance(description, str):
+        return description.strip()
+    if description is None:
+        return ""
+    fragments = _jira_text_fragments(description)
+    text = "".join(fragments)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _jira_issue_to_internal_shape(issue_payload: dict, base_url: str) -> dict:
+    key = str(issue_payload.get("key") or "").strip()
+    fields = issue_payload.get("fields")
+    if not key or not isinstance(fields, dict):
+        raise RuntimeError("Unexpected response from Jira issue API")
+
+    return {
+        "number": key,
+        "title": str(fields.get("summary") or "").strip(),
+        "body": jira_description_to_text(fields.get("description")),
+        "url": f"{base_url}/browse/{key}",
+        "tracker": TRACKER_JIRA,
+    }
+
+
+def _jira_request_json(method: str, url: str, payload: dict | None = None) -> object:
+    credentials = _jira_credentials_from_env()
+    auth_token = base64.b64encode(
+        f"{credentials['email']}:{credentials['api_token']}".encode("utf-8")
+    ).decode("ascii")
+    data = None
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Basic {auth_token}",
+    }
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        detail = f"HTTP {exc.code}"
+        if body:
+            detail = f"{detail}: {body}"
+        raise RuntimeError(f"Jira API request failed for {url}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Jira API request failed for {url}: {exc.reason}") from exc
+
+
+def fetch_jira_issue(issue_key: str) -> dict:
+    credentials = _jira_credentials_from_env()
+    normalized_key = str(normalize_issue_number(issue_key, TRACKER_JIRA))
+    payload = _jira_request_json(
+        method="GET",
+        url=f"{credentials['base_url']}/rest/api/3/issue/{urllib.parse.quote(normalized_key)}",
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected response fetching Jira issue {normalized_key}")
+    return _jira_issue_to_internal_shape(payload, credentials["base_url"])
+
+
+def fetch_jira_issues(jql: str, limit: int) -> list[dict]:
+    credentials = _jira_credentials_from_env()
+    payload = _jira_request_json(
+        method="POST",
+        url=f"{credentials['base_url']}/rest/api/3/issue/search",
+        payload={
+            "jql": jql,
+            "maxResults": limit,
+            "fields": ["summary", "description", "assignee"],
+        },
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected response from Jira issue search")
+    issues = payload.get("issues")
+    if not isinstance(issues, list):
+        raise RuntimeError("Unexpected response from Jira issue search")
+    return [_jira_issue_to_internal_shape(item, credentials["base_url"]) for item in issues if isinstance(item, dict)]
 
 
 def _issue_author_login(issue: dict) -> str:
@@ -430,6 +601,9 @@ def fetch_issues(repo: str, state: str, limit: int) -> list[dict]:
     issues = json.loads(output)
     if not isinstance(issues, list):
         raise RuntimeError("Unexpected response from gh issue list")
+    for issue in issues:
+        if isinstance(issue, dict):
+            issue.setdefault("tracker", TRACKER_GITHUB)
     return issues
 
 
@@ -449,6 +623,7 @@ def fetch_issue(repo: str, number: int) -> dict:
     issue = json.loads(output)
     if not isinstance(issue, dict):
         raise RuntimeError(f"Unexpected response fetching issue #{number}")
+    issue.setdefault("tracker", TRACKER_GITHUB)
     return issue
 
 
@@ -1534,7 +1709,11 @@ def slugify(text: str) -> str:
 
 
 def branch_name_for_issue(issue: dict, prefix: str) -> str:
-    return f"{prefix}/#{issue['number']}-{slugify(issue['title'])}".replace("#", "")
+    tracker = issue_tracker(issue)
+    issue_ref = str(issue.get("number") or "").strip()
+    if tracker == TRACKER_JIRA:
+        issue_ref = issue_ref.lower()
+    return f"{prefix}/{issue_ref}-{slugify(issue['title'])}"
 
 
 def has_changes() -> bool:
@@ -2025,10 +2204,10 @@ def build_prompt(issue: dict, image_paths: list[str] | None = None) -> str:
             image_section = f"\nImage attachments provided with this prompt: {image_filenames}\n"
 
     return (
-        "You are working on a GitHub issue in the current git branch.\n"
+        "You are working on an issue in the current git branch.\n"
         "Implement the fix for the issue in the repository files.\n"
         "Do not run git commands; git actions are handled by orchestration script.\n\n"
-        f"Issue: #{issue['number']} - {issue['title']}\n"
+        f"Issue: {format_issue_ref_from_issue(issue)} - {issue['title']}\n"
         f"URL: {issue['url']}\n\n"
         "Issue body:\n"
         f"{issue.get('body', '').strip()}\n"
@@ -2182,7 +2361,7 @@ def run_agent(
     )
     return run_agent_with_prompt(
         prompt=prompt,
-        item_label=f"issue #{issue['number']}",
+        item_label=format_issue_label_from_issue(issue),
         runner=runner,
         agent=agent,
         model=model,
@@ -2526,7 +2705,7 @@ def sync_reused_branch_with_base(
 
 
 def commit_changes(issue: dict, dry_run: bool) -> str:
-    message = f"Fix issue #{issue['number']}: {issue['title']}"
+    message = issue_commit_title(issue)
     if dry_run:
         print(f"[dry-run] Would commit with message: {message}")
         return message
@@ -2604,13 +2783,15 @@ def open_pr(
     dry_run: bool,
     stacked_base_context: str | None = None,
 ) -> str:
-    title = f"Fix issue #{issue['number']}: {issue['title']}"
+    issue_ref = format_issue_ref_from_issue(issue)
+    title = issue_commit_title(issue)
     body = (
         "## Summary\n"
-        f"- Implements fix for issue #{issue['number']}\n"
+        f"- Implements fix for {issue_ref}\n"
         f"- Source issue: {issue['url']}\n\n"
-        f"Closes #{issue['number']}\n"
     )
+    if issue_tracker(issue) == TRACKER_GITHUB:
+        body += f"Closes {issue_ref}\n"
     if stacked_base_context:
         body += (
             "\n## Stack Context\n"
@@ -2992,6 +3173,7 @@ def project_cli_defaults(project_config: dict) -> dict:
 
 def validate_local_config(config: dict, config_path: str) -> dict:
     supported_keys = {
+        "tracker",
         "state",
         "limit",
         "runner",
@@ -3021,6 +3203,9 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         )
 
     validated: dict = {}
+
+    if "tracker" in config:
+        validated["tracker"] = _parse_tracker(config["tracker"])
 
     if "state" in config:
         if config["state"] not in {"open", "closed", "all"}:
@@ -3407,9 +3592,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo", help="GitHub repo in owner/name format. Defaults to current gh repo."
     )
     parser.add_argument(
+        "--tracker",
+        default=BUILTIN_DEFAULTS["tracker"],
+        choices=sorted(TRACKER_CHOICES),
+        help="Issue tracker to fetch from (default: github).",
+    )
+    parser.add_argument(
         "--issue",
-        type=int,
-        help="Process a single issue by number, ignoring --limit and --state.",
+        type=str,
+        help="Process a single issue by number or key, ignoring --limit and --state.",
     )
     parser.add_argument(
         "--pr",
@@ -3664,14 +3855,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _finish_main(exit_code: int, original_process_cwd: str) -> int:
+    try:
+        os.chdir(original_process_cwd)
+    except FileNotFoundError:
+        pass
+    return exit_code
+
+
 def main() -> int:
     raw_argv = sys.argv[1:]
     args = parse_args(raw_argv)
+    original_process_cwd = os.getcwd()
 
     if bool(getattr(args, "doctor", False)):
-        return run_doctor(args=args, raw_argv=raw_argv)
+        return _finish_main(run_doctor(args=args, raw_argv=raw_argv), original_process_cwd)
 
     issue_number_arg = getattr(args, "issue", None)
+    tracker = _parse_tracker(getattr(args, "tracker", BUILTIN_DEFAULTS["tracker"]))
     pr_number_arg = getattr(args, "pr", None)
     from_review_comments = bool(getattr(args, "from_review_comments", False))
     force_issue_flow = bool(getattr(args, "force_issue_flow", False))
@@ -3698,70 +3899,87 @@ def main() -> int:
         os.chdir(target_dir)
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
-        return 1
+        return _finish_main(1, original_process_cwd)
 
     try:
-        project_config_path = str(
-            getattr(
-                args,
-                "project_config",
-                resolve_project_config_path(None, os.path.abspath(getattr(args, "dir", "."))),
+        try:
+            project_config_path = str(
+                getattr(
+                    args,
+                    "project_config",
+                    resolve_project_config_path(None, os.path.abspath(getattr(args, "dir", "."))),
+                )
             )
-        )
-        project_config = load_project_config(project_config_path)
-        scope_defaults = project_scope_defaults(project_config)
-        workflow_checks = configured_workflow_commands(project_config)
+            project_config = load_project_config(project_config_path)
+            scope_defaults = project_scope_defaults(project_config)
+            workflow_checks = configured_workflow_commands(project_config)
 
-        if workflow_checks:
-            configured_names = ", ".join(name for name, _ in workflow_checks)
-            prefix = "[dry-run] " if args.dry_run else ""
-            print(f"{prefix}Configured workflow checks: {configured_names}")
+            if workflow_checks:
+                configured_names = ", ".join(name for name, _ in workflow_checks)
+                prefix = "[dry-run] " if args.dry_run else ""
+                print(f"{prefix}Configured workflow checks: {configured_names}")
 
-        if issue_number_arg is not None and pr_number_arg is not None:
-            raise RuntimeError("Use either --issue or --pr, not both.")
-        pr_mode_requested = pr_number_arg is not None or from_review_comments
-        if from_review_comments and pr_number_arg is None:
-            raise RuntimeError("--from-review-comments requires --pr <number>.")
-        if pr_number_arg is not None and not from_review_comments:
-            raise RuntimeError("--pr requires --from-review-comments.")
-
-        if not pr_mode_requested and base_branch_mode == "current":
-            for warning in current_branch_stack_warnings():
-                print(f"Warning: {warning}", file=sys.stderr)
-
-        ensure_clean_worktree()
-        repo = args.repo or detect_repo()
-        if pr_mode_requested:
-            base_branch = ""
-            issues = []
-        else:
-            if base_branch_mode == "current":
-                base_branch = current_branch()
-            else:
-                base_branch = detect_default_branch(repo)
-            mode_label = "[dry-run]" if args.dry_run else ""
-            if base_branch_mode == "current":
-                if mode_label:
-                    print(f"{mode_label} Selected current base branch: {base_branch}")
-                    print(f"{mode_label} Base mode: current (stack on current branch: yes)")
-                else:
-                    print(f"Selected current base branch: {base_branch}")
-                    print("Base mode: current (stack on current branch: yes)")
-            else:
-                if mode_label:
-                    print(f"{mode_label} Selected stable base branch: {base_branch}")
-                    print(f"{mode_label} Base mode: default (stack on current branch: no)")
-                else:
-                    print(f"Selected stable base branch: {base_branch}")
-                    print("Base mode: default (stack on current branch: no)")
-
+            if issue_number_arg is not None and pr_number_arg is not None:
+                raise RuntimeError("Use either --issue or --pr, not both.")
+            pr_mode_requested = pr_number_arg is not None or from_review_comments
+            if from_review_comments and pr_number_arg is None:
+                raise RuntimeError("--from-review-comments requires --pr <number>.")
+            if pr_number_arg is not None and not from_review_comments:
+                raise RuntimeError("--pr requires --from-review-comments.")
+            validate_tracker_requirements(tracker=tracker, pr_mode_requested=pr_mode_requested)
             if issue_number_arg is not None:
-                issues = [fetch_issue(repo=repo, number=issue_number_arg)]
+                issue_number_arg = normalize_issue_number(issue_number_arg, tracker=tracker)
+
+            if not pr_mode_requested and base_branch_mode == "current":
+                for warning in current_branch_stack_warnings():
+                    print(f"Warning: {warning}", file=sys.stderr)
+
+            ensure_clean_worktree()
+            repo = args.repo or detect_repo()
+            if pr_mode_requested:
+                base_branch = ""
+                issues = []
             else:
-                issues = fetch_issues(repo=repo, state=args.state, limit=args.limit)
+                if base_branch_mode == "current":
+                    base_branch = current_branch()
+                else:
+                    base_branch = detect_default_branch(repo)
+                mode_label = "[dry-run]" if args.dry_run else ""
+                if base_branch_mode == "current":
+                    if mode_label:
+                        print(f"{mode_label} Selected current base branch: {base_branch}")
+                        print(f"{mode_label} Base mode: current (stack on current branch: yes)")
+                    else:
+                        print(f"Selected current base branch: {base_branch}")
+                        print("Base mode: current (stack on current branch: yes)")
+                else:
+                    if mode_label:
+                        print(f"{mode_label} Selected stable base branch: {base_branch}")
+                        print(f"{mode_label} Base mode: default (stack on current branch: no)")
+                    else:
+                        print(f"Selected stable base branch: {base_branch}")
+                        print("Base mode: default (stack on current branch: no)")
+
+                if issue_number_arg is not None:
+                    if tracker == TRACKER_JIRA:
+                        issues = [fetch_jira_issue(issue_key=str(issue_number_arg))]
+                    else:
+                        issues = [fetch_issue(repo=repo, number=issue_number_arg)]
+                else:
+                    if tracker == TRACKER_JIRA:
+                        jira_jql = {
+                            "open": "status != Done ORDER BY created DESC",
+                            "closed": "status = Done ORDER BY created DESC",
+                            "all": "ORDER BY created DESC",
+                        }[args.state]
+                        issues = fetch_jira_issues(jql=jira_jql, limit=args.limit)
+                    else:
+                        issues = fetch_issues(repo=repo, state=args.state, limit=args.limit)
+        except Exception:
+            raise
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}", file=sys.stderr)
-        return 1
+        return _finish_main(1, original_process_cwd)
 
     if pr_mode_requested:
         try:
@@ -3786,7 +4004,7 @@ def main() -> int:
             pr_state = str(pull_request.get("state") or "").strip().upper()
             if pr_state != "OPEN":
                 print(f"PR #{pr_number_arg} is not open (state: {pr_state}); skipping.")
-                return 0
+                return _finish_main(0, original_process_cwd)
 
             target_pr_branch = str(pull_request.get("headRefName") or "").strip()
             if not target_pr_branch:
@@ -3966,7 +4184,7 @@ def main() -> int:
                             f"CI checks are still pending for PR #{pr_number_arg} "
                             f"({pending_checks_count} pending); keeping waiting-for-ci state."
                         )
-                        return 0
+                        return _finish_main(0, original_process_cwd)
 
                     if ci_overall == "failure":
                         failing_summary = format_failing_ci_checks_summary(failing_checks_list)
@@ -3995,7 +4213,7 @@ def main() -> int:
                             ),
                         )
                         print(f"PR #{pr_number_arg} has failing CI checks: {failing_summary}")
-                        return 0
+                        return _finish_main(0, original_process_cwd)
 
                     safe_post_orchestration_state_comment(
                         repo=repo,
@@ -4024,7 +4242,7 @@ def main() -> int:
                     print(
                         f"CI checks passed for PR #{pr_number_arg}; marking orchestration state as ready-to-merge."
                     )
-                    return 0
+                    return _finish_main(0, original_process_cwd)
 
                 safe_post_orchestration_state_comment(
                     repo=repo,
@@ -4051,7 +4269,7 @@ def main() -> int:
                     "No actionable review comments found "
                     f"for PR #{pr_number_arg}; nothing to do."
                 )
-                return 0
+                return _finish_main(0, original_process_cwd)
 
             linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
             prompt = build_pr_review_prompt(
@@ -4110,7 +4328,7 @@ def main() -> int:
                 print(f"No changes detected for PR #{pr_number_arg}; skipping commit and push")
                 if pr_followup_branch_prefix:
                     run_command(["git", "checkout", base_branch_for_run])
-                return 0
+                return _finish_main(0, original_process_cwd)
 
             failure_stage = "commit_push"
             commit_pr_review_changes(pull_request=pull_request, dry_run=args.dry_run)
@@ -4166,7 +4384,7 @@ def main() -> int:
             print(
                 f"Done. Processed PR #{pr_number_arg} with {len(review_items)} actionable review items."
             )
-            return 0
+            return _finish_main(0, original_process_cwd)
         except Exception as exc:  # noqa: BLE001
             if pr_number_arg is not None:
                 failed_pr_number = pr_state_context.get("pr")
@@ -4203,7 +4421,7 @@ def main() -> int:
                         ),
                     )
             print(f"Error: {exc}", file=sys.stderr)
-            return 1
+            return _finish_main(1, original_process_cwd)
         finally:
             if isolated_worktree_path is not None:
                 os.chdir(original_cwd)
@@ -4228,7 +4446,7 @@ def main() -> int:
 
     if not issues:
         print("No issues found.")
-        return 0
+        return _finish_main(0, original_process_cwd)
 
     run_id = generate_run_id()
     failures = 0
@@ -4250,10 +4468,12 @@ def main() -> int:
             mode_reason = "batch issue processing"
             force_override_applied = False
             skip_agent_run = False
+            supports_github_issue_ops = False
             issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
             state_target_type = "issue"
             state_target_number = issue["number"]
             state_pr_number: int | None = None
+            supports_github_issue_ops = issue_tracker(issue) == TRACKER_GITHUB and type(issue["number"]) is int
 
             scope_decision = evaluate_issue_scope(issue=issue, scope_defaults=scope_defaults)
             scope_eligible = bool(scope_decision.get("eligible", True))
@@ -4270,50 +4490,52 @@ def main() -> int:
                         f"Continuing issue #{issue['number']} despite out-of-scope decision "
                         "because --force-reprocess is set."
                     )
-                    safe_post_issue_scope_skip_comment(
-                        repo=repo,
-                        issue_number=issue["number"],
-                        reason=scope_reason,
-                        forced=True,
-                        dry_run=args.dry_run,
-                    )
+                    if supports_github_issue_ops:
+                        safe_post_issue_scope_skip_comment(
+                            repo=repo,
+                            issue_number=issue["number"],
+                            reason=scope_reason,
+                            forced=True,
+                            dry_run=args.dry_run,
+                        )
                 else:
                     skipped_out_of_scope += 1
-                    safe_post_orchestration_state_comment(
-                        repo=repo,
-                        target_type="issue",
-                        target_number=issue["number"],
-                        dry_run=args.dry_run,
-                        state=build_orchestration_state(
-                            status="blocked",
-                            task_type="issue",
+                    if supports_github_issue_ops:
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type="issue",
+                            target_number=issue["number"],
+                            dry_run=args.dry_run,
+                            state=build_orchestration_state(
+                                status="blocked",
+                                task_type="issue",
+                                issue_number=issue["number"],
+                                pr_number=None,
+                                branch=issue_branch,
+                                base_branch=base_branch if base_branch else None,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=1,
+                                stage="scope_check",
+                                next_action="adjust_scope_or_force_reprocess",
+                                error=short_error_text(scope_reason),
+                            ),
+                        )
+                        safe_post_issue_scope_skip_comment(
+                            repo=repo,
                             issue_number=issue["number"],
-                            pr_number=None,
-                            branch=issue_branch,
-                            base_branch=base_branch if base_branch else None,
-                            runner=args.runner,
-                            agent=args.agent,
-                            model=args.model,
-                            attempt=1,
-                            stage="scope_check",
-                            next_action="adjust_scope_or_force_reprocess",
-                            error=short_error_text(scope_reason),
-                        ),
-                    )
-                    safe_post_issue_scope_skip_comment(
-                        repo=repo,
-                        issue_number=issue["number"],
-                        reason=scope_reason,
-                        forced=False,
-                        dry_run=args.dry_run,
-                    )
+                            reason=scope_reason,
+                            forced=False,
+                            dry_run=args.dry_run,
+                        )
                     print(
                         f"Skipping issue #{issue['number']}: out-of-scope for autonomous run "
                         "(--force-reprocess to override)."
                     )
                     continue
 
-            if skip_if_pr_exists:
+            if skip_if_pr_exists and supports_github_issue_ops:
                 linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
                 if linked_open_pr is not None:
                     if issue_number_arg is not None:
@@ -4355,7 +4577,7 @@ def main() -> int:
                 )
                 continue
 
-            if issue_number_arg is not None and has_force_issue_flow_flag:
+            if issue_number_arg is not None and has_force_issue_flow_flag and supports_github_issue_ops:
                 if linked_open_pr is None:
                     linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
 
@@ -4782,27 +5004,28 @@ def main() -> int:
                 )
 
                 if mode == "issue-flow":
-                    safe_post_orchestration_state_comment(
-                        repo=repo,
-                        target_type=state_target_type,
-                        target_number=state_target_number,
-                        dry_run=args.dry_run,
-                        state=build_orchestration_state(
-                            status="in-progress",
-                            task_type="issue",
-                            issue_number=issue["number"],
-                            pr_number=None,
-                            branch=issue_branch,
-                            base_branch=target_base_branch,
-                            runner=args.runner,
-                            agent=args.agent,
-                            model=args.model,
-                            attempt=1,
-                            stage="agent_run",
-                            next_action="wait_for_agent_result",
-                            error=None,
-                        ),
-                    )
+                    if supports_github_issue_ops:
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type=state_target_type,
+                            target_number=state_target_number,
+                            dry_run=args.dry_run,
+                            state=build_orchestration_state(
+                                status="in-progress",
+                                task_type="issue",
+                                issue_number=issue["number"],
+                                pr_number=None,
+                                branch=issue_branch,
+                                base_branch=target_base_branch,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=1,
+                                stage="agent_run",
+                                next_action="wait_for_agent_result",
+                                error=None,
+                            ),
+                        )
 
                 failure_stage = "prepare_branch"
                 branch_status = prepare_issue_branch(
@@ -4919,7 +5142,7 @@ def main() -> int:
                                     error=None,
                                 ),
                             )
-                        elif mode == "issue-flow":
+                        elif mode == "issue-flow" and supports_github_issue_ops:
                             safe_post_orchestration_state_comment(
                                 repo=repo,
                                 target_type="issue",
@@ -4941,43 +5164,46 @@ def main() -> int:
                                     error=None,
                                 ),
                             )
-                        remove_agent_failure_label_from_issue(
-                            repo=repo,
-                            issue_number=issue["number"],
-                            dry_run=args.dry_run,
-                        )
+                        if supports_github_issue_ops:
+                            remove_agent_failure_label_from_issue(
+                                repo=repo,
+                                issue_number=issue["number"],
+                                dry_run=args.dry_run,
+                            )
                         run_command(["git", "checkout", base_branch])
                         continue
 
                     print(
                         f"No changes detected for issue #{issue['number']}; skipping commit and PR"
                     )
-                    safe_post_orchestration_state_comment(
-                        repo=repo,
-                        target_type=state_target_type,
-                        target_number=state_target_number,
-                        dry_run=False,
-                        state=build_orchestration_state(
-                            status="waiting-for-author",
-                            task_type="issue" if mode == "issue-flow" else "pr",
+                    if supports_github_issue_ops or mode == "pr-review":
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type=state_target_type,
+                            target_number=state_target_number,
+                            dry_run=False,
+                            state=build_orchestration_state(
+                                status="waiting-for-author",
+                                task_type="issue" if mode == "issue-flow" else "pr",
+                                issue_number=issue["number"],
+                                pr_number=state_pr_number,
+                                branch=issue_branch,
+                                base_branch=target_base_branch,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=1,
+                                stage="post_agent_check",
+                                next_action="await_more_context",
+                                error="No changes produced",
+                            ),
+                        )
+                    if supports_github_issue_ops:
+                        remove_agent_failure_label_from_issue(
+                            repo=repo,
                             issue_number=issue["number"],
-                            pr_number=state_pr_number,
-                            branch=issue_branch,
-                            base_branch=target_base_branch,
-                            runner=args.runner,
-                            agent=args.agent,
-                            model=args.model,
-                            attempt=1,
-                            stage="post_agent_check",
-                            next_action="await_more_context",
-                            error="No changes produced",
-                        ),
-                    )
-                    remove_agent_failure_label_from_issue(
-                        repo=repo,
-                        issue_number=issue["number"],
-                        dry_run=args.dry_run,
-                    )
+                            dry_run=args.dry_run,
+                        )
                     run_command(["git", "checkout", base_branch])
                     continue
 
@@ -5014,7 +5240,7 @@ def main() -> int:
                 if pr_url:
                     touched_prs.append(pr_url)
                     print(f"PR status for issue #{issue['number']}: {pr_status} ({pr_url})")
-                    if mode == "issue-flow":
+                    if mode == "issue-flow" and supports_github_issue_ops:
                         safe_post_orchestration_state_comment(
                             repo=repo,
                             target_type="issue",
@@ -5063,11 +5289,12 @@ def main() -> int:
 
                 if not args.dry_run:
                     run_command(["git", "checkout", base_branch])
-                remove_agent_failure_label_from_issue(
-                    repo=repo,
-                    issue_number=issue["number"],
-                    dry_run=args.dry_run,
-                )
+                if supports_github_issue_ops:
+                    remove_agent_failure_label_from_issue(
+                        repo=repo,
+                        issue_number=issue["number"],
+                        dry_run=args.dry_run,
+                    )
         except Exception as exc:  # noqa: BLE001
             failures += 1
             failure_status = "blocked" if failure_stage == "workflow_checks" else "failed"
@@ -5077,42 +5304,44 @@ def main() -> int:
                 else "inspect_error_and_retry"
             )
             workflow_results = exc.checks if isinstance(exc, WorkflowCheckFailure) else None
-            safe_post_orchestration_state_comment(
-                repo=repo,
-                target_type=state_target_type,
-                target_number=state_target_number,
-                dry_run=args.dry_run,
-                state=build_orchestration_state(
-                    status=failure_status,
-                    task_type="issue" if mode == "issue-flow" else "pr",
+            if supports_github_issue_ops or mode == "pr-review":
+                safe_post_orchestration_state_comment(
+                    repo=repo,
+                    target_type=state_target_type,
+                    target_number=state_target_number,
+                    dry_run=args.dry_run,
+                    state=build_orchestration_state(
+                        status=failure_status,
+                        task_type="issue" if mode == "issue-flow" else "pr",
+                        issue_number=issue["number"],
+                        pr_number=state_pr_number,
+                        branch=locals().get("issue_branch", None),
+                        base_branch=locals().get("target_base_branch", None),
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        attempt=1,
+                        stage=failure_stage,
+                        next_action=next_action,
+                        error=short_error_text(str(exc)),
+                        workflow_checks=workflow_results,
+                    ),
+                )
+            if supports_github_issue_ops:
+                safe_report_issue_automation_failure(
+                    repo=repo,
                     issue_number=issue["number"],
-                    pr_number=state_pr_number,
+                    run_id=run_id,
+                    stage=failure_stage,
+                    error=str(exc),
                     branch=locals().get("issue_branch", None),
                     base_branch=locals().get("target_base_branch", None),
                     runner=args.runner,
                     agent=args.agent,
                     model=args.model,
-                    attempt=1,
-                    stage=failure_stage,
-                    next_action=next_action,
-                    error=short_error_text(str(exc)),
-                    workflow_checks=workflow_results,
-                ),
-            )
-            safe_report_issue_automation_failure(
-                repo=repo,
-                issue_number=issue["number"],
-                run_id=run_id,
-                stage=failure_stage,
-                error=str(exc),
-                branch=locals().get("issue_branch", None),
-                base_branch=locals().get("target_base_branch", None),
-                runner=args.runner,
-                agent=args.agent,
-                model=args.model,
-                dry_run=args.dry_run,
-                already_reported_issue_numbers=reported_issue_failures,
-            )
+                    dry_run=args.dry_run,
+                    already_reported_issue_numbers=reported_issue_failures,
+                )
             print(f"Issue #{issue['number']} failed: {exc}", file=sys.stderr)
             if args.stop_on_error:
                 break
@@ -5129,7 +5358,7 @@ def main() -> int:
         print("PRs:")
         for pr_url in touched_prs:
             print(f"- {pr_url}")
-    return 1 if failures > 0 else 0
+    return _finish_main(1 if failures > 0 else 0, original_process_cwd)
 
 
 if __name__ == "__main__":

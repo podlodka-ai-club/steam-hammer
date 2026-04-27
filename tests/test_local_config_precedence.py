@@ -13,6 +13,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
             args = parse_args(["--dir", tmpdir])
 
         self.assertEqual(args.runner, BUILTIN_DEFAULTS["runner"])
+        self.assertEqual(args.tracker, BUILTIN_DEFAULTS["tracker"])
         self.assertEqual(args.limit, BUILTIN_DEFAULTS["limit"])
         self.assertEqual(args.branch_prefix, BUILTIN_DEFAULTS["branch_prefix"])
         self.assertEqual(args.fail_on_existing, BUILTIN_DEFAULTS["fail_on_existing"])
@@ -30,6 +31,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
             with open(config_path, "w", encoding="utf-8") as config_file:
                 json.dump(
                     {
+                        "tracker": "jira",
                         "runner": "opencode",
                         "limit": 3,
                         "branch_prefix": "my-fixes",
@@ -46,6 +48,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
 
             args = parse_args(["--dir", tmpdir])
 
+        self.assertEqual(args.tracker, "jira")
         self.assertEqual(args.runner, "opencode")
         self.assertEqual(args.limit, 3)
         self.assertEqual(args.branch_prefix, "my-fixes")
@@ -64,6 +67,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
             with open(config_path, "w", encoding="utf-8") as config_file:
                 json.dump(
                     {
+                        "tracker": "jira",
                         "runner": "opencode",
                         "limit": 2,
                         "branch_prefix": "my-fixes",
@@ -75,6 +79,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
                 ["--dir", tmpdir, "--runner", "claude", "--limit", "7"]
             )
 
+        self.assertEqual(args.tracker, "jira")
         self.assertEqual(args.runner, "claude")
         self.assertEqual(args.limit, 7)
         self.assertEqual(args.branch_prefix, "my-fixes")

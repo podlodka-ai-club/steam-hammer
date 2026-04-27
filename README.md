@@ -53,6 +53,18 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --f
 python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 45 --base current --runner opencode --agent build
 ```
 
+**Use Jira as the issue source:**
+```bash
+export JIRA_BASE_URL=https://mycompany.atlassian.net
+export JIRA_EMAIL=you@example.com
+export JIRA_API_TOKEN=your_token
+
+python scripts/run_github_issues_to_opencode.py \
+  --tracker jira \
+  --issue PROJ-42 \
+  --repo owner/repo
+```
+
 ## Doctor diagnostics
 
 Run environment diagnostics without starting an agent run:

@@ -12,9 +12,33 @@
   },
   "workflow": {
     "commands": {
+      "setup": "python -m pip install -r requirements.txt",
       "test": "python -m unittest",
       "lint": null,
-      "build": null
+      "build": null,
+      "e2e": null
+    },
+    "hooks": {
+      "before_agent": [
+        "python -m unittest tests.test_local_config_precedence"
+      ],
+      "after_agent": [],
+      "before_pr_update": [],
+      "after_pr_update": []
+    },
+    "readiness": {
+      "required_checks": [
+        "ci/test"
+      ],
+      "required_approvals": 1,
+      "require_review_approval": true,
+      "require_required_file_evidence": true,
+      "require_green_checks": true,
+      "require_local_workflow_checks": true
+    },
+    "merge": {
+      "auto_merge": false,
+      "method": "squash"
     }
   },
   "retry": {

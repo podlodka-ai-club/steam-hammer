@@ -495,9 +495,13 @@ def command_succeeds(command: list[str]) -> bool:
     return result.returncode == 0
 
 
-def run_check_command(command: list[str], cwd: str | None = None) -> tuple[bool, str, str, int]:
+def run_check_command(
+    command: list[str],
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[bool, str, str, int]:
     try:
-        result = subprocess.run(command, capture_output=True, text=True, cwd=cwd)
+        result = subprocess.run(command, capture_output=True, text=True, cwd=cwd, env=env)
     except FileNotFoundError as exc:
         return False, "", str(exc), 127
     return (
@@ -540,7 +544,9 @@ def _label_already_exists_error(message: str) -> bool:
     return "already exists" in str(message).lower()
 
 
-WORKFLOW_COMMAND_ORDER = ["test", "lint", "build"]
+WORKFLOW_SETUP_COMMAND_ORDER = ["setup"]
+WORKFLOW_COMMAND_ORDER = ["test", "lint", "build", "e2e"]
+WORKFLOW_HOOK_NAMES = ["before_agent", "after_agent", "before_pr_update", "after_pr_update"]
 
 CI_PENDING_CHECK_RUN_STATUSES = {"queued", "in_progress", "requested", "waiting", "pending"}
 CI_SUCCESS_CHECK_RUN_CONCLUSIONS = {"success", "neutral", "skipped"}
@@ -556,12 +562,19 @@ CI_FAILURE_COMMIT_STATES = {"error", "failure"}
 
 
 def failure_state_for_stage(failure_stage: str) -> str:
-    return "blocked" if failure_stage in {"workflow_checks", "residual_untracked_validation", "token_budget"} else "failed"
+    return (
+        "blocked"
+        if failure_stage
+        in {"workflow_checks", "workflow_hooks", "residual_untracked_validation", "token_budget"}
+        else "failed"
+    )
 
 
 def failure_next_action_for_stage(failure_stage: str) -> str:
     if failure_stage == "workflow_checks":
         return "fix_workflow_checks_and_retry"
+    if failure_stage == "workflow_hooks":
+        return "fix_workflow_hooks_and_retry"
     if failure_stage == "residual_untracked_validation":
         return "stage_or-remove-residual-untracked-files"
     if failure_stage == "token_budget":
@@ -588,6 +601,24 @@ class WorkflowCheckFailure(RuntimeError):
         super().__init__(
             f"Workflow check '{check_name}' failed"
             f" (exit code {exit_code if exit_code is not None else 'unknown'}){evidence}"
+        )
+
+
+class WorkflowHookFailure(RuntimeError):
+    def __init__(self, failed_hook: dict, hooks: list[dict]):
+        self.failed_hook = failed_hook
+        self.hooks = hooks
+
+        hook_name = str(failed_hook.get("hook") or "hook")
+        command = str(failed_hook.get("command") or "")
+        exit_code = failed_hook.get("exit_code")
+        error = str(failed_hook.get("error") or "")
+        evidence = f": {error}" if error else ""
+
+        super().__init__(
+            f"Workflow hook '{hook_name}' failed"
+            f" (exit code {exit_code if exit_code is not None else 'unknown'})"
+            f" while running: {command}{evidence}"
         )
 
 
@@ -631,6 +662,185 @@ def configured_workflow_commands(project_config: dict) -> list[tuple[str, str]]:
             continue
         configured.append((check_name, command_text))
     return configured
+
+
+def configured_setup_commands(project_config: dict) -> list[tuple[str, str]]:
+    workflow = project_config.get("workflow") if isinstance(project_config, dict) else None
+    if not isinstance(workflow, dict):
+        return []
+
+    commands = workflow.get("commands")
+    if not isinstance(commands, dict):
+        return []
+
+    configured: list[tuple[str, str]] = []
+    for command_name in WORKFLOW_SETUP_COMMAND_ORDER:
+        command = commands.get(command_name)
+        if command is None:
+            continue
+        command_text = str(command).strip()
+        if not command_text:
+            continue
+        configured.append((command_name, command_text))
+    return configured
+
+
+def _normalize_string_list_config(value: object, config_key: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            raise RuntimeError(f"Project config key '{config_key}' must be a non-empty string or array of strings")
+        return [normalized]
+    if not isinstance(value, list):
+        raise RuntimeError(f"Project config key '{config_key}' must be a string or array of strings")
+
+    normalized_values: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise RuntimeError(f"Project config key '{config_key}' must contain non-empty strings")
+        normalized_values.append(item.strip())
+    return normalized_values
+
+
+def configured_workflow_hooks(project_config: dict) -> dict[str, list[str]]:
+    workflow = project_config.get("workflow") if isinstance(project_config, dict) else None
+    if not isinstance(workflow, dict):
+        return {}
+
+    hooks = workflow.get("hooks")
+    if not isinstance(hooks, dict):
+        return {}
+
+    configured: dict[str, list[str]] = {}
+    for hook_name in WORKFLOW_HOOK_NAMES:
+        commands = _normalize_string_list_config(hooks.get(hook_name), f"workflow.hooks.{hook_name}")
+        if commands:
+            configured[hook_name] = commands
+    return configured
+
+
+def workflow_readiness_policy(project_config: dict) -> dict[str, object]:
+    policy = {
+        "required_checks": [],
+        "required_approvals": 0,
+        "require_review_approval": False,
+        "require_required_file_evidence": True,
+        "require_green_checks": True,
+        "require_local_workflow_checks": True,
+    }
+    workflow = project_config.get("workflow") if isinstance(project_config, dict) else None
+    if not isinstance(workflow, dict):
+        return policy
+
+    readiness = workflow.get("readiness")
+    if not isinstance(readiness, dict):
+        return policy
+
+    if "required_checks" in readiness:
+        policy["required_checks"] = _normalize_string_list_config(
+            readiness.get("required_checks"),
+            "workflow.readiness.required_checks",
+        )
+    if "required_approvals" in readiness:
+        policy["required_approvals"] = int(readiness.get("required_approvals") or 0)
+    if "require_review_approval" in readiness:
+        policy["require_review_approval"] = bool(readiness.get("require_review_approval"))
+    if "require_required_file_evidence" in readiness:
+        policy["require_required_file_evidence"] = bool(readiness.get("require_required_file_evidence"))
+    if "require_green_checks" in readiness:
+        policy["require_green_checks"] = bool(readiness.get("require_green_checks"))
+    if "require_local_workflow_checks" in readiness:
+        policy["require_local_workflow_checks"] = bool(readiness.get("require_local_workflow_checks"))
+
+    if policy["require_review_approval"] and not policy["required_approvals"]:
+        policy["required_approvals"] = 1
+    return policy
+
+
+def workflow_merge_policy(project_config: dict) -> dict[str, object]:
+    policy = {"auto_merge": False, "method": "squash"}
+    workflow = project_config.get("workflow") if isinstance(project_config, dict) else None
+    if not isinstance(workflow, dict):
+        return policy
+
+    merge = workflow.get("merge")
+    if not isinstance(merge, dict):
+        return policy
+
+    if "auto_merge" in merge:
+        policy["auto_merge"] = bool(merge.get("auto_merge"))
+    if "method" in merge:
+        policy["method"] = str(merge.get("method") or "").strip() or "squash"
+    return policy
+
+
+def _workflow_hook_environment(hook_name: str, context: dict[str, object] | None = None) -> dict[str, str]:
+    env = dict(os.environ)
+    env["ORCHESTRATOR_WORKFLOW_HOOK"] = hook_name
+    if not context:
+        return env
+
+    for key, value in context.items():
+        if value is None:
+            continue
+        env_key = f"ORCHESTRATOR_{key.upper()}"
+        env[env_key] = str(value)
+    return env
+
+
+def run_configured_workflow_hooks(
+    hook_name: str,
+    configured_hooks: dict[str, list[str]],
+    dry_run: bool,
+    cwd: str | None = None,
+    context: dict[str, object] | None = None,
+) -> list[dict]:
+    commands = configured_hooks.get(hook_name) if isinstance(configured_hooks, dict) else None
+    if not commands:
+        return []
+
+    results: list[dict] = []
+    for command_text in commands:
+        if dry_run:
+            print(f"[dry-run] Would run workflow hook '{hook_name}': {command_text}")
+            results.append(
+                {
+                    "hook": hook_name,
+                    "command": command_text,
+                    "status": "dry-run",
+                    "exit_code": None,
+                }
+            )
+            continue
+
+        print(f"Running workflow hook '{hook_name}': {command_text}")
+        ok, stdout_text, stderr_text, exit_code = run_check_command(
+            ["bash", "-lc", command_text],
+            cwd=cwd,
+            env=_workflow_hook_environment(hook_name, context=context),
+        )
+        result = {
+            "hook": hook_name,
+            "command": command_text,
+            "status": "passed" if ok else "failed",
+            "exit_code": exit_code,
+        }
+        if stdout_text:
+            result["stdout_excerpt"] = _workflow_output_excerpt(stdout_text)
+        if stderr_text:
+            result["stderr_excerpt"] = _workflow_output_excerpt(stderr_text)
+        if not ok:
+            result["error"] = stderr_text or stdout_text or "hook failed"
+
+        results.append(result)
+        if ok:
+            print(f"Workflow hook '{hook_name}' passed")
+            continue
+        raise WorkflowHookFailure(failed_hook=result, hooks=results)
+
+    return results
 
 
 def _workflow_output_excerpt(text: str, max_len: int = 600) -> str:
@@ -2720,6 +2930,159 @@ def format_failing_ci_checks_summary(failing_checks: list[dict], max_items: int 
     return "CI failing checks: " + "; ".join(rendered_items)
 
 
+def count_current_pr_approvals(reviews: list[dict], pr_author_login: str = "") -> int:
+    latest_by_author: dict[str, tuple[str, str]] = {}
+    pr_author = pr_author_login.strip().lower()
+
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        author_payload = review.get("author")
+        author = ""
+        if isinstance(author_payload, dict):
+            author = str(author_payload.get("login") or "").strip().lower()
+        if not author or author == pr_author:
+            continue
+
+        submitted_at = _submitted_at_key(review)
+        state = str(review.get("state") or "").strip().upper()
+        current = latest_by_author.get(author)
+        if current is None or submitted_at >= current[0]:
+            latest_by_author[author] = (submitted_at, state)
+
+    return sum(1 for _submitted_at, state in latest_by_author.values() if state == "APPROVED")
+
+
+def select_required_ci_checks(ci_checks: list[dict], required_names: list[str]) -> dict[str, list[dict]]:
+    if not required_names:
+        return {
+            "matched": list(ci_checks),
+            "missing": [],
+            "pending": [check for check in ci_checks if check.get("state") == "pending"],
+            "failing": [check for check in ci_checks if check.get("state") == "failure"],
+        }
+
+    matched: list[dict] = []
+    pending: list[dict] = []
+    failing: list[dict] = []
+    missing: list[str] = []
+    checks_by_name: dict[str, list[dict]] = {}
+    for check in ci_checks:
+        name = str(check.get("name") or "").strip()
+        if not name:
+            continue
+        checks_by_name.setdefault(name, []).append(check)
+
+    for required_name in required_names:
+        required_checks = checks_by_name.get(required_name, [])
+        if not required_checks:
+            missing.append(required_name)
+            continue
+        matched.extend(required_checks)
+        pending.extend(check for check in required_checks if check.get("state") == "pending")
+        failing.extend(check for check in required_checks if check.get("state") == "failure")
+
+    return {"matched": matched, "missing": missing, "pending": pending, "failing": failing}
+
+
+def evaluate_pr_readiness(
+    project_config: dict,
+    pull_request: dict,
+    ci_status: dict,
+    linked_issues: list[dict] | None = None,
+) -> dict[str, object]:
+    readiness_policy = workflow_readiness_policy(project_config)
+    merge_policy = workflow_merge_policy(project_config)
+    ci_checks = ci_status.get("checks") if isinstance(ci_status.get("checks"), list) else []
+    required_checks = select_required_ci_checks(
+        ci_checks=ci_checks,
+        required_names=list(readiness_policy.get("required_checks") or []),
+    )
+
+    if required_checks["missing"]:
+        missing_names = ", ".join(str(name) for name in required_checks["missing"])
+        return {
+            "status": "waiting-for-ci",
+            "next_action": "wait_for_required_checks",
+            "error": f"Required checks not reported yet: {missing_names}",
+            "ci_checks": ci_checks,
+            "required_file_validation": None,
+        }
+
+    if required_checks["pending"]:
+        pending_names = ", ".join(
+            sorted(str(check.get("name") or "unknown") for check in required_checks["pending"])
+        )
+        return {
+            "status": "waiting-for-ci",
+            "next_action": "wait_for_required_checks",
+            "error": f"Required checks are still pending: {pending_names}",
+            "ci_checks": ci_checks,
+            "required_file_validation": None,
+        }
+
+    if required_checks["failing"]:
+        return {
+            "status": "blocked",
+            "next_action": "inspect_failing_ci_checks",
+            "error": short_error_text(format_failing_ci_checks_summary(required_checks["failing"])),
+            "ci_checks": ci_checks,
+            "required_file_validation": None,
+        }
+
+    if readiness_policy.get("require_green_checks") and str(ci_status.get("overall") or "") == "failure":
+        failing_checks = ci_status.get("failing_checks") if isinstance(ci_status.get("failing_checks"), list) else []
+        return {
+            "status": "blocked",
+            "next_action": "inspect_failing_ci_checks",
+            "error": short_error_text(format_failing_ci_checks_summary(failing_checks)),
+            "ci_checks": ci_checks,
+            "required_file_validation": None,
+        }
+
+    required_file_validation: dict[str, object] | None = None
+    if readiness_policy.get("require_required_file_evidence"):
+        required_file_validation = validate_required_files_in_pr(
+            pull_request=pull_request,
+            linked_issues=linked_issues,
+        )
+        if required_file_validation.get("status") == "blocked":
+            missing_files = required_file_validation.get("missing_files")
+            missing_summary = ", ".join(sorted(str(file) for file in missing_files))
+            return {
+                "status": "blocked",
+                "next_action": "update_pr_with_required_files",
+                "error": f"Missing required file evidence: {missing_summary}",
+                "ci_checks": ci_checks,
+                "required_file_validation": required_file_validation,
+            }
+
+    reviews = pull_request.get("reviews") if isinstance(pull_request.get("reviews"), list) else []
+    pr_author_payload = pull_request.get("author")
+    pr_author_login = ""
+    if isinstance(pr_author_payload, dict):
+        pr_author_login = str(pr_author_payload.get("login") or "")
+    current_approvals = count_current_pr_approvals(reviews, pr_author_login=pr_author_login)
+    required_approvals = int(readiness_policy.get("required_approvals") or 0)
+    if required_approvals > 0 and current_approvals < required_approvals:
+        return {
+            "status": "ready-for-review",
+            "next_action": "await_required_approval",
+            "error": f"Waiting for approvals: {current_approvals}/{required_approvals}",
+            "ci_checks": ci_checks,
+            "required_file_validation": required_file_validation,
+        }
+
+    next_action = "auto_merge_if_allowed" if merge_policy.get("auto_merge") else "ready_for_merge"
+    return {
+        "status": "ready-to-merge",
+        "next_action": next_action,
+        "error": None,
+        "ci_checks": ci_checks,
+        "required_file_validation": required_file_validation,
+    }
+
+
 def fetch_pr_conversation_comments(repo: str, pr_number: int) -> list[dict]:
     comments = fetch_issue_comments(repo=repo, issue_number=pr_number)
 
@@ -4739,7 +5102,7 @@ def resolve_project_config_path(raw_path: str | None, target_dir: str) -> str:
 
 
 def _validate_project_workflow(config: dict, config_path: str) -> None:
-    supported_workflow_keys = {"commands"}
+    supported_workflow_keys = {"commands", "hooks", "readiness", "merge"}
     unsupported_workflow = sorted(set(config) - supported_workflow_keys)
     if unsupported_workflow:
         raise RuntimeError(
@@ -4748,28 +5111,102 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
         )
 
     commands = config.get("commands")
-    if commands is None:
-        return
-    if not isinstance(commands, dict):
-        raise RuntimeError("Project config key 'workflow.commands' must be an object")
+    if commands is not None:
+        if not isinstance(commands, dict):
+            raise RuntimeError("Project config key 'workflow.commands' must be an object")
 
-    supported_commands = {"test", "lint", "build"}
-    unsupported_commands = sorted(set(commands) - supported_commands)
-    if unsupported_commands:
-        raise RuntimeError(
-            f"Unsupported key(s) in project config {config_path} under 'workflow.commands': "
-            + ", ".join(unsupported_commands)
-        )
+        supported_commands = set(WORKFLOW_SETUP_COMMAND_ORDER + WORKFLOW_COMMAND_ORDER)
+        unsupported_commands = sorted(set(commands) - supported_commands)
+        if unsupported_commands:
+            raise RuntimeError(
+                f"Unsupported key(s) in project config {config_path} under 'workflow.commands': "
+                + ", ".join(unsupported_commands)
+            )
 
-    for key in supported_commands:
-        if key in commands and commands[key] is not None and not isinstance(commands[key], str):
+        for key in supported_commands:
+            if key in commands and commands[key] is not None and not isinstance(commands[key], str):
+                raise RuntimeError(
+                    f"Project config key 'workflow.commands.{key}' must be a string or null"
+                )
+            if key in commands and isinstance(commands[key], str) and not commands[key].strip():
+                raise RuntimeError(
+                    f"Project config key 'workflow.commands.{key}' must be a non-empty string or null"
+                )
+
+    hooks = config.get("hooks")
+    if hooks is not None:
+        if not isinstance(hooks, dict):
+            raise RuntimeError("Project config key 'workflow.hooks' must be an object")
+        unsupported_hooks = sorted(set(hooks) - set(WORKFLOW_HOOK_NAMES))
+        if unsupported_hooks:
             raise RuntimeError(
-                f"Project config key 'workflow.commands.{key}' must be a string or null"
+                f"Unsupported key(s) in project config {config_path} under 'workflow.hooks': "
+                + ", ".join(unsupported_hooks)
             )
-        if key in commands and isinstance(commands[key], str) and not commands[key].strip():
+        for hook_name in WORKFLOW_HOOK_NAMES:
+            if hook_name in hooks:
+                _normalize_string_list_config(hooks.get(hook_name), f"workflow.hooks.{hook_name}")
+
+    readiness = config.get("readiness")
+    if readiness is not None:
+        if not isinstance(readiness, dict):
+            raise RuntimeError("Project config key 'workflow.readiness' must be an object")
+
+        supported_readiness_keys = {
+            "required_checks",
+            "required_approvals",
+            "require_review_approval",
+            "require_required_file_evidence",
+            "require_green_checks",
+            "require_local_workflow_checks",
+        }
+        unsupported_readiness = sorted(set(readiness) - supported_readiness_keys)
+        if unsupported_readiness:
             raise RuntimeError(
-                f"Project config key 'workflow.commands.{key}' must be a non-empty string or null"
+                f"Unsupported key(s) in project config {config_path} under 'workflow.readiness': "
+                + ", ".join(unsupported_readiness)
             )
+
+        if "required_checks" in readiness:
+            _normalize_string_list_config(
+                readiness.get("required_checks"),
+                "workflow.readiness.required_checks",
+            )
+        if "required_approvals" in readiness:
+            value = readiness["required_approvals"]
+            if type(value) is not int or value < 0:
+                raise RuntimeError(
+                    "Project config key 'workflow.readiness.required_approvals' must be a non-negative integer"
+                )
+        for key in [
+            "require_review_approval",
+            "require_required_file_evidence",
+            "require_green_checks",
+            "require_local_workflow_checks",
+        ]:
+            if key in readiness and not isinstance(readiness[key], bool):
+                raise RuntimeError(f"Project config key 'workflow.readiness.{key}' must be a boolean")
+
+    merge = config.get("merge")
+    if merge is not None:
+        if not isinstance(merge, dict):
+            raise RuntimeError("Project config key 'workflow.merge' must be an object")
+
+        supported_merge_keys = {"auto_merge", "method"}
+        unsupported_merge = sorted(set(merge) - supported_merge_keys)
+        if unsupported_merge:
+            raise RuntimeError(
+                f"Unsupported key(s) in project config {config_path} under 'workflow.merge': "
+                + ", ".join(unsupported_merge)
+            )
+        if "auto_merge" in merge and not isinstance(merge["auto_merge"], bool):
+            raise RuntimeError("Project config key 'workflow.merge.auto_merge' must be a boolean")
+        if "method" in merge:
+            value = merge["method"]
+            if value not in {"merge", "squash", "rebase"}:
+                raise RuntimeError(
+                    "Project config key 'workflow.merge.method' must be one of: merge, squash, rebase"
+                )
 
 
 def _validate_project_defaults(config: dict, config_path: str) -> None:
@@ -5350,6 +5787,7 @@ def run_doctor(args: argparse.Namespace, raw_argv: list[str] | None = None) -> i
     base_branch_mode = str(getattr(args, "base_branch", BUILTIN_DEFAULTS["base_branch"]))
     smoke_enabled = bool(getattr(args, "doctor_smoke_check", False))
     explicit_local_config = _doctor_has_flag(argv, "--local-config")
+    explicit_project_config = _doctor_has_flag(argv, "--project-config")
 
     print("Doctor diagnostics")
     print(f"- Directory: {target_dir}")
@@ -5542,6 +5980,58 @@ def run_doctor(args: argparse.Namespace, raw_argv: list[str] | None = None) -> i
         )
 
     local_config_path = resolve_local_config_path(getattr(args, "local_config", None), target_dir)
+    project_config_path = resolve_project_config_path(getattr(args, "project_config", None), target_dir)
+    project_config: dict = {}
+
+    if os.path.exists(project_config_path):
+        try:
+            project_config = load_project_config(project_config_path)
+            workflow_commands = configured_setup_commands(project_config) + configured_workflow_commands(project_config)
+            workflow_hooks = configured_workflow_hooks(project_config)
+            readiness_policy = workflow_readiness_policy(project_config)
+            merge_policy = workflow_merge_policy(project_config)
+            command_names = ", ".join(name for name, _ in workflow_commands) or "none"
+            hook_names = ", ".join(sorted(name for name, values in workflow_hooks.items() if values)) or "none"
+            readiness_parts = []
+            required_checks = list(readiness_policy.get("required_checks") or [])
+            if required_checks:
+                readiness_parts.append("required_checks=" + ", ".join(required_checks))
+            required_approvals = int(readiness_policy.get("required_approvals") or 0)
+            if required_approvals > 0:
+                readiness_parts.append(f"required_approvals={required_approvals}")
+            if bool(readiness_policy.get("require_required_file_evidence")):
+                readiness_parts.append("require_required_file_evidence=true")
+            readiness_text = "; ".join(readiness_parts) if readiness_parts else "defaults"
+            _doctor_record(
+                checks,
+                "PASS",
+                "Project config",
+                f"valid: {project_config_path} ({len(project_config)} top-level key(s))",
+            )
+            _doctor_record(
+                checks,
+                "PASS",
+                "Workflow config",
+                f"commands={command_names}; hooks={hook_names}; readiness={readiness_text}; auto_merge={merge_policy.get('auto_merge')}; merge_method={merge_policy.get('method')}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            _doctor_record(checks, "FAIL", "Project config", str(exc))
+    else:
+        if explicit_project_config:
+            _doctor_record(
+                checks,
+                "FAIL",
+                "Project config",
+                f"configured path does not exist: {project_config_path}",
+            )
+        else:
+            _doctor_record(
+                checks,
+                "WARN",
+                "Project config",
+                f"optional config not found: {project_config_path}",
+            )
+
     if os.path.exists(local_config_path):
         try:
             config = load_local_config(local_config_path)
@@ -6006,12 +6496,34 @@ def main() -> int:
             )
             project_config = load_project_config(project_config_path)
             scope_defaults = project_scope_defaults(project_config)
+            workflow_setup_commands = configured_setup_commands(project_config)
             workflow_checks = configured_workflow_commands(project_config)
+            workflow_hooks = configured_workflow_hooks(project_config)
+            workflow_readiness = workflow_readiness_policy(project_config)
+            merge_policy = workflow_merge_policy(project_config)
 
+            if workflow_setup_commands:
+                setup_names = ", ".join(name for name, _ in workflow_setup_commands)
+                prefix = "[dry-run] " if args.dry_run else ""
+                print(f"{prefix}Configured workflow setup steps: {setup_names}")
             if workflow_checks:
                 configured_names = ", ".join(name for name, _ in workflow_checks)
                 prefix = "[dry-run] " if args.dry_run else ""
                 print(f"{prefix}Configured workflow checks: {configured_names}")
+            if workflow_hooks:
+                configured_hooks = ", ".join(
+                    sorted(hook_name for hook_name, commands in workflow_hooks.items() if commands)
+                )
+                prefix = "[dry-run] " if args.dry_run else ""
+                print(f"{prefix}Configured workflow hooks: {configured_hooks}")
+            required_check_names = list(workflow_readiness.get("required_checks") or [])
+            if required_check_names:
+                print("Readiness requires checks: " + ", ".join(required_check_names))
+            required_approvals = int(workflow_readiness.get("required_approvals") or 0)
+            if required_approvals > 0:
+                print(f"Readiness requires approvals: {required_approvals}")
+            if bool(merge_policy.get("auto_merge")):
+                print(f"Merge policy: auto-merge enabled ({merge_policy.get('method')})")
             if selected_preset is not None:
                 print(f"Selected preset: {selected_preset}")
             if max_attempts != BUILTIN_DEFAULTS["max_attempts"] or escalate_to_preset is not None:
@@ -6253,127 +6765,21 @@ def main() -> int:
                         repo=repo,
                         pull_request=pull_request,
                     )
-                    ci_overall = str(ci_status.get("overall") or "")
-                    failing_checks = ci_status.get("failing_checks")
-                    failing_checks_list = (
-                        failing_checks if isinstance(failing_checks, list) else []
-                    )
-                    pending_checks = ci_status.get("pending_checks")
-                    pending_checks_count = (
-                        len(pending_checks) if isinstance(pending_checks, list) else 0
-                    )
-
-                    if ci_overall == "pending":
-                        safe_post_orchestration_state_comment(
-                            repo=repo,
-                            target_type="pr",
-                            target_number=pr_number_arg,
-                            dry_run=args.dry_run,
-                            state=build_orchestration_state(
-                                status="waiting-for-ci",
-                                task_type="pr",
-                                issue_number=None,
-                                pr_number=pr_number_arg,
-                                branch=active_branch,
-                                base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
-                                attempt=1,
-                                stage="ci_checks",
-                                next_action="wait_for_ci",
-                                error=None,
-                                ci_checks=(
-                                    ci_status.get("checks")
-                                    if isinstance(ci_status.get("checks"), list)
-                                    else []
-                                ),
-                                decomposition=pr_recovered_decomposition_rollup,
-                            ),
-                        )
-                        print(
-                            f"CI checks are still pending for PR #{pr_number_arg} "
-                            f"({pending_checks_count} pending); keeping waiting-for-ci state."
-                        )
-                        return _finish_main(0, original_process_cwd)
-
-                    if ci_overall == "failure":
-                        failing_summary = format_failing_ci_checks_summary(failing_checks_list)
-                        safe_post_orchestration_state_comment(
-                            repo=repo,
-                            target_type="pr",
-                            target_number=pr_number_arg,
-                            dry_run=args.dry_run,
-                            state=build_orchestration_state(
-                                status="blocked",
-                                task_type="pr",
-                                issue_number=None,
-                                pr_number=pr_number_arg,
-                                branch=active_branch,
-                                base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
-                                attempt=1,
-                                stage="ci_checks",
-                                 next_action="inspect_failing_ci_checks",
-                                 error=short_error_text(failing_summary),
-                                 ci_checks=ci_status.get("checks")
-                                 if isinstance(ci_status.get("checks"), list)
-                                 else [],
-                                 decomposition=pr_recovered_decomposition_rollup,
-                             ),
-                         )
-                        print(f"PR #{pr_number_arg} has failing CI checks: {failing_summary}")
-                        return 0
-
-                    required_file_validation = validate_required_files_in_pr(
+                    readiness = evaluate_pr_readiness(
+                        project_config=project_config,
                         pull_request=pull_request,
+                        ci_status=ci_status,
                         linked_issues=load_linked_issue_context(repo=repo, pull_request=pull_request),
                     )
-
-                    if required_file_validation.get("status") == "blocked":
-                        missing_files = required_file_validation.get("missing_files")
-                        missing_summary = ", ".join(sorted(str(file) for file in missing_files))
-                        safe_post_orchestration_state_comment(
-                            repo=repo,
-                            target_type="pr",
-                            target_number=pr_number_arg,
-                            dry_run=args.dry_run,
-                            state=build_orchestration_state(
-                                status="blocked",
-                                task_type="pr",
-                                issue_number=None,
-                                pr_number=pr_number_arg,
-                                branch=active_branch,
-                                base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
-                                attempt=1,
-                                stage="ci_checks",
-                                next_action="update_pr_with_required_files",
-                                error=f"Missing required file evidence: {missing_summary}",
-                                ci_checks=ci_status.get("checks")
-                                if isinstance(ci_status.get("checks"), list)
-                                else [],
-                                decomposition=pr_recovered_decomposition_rollup,
-                                required_file_validation=required_file_validation,
-                            ),
-                        )
-                        print(
-                            f"PR #{pr_number_arg} CI passed but required file evidence check failed. "
-                            f"Missing files: {missing_summary}"
-                        )
-                        return _finish_main(0, original_process_cwd)
-
+                    readiness_status = str(readiness.get("status") or "")
+                    readiness_error = readiness.get("error")
                     safe_post_orchestration_state_comment(
                         repo=repo,
                         target_type="pr",
                         target_number=pr_number_arg,
                         dry_run=args.dry_run,
                         state=build_orchestration_state(
-                            status="ready-to-merge",
+                            status=readiness_status,
                             task_type="pr",
                             issue_number=None,
                             pr_number=pr_number_arg,
@@ -6384,18 +6790,27 @@ def main() -> int:
                             model=args.model,
                             attempt=1,
                             stage="ci_checks",
-                            next_action="ready_for_merge",
-                            error=None,
-                            ci_checks=ci_status.get("checks")
-                            if isinstance(ci_status.get("checks"), list)
+                            next_action=str(readiness.get("next_action") or "wait_for_ci"),
+                            error=str(readiness_error) if readiness_error is not None else None,
+                            ci_checks=readiness.get("ci_checks")
+                            if isinstance(readiness.get("ci_checks"), list)
                             else [],
                             decomposition=pr_recovered_decomposition_rollup,
-                            required_file_validation=required_file_validation,
+                            required_file_validation=readiness.get("required_file_validation")
+                            if isinstance(readiness.get("required_file_validation"), dict)
+                            else None,
                         ),
                     )
-                    print(
-                        f"CI checks passed for PR #{pr_number_arg}; marking orchestration state as ready-to-merge."
-                    )
+                    if readiness_status == "waiting-for-ci":
+                        print(f"PR #{pr_number_arg} CI checks are still pending: {readiness_error}")
+                        return _finish_main(0, original_process_cwd)
+                    if readiness_status == "blocked":
+                        print(f"PR #{pr_number_arg} is blocked: {readiness_error}")
+                        return _finish_main(0, original_process_cwd)
+                    if readiness_status == "ready-for-review":
+                        print(f"PR #{pr_number_arg} is waiting for approval: {readiness_error}")
+                        return _finish_main(0, original_process_cwd)
+                    print(f"CI checks passed for PR #{pr_number_arg}; marking orchestration state as ready-to-merge.")
                     return _finish_main(0, original_process_cwd)
 
                 safe_post_orchestration_state_comment(
@@ -6446,6 +6861,31 @@ def main() -> int:
             if not args.dry_run:
                 pre_run_untracked_files = list_untracked_files()
             pr_agent_run_stats: dict[str, object] = {}
+            hook_context = {
+                "hook_target": "pr",
+                "pr_number": pr_number_arg,
+                "branch": active_branch,
+                "base_branch": pr_state_context.get("base_branch"),
+                "repo_dir": os.getcwd(),
+            }
+            if workflow_setup_commands:
+                failure_stage = "workflow_checks"
+                run_configured_workflow_checks(
+                    checks=workflow_setup_commands,
+                    dry_run=args.dry_run,
+                    cwd=os.getcwd(),
+                )
+                failure_stage = "agent_run"
+            if workflow_hooks:
+                failure_stage = "workflow_hooks"
+                run_configured_workflow_hooks(
+                    hook_name="before_agent",
+                    configured_hooks=workflow_hooks,
+                    dry_run=args.dry_run,
+                    cwd=os.getcwd(),
+                    context=hook_context,
+                )
+                failure_stage = "agent_run"
             exit_code = run_agent_with_prompt(
                 prompt=prompt,
                 item_label=f"PR #{pr_number_arg}",
@@ -6460,6 +6900,16 @@ def main() -> int:
                 token_budget=token_budget,
                 run_stats=pr_agent_run_stats,
             )
+            if workflow_hooks:
+                failure_stage = "workflow_hooks"
+                run_configured_workflow_hooks(
+                    hook_name="after_agent",
+                    configured_hooks=workflow_hooks,
+                    dry_run=args.dry_run,
+                    cwd=os.getcwd(),
+                    context=hook_context,
+                )
+                failure_stage = "agent_run"
             if exit_code != 0:
                 exit_summary = describe_exit_code(exit_code)
                 diagnosis = (
@@ -6517,6 +6967,16 @@ def main() -> int:
             )
 
             failure_stage = "commit_push"
+            if workflow_hooks:
+                failure_stage = "workflow_hooks"
+                run_configured_workflow_hooks(
+                    hook_name="before_pr_update",
+                    configured_hooks=workflow_hooks,
+                    dry_run=args.dry_run,
+                    cwd=os.getcwd(),
+                    context=hook_context,
+                )
+                failure_stage = "commit_push"
             if pr_followup_branch_prefix:
                 push_branch(branch_name=active_branch, dry_run=args.dry_run)
                 print(f"Pushed follow-up branch for PR #{pr_number_arg}: {active_branch}")
@@ -6574,9 +7034,9 @@ def main() -> int:
 
                     failure_status = failure_state_for_stage(failure_stage)
                     next_action = failure_next_action_for_stage(failure_stage)
-                    workflow_results = (
-                        exc.checks if isinstance(exc, WorkflowCheckFailure) else None
-                    )
+                    workflow_results = exc.checks if isinstance(exc, WorkflowCheckFailure) else None
+                    if workflow_results is None and isinstance(exc, WorkflowHookFailure):
+                        workflow_results = exc.hooks
                     residual_untracked_files = (
                         exc.files if isinstance(exc, ResidualUntrackedFilesError) else None
                     )
@@ -6605,6 +7065,16 @@ def main() -> int:
                             decomposition=pr_recovered_decomposition_rollup,
                         ),
                     )
+            if workflow_hooks:
+                failure_stage = "workflow_hooks"
+                run_configured_workflow_hooks(
+                    hook_name="after_pr_update",
+                    configured_hooks=workflow_hooks,
+                    dry_run=args.dry_run,
+                    cwd=os.getcwd(),
+                    context=hook_context,
+                )
+                failure_stage = "commit_push"
             print(f"Error: {exc}", file=sys.stderr)
             return _finish_main(1, original_process_cwd)
         finally:
@@ -7274,142 +7744,21 @@ def main() -> int:
                                 repo=repo,
                                 pull_request=pull_request,
                             )
-                            ci_overall = str(ci_status.get("overall") or "")
-                            failing_checks = ci_status.get("failing_checks")
-                            failing_checks_list = (
-                                failing_checks if isinstance(failing_checks, list) else []
-                            )
-                            pending_checks = ci_status.get("pending_checks")
-                            pending_checks_count = (
-                                len(pending_checks) if isinstance(pending_checks, list) else 0
-                            )
-                            ci_checks_payload = (
-                                ci_status.get("checks") if isinstance(ci_status.get("checks"), list) else []
-                            )
-
-                            if ci_overall == "pending":
-                                safe_post_orchestration_state_comment(
-                                    repo=repo,
-                                    target_type="pr",
-                                    target_number=state_target_number,
-                                    dry_run=args.dry_run,
-                                    state=build_orchestration_state(
-                                        status="waiting-for-ci",
-                                        task_type="pr",
-                                        issue_number=issue["number"],
-                                        pr_number=state_pr_number,
-                                        branch=issue_branch,
-                                        base_branch=target_base_branch,
-                                        runner=args.runner,
-                                        agent=args.agent,
-                                        model=args.model,
-                                        attempt=1,
-                                         stage="ci_checks",
-                                         next_action="wait_for_ci",
-                                         error=None,
-                                         ci_checks=ci_checks_payload,
-                                         decomposition=decomposition_rollup,
-                                     ),
-                                 )
-                                print(
-                                    f"No actionable review comments for linked PR #{pr_number}; "
-                                    f"CI checks are still pending ({pending_checks_count} pending), "
-                                    "keeping waiting-for-ci state."
-                                )
-                                remove_agent_failure_label_from_issue(
-                                    repo=repo,
-                                    issue_number=issue["number"],
-                                    dry_run=args.dry_run,
-                                )
-                                continue
-
-                            if ci_overall == "failure":
-                                failing_summary = format_failing_ci_checks_summary(failing_checks_list)
-                                safe_post_orchestration_state_comment(
-                                    repo=repo,
-                                    target_type="pr",
-                                    target_number=state_target_number,
-                                    dry_run=args.dry_run,
-                                    state=build_orchestration_state(
-                                        status="blocked",
-                                        task_type="pr",
-                                        issue_number=issue["number"],
-                                        pr_number=state_pr_number,
-                                        branch=issue_branch,
-                                        base_branch=target_base_branch,
-                                        runner=args.runner,
-                                        agent=args.agent,
-                                        model=args.model,
-                                        attempt=1,
-                                        stage="ci_checks",
-                                        next_action="inspect_failing_ci_checks",
-                                        error=short_error_text(failing_summary),
-                                        ci_checks=ci_checks_payload,
-                                        decomposition=decomposition_rollup,
-                                    ),
-                                )
-                                print(
-                                    f"No actionable review comments for linked PR #{pr_number}; "
-                                    f"CI is failing: {failing_summary}"
-                                )
-                                remove_agent_failure_label_from_issue(
-                                    repo=repo,
-                                    issue_number=issue["number"],
-                                    dry_run=args.dry_run,
-                                )
-                                continue
-
-                            required_file_validation = validate_required_files_in_pr(
+                            readiness = evaluate_pr_readiness(
+                                project_config=project_config,
                                 pull_request=pull_request,
+                                ci_status=ci_status,
                                 linked_issues=[issue],
                             )
-
-                            if required_file_validation.get("status") == "blocked":
-                                missing_files = required_file_validation.get("missing_files")
-                                missing_summary = ", ".join(sorted(str(file) for file in missing_files))
-                                safe_post_orchestration_state_comment(
-                                    repo=repo,
-                                    target_type="pr",
-                                    target_number=state_target_number,
-                                    dry_run=args.dry_run,
-                                    state=build_orchestration_state(
-                                        status="blocked",
-                                        task_type="pr",
-                                        issue_number=issue["number"],
-                                        pr_number=state_pr_number,
-                                        branch=issue_branch,
-                                        base_branch=target_base_branch,
-                                        runner=args.runner,
-                                        agent=args.agent,
-                                        model=args.model,
-                                        attempt=1,
-                                        stage="ci_checks",
-                                        next_action="update_pr_with_required_files",
-                                        error=f"Missing required file evidence: {missing_summary}",
-                                        ci_checks=ci_checks_payload,
-                                        decomposition=decomposition_rollup,
-                                        required_file_validation=required_file_validation,
-                                    ),
-                                )
-                                print(
-                                    f"No actionable review comments for linked PR #{pr_number}; "
-                                    "CI checks passed but required file evidence check failed. "
-                                    f"Missing files: {missing_summary}"
-                                )
-                                remove_agent_failure_label_from_issue(
-                                    repo=repo,
-                                    issue_number=issue["number"],
-                                    dry_run=args.dry_run,
-                                )
-                                continue
-
+                            readiness_status = str(readiness.get("status") or "")
+                            readiness_error = readiness.get("error")
                             safe_post_orchestration_state_comment(
                                 repo=repo,
                                 target_type="pr",
                                 target_number=state_target_number,
                                 dry_run=args.dry_run,
                                 state=build_orchestration_state(
-                                    status="ready-to-merge",
+                                    status=readiness_status,
                                     task_type="pr",
                                     issue_number=issue["number"],
                                     pr_number=state_pr_number,
@@ -7420,13 +7769,50 @@ def main() -> int:
                                     model=args.model,
                                     attempt=1,
                                     stage="ci_checks",
-                                    next_action="ready_for_merge",
-                                    error=None,
-                                    ci_checks=ci_checks_payload,
+                                    next_action=str(readiness.get("next_action") or "wait_for_ci"),
+                                    error=str(readiness_error) if readiness_error is not None else None,
+                                    ci_checks=readiness.get("ci_checks")
+                                    if isinstance(readiness.get("ci_checks"), list)
+                                    else [],
                                     decomposition=decomposition_rollup,
-                                    required_file_validation=required_file_validation,
+                                    required_file_validation=readiness.get("required_file_validation")
+                                    if isinstance(readiness.get("required_file_validation"), dict)
+                                    else None,
                                 ),
                             )
+                            if readiness_status == "waiting-for-ci":
+                                print(
+                                    f"No actionable review comments for linked PR #{pr_number}; "
+                                    f"CI checks are still pending: {readiness_error}"
+                                )
+                                remove_agent_failure_label_from_issue(
+                                    repo=repo,
+                                    issue_number=issue["number"],
+                                    dry_run=args.dry_run,
+                                )
+                                continue
+                            if readiness_status == "blocked":
+                                print(
+                                    f"No actionable review comments for linked PR #{pr_number}; "
+                                    f"blocked: {readiness_error}"
+                                )
+                                remove_agent_failure_label_from_issue(
+                                    repo=repo,
+                                    issue_number=issue["number"],
+                                    dry_run=args.dry_run,
+                                )
+                                continue
+                            if readiness_status == "ready-for-review":
+                                print(
+                                    f"No actionable review comments for linked PR #{pr_number}; "
+                                    f"waiting for approval: {readiness_error}"
+                                )
+                                remove_agent_failure_label_from_issue(
+                                    repo=repo,
+                                    issue_number=issue["number"],
+                                    dry_run=args.dry_run,
+                                )
+                                continue
                             print(
                                 f"No actionable review comments for linked PR #{pr_number}; "
                                 "CI checks passed, marking ready-to-merge."
@@ -7611,6 +7997,14 @@ def main() -> int:
                 pre_run_untracked_files: set[str] | None = None
                 if not skip_agent_run and not args.dry_run:
                     pre_run_untracked_files = list_untracked_files()
+                issue_hook_context = {
+                    "hook_target": "issue" if mode == "issue-flow" else "pr",
+                    "issue_number": issue["number"],
+                    "pr_number": state_pr_number,
+                    "branch": issue_branch,
+                    "base_branch": target_base_branch,
+                    "repo_dir": os.getcwd(),
+                }
 
                 if skip_agent_run:
                     print(
@@ -7618,7 +8012,24 @@ def main() -> int:
                         "no actionable review comments; running sync-only path"
                     )
                 else:
+                    if workflow_setup_commands:
+                        failure_stage = "workflow_checks"
+                        run_configured_workflow_checks(
+                            checks=workflow_setup_commands,
+                            dry_run=args.dry_run,
+                            cwd=os.getcwd(),
+                        )
                     failure_stage = "agent_run"
+                    if workflow_hooks:
+                        failure_stage = "workflow_hooks"
+                        run_configured_workflow_hooks(
+                            hook_name="before_agent",
+                            configured_hooks=workflow_hooks,
+                            dry_run=args.dry_run,
+                            cwd=os.getcwd(),
+                            context=issue_hook_context,
+                        )
+                        failure_stage = "agent_run"
                     issue_agent_run_stats = {}
                     exit_code = run_agent(
                         issue=issue,
@@ -7635,6 +8046,16 @@ def main() -> int:
                         token_budget=token_budget,
                         run_stats=issue_agent_run_stats,
                     )
+                    if workflow_hooks:
+                        failure_stage = "workflow_hooks"
+                        run_configured_workflow_hooks(
+                            hook_name="after_agent",
+                            configured_hooks=workflow_hooks,
+                            dry_run=args.dry_run,
+                            cwd=os.getcwd(),
+                            context=issue_hook_context,
+                        )
+                        failure_stage = "agent_run"
                     if exit_code != 0:
                         exit_summary = describe_exit_code(exit_code)
                         diagnosis = classify_opencode_failure(
@@ -7822,6 +8243,16 @@ def main() -> int:
                 )
 
                 failure_stage = "commit_push"
+                if workflow_hooks:
+                    failure_stage = "workflow_hooks"
+                    run_configured_workflow_hooks(
+                        hook_name="before_pr_update",
+                        configured_hooks=workflow_hooks,
+                        dry_run=args.dry_run,
+                        cwd=os.getcwd(),
+                        context=issue_hook_context,
+                    )
+                    failure_stage = "commit_push"
                 push_branch(
                     branch_name=issue_branch,
                     dry_run=args.dry_run,
@@ -7895,6 +8326,17 @@ def main() -> int:
                                 ),
                             )
 
+                if workflow_hooks:
+                    failure_stage = "workflow_hooks"
+                    run_configured_workflow_hooks(
+                        hook_name="after_pr_update",
+                        configured_hooks=workflow_hooks,
+                        dry_run=args.dry_run,
+                        cwd=os.getcwd(),
+                        context=issue_hook_context,
+                    )
+                    failure_stage = "commit_push"
+
                 if (
                     decomposition_parent_issue is not None
                     and decomposition_parent_branch is not None
@@ -7930,6 +8372,8 @@ def main() -> int:
             failure_status = failure_state_for_stage(failure_stage)
             next_action = failure_next_action_for_stage(failure_stage)
             workflow_results = exc.checks if isinstance(exc, WorkflowCheckFailure) else None
+            if workflow_results is None and isinstance(exc, WorkflowHookFailure):
+                workflow_results = exc.hooks
             residual_untracked_files = (
                 exc.files if isinstance(exc, ResidualUntrackedFilesError) else None
             )

@@ -127,6 +127,123 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
 
         self.assertEqual(args.token_budget, 18000)
 
+    def test_project_preset_is_applied_from_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            project_config_path = os.path.join(tmpdir, "project-config.json")
+            with open(project_config_path, "w", encoding="utf-8") as config_file:
+                json.dump(
+                    {
+                        "presets": {
+                            "cheap": {
+                                "runner": "opencode",
+                                "agent": "build",
+                                "model": "openai/gpt-4o-mini",
+                                "token_budget": 8000,
+                                "max_attempts": 2,
+                            }
+                        }
+                    },
+                    config_file,
+                )
+
+            args = parse_args(
+                ["--dir", tmpdir, "--project-config", project_config_path, "--preset", "cheap"]
+            )
+
+        self.assertEqual(args.preset, "cheap")
+        self.assertEqual(args.runner, "opencode")
+        self.assertEqual(args.agent, "build")
+        self.assertEqual(args.model, "openai/gpt-4o-mini")
+        self.assertEqual(args.token_budget, 8000)
+        self.assertEqual(args.max_attempts, 2)
+
+    def test_local_preset_overrides_project_default_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            project_config_path = os.path.join(tmpdir, "project-config.json")
+            local_config_path = os.path.join(tmpdir, "local-config.json")
+            with open(project_config_path, "w", encoding="utf-8") as project_config_file:
+                json.dump(
+                    {
+                        "defaults": {"preset": "default"},
+                        "presets": {
+                            "default": {"model": "openai/gpt-4o", "max_attempts": 2},
+                            "hard": {"model": "claude-sonnet-4-5", "max_attempts": 4},
+                        },
+                    },
+                    project_config_file,
+                )
+            with open(local_config_path, "w", encoding="utf-8") as local_config_file:
+                json.dump({"preset": "hard"}, local_config_file)
+
+            args = parse_args(
+                ["--dir", tmpdir, "--project-config", project_config_path, "--local-config", local_config_path]
+            )
+
+        self.assertEqual(args.preset, "hard")
+        self.assertEqual(args.model, "claude-sonnet-4-5")
+        self.assertEqual(args.max_attempts, 4)
+
+    def test_cli_runner_override_beats_selected_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            project_config_path = os.path.join(tmpdir, "project-config.json")
+            with open(project_config_path, "w", encoding="utf-8") as config_file:
+                json.dump(
+                    {
+                        "presets": {
+                            "hard": {
+                                "runner": "claude",
+                                "model": "claude-sonnet-4-5",
+                            }
+                        }
+                    },
+                    config_file,
+                )
+
+            args = parse_args(
+                [
+                    "--dir",
+                    tmpdir,
+                    "--project-config",
+                    project_config_path,
+                    "--preset",
+                    "hard",
+                    "--runner",
+                    "opencode",
+                ]
+            )
+
+        self.assertEqual(args.preset, "hard")
+        self.assertEqual(args.runner, "opencode")
+        self.assertEqual(args.model, "claude-sonnet-4-5")
+
+    def test_project_retry_defaults_are_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            project_config_path = os.path.join(tmpdir, "project-config.json")
+            with open(project_config_path, "w", encoding="utf-8") as config_file:
+                json.dump(
+                    {"retry": {"max_attempts": 3, "escalate_to_preset": "hard"}, "presets": {"hard": {}}},
+                    config_file,
+                )
+
+            args = parse_args(["--dir", tmpdir, "--project-config", project_config_path])
+
+        self.assertEqual(args.max_attempts, 3)
+        self.assertEqual(args.escalate_to_preset, "hard")
+
+    def test_unknown_preset_fails_fast(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            project_config_path = os.path.join(tmpdir, "project-config.json")
+            with open(project_config_path, "w", encoding="utf-8") as config_file:
+                json.dump({"presets": {"cheap": {"runner": "opencode"}}}, config_file)
+
+            with self.assertRaisesRegex(RuntimeError, "Unknown preset 'hard'"):
+                parse_args(["--dir", tmpdir, "--project-config", project_config_path, "--preset", "hard"])
+
     def test_local_config_overrides_project_config_track_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             os.mkdir(os.path.join(tmpdir, ".git"))

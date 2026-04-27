@@ -160,9 +160,11 @@ func TestRunIssueCommandMapsCoreCompatibilityFlags(t *testing.T) {
 		"run", "issue",
 		"--id", "20",
 		"--repo", "owner/repo",
+		"--preset", "hard",
 		"--runner", "opencode",
 		"--agent", "build",
 		"--model", "openai/gpt-4o",
+		"--max-attempts", "3",
 	})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
@@ -173,6 +175,8 @@ func TestRunIssueCommandMapsCoreCompatibilityFlags(t *testing.T) {
 		"--runner", "opencode",
 		"--agent", "build",
 		"--model", "openai/gpt-4o",
+		"--preset", "hard",
+		"--max-attempts", "3",
 	})
 }
 

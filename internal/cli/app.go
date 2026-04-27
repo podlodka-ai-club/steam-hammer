@@ -298,11 +298,13 @@ type commonOptions struct {
 	runner   *string
 	agent    *string
 	model    *string
+	preset   *string
 	autoYes  *bool
 	branch   *string
 	dryRun   *bool
 	local    *string
 	project  *string
+	maxTry   *int
 	timeout  *int
 	idleTime *int
 }
@@ -313,11 +315,13 @@ func addCommonFlags(fs *flag.FlagSet, opts *commonOptions) {
 	opts.runner = fs.String("runner", "", "AI runner: claude or opencode")
 	opts.agent = fs.String("agent", "", "OpenCode agent name")
 	opts.model = fs.String("model", "", "optional model override")
+	opts.preset = fs.String("preset", "", "named project config preset")
 	opts.autoYes = fs.Bool("opencode-auto-approve", false, "allow OpenCode to skip interactive approvals")
 	opts.branch = fs.String("branch-prefix", "", "prefix for per-issue git branches")
 	opts.dryRun = fs.Bool("dry-run", false, "print actions without running the agent")
 	opts.local = fs.String("local-config", "", "path to local JSON config")
 	opts.project = fs.String("project-config", "", "path to project JSON config")
+	opts.maxTry = fs.Int("max-attempts", 0, "retry policy placeholder maximum")
 	opts.timeout = fs.Int("agent-timeout-seconds", 0, "hard timeout for agent execution in seconds")
 	opts.idleTime = fs.Int("agent-idle-timeout-seconds", 0, "abort if agent produces no output for this many seconds")
 }
@@ -338,6 +342,9 @@ func appendCommonPythonArgs(args []string, opts commonOptions) []string {
 	if *opts.model != "" {
 		args = append(args, "--model", *opts.model)
 	}
+	if *opts.preset != "" {
+		args = append(args, "--preset", *opts.preset)
+	}
 	if *opts.autoYes {
 		args = append(args, "--opencode-auto-approve")
 	}
@@ -352,6 +359,9 @@ func appendCommonPythonArgs(args []string, opts commonOptions) []string {
 	}
 	if *opts.project != "" {
 		args = append(args, "--project-config", *opts.project)
+	}
+	if *opts.maxTry > 0 {
+		args = append(args, "--max-attempts", strconv.Itoa(*opts.maxTry))
 	}
 	if *opts.timeout > 0 {
 		args = append(args, "--agent-timeout-seconds", strconv.Itoa(*opts.timeout))

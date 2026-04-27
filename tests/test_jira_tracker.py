@@ -65,6 +65,43 @@ class JiraTrackerTests(unittest.TestCase):
         self.assertIn("Missing required Jira environment variables", stderr.getvalue())
         ensure_clean_worktree_mock.assert_not_called()
 
+    def test_pr_review_mode_rejects_jira_tracker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            stderr = io.StringIO()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "JIRA_BASE_URL": "https://example.atlassian.net",
+                        "JIRA_EMAIL": "dev@example.com",
+                        "JIRA_API_TOKEN": "token-123",
+                    },
+                    clear=True,
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "prog",
+                        "--dir",
+                        tmpdir,
+                        "--tracker",
+                        "jira",
+                        "--pr",
+                        "76",
+                        "--from-review-comments",
+                    ],
+                ),
+                patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree") as ensure_clean_worktree_mock,
+                patch("sys.stderr", stderr),
+            ):
+                exit_code = main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("only supports --tracker github", stderr.getvalue())
+        ensure_clean_worktree_mock.assert_not_called()
+
     def test_fetch_jira_issue_maps_payload(self) -> None:
         request_mock = Mock()
 
@@ -250,6 +287,54 @@ class JiraTrackerTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         fetch_issue_mock.assert_called_once_with(repo="owner/repo", number=42)
         fetch_jira_issue_mock.assert_not_called()
+
+    def test_jira_tracker_uses_jira_list_path_for_open_issues(self) -> None:
+        previous_cwd = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                os.mkdir(os.path.join(tmpdir, ".git"))
+                stdout = io.StringIO()
+                issue = {
+                    "number": "PROJ-42",
+                    "title": "Title",
+                    "body": "Body",
+                    "url": "https://example.atlassian.net/browse/PROJ-42",
+                    "tracker": TRACKER_JIRA,
+                }
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "JIRA_BASE_URL": "https://example.atlassian.net",
+                            "JIRA_EMAIL": "dev@example.com",
+                            "JIRA_API_TOKEN": "token-123",
+                        },
+                        clear=True,
+                    ),
+                    patch.object(sys, "argv", ["prog", "--dir", tmpdir, "--tracker", "jira", "--limit", "5", "--dry-run"]),
+                    patch("sys.stdout", stdout),
+                    patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+                    patch("scripts.run_github_issues_to_opencode.detect_repo", return_value="owner/repo"),
+                    patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+                    patch("scripts.run_github_issues_to_opencode.fetch_jira_issues", return_value=[issue]) as fetch_jira_issues_mock,
+                    patch("scripts.run_github_issues_to_opencode.fetch_issues") as fetch_issues_mock,
+                    patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False),
+                    patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="created"),
+                    patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0),
+                    patch("scripts.run_github_issues_to_opencode.push_branch"),
+                    patch("scripts.run_github_issues_to_opencode.ensure_pr", return_value=("created", "")),
+                    patch("scripts.run_github_issues_to_opencode.run_configured_workflow_checks", return_value=[]),
+                ):
+                    exit_code = main()
+        finally:
+            os.chdir(previous_cwd)
+
+        self.assertEqual(exit_code, 0)
+        fetch_jira_issues_mock.assert_called_once_with(
+            jql="status != Done ORDER BY created DESC",
+            limit=5,
+        )
+        fetch_issues_mock.assert_not_called()
 
 
 if __name__ == "__main__":

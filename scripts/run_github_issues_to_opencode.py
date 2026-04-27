@@ -4469,6 +4469,7 @@ def main() -> int:
             force_override_applied = False
             skip_agent_run = False
             supports_github_issue_ops = False
+            issue_label = format_issue_label_from_issue(issue)
             issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
             state_target_type = "issue"
             state_target_number = issue["number"]
@@ -4480,14 +4481,14 @@ def main() -> int:
             scope_reason = str(scope_decision.get("reason") or "scope rules passed")
             scope_prefix = "[dry-run] " if args.dry_run else ""
             print(
-                f"{scope_prefix}Scope decision for issue #{issue['number']}: "
+                f"{scope_prefix}Scope decision for {issue_label}: "
                 f"{'eligible' if scope_eligible else 'out-of-scope'} ({scope_reason})"
             )
 
             if not scope_eligible:
                 if force_reprocess:
                     print(
-                        f"Continuing issue #{issue['number']} despite out-of-scope decision "
+                        f"Continuing {issue_label} despite out-of-scope decision "
                         "because --force-reprocess is set."
                     )
                     if supports_github_issue_ops:
@@ -4530,7 +4531,7 @@ def main() -> int:
                             dry_run=args.dry_run,
                         )
                     print(
-                        f"Skipping issue #{issue['number']}: out-of-scope for autonomous run "
+                        f"Skipping {issue_label}: out-of-scope for autonomous run "
                         "(--force-reprocess to override)."
                     )
                     continue
@@ -4549,7 +4550,7 @@ def main() -> int:
                         if linked_pr_url:
                             linked_pr_context = f"{linked_pr_context} ({linked_pr_url})"
                         print(
-                            f"Found linked open PR for issue #{issue['number']}: {linked_pr_context}; "
+                            f"Found linked open PR for {issue_label}: {linked_pr_context}; "
                             "skipping duplicate issue-flow and evaluating PR-review/recovery path."
                         )
                     else:
@@ -4564,7 +4565,7 @@ def main() -> int:
                         if linked_pr_url:
                             linked_pr_context = f"{linked_pr_context} ({linked_pr_url})"
                         print(
-                            f"Skipping issue #{issue['number']}: {linked_pr_context} already exists "
+                            f"Skipping {issue_label}: {linked_pr_context} already exists "
                             "(--force-reprocess or --no-skip-if-pr-exists to override)."
                         )
                         continue
@@ -4572,7 +4573,7 @@ def main() -> int:
             if skip_if_branch_exists and remote_branch_exists(issue_branch):
                 skipped_existing_branch += 1
                 print(
-                    f"Skipping issue #{issue['number']}: branch '{issue_branch}' already exists on origin "
+                    f"Skipping {issue_label}: branch '{issue_branch}' already exists on origin "
                     "(--force-reprocess or --no-skip-if-branch-exists to override)."
                 )
                 continue
@@ -4589,14 +4590,14 @@ def main() -> int:
                         issue_state_warnings,
                     ) = select_latest_parseable_orchestration_state(
                         comments=issue_comments,
-                        source_label=f"issue #{issue['number']}",
+                        source_label=issue_label,
                     )
                     for warning in issue_state_warnings:
                         print(f"Warning: {warning}", file=sys.stderr)
                 except Exception as exc:  # noqa: BLE001
                     print(
                         "Warning: unable to recover orchestration state from "
-                        f"issue #{issue['number']} comments: {exc}",
+                        f"{issue_label} comments: {exc}",
                         file=sys.stderr,
                     )
 
@@ -4652,7 +4653,7 @@ def main() -> int:
                 )
                 if mode == "skip":
                     print(
-                        f"Skipping issue #{issue['number']}: {mode_reason} "
+                        f"Skipping {issue_label}: {mode_reason} "
                         "(use --force-issue-flow to override)."
                     )
                     continue
@@ -4671,11 +4672,11 @@ def main() -> int:
                 has_issue_text=has_issue_text,
                 issue_image_urls=issue_image_urls,
             ):
-                print(f"Skipping issue #{issue['number']} (empty body)")
+                print(f"Skipping {issue_label} (empty body)")
                 continue
 
             if body_image_reason:
-                print(f"Issue #{issue['number']} {body_image_reason}")
+                print(f"{issue_label.capitalize()} {body_image_reason}")
 
             processed += 1
 
@@ -4690,7 +4691,7 @@ def main() -> int:
                 elif issue_image_urls and args.dry_run:
                     print(
                         f"[dry-run] Would download {len(issue_image_urls)} image attachment(s) "
-                        f"for issue #{issue['number']}"
+                        f"for {issue_label}"
                     )
 
                 prompt_override: str | None = None
@@ -4709,13 +4710,13 @@ def main() -> int:
                 if mode == "pr-review":
                     if linked_open_pr is None:
                         raise RuntimeError(
-                            f"Internal error: PR-review mode selected without linked PR for issue #{issue['number']}"
+                            f"Internal error: PR-review mode selected without linked PR for {issue_label}"
                         )
 
                     pr_number_raw = linked_open_pr.get("number")
                     if type(pr_number_raw) is not int:
                         raise RuntimeError(
-                            f"Linked PR for issue #{issue['number']} has invalid number: {pr_number_raw}"
+                            f"Linked PR for {issue_label} has invalid number: {pr_number_raw}"
                         )
                     pr_number = pr_number_raw
                     state_target_type = "pr"
@@ -4723,7 +4724,7 @@ def main() -> int:
                     state_pr_number = pr_number
 
                     print(
-                        f"Auto-switch to PR-review mode for issue #{issue['number']}: {mode_reason}."
+                        f"Auto-switch to PR-review mode for {issue_label}: {mode_reason}."
                     )
                     pull_request = fetch_pull_request(repo=repo, number=pr_number)
                     merge_state = str(pull_request.get("mergeStateStatus") or "").strip().upper()
@@ -5034,7 +5035,7 @@ def main() -> int:
                     dry_run=args.dry_run,
                     fail_on_existing=args.fail_on_existing,
                 )
-                print(f"Branch status for issue #{issue['number']}: {branch_status}")
+                print(f"Branch status for {issue_label}: {branch_status}")
 
                 reused_branch_sync_changed = False
 
@@ -5062,7 +5063,7 @@ def main() -> int:
 
                 if skip_agent_run:
                     print(
-                        f"Skipping agent run for issue #{issue['number']} in pr-review mode: "
+                        f"Skipping agent run for {issue_label} in pr-review mode: "
                         "no actionable review comments; running sync-only path"
                     )
                 else:
@@ -5081,13 +5082,13 @@ def main() -> int:
                     )
                     if exit_code != 0:
                         raise RuntimeError(
-                            f"Agent failed for issue #{issue['number']} with exit code {exit_code}"
+                            f"Agent failed for {issue_label} with exit code {exit_code}"
                         )
 
                 if not args.dry_run and not has_changes():
                     if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:
                         print(
-                            f"No file changes from agent for issue #{issue['number']}; "
+                            f"No file changes from agent for {issue_label}; "
                             "pushing sync-only branch updates"
                         )
                         used_force_with_lease = args.sync_strategy == "rebase"
@@ -5097,7 +5098,7 @@ def main() -> int:
                             force_with_lease=used_force_with_lease,
                         )
                         print(
-                            f"Sync-only push result for issue #{issue['number']}: "
+                            f"Sync-only push result for {issue_label}: "
                             f"branch '{issue_branch}' pushed "
                             f"(force-with-lease: {'yes' if used_force_with_lease else 'no'})"
                         )
@@ -5119,7 +5120,7 @@ def main() -> int:
                         )
                         if pr_url:
                             touched_prs.append(pr_url)
-                            print(f"PR status for issue #{issue['number']}: {pr_status} ({pr_url})")
+                            print(f"PR status for {issue_label}: {pr_status} ({pr_url})")
                         if mode == "pr-review":
                             safe_post_orchestration_state_comment(
                                 repo=repo,
@@ -5174,7 +5175,7 @@ def main() -> int:
                         continue
 
                     print(
-                        f"No changes detected for issue #{issue['number']}; skipping commit and PR"
+                        f"No changes detected for {issue_label}; skipping commit and PR"
                     )
                     if supports_github_issue_ops or mode == "pr-review":
                         safe_post_orchestration_state_comment(
@@ -5239,7 +5240,7 @@ def main() -> int:
                 )
                 if pr_url:
                     touched_prs.append(pr_url)
-                    print(f"PR status for issue #{issue['number']}: {pr_status} ({pr_url})")
+                    print(f"PR status for {issue_label}: {pr_status} ({pr_url})")
                     if mode == "issue-flow" and supports_github_issue_ops:
                         safe_post_orchestration_state_comment(
                             repo=repo,
@@ -5342,7 +5343,7 @@ def main() -> int:
                     dry_run=args.dry_run,
                     already_reported_issue_numbers=reported_issue_failures,
                 )
-            print(f"Issue #{issue['number']} failed: {exc}", file=sys.stderr)
+            print(f"{issue_label.capitalize()} failed: {exc}", file=sys.stderr)
             if args.stop_on_error:
                 break
 

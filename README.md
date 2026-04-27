@@ -98,7 +98,6 @@ Available commands:
 
 ```bash
 go run ./cmd/orchestrator doctor --repo owner/repo
-go run ./cmd/orchestrator run issue --repo owner/repo --limit 1
 go run ./cmd/orchestrator run issue --id 71 --repo owner/repo --dry-run
 go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --dry-run
 ```
@@ -108,8 +107,8 @@ Common Python-runner examples map to the Go wrapper as follows:
 ```bash
 go run ./cmd/orchestrator doctor --repo owner/repo
 go run ./cmd/orchestrator doctor --doctor-smoke-check --runner opencode --model openai/gpt-5.3-codex
-go run ./cmd/orchestrator run issue --repo owner/repo --limit 1
-go run ./cmd/orchestrator run issue --repo owner/repo --limit 1 --runner opencode --agent build --model openai/gpt-4o
+go run ./cmd/orchestrator run issue --id 20 --repo owner/repo
+go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --agent build --model openai/gpt-4o
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --model openai/gpt-5.3-codex --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
 go run ./cmd/orchestrator run issue --id 31 --repo owner/repo --force-issue-flow
 go run ./cmd/orchestrator run issue --id 45 --repo owner/repo --base current --runner opencode --agent build
@@ -120,7 +119,7 @@ The Go handlers only translate CLI intent into the current Python runner argumen
 
 Compatibility boundary for Phase 1:
 
-- `run issue` supports single-issue execution and batch issue selection with `--state` / `--limit`. `--issue N` is accepted as a compatibility alias for `--id N`.
+- `run issue` supports single-issue execution through the Python runner. `--issue N` is accepted as a compatibility alias for `--id N`.
 - `run pr` supports PR review-comments execution. `--pr N` is accepted as a compatibility alias for `--id N`, and `--from-review-comments` is accepted as a no-op because the command always selects that mode.
 - `doctor` accepts `--doctor` as a no-op because the command already selects diagnostics mode.
 - Precedence remains delegated to the Python runner: CLI flags forwarded by Go override local config, local config overrides project config, and project config overrides built-in defaults.

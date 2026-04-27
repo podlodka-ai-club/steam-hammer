@@ -116,30 +116,6 @@ func TestRunIssueCommandMapsPythonRunnerFlags(t *testing.T) {
 	})
 }
 
-func TestRunIssueBatchCommandMapsREADMEExample(t *testing.T) {
-	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
-	app.SetRunner(runner)
-
-	code := app.Run([]string{"run", "issue", "--repo", "owner/repo", "--limit", "1", "--runner", "opencode", "--agent", "build", "--model", "openai/gpt-4o"})
-	if code != 0 {
-		t.Fatalf("Run() code = %d, want 0", code)
-	}
-	assertCommand(t, runner, []string{runnerScript, "--repo", "owner/repo", "--runner", "opencode", "--agent", "build", "--model", "openai/gpt-4o", "--limit", "1"})
-}
-
-func TestRunIssueBatchCommandMapsState(t *testing.T) {
-	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
-	app.SetRunner(runner)
-
-	code := app.Run([]string{"run", "issue", "--repo", "owner/repo", "--state", "open", "--limit", "2"})
-	if code != 0 {
-		t.Fatalf("Run() code = %d, want 0", code)
-	}
-	assertCommand(t, runner, []string{runnerScript, "--repo", "owner/repo", "--state", "open", "--limit", "2"})
-}
-
 func TestRunIssueCommandForwardsExplicitDefaultTrueFlags(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -173,6 +149,31 @@ func TestRunIssueCommandAcceptsIssueAlias(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--issue", "71"})
+}
+
+func TestRunIssueCommandMapsCoreCompatibilityFlags(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{
+		"run", "issue",
+		"--id", "20",
+		"--repo", "owner/repo",
+		"--runner", "opencode",
+		"--agent", "build",
+		"--model", "openai/gpt-4o",
+	})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{
+		runnerScript, "--issue", "20",
+		"--repo", "owner/repo",
+		"--runner", "opencode",
+		"--agent", "build",
+		"--model", "openai/gpt-4o",
+	})
 }
 
 func TestRunPRCommandWiresPythonRunner(t *testing.T) {
@@ -226,6 +227,23 @@ func TestRunIssueRequiresID(t *testing.T) {
 	}
 	if runner.calls != 0 {
 		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+}
+
+func TestRunIssueRejectsBatchFlags(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+
+	if code := app.Run([]string{"run", "issue", "--id", "71", "--limit", "1"}); code != 2 {
+		t.Fatalf("Run() code = %d, want 2", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "unsupported flag --limit") {
+		t.Fatalf("stderr = %q, want batch flag rejection", errOut.String())
 	}
 }
 

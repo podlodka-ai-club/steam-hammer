@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -65,6 +66,7 @@ JIRA_ENV_VARS = {
 JIRA_ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
 
 ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"
+ORCHESTRATION_CLAIM_MARKER = "<!-- orchestration-claim:v1 -->"
 AGENT_FAILURE_REPORT_MARKER = "<!-- orchestration-agent-failure:v1 -->"
 SCOPE_DECISION_MARKER = "<!-- orchestration-scope:v1 -->"
 DECOMPOSITION_PLAN_MARKER = "<!-- orchestration-decomposition:v1 -->"
@@ -73,6 +75,7 @@ AGENT_FAILURE_LABEL_NAME = "auto:agent-failed"
 AGENT_FAILURE_LABEL_COLOR = "B60205"
 AGENT_FAILURE_LABEL_DESCRIPTION = "Automation run failed for this issue"
 RECOMMENDED_OPENCODE_MODEL = "openai/gpt-4o"
+AUTONOMOUS_CLAIM_TTL_SECONDS = 900
 SIGKILL_EXIT_DESCRIPTION = (
     "This usually indicates a hard kill (SIGKILL), commonly from resource limits or environment-level"
     " termination rather than an argument/model syntax error."
@@ -384,6 +387,21 @@ def _issue_author_login(issue: dict) -> str:
     return ""
 
 
+def _issue_assignee_logins(issue: dict) -> list[str]:
+    assignees_payload = issue.get("assignees") if isinstance(issue, dict) else None
+    if not isinstance(assignees_payload, list):
+        return []
+
+    assignees: list[str] = []
+    for assignee in assignees_payload:
+        if not isinstance(assignee, dict):
+            continue
+        login = str(assignee.get("login") or "").strip().lower()
+        if login:
+            assignees.append(login)
+    return assignees
+
+
 def _issue_label_names(issue: dict) -> list[str]:
     labels_payload = issue.get("labels") if isinstance(issue, dict) else None
     if not isinstance(labels_payload, list):
@@ -397,6 +415,30 @@ def _issue_label_names(issue: dict) -> list[str]:
         if name:
             labels.append(name)
     return labels
+
+
+def _parse_iso_timestamp(value: object) -> datetime | None:
+    text = _as_optional_string(value)
+    if text is None:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _issue_priority_rank(issue: dict, ordered_labels: list[str]) -> int:
+    if not ordered_labels:
+        return len(ordered_labels)
+    issue_labels = set(_issue_label_names(issue))
+    for index, label in enumerate(ordered_labels):
+        if label in issue_labels:
+            return index
+    return len(ordered_labels)
 
 
 def project_scope_defaults(project_config: dict) -> dict:
@@ -413,6 +455,9 @@ def project_scope_defaults(project_config: dict) -> dict:
 def evaluate_issue_scope(issue: dict, scope_defaults: dict) -> dict:
     labels_config = scope_defaults.get("labels") if isinstance(scope_defaults, dict) else None
     authors_config = scope_defaults.get("authors") if isinstance(scope_defaults, dict) else None
+    assignees_config = scope_defaults.get("assignees") if isinstance(scope_defaults, dict) else None
+    priority_config = scope_defaults.get("priority") if isinstance(scope_defaults, dict) else None
+    freshness_config = scope_defaults.get("freshness") if isinstance(scope_defaults, dict) else None
 
     allow_labels = _normalize_match_list(
         labels_config.get("allow") if isinstance(labels_config, dict) else None
@@ -426,9 +471,31 @@ def evaluate_issue_scope(issue: dict, scope_defaults: dict) -> dict:
     deny_authors = _normalize_match_list(
         authors_config.get("deny") if isinstance(authors_config, dict) else None
     )
+    allow_assignees = _normalize_match_list(
+        assignees_config.get("allow") if isinstance(assignees_config, dict) else None
+    )
+    deny_assignees = _normalize_match_list(
+        assignees_config.get("deny") if isinstance(assignees_config, dict) else None
+    )
+    allow_priority = _normalize_match_list(
+        priority_config.get("allow") if isinstance(priority_config, dict) else None
+    )
+    deny_priority = _normalize_match_list(
+        priority_config.get("deny") if isinstance(priority_config, dict) else None
+    )
+    priority_order = _normalize_match_list(
+        priority_config.get("order") if isinstance(priority_config, dict) else None
+    )
+    max_age_days = (
+        freshness_config.get("max_age_days") if isinstance(freshness_config, dict) else None
+    )
+    max_idle_days = (
+        freshness_config.get("max_idle_days") if isinstance(freshness_config, dict) else None
+    )
 
     issue_labels = set(_issue_label_names(issue))
     issue_author = _issue_author_login(issue)
+    issue_assignees = set(_issue_assignee_logins(issue))
 
     matched_deny_labels = sorted(label for label in deny_labels if label in issue_labels)
     if matched_deny_labels:
@@ -469,11 +536,96 @@ def evaluate_issue_scope(issue: dict, scope_defaults: dict) -> dict:
                 "matched": {"author_allow": []},
             }
 
+    matched_deny_assignees = sorted(assignee for assignee in deny_assignees if assignee in issue_assignees)
+    if matched_deny_assignees:
+        return {
+            "eligible": False,
+            "reason": f"matched denied assignee(s): {', '.join(matched_deny_assignees)}",
+            "matched": {"assignees_deny": matched_deny_assignees},
+        }
+
+    if allow_assignees:
+        matched_allow_assignees = sorted(
+            assignee for assignee in allow_assignees if assignee in issue_assignees
+        )
+        if not matched_allow_assignees:
+            return {
+                "eligible": False,
+                "reason": (
+                    "missing required assignee "
+                    f"(expected one of: {', '.join(sorted(allow_assignees))})"
+                ),
+                "matched": {"assignees_allow": []},
+            }
+
+    matched_deny_priority = sorted(label for label in deny_priority if label in issue_labels)
+    if matched_deny_priority:
+        return {
+            "eligible": False,
+            "reason": f"matched deny priority label(s): {', '.join(matched_deny_priority)}",
+            "matched": {"priority_deny": matched_deny_priority},
+        }
+
+    if allow_priority:
+        matched_allow_priority = sorted(label for label in allow_priority if label in issue_labels)
+        if not matched_allow_priority:
+            return {
+                "eligible": False,
+                "reason": (
+                    "missing required priority label "
+                    f"(expected one of: {', '.join(sorted(allow_priority))})"
+                ),
+                "matched": {"priority_allow": []},
+            }
+
+    now = datetime.now(timezone.utc)
+    created_at = _parse_iso_timestamp(issue.get("createdAt"))
+    updated_at = _parse_iso_timestamp(issue.get("updatedAt"))
+    if isinstance(max_age_days, int) and max_age_days > 0 and created_at is not None:
+        age_days = (now - created_at).total_seconds() / 86400
+        if age_days > max_age_days:
+            return {
+                "eligible": False,
+                "reason": f"issue is too old for autonomous scope ({age_days:.1f}d > {max_age_days}d)",
+                "matched": {"freshness_max_age_days": max_age_days},
+            }
+
+    if isinstance(max_idle_days, int) and max_idle_days > 0 and updated_at is not None:
+        idle_days = (now - updated_at).total_seconds() / 86400
+        if idle_days > max_idle_days:
+            return {
+                "eligible": False,
+                "reason": f"issue is too stale for autonomous scope ({idle_days:.1f}d > {max_idle_days}d idle)",
+                "matched": {"freshness_max_idle_days": max_idle_days},
+            }
+
     return {
         "eligible": True,
         "reason": "scope rules passed",
-        "matched": {},
+        "matched": {
+            "priority_rank": _issue_priority_rank(issue, priority_order),
+        },
     }
+
+
+def sort_autonomous_issues(issues: list[dict], scope_defaults: dict) -> list[dict]:
+    priority_config = scope_defaults.get("priority") if isinstance(scope_defaults, dict) else None
+    priority_order = _normalize_match_list(
+        priority_config.get("order") if isinstance(priority_config, dict) else None
+    )
+
+    def sort_key(issue: dict) -> tuple[int, float, int]:
+        updated_at = _parse_iso_timestamp(issue.get("updatedAt"))
+        updated_ts = updated_at.timestamp() if updated_at is not None else 0.0
+        issue_number = issue.get("number")
+        numeric_issue = issue_number if type(issue_number) is int else 0
+        return (
+            _issue_priority_rank(issue, priority_order),
+            -updated_ts,
+            -numeric_issue,
+        )
+
+    return sorted(issues, key=sort_key)
 
 
 def run_capture(command: list[str]) -> str:
@@ -741,7 +893,7 @@ def fetch_issues(repo: str, state: str, limit: int) -> list[dict]:
             "--limit",
             str(limit),
             "--json",
-            "number,title,body,url,state,labels,author",
+            "number,title,body,url,state,labels,author,assignees,createdAt,updatedAt",
         ]
     )
     issues = json.loads(output)
@@ -763,7 +915,7 @@ def fetch_issue(repo: str, number: int) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,url,state,labels,author",
+            "number,title,body,url,state,labels,author,assignees,createdAt,updatedAt",
         ]
     )
     issue = json.loads(output)
@@ -1349,6 +1501,111 @@ def select_latest_parseable_orchestration_state(
             latest = candidate
 
     return latest, warnings
+
+
+def parse_orchestration_claim_comment_body(body: str) -> tuple[dict | None, str | None]:
+    if ORCHESTRATION_CLAIM_MARKER not in body:
+        return None, None
+
+    after_marker = body.split(ORCHESTRATION_CLAIM_MARKER, maxsplit=1)[1].strip()
+    if not after_marker:
+        return None, "marker found but payload is empty"
+
+    fenced_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", after_marker, flags=re.DOTALL)
+    candidates = fenced_matches if fenced_matches else [after_marker]
+
+    parse_errors: list[str] = []
+    for candidate in candidates:
+        try:
+            return _first_json_object(candidate), None
+        except (ValueError, json.JSONDecodeError) as exc:
+            parse_errors.append(str(exc))
+
+    if parse_errors:
+        return None, parse_errors[-1]
+    return None, "unable to parse claim payload"
+
+
+def select_latest_parseable_orchestration_claim(
+    comments: list[dict],
+    source_label: str,
+) -> tuple[dict | None, list[str]]:
+    latest: dict | None = None
+    warnings: list[str] = []
+
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+
+        body = str(comment.get("body") or "")
+        payload, error = parse_orchestration_claim_comment_body(body)
+        if payload is None:
+            if error:
+                created_at = str(comment.get("created_at") or "unknown-time")
+                url = str(comment.get("html_url") or "")
+                context = f" at {url}" if url else ""
+                warnings.append(
+                    f"ignoring malformed orchestration claim comment in {source_label}"
+                    f" ({created_at}){context}: {error}"
+                )
+            continue
+
+        created_at = str(comment.get("created_at") or "")
+        candidate = {
+            "source": source_label,
+            "created_at": created_at,
+            "url": str(comment.get("html_url") or ""),
+            "comment_id": comment.get("id"),
+            "payload": payload,
+            "status": str(payload.get("status") or "").strip().lower(),
+        }
+        if latest is None or created_at >= str(latest.get("created_at") or ""):
+            latest = candidate
+
+    return latest, warnings
+
+
+def build_orchestration_claim(
+    issue_number: int,
+    run_id: str,
+    status: str,
+    ttl_seconds: int,
+) -> dict:
+    now = datetime.now(timezone.utc)
+    expires_at = now.timestamp() + max(ttl_seconds, 1)
+    return {
+        "status": status,
+        "issue": issue_number,
+        "run_id": run_id,
+        "worker": f"pid-{os.getpid()}",
+        "claimed_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": datetime.fromtimestamp(expires_at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def is_active_orchestration_claim(claim: dict | None, run_id: str | None = None) -> bool:
+    if not isinstance(claim, dict):
+        return False
+    payload = claim.get("payload") if isinstance(claim.get("payload"), dict) else claim
+    status = str(payload.get("status") or "").strip().lower()
+    if status != "claimed":
+        return False
+    if run_id is not None and str(payload.get("run_id") or "") == run_id:
+        return False
+    expires_at = _parse_iso_timestamp(payload.get("expires_at"))
+    if expires_at is None:
+        return False
+    return expires_at > datetime.now(timezone.utc)
+
+
+def next_orchestration_attempt(recovered_state: dict | None) -> int:
+    if not isinstance(recovered_state, dict):
+        return 1
+    payload = recovered_state.get("payload") if isinstance(recovered_state.get("payload"), dict) else {}
+    previous_attempt = payload.get("attempt")
+    if type(previous_attempt) is int and previous_attempt > 0:
+        return previous_attempt + 1
+    return 1
 
 
 def parse_decomposition_plan_comment_body(body: str) -> tuple[dict | None, str | None]:
@@ -3688,6 +3945,59 @@ def safe_post_orchestration_state_comment(
         )
 
 
+def format_orchestration_claim_comment(claim: dict) -> str:
+    status = str(claim.get("status") or "unknown")
+    issue_number = claim.get("issue")
+    return (
+        f"Orchestration claim update: {status} for issue #{issue_number}.\n\n"
+        f"{ORCHESTRATION_CLAIM_MARKER}\n"
+        f"```json\n{json.dumps(claim, ensure_ascii=True, indent=2)}\n```"
+    )
+
+
+def post_orchestration_claim_comment(repo: str, issue_number: int, claim: dict, dry_run: bool) -> None:
+    body = format_orchestration_claim_comment(claim)
+    if dry_run:
+        print(
+            f"[dry-run] Would post orchestration claim to issue #{issue_number}: "
+            f"status={claim.get('status')}"
+        )
+        return
+
+    run_command(
+        [
+            "gh",
+            "issue",
+            "comment",
+            str(issue_number),
+            "--repo",
+            repo,
+            "--body",
+            body,
+        ]
+    )
+
+
+def safe_post_orchestration_claim_comment(
+    repo: str,
+    issue_number: int,
+    claim: dict,
+    dry_run: bool,
+) -> None:
+    try:
+        post_orchestration_claim_comment(
+            repo=repo,
+            issue_number=issue_number,
+            claim=claim,
+            dry_run=dry_run,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Warning: failed to post orchestration claim to issue #{issue_number}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def build_prompt(issue: dict, image_paths: list[str] | None = None) -> str:
     attached_images = image_paths if image_paths else []
     image_section = ""
@@ -4855,7 +5165,7 @@ def _validate_project_scope(config: dict, config_path: str) -> None:
     if not isinstance(defaults, dict):
         return
 
-    supported_defaults_keys = {"labels", "authors"}
+    supported_defaults_keys = {"labels", "authors", "assignees", "priority", "freshness"}
     unsupported_defaults = sorted(set(defaults) - supported_defaults_keys)
     if unsupported_defaults:
         raise RuntimeError(
@@ -4863,7 +5173,7 @@ def _validate_project_scope(config: dict, config_path: str) -> None:
             + ", ".join(unsupported_defaults)
         )
 
-    for section_key in ["labels", "authors"]:
+    for section_key in ["labels", "authors", "assignees", "priority"]:
         section = defaults.get(section_key)
         if section is None:
             continue
@@ -4873,6 +5183,8 @@ def _validate_project_scope(config: dict, config_path: str) -> None:
             )
 
         supported_section_keys = {"allow", "deny"}
+        if section_key == "priority":
+            supported_section_keys = {"allow", "deny", "order"}
         unsupported_section = sorted(set(section) - supported_section_keys)
         if unsupported_section:
             raise RuntimeError(
@@ -4880,7 +5192,7 @@ def _validate_project_scope(config: dict, config_path: str) -> None:
                 + ", ".join(unsupported_section)
             )
 
-        for rule_key in ["allow", "deny"]:
+        for rule_key in sorted(supported_section_keys):
             values = section.get(rule_key)
             if values is None:
                 continue
@@ -4893,6 +5205,26 @@ def _validate_project_scope(config: dict, config_path: str) -> None:
                     raise RuntimeError(
                         f"Project config key 'scope.defaults.{section_key}.{rule_key}' must contain non-empty strings"
                     )
+
+    freshness = defaults.get("freshness")
+    if freshness is not None:
+        if not isinstance(freshness, dict):
+            raise RuntimeError("Project config key 'scope.defaults.freshness' must be an object")
+        supported_freshness_keys = {"max_age_days", "max_idle_days"}
+        unsupported_freshness = sorted(set(freshness) - supported_freshness_keys)
+        if unsupported_freshness:
+            raise RuntimeError(
+                f"Unsupported key(s) in project config {config_path} under 'scope.defaults.freshness': "
+                + ", ".join(unsupported_freshness)
+            )
+        for rule_key in sorted(supported_freshness_keys):
+            value = freshness.get(rule_key)
+            if value is None:
+                continue
+            if type(value) is not int or value <= 0:
+                raise RuntimeError(
+                    f"Project config key 'scope.defaults.freshness.{rule_key}' must be a positive integer"
+                )
 
 
 def _validate_project_retry(config: dict, config_path: str) -> None:
@@ -5887,6 +6219,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="Print actions without running the agent."
     )
     parser.add_argument(
+        "--autonomous",
+        action="store_true",
+        help=(
+            "Enable autonomous batch selection behavior: recover state, respect claims, "
+            "and continue linked PR tasks instead of treating batch mode as one-shot issue intake."
+        ),
+    )
+    parser.add_argument(
         "--doctor",
         action="store_true",
         help="Run environment diagnostics and exit without running any agent.",
@@ -5964,6 +6304,7 @@ def main() -> int:
     isolate_worktree = bool(getattr(args, "isolate_worktree", False))
     post_pr_summary = bool(getattr(args, "post_pr_summary", False))
     track_tokens = bool(getattr(args, "track_tokens", False))
+    autonomous_mode = bool(getattr(args, "autonomous", False))
     token_budget = getattr(args, "token_budget", BUILTIN_DEFAULTS["token_budget"])
     if token_budget is not None and (type(token_budget) is not int or token_budget <= 0):
         print("Error: --token-budget must be a positive integer", file=sys.stderr)
@@ -6633,6 +6974,9 @@ def main() -> int:
         print("No issues found.")
         return _finish_main(0, original_process_cwd)
 
+    if autonomous_mode and not pr_mode_requested and issue_number_arg is None:
+        issues = sort_autonomous_issues(issues=issues, scope_defaults=scope_defaults)
+
     run_id = generate_run_id()
     failures = 0
     processed = 0
@@ -6666,6 +7010,8 @@ def main() -> int:
             decomposition_child_note: str | None = None
             selected_decomposition_child = False
             issue_agent_run_stats: dict[str, object] | None = None
+            orchestration_attempt = 1
+            claim_acquired = False
             supports_github_issue_ops = issue_tracker(issue) == TRACKER_GITHUB and type(issue["number"]) is int
 
             scope_decision = evaluate_issue_scope(issue=issue, scope_defaults=scope_defaults)
@@ -6728,7 +7074,7 @@ def main() -> int:
                     )
                     continue
 
-            if skip_if_pr_exists and supports_github_issue_ops:
+            if skip_if_pr_exists and supports_github_issue_ops and not autonomous_mode:
                 linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
                 if linked_open_pr is not None:
                     if issue_number_arg is not None:
@@ -6762,7 +7108,7 @@ def main() -> int:
                         )
                         continue
 
-            if skip_if_branch_exists and remote_branch_exists(issue_branch):
+            if skip_if_branch_exists and remote_branch_exists(issue_branch) and not autonomous_mode:
                 skipped_existing_branch += 1
                 print(
                     f"Skipping {issue_label}: branch '{issue_branch}' already exists on origin "
@@ -6770,11 +7116,12 @@ def main() -> int:
                 )
                 continue
 
-            if issue_number_arg is not None and has_force_issue_flow_flag and supports_github_issue_ops:
+            if (issue_number_arg is not None or autonomous_mode) and has_force_issue_flow_flag and supports_github_issue_ops:
                 if linked_open_pr is None:
                     linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
 
                 recovered_issue_state: dict | None = None
+                issue_comments: list[dict] = []
                 try:
                     issue_comments = fetch_issue_comments(repo=repo, issue_number=issue["number"])
                     (
@@ -6834,6 +7181,7 @@ def main() -> int:
 
                 if recovered_state is not None:
                     recovered_status = str(recovered_state.get("status") or "")
+                    orchestration_attempt = next_orchestration_attempt(recovered_state)
                 if recovered_status in {"waiting-for-author", "blocked"} and force_issue_flow:
                     force_override_applied = True
                     print(
@@ -6853,6 +7201,41 @@ def main() -> int:
                         "(use --force-issue-flow to override)."
                     )
                     continue
+
+                if autonomous_mode:
+                    if recovered_status == "failed" and orchestration_attempt > max_attempts:
+                        print(
+                            f"Skipping {issue_label}: retry limit reached "
+                            f"(attempt {orchestration_attempt - 1}/{max_attempts})."
+                        )
+                        continue
+
+                    issue_claim, claim_warnings = select_latest_parseable_orchestration_claim(
+                        comments=issue_comments,
+                        source_label=issue_label,
+                    )
+                    for warning in claim_warnings:
+                        print(f"Warning: {warning}", file=sys.stderr)
+                    if is_active_orchestration_claim(issue_claim, run_id=run_id):
+                        claim_payload = issue_claim.get("payload") if isinstance(issue_claim, dict) else {}
+                        active_run_id = str(claim_payload.get("run_id") or "unknown")
+                        print(
+                            f"Skipping {issue_label}: active orchestration claim exists "
+                            f"(run_id={active_run_id})."
+                        )
+                        continue
+                    safe_post_orchestration_claim_comment(
+                        repo=repo,
+                        issue_number=issue["number"],
+                        claim=build_orchestration_claim(
+                            issue_number=issue["number"],
+                            run_id=run_id,
+                            status="claimed",
+                            ttl_seconds=AUTONOMOUS_CLAIM_TTL_SECONDS,
+                        ),
+                        dry_run=args.dry_run,
+                    )
+                    claim_acquired = True
 
             issue_image_urls = collect_issue_image_urls(issue)
             has_issue_text = bool((issue.get("body") or "").strip())
@@ -6965,7 +7348,7 @@ def main() -> int:
                                         runner=args.runner,
                                         agent=args.agent,
                                         model=args.model,
-                                        attempt=1,
+                                        attempt=orchestration_attempt,
                                         stage="decomposition_plan",
                                         next_action="execute_children_in_order",
                                         error=(
@@ -6997,7 +7380,7 @@ def main() -> int:
                                         runner=args.runner,
                                         agent=args.agent,
                                         model=args.model,
-                                        attempt=1,
+                                        attempt=orchestration_attempt,
                                         stage="decomposition_plan",
                                         next_action="create_missing_child_issues",
                                         error="Approved decomposition plan still has missing child issues",
@@ -7047,7 +7430,7 @@ def main() -> int:
                                         runner=args.runner,
                                         agent=args.agent,
                                         model=args.model,
-                                        attempt=1,
+                                        attempt=orchestration_attempt,
                                         stage="decomposition_execution",
                                         next_action=str(
                                             latest_payload_dict.get("next_action")
@@ -7093,7 +7476,7 @@ def main() -> int:
                                     runner=args.runner,
                                     agent=args.agent,
                                     model=args.model,
-                                    attempt=1,
+                                    attempt=orchestration_attempt,
                                     stage="decomposition_execution",
                                     next_action="run_selected_child_issue",
                                     error=None,
@@ -7155,7 +7538,7 @@ def main() -> int:
                                 runner=args.runner,
                                 agent=args.agent,
                                 model=args.model,
-                                attempt=1,
+                                attempt=orchestration_attempt,
                                 stage="decomposition_plan",
                                 next_action="approve_plan_or_rerun_with_decompose_never",
                                 error="Task requires planning-only decomposition before implementation",
@@ -7303,7 +7686,7 @@ def main() -> int:
                                         runner=args.runner,
                                         agent=args.agent,
                                         model=args.model,
-                                        attempt=1,
+                                        attempt=orchestration_attempt,
                                          stage="ci_checks",
                                          next_action="wait_for_ci",
                                          error=None,
@@ -7340,7 +7723,7 @@ def main() -> int:
                                         runner=args.runner,
                                         agent=args.agent,
                                         model=args.model,
-                                        attempt=1,
+                                        attempt=orchestration_attempt,
                                         stage="ci_checks",
                                         next_action="inspect_failing_ci_checks",
                                         error=short_error_text(failing_summary),
@@ -7382,7 +7765,7 @@ def main() -> int:
                                         runner=args.runner,
                                         agent=args.agent,
                                         model=args.model,
-                                        attempt=1,
+                                        attempt=orchestration_attempt,
                                         stage="ci_checks",
                                         next_action="update_pr_with_required_files",
                                         error=f"Missing required file evidence: {missing_summary}",
@@ -7418,7 +7801,7 @@ def main() -> int:
                                     runner=args.runner,
                                     agent=args.agent,
                                     model=args.model,
-                                    attempt=1,
+                                    attempt=orchestration_attempt,
                                     stage="ci_checks",
                                     next_action="ready_for_merge",
                                     error=None,
@@ -7464,7 +7847,7 @@ def main() -> int:
                                     runner=args.runner,
                                     agent=args.agent,
                                     model=args.model,
-                                    attempt=1,
+                                    attempt=orchestration_attempt,
                                      stage="review_feedback",
                                      next_action="await_new_review_comments",
                                      error="No actionable review comments found",
@@ -7497,7 +7880,7 @@ def main() -> int:
                             runner=args.runner,
                             agent=args.agent,
                             model=args.model,
-                            attempt=1,
+                            attempt=orchestration_attempt,
                                 stage="agent_run",
                                 next_action="wait_for_agent_result",
                                 error=None,
@@ -7567,7 +7950,7 @@ def main() -> int:
                                 runner=args.runner,
                                 agent=args.agent,
                                 model=args.model,
-                                attempt=1,
+                                attempt=orchestration_attempt,
                                 stage="agent_run",
                                 next_action="wait_for_agent_result",
                                 error=None,
@@ -7698,7 +8081,7 @@ def main() -> int:
                                     runner=args.runner,
                                     agent=args.agent,
                                     model=args.model,
-                                    attempt=1,
+                                    attempt=orchestration_attempt,
                                     stage="changes_pushed",
                                     next_action="wait_for_ci",
                                     error=None,
@@ -7722,7 +8105,7 @@ def main() -> int:
                                     runner=args.runner,
                                     agent=args.agent,
                                     model=args.model,
-                                    attempt=1,
+                                    attempt=orchestration_attempt,
                                     stage="pr_ready",
                                     next_action="wait_for_review",
                                     error=None,
@@ -7774,7 +8157,7 @@ def main() -> int:
                                 runner=args.runner,
                                 agent=args.agent,
                                 model=args.model,
-                                attempt=1,
+                                attempt=orchestration_attempt,
                                 stage="post_agent_check",
                                 next_action="await_more_context",
                                 error="No changes produced",
@@ -7860,7 +8243,7 @@ def main() -> int:
                                 runner=args.runner,
                                 agent=args.agent,
                                 model=args.model,
-                                attempt=1,
+                                attempt=orchestration_attempt,
                                 stage="pr_ready",
                                 next_action="wait_for_review",
                                 error=None,
@@ -7949,7 +8332,7 @@ def main() -> int:
                         runner=args.runner,
                         agent=args.agent,
                         model=args.model,
-                        attempt=1,
+                        attempt=orchestration_attempt,
                         stage=failure_stage,
                         next_action=next_action,
                         error=short_error_text(str(exc)),
@@ -8002,6 +8385,19 @@ def main() -> int:
             print(f"{issue_label.capitalize()} failed: {exc}", file=sys.stderr)
             if args.stop_on_error:
                 break
+        finally:
+            if autonomous_mode and claim_acquired and supports_github_issue_ops:
+                safe_post_orchestration_claim_comment(
+                    repo=repo,
+                    issue_number=issue["number"],
+                    claim=build_orchestration_claim(
+                        issue_number=issue["number"],
+                        run_id=run_id,
+                        status="released",
+                        ttl_seconds=1,
+                    ),
+                    dry_run=args.dry_run,
+                )
 
     print(
         "Done. "

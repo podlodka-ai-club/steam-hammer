@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"time"
 )
 
 const runnerScript = "scripts/run_github_issues_to_opencode.py"
@@ -112,11 +113,93 @@ func (a *App) runRun(ctx context.Context, args []string) int {
 		return 0
 	case "issue":
 		return a.runIssue(ctx, args[1:])
+	case "daemon":
+		return a.runDaemon(ctx, args[1:])
 	case "pr":
 		return a.runPR(ctx, args[1:])
 	default:
 		_, _ = fmt.Fprintf(a.err, "unknown run target %q\n\n%s", args[0], runUsage())
 		return 2
+	}
+}
+
+func (a *App) runDaemon(ctx context.Context, args []string) int {
+	if unsupported := firstUnsupportedFlag(args, unsupportedRunDaemonFlags); unsupported != "" {
+		_, _ = fmt.Fprintln(a.err, unsupported)
+		return 2
+	}
+
+	fs := newFlagSet("run daemon", a.err)
+	opts := commonOptions{}
+	addCommonFlags(fs, &opts)
+	state := fs.String("state", "open", "issue state to poll: open, closed, or all")
+	limit := fs.Int("limit", 10, "maximum number of issues to scan per poll")
+	pollIntervalSeconds := fs.Int("poll-interval-seconds", 120, "delay between autonomous polls")
+	maxParallelTasks := fs.Int("max-parallel-tasks", 1, "maximum parallel tasks; only 1 is supported currently")
+	maxCycles := fs.Int("max-cycles", 0, "optional test/debug bound on daemon polling cycles")
+	includeEmpty := fs.Bool("include-empty", false, "process issues even if body is empty")
+	stopOnError := fs.Bool("stop-on-error", false, "stop after the first failed poll cycle")
+	forceReprocess := fs.Bool("force-reprocess", false, "override skip guards during autonomous polling")
+
+	if err := fs.Parse(args); err != nil {
+		return flagExitCode(err)
+	}
+	if fs.NArg() != 0 {
+		_, _ = fmt.Fprintf(a.err, "unexpected run daemon argument: %s\n", fs.Arg(0))
+		return 2
+	}
+	if *pollIntervalSeconds <= 0 {
+		_, _ = fmt.Fprintln(a.err, "run daemon requires --poll-interval-seconds > 0")
+		return 2
+	}
+	if *limit <= 0 {
+		_, _ = fmt.Fprintln(a.err, "run daemon requires --limit > 0")
+		return 2
+	}
+	if *maxParallelTasks != 1 {
+		_, _ = fmt.Fprintln(a.err, "run daemon currently supports only --max-parallel-tasks=1")
+		return 2
+	}
+
+	pythonArgs := []string{runnerScript, "--autonomous", "--state", *state, "--limit", strconv.Itoa(*limit)}
+	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
+	if *includeEmpty {
+		pythonArgs = append(pythonArgs, "--include-empty")
+	}
+	if *stopOnError {
+		pythonArgs = append(pythonArgs, "--stop-on-error")
+	}
+	if *forceReprocess {
+		pythonArgs = append(pythonArgs, "--force-reprocess")
+	}
+
+	cycles := 0
+	for {
+		cycles++
+		code := a.runPython(ctx, pythonArgs)
+		if code != 0 {
+			if *stopOnError {
+				return code
+			}
+			_, _ = fmt.Fprintf(a.err, "orchestrator: daemon poll cycle %d exited with code %d\n", cycles, code)
+		}
+		if *maxCycles > 0 && cycles >= *maxCycles {
+			return code
+		}
+
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.Canceled) {
+				_, _ = fmt.Fprintln(a.err, "orchestrator: daemon canceled")
+				return 130
+			}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				_, _ = fmt.Fprintln(a.err, "orchestrator: daemon timed out")
+				return 124
+			}
+			return 1
+		case <-time.After(time.Duration(*pollIntervalSeconds) * time.Second):
+		}
 	}
 }
 
@@ -422,6 +505,16 @@ var unsupportedRunPRFlags = map[string]string{
 	"base-branch":        "issue-flow base selection only applies to `orchestrator run issue`",
 }
 
+var unsupportedRunDaemonFlags = map[string]string{
+	"issue":                "use `orchestrator run issue --id N` instead",
+	"pr":                   "use `orchestrator run pr --id N` instead",
+	"from-review-comments": "use `orchestrator run pr --id N` instead",
+	"doctor":               "use `orchestrator doctor` instead",
+	"doctor-smoke-check":   "use `orchestrator doctor --doctor-smoke-check` instead",
+	"base":                 "autonomous daemon polls tracker tasks instead of stacking a single issue branch",
+	"base-branch":          "autonomous daemon polls tracker tasks instead of stacking a single issue branch",
+}
+
 func firstUnsupportedFlag(args []string, unsupported map[string]string) string {
 	for _, arg := range args {
 		if arg == "--" {
@@ -456,11 +549,13 @@ func usage() string {
 	return `Usage:
   orchestrator doctor [flags]
   orchestrator run issue --id N [flags]
+  orchestrator run daemon [flags]
   orchestrator run pr --id N [flags]
 
 Commands:
   doctor     Run environment diagnostics via the current Python runner.
   run issue  Run issue orchestration via the current Python runner.
+  run daemon Run autonomous polling via the current Python runner.
   run pr     Run PR review-comment orchestration via the current Python runner.
 
 Use "orchestrator <command> --help" for command flags.
@@ -470,6 +565,7 @@ Use "orchestrator <command> --help" for command flags.
 func runUsage() string {
 	return `Usage:
   orchestrator run issue --id N [flags]
+  orchestrator run daemon [flags]
   orchestrator run pr --id N [flags]
 `
 }

@@ -21,6 +21,25 @@
     "max_attempts": 2,
     "escalate_to_preset": "hard"
   },
+  "scope": {
+    "defaults": {
+      "labels": {
+        "allow": ["autonomous", "bug"],
+        "deny": ["manual-only"]
+      },
+      "assignees": {
+        "deny": ["human-only"]
+      },
+      "priority": {
+        "allow": ["priority:high", "priority:medium"],
+        "order": ["priority:high", "priority:medium", "priority:low"]
+      },
+      "freshness": {
+        "max_age_days": 30,
+        "max_idle_days": 14
+      }
+    }
+  },
   "presets": {
     "cheap": {
       "runner": "opencode",

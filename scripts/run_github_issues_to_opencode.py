@@ -10,12 +10,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import re
-import selectors
+import queue as _queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import signal
 
 
 LOCAL_CONFIG_RELATIVE_PATH = "local-config.json"
@@ -29,7 +31,9 @@ BUILTIN_DEFAULTS = {
     "model": None,
     "agent_timeout_seconds": 900,
     "agent_idle_timeout_seconds": None,
+    "token_budget": None,
     "opencode_auto_approve": False,
+    "track_tokens": False,
     "branch_prefix": "issue-fix",
     "include_empty": False,
     "stop_on_error": False,
@@ -41,6 +45,11 @@ BUILTIN_DEFAULTS = {
     "sync_reused_branch": True,
     "sync_strategy": "rebase",
     "base_branch": "default",
+    "decompose": "auto",
+    "create_child_issues": False,
+    "preset": None,
+    "max_attempts": 1,
+    "escalate_to_preset": None,
     "dir": ".",
 }
 
@@ -58,9 +67,16 @@ JIRA_ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
 ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"
 AGENT_FAILURE_REPORT_MARKER = "<!-- orchestration-agent-failure:v1 -->"
 SCOPE_DECISION_MARKER = "<!-- orchestration-scope:v1 -->"
+DECOMPOSITION_PLAN_MARKER = "<!-- orchestration-decomposition:v1 -->"
+DECOMPOSITION_CHILD_ORDER_PREFIX = "Step"
 AGENT_FAILURE_LABEL_NAME = "auto:agent-failed"
 AGENT_FAILURE_LABEL_COLOR = "B60205"
 AGENT_FAILURE_LABEL_DESCRIPTION = "Automation run failed for this issue"
+RECOMMENDED_OPENCODE_MODEL = "openai/gpt-4o"
+SIGKILL_EXIT_DESCRIPTION = (
+    "This usually indicates a hard kill (SIGKILL), commonly from resource limits or environment-level"
+    " termination rather than an argument/model syntax error."
+)
 ORCHESTRATION_STATE_STATUSES = {
     "in-progress",
     "ready-for-review",
@@ -70,6 +86,69 @@ ORCHESTRATION_STATE_STATUSES = {
     "waiting-for-ci",
     "ready-to-merge",
 }
+DECOMPOSITION_CHILD_STATUSES = ("planned", "created", "in-progress", "done", "blocked")
+KNOWN_NO_EXTENSION_REQUIRED_FILES = frozenset(
+    {
+        "readme",
+        "changelog",
+        "dockerfile",
+        "docker-compose",
+        "makefile",
+        "gitattributes",
+        "gitignore",
+        "license",
+        "authors",
+    }
+)
+REQUIRED_FILE_SECTION_HEADERS = re.compile(
+    r"(?im)^\s*#{0,6}\s*(?:[\-*]\s*)?(?:required files|required file|files required|acceptance criteria|acceptance|definition of done|done criteria)\b"
+)
+REQUIRED_FILE_SECTION_BREAK_HEADER = re.compile(r"(?im)^\s*#{1,6}\b")
+REQUIRED_FILE_HINT_LINE = re.compile(
+    r"(?i)(?:required|must\s+(?:change|update|modify|touch|add|create)|needs?\s+(?:to\s+)?change|evidence\s+of\s+change)"
+)
+FILE_PATH_TOKEN_RE = re.compile(
+    r"(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)?|[A-Za-z0-9._-]+\.[A-Za-z0-9][A-Za-z0-9._-]+"
+)
+
+
+def _as_positive_int(value: object) -> int | None:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return None
+    if normalized < 1:
+        return None
+    return normalized
+
+
+def _as_optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return normalized
+
+
+def _normalize_child_status(value: object) -> str:
+    status = str(value or "").strip().lower()
+    if status in DECOMPOSITION_CHILD_STATUSES:
+        return status
+    return "planned"
+
+
+def _safe_join_sorted(values: object) -> str:
+    if not isinstance(values, list):
+        return ""
+    normalized: list[str] = []
+    for value in values:
+        item = str(value or "").strip()
+        if item:
+            normalized.append(item)
+    return ", ".join(sorted(normalized))
 
 
 def _normalize_match_list(values: list[str] | None) -> list[str]:
@@ -429,6 +508,38 @@ def run_check_command(command: list[str], cwd: str | None = None) -> tuple[bool,
     )
 
 
+def describe_exit_code(return_code: int) -> str:
+    if return_code >= 0:
+        return f"exit code {return_code}"
+
+    signal_number = -return_code
+    try:
+        signal_name = signal.Signals(signal_number).name
+    except ValueError:
+        return f"terminated by signal {signal_number}"
+
+    return f"terminated by {signal_name} ({signal_number})"
+
+
+def classify_opencode_failure(return_code: int, model: str | None) -> str | None:
+    if return_code != -signal.SIGKILL:
+        return None
+
+    details = [
+        SIGKILL_EXIT_DESCRIPTION,
+        f"For stability, run with --runner opencode --agent build --model {RECOMMENDED_OPENCODE_MODEL} first.",
+    ]
+
+    if model and model != RECOMMENDED_OPENCODE_MODEL:
+        details.append(f"This run used model '{model}', which is different from the current recommended baseline.")
+
+    return " ".join(details)
+
+
+def _label_already_exists_error(message: str) -> bool:
+    return "already exists" in str(message).lower()
+
+
 WORKFLOW_COMMAND_ORDER = ["test", "lint", "build"]
 
 CI_PENDING_CHECK_RUN_STATUSES = {"queued", "in_progress", "requested", "waiting", "pending"}
@@ -442,6 +553,20 @@ CI_FAILURE_CHECK_RUN_CONCLUSIONS = {
     "stale",
 }
 CI_FAILURE_COMMIT_STATES = {"error", "failure"}
+
+
+def failure_state_for_stage(failure_stage: str) -> str:
+    return "blocked" if failure_stage in {"workflow_checks", "residual_untracked_validation", "token_budget"} else "failed"
+
+
+def failure_next_action_for_stage(failure_stage: str) -> str:
+    if failure_stage == "workflow_checks":
+        return "fix_workflow_checks_and_retry"
+    if failure_stage == "residual_untracked_validation":
+        return "stage_or-remove-residual-untracked-files"
+    if failure_stage == "token_budget":
+        return "raise_token_budget_or_split_issue"
+    return "inspect_error_and_retry"
 
 
 class WorkflowCheckFailure(RuntimeError):
@@ -463,6 +588,27 @@ class WorkflowCheckFailure(RuntimeError):
         super().__init__(
             f"Workflow check '{check_name}' failed"
             f" (exit code {exit_code if exit_code is not None else 'unknown'}){evidence}"
+        )
+
+
+class ResidualUntrackedFilesError(RuntimeError):
+    def __init__(self, files: list[str], stage: str):
+        self.files = files
+        self.stage = stage
+        super().__init__(
+            "Residual untracked files detected during"
+            f" {stage}: {', '.join(sorted(files))}"
+        )
+
+
+class TokenBudgetExceededError(RuntimeError):
+    def __init__(self, budget: int, reached: int, item_label: str):
+        self.budget = budget
+        self.reached = reached
+        self.item_label = item_label
+        super().__init__(
+            f"Agent stopped: token budget of {_format_budget_message_count(budget) or budget} exceeded "
+            f"(reached ~{_format_budget_message_count(reached) or reached}). Use --token-budget to raise the limit or split the issue."
         )
 
 
@@ -595,7 +741,7 @@ def fetch_issues(repo: str, state: str, limit: int) -> list[dict]:
             "--limit",
             str(limit),
             "--json",
-            "number,title,body,url,labels,author",
+            "number,title,body,url,state,labels,author",
         ]
     )
     issues = json.loads(output)
@@ -617,7 +763,7 @@ def fetch_issue(repo: str, number: int) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,url,labels,author",
+            "number,title,body,url,state,labels,author",
         ]
     )
     issue = json.loads(output)
@@ -859,6 +1005,185 @@ def split_repo_name(repo: str) -> tuple[str, str]:
     return owner, name
 
 
+def _normalize_required_file_path(value: str) -> str:
+    candidate = value.strip().strip("`\"'()[]{}<>.,;:")
+    if not candidate:
+        return ""
+    candidate = candidate.replace("\\", "/")
+    while "//" in candidate:
+        candidate = candidate.replace("//", "/")
+    return candidate.lstrip("./")
+
+
+def _is_valid_file_path(value: str) -> bool:
+    if not value:
+        return False
+    if "//" in value:
+        return False
+    if value.startswith("http://") or value.startswith("https://"):
+        return False
+    base = os.path.basename(value)
+    if not base:
+        return False
+    if base.startswith(".") and base in {".gitignore", ".gitattributes", ".npmrc"}:
+        return True
+    if "." not in base:
+        return base.lower() in KNOWN_NO_EXTENSION_REQUIRED_FILES
+    if value.endswith("/"):
+        return False
+    if "/" not in value and value.startswith("#"):
+        return False
+    base_without_ext = os.path.basename(value).rpartition(".")
+    extension = base_without_ext[2].lower()
+    if not extension:
+        return False
+    return len(extension) <= 12
+
+
+def extract_required_file_paths_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+
+    required_files: list[str] = []
+    normalized_seen: set[str] = set()
+    in_required_section = False
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if REQUIRED_FILE_SECTION_BREAK_HEADER.match(stripped):
+            if in_required_section:
+                in_required_section = False
+            if REQUIRED_FILE_SECTION_HEADERS.match(stripped):
+                in_required_section = True
+            continue
+
+        if REQUIRED_FILE_SECTION_HEADERS.match(stripped):
+            in_required_section = True
+            continue
+
+        line_candidates = []
+        for code_match in re.finditer(r"`([^`]+)`", stripped):
+            line_candidates.append(code_match.group(1))
+
+        if in_required_section or REQUIRED_FILE_HINT_LINE.search(stripped):
+            line_candidates.append(stripped)
+
+        for raw_candidate in line_candidates:
+            for token_match in FILE_PATH_TOKEN_RE.finditer(raw_candidate):
+                token = _normalize_required_file_path(token_match.group(0))
+                if not token or token in normalized_seen:
+                    continue
+                if _is_valid_file_path(token):
+                    normalized_seen.add(token)
+                    required_files.append(token)
+
+    return required_files
+
+
+def collect_required_file_references_from_pr_context(
+    pull_request: dict,
+    linked_issues: list[dict] | None = None,
+) -> list[str]:
+    references: list[str] = []
+    linked_issues_payload = linked_issues if isinstance(linked_issues, list) else []
+
+    references.extend(extract_required_file_paths_from_text(str(pull_request.get("body") or "")))
+
+    for issue in linked_issues_payload:
+        if not isinstance(issue, dict):
+            continue
+        body = str(issue.get("body") or "").strip()
+        if body:
+            references.extend(extract_required_file_paths_from_text(body))
+
+    return _dedupe_preserve_order(references)
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        normalized = _normalize_required_file_path(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
+def extract_pull_request_changed_file_paths(pull_request: dict) -> list[str]:
+    raw_files = pull_request.get("files")
+    if not isinstance(raw_files, list):
+        return []
+
+    seen: set[str] = set()
+    changed: list[str] = []
+    for file_payload in raw_files:
+        path = None
+        if isinstance(file_payload, str):
+            path = file_payload
+        elif isinstance(file_payload, dict):
+            for key in ("path", "filePath", "filename"):
+                value = file_payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    path = value
+                    break
+        if not isinstance(path, str):
+            continue
+        normalized = _normalize_required_file_path(path)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            changed.append(normalized)
+    return changed
+
+
+def validate_required_files_in_pr(pull_request: dict, linked_issues: list[dict] | None = None) -> dict[str, object]:
+    required_files = collect_required_file_references_from_pr_context(
+        pull_request=pull_request,
+        linked_issues=linked_issues,
+    )
+    changed_paths = extract_pull_request_changed_file_paths(pull_request)
+    changed_lookup = {path: path for path in changed_paths}
+    changed_basenames = {os.path.basename(path): path for path in changed_paths}
+
+    if not required_files:
+        return {
+            "status": "not-applicable",
+            "required_file_count": 0,
+            "required_files": [],
+            "matched_files": [],
+            "missing_files": [],
+            "changed_file_count": len(changed_paths),
+        }
+
+    matched: list[str] = []
+    missing: list[str] = []
+    for required in required_files:
+        required_normalized = _normalize_required_file_path(required)
+        required_basename = os.path.basename(required_normalized)
+        if (
+            required_normalized in changed_lookup
+            or required in changed_lookup
+            or required_basename in changed_basenames
+            or any(path.endswith(f"/{required_normalized}") for path in changed_paths)
+        ):
+            matched.append(required_normalized)
+        else:
+            missing.append(required_normalized)
+
+    return {
+        "status": "passed" if not missing else "blocked",
+        "required_file_count": len(required_files),
+        "required_files": required_files,
+        "matched_files": matched,
+        "missing_files": missing,
+        "changed_file_count": len(changed_paths),
+    }
+
+
 def fetch_pull_request(repo: str, number: int) -> dict:
     output = run_capture(
         [
@@ -869,7 +1194,7 @@ def fetch_pull_request(repo: str, number: int) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,url,state,mergeStateStatus,headRefName,headRefOid,baseRefName,author,closingIssuesReferences,reviews",
+            "number,title,body,url,state,mergeStateStatus,headRefName,headRefOid,baseRefName,author,closingIssuesReferences,reviews,files",
         ]
     )
     pull_request = json.loads(output)
@@ -1026,6 +1351,753 @@ def select_latest_parseable_orchestration_state(
     return latest, warnings
 
 
+def parse_decomposition_plan_comment_body(body: str) -> tuple[dict | None, str | None]:
+    if DECOMPOSITION_PLAN_MARKER not in body:
+        return None, None
+
+    after_marker = body.split(DECOMPOSITION_PLAN_MARKER, maxsplit=1)[1].strip()
+    if not after_marker:
+        return None, "marker found but payload is empty"
+
+    fenced_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", after_marker, flags=re.DOTALL)
+    candidates = fenced_matches if fenced_matches else [after_marker]
+
+    parse_errors: list[str] = []
+    for candidate in candidates:
+        try:
+            return _first_json_object(candidate), None
+        except (ValueError, json.JSONDecodeError) as exc:
+            parse_errors.append(str(exc))
+
+    if parse_errors:
+        return None, parse_errors[-1]
+    return None, "unable to parse decomposition payload"
+
+
+def select_latest_parseable_decomposition_plan(
+    comments: list[dict],
+    source_label: str,
+) -> tuple[dict | None, list[str]]:
+    latest: dict | None = None
+    warnings: list[str] = []
+
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+
+        body = str(comment.get("body") or "")
+        payload, error = parse_decomposition_plan_comment_body(body)
+        if payload is None:
+            if error:
+                created_at = str(comment.get("created_at") or "unknown-time")
+                url = str(comment.get("html_url") or "")
+                context = f" at {url}" if url else ""
+                warnings.append(
+                    f"ignoring malformed decomposition comment in {source_label}"
+                    f" ({created_at}){context}: {error}"
+                )
+            continue
+
+        created_at = str(comment.get("created_at") or "")
+        candidate = {
+            "source": source_label,
+            "created_at": created_at,
+            "url": str(comment.get("html_url") or ""),
+            "comment_id": comment.get("id"),
+            "payload": payload,
+            "status": str(payload.get("status") or "").strip().lower(),
+        }
+        if latest is None or created_at >= str(latest.get("created_at") or ""):
+            latest = candidate
+
+    return latest, warnings
+
+
+def build_decomposition_rollup_from_plan_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {
+            "parent_issue": None,
+            "counts": {status: 0 for status in DECOMPOSITION_CHILD_STATUSES},
+            "children": [],
+            "blockers": [],
+            "progress": {"completed": 0, "total": 0, "percent": 0},
+            "next_child": None,
+            "next_action_hint": "no_children",
+            "source": "plan",
+        }
+
+    plan_parent_issue = _as_positive_int(payload.get("parent_issue"))
+    proposed_children = normalize_decomposition_proposed_children(payload)
+    created_children = _normalize_created_children(payload.get("created_children") or [])
+    created_by_order = {
+        child.get("order"): child for child in created_children if isinstance(child.get("order"), int)
+    }
+
+    blockers_raw = payload.get("blockers")
+    blockers = [str(blocker).strip() for blocker in blockers_raw if str(blocker).strip()] if isinstance(blockers_raw, list) else []
+
+    effective_status_by_order: dict[int, str] = {}
+    for child in proposed_children:
+        order = child.get("order")
+        if type(order) is not int:
+            continue
+        created = created_by_order.get(order)
+        created = created if isinstance(created, dict) else {}
+
+        issue_number = created.get("issue_number")
+        child_status = _normalize_child_status(created.get("status") or child.get("status"))
+        if child_status == "planned" and isinstance(issue_number, int):
+            child_status = "created"
+        effective_status_by_order[order] = child_status
+
+    rollup_children: list[dict] = []
+    counts = {status: 0 for status in DECOMPOSITION_CHILD_STATUSES}
+    next_child: dict | None = None
+    total_children = len(proposed_children)
+
+    for child in proposed_children:
+        order = child.get("order")
+        if type(order) is not int:
+            continue
+
+        created = created_by_order.get(order)
+        created = created if isinstance(created, dict) else {}
+
+        issue_number = created.get("issue_number")
+        if not isinstance(issue_number, int):
+            issue_number = child.get("issue_number")
+        issue_url = str(created.get("issue_url") or child.get("issue_url") or "").strip()
+        child_status = _normalize_child_status(created.get("status") or child.get("status"))
+        if child_status == "planned" and isinstance(issue_number, int):
+            child_status = "created"
+
+        rollup_child: dict = {
+            "order": order,
+            "title": str(child.get("title") or f"Child task {order}"),
+            "status": child_status,
+            "issue_number": issue_number if isinstance(issue_number, int) else None,
+            "depends_on": list(child.get("depends_on") or []),
+        }
+        if issue_url:
+            rollup_child["issue_url"] = issue_url
+        rollup_children.append(rollup_child)
+
+        counts[child_status] += 1
+
+        dependencies = child.get("depends_on") if isinstance(child.get("depends_on"), list) else []
+        dependency_orders: list[int] = []
+        for dependency in dependencies:
+            dependency_order = _as_positive_int(dependency)
+            if dependency_order is not None:
+                dependency_orders.append(dependency_order)
+        dependencies_satisfied = all(
+            effective_status_by_order.get(dependency_order) == "done"
+            for dependency_order in dependency_orders
+        )
+
+        if (
+            child_status in {"planned", "created", "in-progress"}
+            and dependencies_satisfied
+            and next_child is None
+        ):
+            next_child = {
+                "order": order,
+                "title": str(child.get("title") or f"Child task {order}"),
+                "status": child_status,
+                "depends_on": dependency_orders,
+            }
+            if isinstance(issue_number, int):
+                next_child["issue_number"] = issue_number
+            if issue_url:
+                next_child["issue_url"] = issue_url
+
+    completed_children = counts["done"]
+    percent_done = 0 if total_children == 0 else int((completed_children / total_children) * 100)
+    next_action_hint = str(payload.get("next_action") or "").strip() or (
+        "execute_next_child" if next_child is not None else "all_children_complete"
+    )
+
+    return {
+        "parent_issue": plan_parent_issue,
+        "counts": counts,
+        "children": rollup_children,
+        "total_children": total_children,
+        "blockers": blockers,
+        "progress": {
+            "completed": completed_children,
+            "total": total_children,
+            "percent": percent_done,
+        },
+        "next_child": next_child,
+        "next_action_hint": next_action_hint,
+        "source": "plan_payload",
+    }
+
+
+def build_decomposition_rollup_from_recovered_state(
+    recovered_state: dict | None,
+    parent_issue: int | None,
+) -> dict | None:
+    if not isinstance(recovered_state, dict):
+        return None
+
+    state_payload = recovered_state.get("payload") if isinstance(recovered_state, dict) else None
+    if not isinstance(state_payload, dict):
+        return None
+
+    decomposition = state_payload.get("decomposition")
+    if not isinstance(decomposition, dict):
+        decomposition = recovered_state.get("decomposition")
+    if not isinstance(decomposition, dict):
+        return None
+
+    if "counts" in decomposition and isinstance(decomposition.get("children"), list):
+        rollup = dict(decomposition)
+    elif "proposed_children" in decomposition:
+        rollup = build_decomposition_rollup_from_plan_payload(decomposition)
+    else:
+        return None
+
+    if parent_issue is not None:
+        rollup["parent_issue"] = parent_issue
+
+    if "resume_context" not in rollup:
+        rollup["resume_context"] = {
+            "task_type": str(state_payload.get("task_type") or ""),
+            "status": str(recovered_state.get("status") or state_payload.get("status") or ""),
+            "stage": str(state_payload.get("stage") or ""),
+            "branch": str(state_payload.get("branch") or ""),
+        }
+    resume_context = rollup.get("resume_context")
+    if isinstance(resume_context, dict):
+        if str(resume_context.get("branch") or "") == "":
+            resume_context["branch"] = str(state_payload.get("branch") or "")
+        if str(resume_context.get("base_branch") or "") == "":
+            resume_context["base_branch"] = str(state_payload.get("base_branch") or "")
+        if str(resume_context.get("task_type") or "") == "":
+            resume_context["task_type"] = str(state_payload.get("task_type") or "")
+        resolved_pr = state_payload.get("pr")
+        if "pr" not in resume_context:
+            resume_context["pr"] = resolved_pr if isinstance(resolved_pr, int) else None
+
+    return rollup
+
+
+def format_decomposition_rollup_context(decomposition: dict) -> str:
+    if not isinstance(decomposition, dict):
+        return ""
+
+    parent_issue = decomposition.get("parent_issue")
+    parent_text = str(parent_issue) if isinstance(parent_issue, int) else "?"
+
+    counts = decomposition.get("counts")
+    counts_dict = counts if isinstance(counts, dict) else {}
+    total_children = 0
+    try:
+        total_children = int(decomposition.get("total_children") or 0)
+    except (TypeError, ValueError):
+        total_children = 0
+
+    count_bits: list[str] = []
+    for status in DECOMPOSITION_CHILD_STATUSES:
+        try:
+            count_bits.append(f"{status}={int(counts_dict.get(status) or 0)}")
+        except (TypeError, ValueError):
+            count_bits.append(f"{status}=0")
+
+    next_child_payload = decomposition.get("next_child")
+    next_child_text = "none"
+    if isinstance(next_child_payload, dict):
+        next_order = next_child_payload.get("order")
+        next_title = str(next_child_payload.get("title") or "").strip()
+        next_status = str(next_child_payload.get("status") or "").strip()
+        issue_number = next_child_payload.get("issue_number")
+        if isinstance(issue_number, int):
+            next_child_text = f"{next_order}:{next_title} (#{issue_number}, {next_status})"
+        else:
+            next_child_text = f"{next_order}:{next_title} ({next_status})"
+
+    blockers = decomposition.get("blockers")
+    blockers_text = _safe_join_sorted(blockers) if blockers else ""
+    blockers_suffix = f"; blockers={blockers_text}" if blockers_text else ""
+
+    resume_context = decomposition.get("resume_context")
+    resume_bits: list[str] = []
+    if isinstance(resume_context, dict):
+        branch = str(resume_context.get("branch") or "").strip()
+        pr = resume_context.get("pr")
+        if isinstance(pr, int) and pr > 0:
+            resume_bits.append(f"pr={pr}")
+        if branch:
+            resume_bits.append(f"branch={branch}")
+        base_branch = str(resume_context.get("base_branch") or "").strip()
+        if base_branch:
+            resume_bits.append(f"base={base_branch}")
+    resume_suffix = f"; resume={'; '.join(resume_bits)}" if resume_bits else ""
+
+    progress = decomposition.get("progress")
+    completed = 0
+    percent = 0
+    if isinstance(progress, dict):
+        completed = int(progress.get("completed") or 0)
+        percent = int(progress.get("percent") or 0)
+
+    return (
+        "decomposition(" \
+        f"parent=#{parent_text}, "
+        f"children={total_children}, "
+        f"counts=({', '.join(count_bits)}), "
+        f"done={completed}/{total_children} ({percent}%), "
+        f"next={next_child_text}" \
+        f"{blockers_suffix}{resume_suffix}"
+        ")"
+    )
+
+
+def _normalize_decomposition_plan_child(child: dict, fallback_order: int) -> dict | None:
+    if not isinstance(child, dict):
+        return None
+
+    raw_order = child.get("order")
+    try:
+        order = int(raw_order)
+    except (TypeError, ValueError):
+        order = fallback_order
+    if order <= 0:
+        order = fallback_order
+
+    title = str(child.get("title") or "").strip() or f"Child task {order}"
+    depends_raw = child.get("depends_on")
+    depends_on: list[int] = []
+    if isinstance(depends_raw, list):
+        for dep in depends_raw:
+            try:
+                dep_order = int(dep)
+            except (TypeError, ValueError):
+                continue
+            if dep_order > 0:
+                depends_on.append(dep_order)
+
+    acceptance_raw = child.get("acceptance")
+    acceptance: list[str] = []
+    if isinstance(acceptance_raw, list):
+        acceptance = [str(item).strip() for item in acceptance_raw if str(item).strip()]
+    if not acceptance:
+        acceptance = [f"{title} is completed and validated."]
+
+    status = _normalize_child_status(child.get("status"))
+    issue_number = _as_positive_int(child.get("issue_number"))
+    if issue_number is None:
+        issue_number = _as_positive_int(child.get("issue"))
+    issue_url = str(child.get("issue_url") or "").strip()
+
+    normalized_child = {
+        "title": title,
+        "order": order,
+        "depends_on": sorted(set(depends_on)),
+        "acceptance": acceptance,
+        "status": status,
+        "issue_number": issue_number,
+    }
+    if issue_url:
+        normalized_child["issue_url"] = issue_url
+    return normalized_child
+
+
+def normalize_decomposition_proposed_children(plan_payload: dict) -> list[dict]:
+    raw_children = plan_payload.get("proposed_children")
+    if not isinstance(raw_children, list):
+        return []
+
+    normalized: list[dict] = []
+    for index, child in enumerate(raw_children, start=1):
+        normalized_child = _normalize_decomposition_plan_child(child, fallback_order=index)
+        if normalized_child is None:
+            continue
+        normalized.append(normalized_child)
+
+    return sorted(normalized, key=lambda item: int(item.get("order") or 0))
+
+
+def _extract_ordered_linked_children(plan_payload: dict) -> dict[int, dict]:
+    raw_created = plan_payload.get("created_children")
+    if not isinstance(raw_created, list):
+        return {}
+
+    created_by_order: dict[int, dict] = {}
+    for child in raw_created:
+        if not isinstance(child, dict):
+            continue
+        try:
+            order = int(child.get("order"))
+        except (TypeError, ValueError):
+            continue
+
+        if order <= 0:
+            continue
+        child_copy = dict(child)
+        child_copy["order"] = order
+        created_by_order[order] = child_copy
+
+    return created_by_order
+
+
+def _normalize_created_children(raw_created_children: list[dict] | dict[int, dict]) -> list[dict]:
+    created_children_values: list[dict] = []
+    if isinstance(raw_created_children, dict):
+        created_children_values = [
+            child for child in raw_created_children.values() if isinstance(child, dict)
+        ]
+    elif isinstance(raw_created_children, list):
+        created_children_values = [
+            child for child in raw_created_children if isinstance(child, dict)
+        ]
+    else:
+        return []
+
+    normalized: list[dict] = []
+    for child in created_children_values:
+        child_copy = dict(child)
+        try:
+            order = int(child_copy.get("order"))
+        except (TypeError, ValueError):
+            continue
+
+        if order <= 0:
+            continue
+        child_copy["order"] = order
+        normalized.append(child_copy)
+
+    normalized.sort(key=lambda item: int(item.get("order") or 0))
+    return normalized
+
+
+def _classify_decomposition_child_execution_status(
+    child_issue: dict,
+    recovered_state: dict | None,
+) -> tuple[str, str | None]:
+    issue_state = str(child_issue.get("state") or "").strip().lower()
+    if issue_state == "closed":
+        return "done", None
+
+    recovered_status = str(recovered_state.get("status") or "") if isinstance(recovered_state, dict) else ""
+    if recovered_status in {"in-progress", "ready-for-review", "waiting-for-ci", "ready-to-merge"}:
+        return "in-progress", None
+
+    if recovered_status in {"blocked", "failed", "waiting-for-author"}:
+        payload = recovered_state.get("payload") if isinstance(recovered_state, dict) else None
+        payload = payload if isinstance(payload, dict) else {}
+        blocker = str(
+            payload.get("error")
+            or payload.get("reason")
+            or payload.get("summary")
+            or recovered_status
+        ).strip()
+        return "blocked", blocker or recovered_status
+
+    return "created", None
+
+
+def refresh_decomposition_plan_payload_from_child_states(
+    repo: str,
+    plan_payload: dict,
+) -> dict:
+    refreshed_payload = dict(plan_payload)
+    refreshed_created_children = _normalize_created_children(plan_payload.get("created_children") or [])
+    blockers: list[str] = []
+
+    for index, child in enumerate(refreshed_created_children):
+        issue_number = _as_positive_int(child.get("issue_number"))
+        if issue_number is None:
+            continue
+
+        child_issue = fetch_issue(repo=repo, number=issue_number)
+        child_comments = fetch_issue_comments(repo=repo, issue_number=issue_number)
+        recovered_state, _warnings = select_latest_parseable_orchestration_state(
+            comments=child_comments,
+            source_label=f"issue #{issue_number}",
+        )
+        status, blocker = _classify_decomposition_child_execution_status(
+            child_issue=child_issue,
+            recovered_state=recovered_state,
+        )
+
+        updated_child = dict(child)
+        updated_child["status"] = status
+        child_url = str(updated_child.get("issue_url") or child_issue.get("url") or "").strip()
+        if child_url:
+            updated_child["issue_url"] = child_url
+        child_title = str(updated_child.get("title") or child_issue.get("title") or "").strip()
+        if child_title:
+            updated_child["title"] = child_title
+        refreshed_created_children[index] = updated_child
+
+        if blocker:
+            child_order = updated_child.get("order")
+            child_prefix = f"step {child_order}" if isinstance(child_order, int) else f"issue #{issue_number}"
+            blockers.append(f"{child_prefix}: {blocker}")
+
+    refreshed_payload["created_children"] = refreshed_created_children
+    refreshed_payload["blockers"] = sorted(set(blockers))
+    refreshed_payload["timestamp"] = utc_now_iso()
+
+    rollup = build_decomposition_rollup_from_plan_payload(refreshed_payload)
+    next_child = rollup.get("next_child")
+    if isinstance(next_child, dict):
+        refreshed_payload["next_action"] = "execute_next_child"
+    elif int(rollup.get("progress", {}).get("completed") or 0) >= int(rollup.get("total_children") or 0):
+        refreshed_payload["next_action"] = "all_children_complete"
+    elif blockers:
+        refreshed_payload["next_action"] = "resolve_blocked_child"
+    else:
+        refreshed_payload["next_action"] = "await_child_dependencies"
+    return refreshed_payload
+
+
+def build_decomposition_child_execution_note(
+    parent_issue: dict,
+    decomposition_rollup: dict,
+    selected_child: dict,
+) -> str:
+    parent_number = parent_issue.get("number")
+    parent_title = str(parent_issue.get("title") or "").strip()
+    child_order = selected_child.get("order")
+    child_title = str(selected_child.get("title") or "").strip()
+    rollup_context = format_decomposition_rollup_context(decomposition_rollup)
+    return (
+        "Parent decomposition context:\n"
+        f"- Parent issue: #{parent_number} - {parent_title}\n"
+        f"- Selected child step: {child_order}: {child_title}\n"
+        f"- Current roll-up: {rollup_context}\n"
+        "- Preserve dependency order and update the parent tracker state through normal orchestration outputs."
+    )
+
+
+def post_parent_decomposition_rollup_update(
+    repo: str,
+    parent_issue: dict,
+    parent_branch: str,
+    base_branch: str | None,
+    runner: str,
+    agent: str,
+    model: str | None,
+    plan_payload: dict,
+    dry_run: bool,
+) -> tuple[dict, dict]:
+    refreshed_payload = refresh_decomposition_plan_payload_from_child_states(
+        repo=repo,
+        plan_payload=plan_payload,
+    )
+    rollup = build_decomposition_rollup_from_plan_payload(refreshed_payload)
+    blockers = rollup.get("blockers") if isinstance(rollup.get("blockers"), list) else []
+    next_child = rollup.get("next_child") if isinstance(rollup.get("next_child"), dict) else None
+    progress = rollup.get("progress") if isinstance(rollup.get("progress"), dict) else {}
+    completed = int(progress.get("completed") or 0)
+    total = int(progress.get("total") or 0)
+
+    if total > 0 and completed >= total:
+        state_status = "ready-for-review"
+        next_action = "review_completed_children"
+        error = None
+    elif blockers:
+        state_status = "blocked"
+        next_action = "resolve_blocked_child"
+        error = short_error_text("; ".join(str(blocker) for blocker in blockers))
+    else:
+        state_status = "in-progress"
+        next_action = str(refreshed_payload.get("next_action") or "execute_next_child")
+        error = None
+
+    post_decomposition_plan_comment(
+        repo=repo,
+        issue_number=parent_issue["number"],
+        payload=refreshed_payload,
+        dry_run=dry_run,
+    )
+    safe_post_orchestration_state_comment(
+        repo=repo,
+        target_type="issue",
+        target_number=parent_issue["number"],
+        dry_run=dry_run,
+        state=build_orchestration_state(
+            status=state_status,
+            task_type="issue",
+            issue_number=parent_issue["number"],
+            pr_number=None,
+            branch=parent_branch,
+            base_branch=base_branch,
+            runner=runner,
+            agent=agent,
+            model=model,
+            attempt=1,
+            stage="decomposition_execution",
+            next_action=next_action,
+            error=error,
+            decomposition=rollup,
+        ),
+    )
+    return refreshed_payload, rollup
+
+
+def is_decomposition_plan_approved(plan_payload: dict) -> bool:
+    status = str(plan_payload.get("status") or "").strip().lower()
+    return status in {"approved", "children_created", "execution_plan"}
+
+
+def _build_child_issue_body(
+    parent_issue: dict,
+    child: dict,
+    created_dependencies: dict[int, dict],
+) -> str:
+    parent_number = parent_issue.get("number")
+    parent_title = str(parent_issue.get("title") or "(untitled)").strip()
+    order = child.get("order")
+    depends_on = child.get("depends_on")
+    if isinstance(depends_on, list):
+        dependency_lines: list[str] = []
+        for dep in depends_on:
+            try:
+                dep_order = int(dep)
+            except (TypeError, ValueError):
+                continue
+
+            dependency_child = created_dependencies.get(dep_order)
+            dependency_ref = f"step {dep_order}"
+            dep_issue_number = dependency_child.get("issue_number")
+            dep_issue_url = str(dependency_child.get("issue_url") or "").strip()
+            if isinstance(dep_issue_number, int):
+                dependency_ref = f"[{DECOMPOSITION_CHILD_ORDER_PREFIX} {dep_order}: #{dep_issue_number}]({dep_issue_url})"
+            elif dep_issue_url:
+                dependency_ref = f"[{DECOMPOSITION_CHILD_ORDER_PREFIX} {dep_order}: {dep_issue_url}]"
+            dependency_lines.append(dependency_ref)
+    else:
+        dependency_lines = []
+
+    execution_order_text = str(order) if isinstance(order, int) else "unknown"
+    dependency_text = (
+        "\nDepends on: " + ", ".join(dependency_lines)
+        if dependency_lines
+        else "\nDepends on: none"
+    )
+
+    acceptance = child.get("acceptance")
+    acceptance_lines: list[str] = []
+    if isinstance(acceptance, list):
+        for criterion in acceptance:
+            criterion_text = str(criterion or "").strip()
+            if criterion_text:
+                acceptance_lines.append(f"- {criterion_text}")
+
+    if not acceptance_lines:
+        acceptance_lines = ["- Implementation is complete and validated."]
+
+    return (
+        "Child task generated from decomposition plan\n\n"
+        f"Parent issue: #{parent_number} ({parent_title})\n"
+        f"Execution order: {execution_order_text}\n"
+        f"{dependency_text}\n\n"
+        f"Suggested acceptance criteria:\n" + "\n".join(acceptance_lines)
+    )
+
+
+def create_decomposition_child_issue(
+    repo: str,
+    parent_issue: dict,
+    child: dict,
+    created_dependencies: dict[int, dict],
+    dry_run: bool,
+) -> dict:
+    child_title = str(child.get("title") or "")[:120]
+    if not child_title:
+        raise RuntimeError("Cannot create child issue with empty title")
+
+    body = _build_child_issue_body(parent_issue, child, created_dependencies)
+    if dry_run:
+        print(f"[dry-run] Would create child issue for order {child.get('order')} of parent #{parent_issue.get('number')}")
+        return {
+            "title": child_title,
+            "order": child.get("order"),
+            "issue_number": None,
+            "issue_url": None,
+            "created": False,
+        }
+
+    output = run_capture(
+        [
+            "gh",
+            "issue",
+            "create",
+            "--repo",
+            repo,
+            "--title",
+            child_title,
+            "--body",
+            body,
+            "--json",
+            "number,url",
+        ]
+    )
+    created = json.loads(output)
+    if not isinstance(created, dict):
+        raise RuntimeError("Unexpected response from gh issue create")
+
+    issue_number = created.get("number")
+    if type(issue_number) is not int:
+        raise RuntimeError("Created child issue response missing integer number")
+
+    return {
+        "title": child_title,
+        "order": child.get("order"),
+        "issue_number": issue_number,
+        "issue_url": str(created.get("url") or ""),
+        "created": True,
+    }
+
+
+def _decomposition_plan_has_missing_children(plan_payload: dict) -> list[dict]:
+    proposed_children = normalize_decomposition_proposed_children(plan_payload)
+    created_children = _extract_ordered_linked_children(plan_payload)
+
+    missing_children: list[dict] = []
+    for child in proposed_children:
+        order = child.get("order")
+        if order not in created_children:
+            missing_children.append(child)
+
+    return missing_children
+
+
+def merge_created_children_into_plan_payload(
+    plan_payload: dict,
+    created_children: list[dict],
+) -> dict:
+    merged_children: list[dict] = []
+    existing_children = _extract_ordered_linked_children(plan_payload)
+    for order in sorted(existing_children):
+        merged_children.append(dict(existing_children[order]))
+
+    for child in created_children:
+        order = child.get("order")
+        if type(order) is not int:
+            continue
+        if order < 1:
+            continue
+        child_copy = dict(child)
+        child_copy["order"] = order
+        merged_children = [
+            existing
+            for existing in merged_children
+            if existing.get("order") != order
+        ] + [child_copy]
+
+    merged_children.sort(key=lambda item: int(item.get("order") or 0))
+
+    merged_payload = dict(plan_payload)
+    merged_payload["created_children"] = merged_children
+    merged_payload["timestamp"] = utc_now_iso()
+    return merged_payload
+
+
 def merge_latest_recovered_state(states: list[dict | None]) -> dict | None:
     latest: dict | None = None
     for state in states:
@@ -1041,7 +2113,18 @@ def format_recovered_state_context(state: dict) -> str:
     source = str(state.get("source") or "unknown")
     created_at = str(state.get("created_at") or "unknown-time")
     url = str(state.get("url") or "")
+    state_payload = state.get("payload") if isinstance(state, dict) else None
+    decomposition_payload = state.get("decomposition") if isinstance(state, dict) else None
+    if decomposition_payload is None and isinstance(state_payload, dict):
+        decomposition_payload = state_payload.get("decomposition")
+
     details = f"status={status}; source={source}; created_at={created_at}"
+
+    if isinstance(decomposition_payload, dict):
+        decomposition_context = format_decomposition_rollup_context(decomposition_payload)
+        if decomposition_context:
+            details += f"; {decomposition_context}"
+
     if url:
         details += f"; comment={url}"
     return details
@@ -1720,6 +2803,34 @@ def has_changes() -> bool:
     return bool(run_capture(["git", "status", "--porcelain"]).strip())
 
 
+def residual_untracked_files_after_baseline(
+    pre_run_untracked_files: set[str] | None,
+) -> list[str]:
+    if pre_run_untracked_files is None:
+        return []
+
+    post_run_untracked_files = list_untracked_files()
+    return sorted(post_run_untracked_files - set(pre_run_untracked_files))
+
+
+def list_untracked_files() -> set[str]:
+    status_output = run_capture(["git", "ls-files", "--others", "--exclude-standard"]).strip()
+    if not status_output:
+        return set()
+    return {line for line in status_output.splitlines() if line.strip()}
+
+
+def stage_worktree_changes(pre_run_untracked_files: set[str] | None = None) -> None:
+    run_command(["git", "add", "-u"])
+
+    if pre_run_untracked_files is None:
+        return
+
+    new_untracked_files = residual_untracked_files_after_baseline(pre_run_untracked_files)
+    if new_untracked_files:
+        run_command(["git", "add", "--", *new_untracked_files])
+
+
 def sanitize_branch_for_path(branch_name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "-", branch_name).strip("-") or "pr-branch"
 
@@ -1806,6 +2917,8 @@ def build_issue_failure_report_comment(
     runner: str,
     agent: str,
     model: str | None,
+    residual_untracked_files: list[str] | None = None,
+    next_action: str | None = None,
 ) -> str:
     payload = {
         "status": "failed",
@@ -1820,10 +2933,26 @@ def build_issue_failure_report_comment(
         "model": model,
         "timestamp": utc_now_iso(),
     }
-    next_actions = (
+    if residual_untracked_files:
+        payload["residual_untracked_files"] = sorted(residual_untracked_files)
+        payload["residual_untracked_count"] = len(residual_untracked_files)
+        payload["residual_validation_stage"] = stage
+
+    next_actions = next_action or (
         "Next actions: rerun with --dry-run for preview, rerun with --force-reprocess "
         "to override skip guards, or take over manually from the branch above."
     )
+
+    evidence = ""
+    if payload.get("residual_untracked_files"):
+        files = payload["residual_untracked_files"]
+        file_lines = "\n".join(f"  - `{item}`" for item in files)
+        evidence = (
+            f"\nFailure evidence:\n"
+            f"- stage: `{payload.get('residual_validation_stage') or 'unknown'}`\n"
+            f"- residual untracked files:\n{file_lines}"
+        )
+
     return (
         "Automation failure report\n\n"
         f"- status: `{payload['status']}`\n"
@@ -1836,6 +2965,7 @@ def build_issue_failure_report_comment(
         f"- model: `{payload['model'] or 'default'}`\n"
         f"- run id: `{payload['run_id']}`\n"
         f"- timestamp: `{payload['timestamp']}`\n\n"
+        f"{evidence}\n"
         f"{next_actions}\n\n"
         f"{AGENT_FAILURE_REPORT_MARKER}\n"
         f"```json\n{json.dumps(payload, ensure_ascii=True, indent=2)}\n```"
@@ -1843,7 +2973,8 @@ def build_issue_failure_report_comment(
 
 
 def ensure_agent_failure_label(repo: str, dry_run: bool) -> None:
-    if command_succeeds(["gh", "label", "view", AGENT_FAILURE_LABEL_NAME, "--repo", repo]):
+    label_view_command = ["gh", "label", "view", AGENT_FAILURE_LABEL_NAME, "--repo", repo]
+    if command_succeeds(label_view_command):
         return
 
     if dry_run:
@@ -1853,19 +2984,27 @@ def ensure_agent_failure_label(repo: str, dry_run: bool) -> None:
         )
         return
 
-    run_command(
-        [
-            "gh",
-            "label",
-            "create",
-            AGENT_FAILURE_LABEL_NAME,
-            "--repo",
-            repo,
-            "--color",
-            AGENT_FAILURE_LABEL_COLOR,
-            "--description",
-            AGENT_FAILURE_LABEL_DESCRIPTION,
-        ]
+    create_command = [
+        "gh",
+        "label",
+        "create",
+        AGENT_FAILURE_LABEL_NAME,
+        "--repo",
+        repo,
+        "--color",
+        AGENT_FAILURE_LABEL_COLOR,
+        "--description",
+        AGENT_FAILURE_LABEL_DESCRIPTION,
+    ]
+    created, _stdout, stderr, _exit_code = run_check_command(create_command)
+    if created:
+        return
+
+    if _label_already_exists_error(stderr) and command_succeeds(label_view_command):
+        return
+
+    raise RuntimeError(
+        f"Failed to create missing failure label '{AGENT_FAILURE_LABEL_NAME}': {stderr or 'unknown error'}"
     )
 
 
@@ -1952,6 +3091,8 @@ def safe_report_issue_automation_failure(
     model: str | None,
     dry_run: bool,
     already_reported_issue_numbers: set[int],
+    residual_untracked_files: list[str] | None = None,
+    next_action: str | None = None,
 ) -> None:
     if issue_number in already_reported_issue_numbers:
         return
@@ -1967,6 +3108,8 @@ def safe_report_issue_automation_failure(
             runner=runner,
             agent=agent,
             model=model,
+            residual_untracked_files=residual_untracked_files,
+            next_action=next_action,
         )
         if dry_run:
             print(
@@ -2027,6 +3170,344 @@ def build_issue_scope_skip_comment(issue_number: int, reason: str, forced: bool)
         f"{next_action}\n\n"
         f"{SCOPE_DECISION_MARKER}\n"
         f"```json\n{json.dumps(payload, ensure_ascii=True, indent=2)}\n```"
+    )
+
+
+DECOMPOSITION_KEYWORDS = {
+    "epic",
+    "roadmap",
+    "architecture",
+    "daemon",
+    "multi-provider",
+    "decomposition",
+    "linked subtask",
+    "subtask",
+    "multiple pr",
+    "multi-step",
+    "large",
+}
+
+DECOMPOSITION_SOURCE_HEADINGS = {
+    "scope",
+    "implementation",
+    "implementation plan",
+    "work items",
+    "tasks",
+    "plan",
+}
+
+DECOMPOSITION_EXCLUDED_HEADINGS = {
+    "acceptance criteria",
+    "success criteria",
+    "validation",
+    "done when",
+    "non-goals",
+    "out of scope",
+}
+
+AUTO_DECOMPOSITION_HARD_TITLE_PREFIXES = (
+    "epic:",
+    "roadmap:",
+)
+
+CONCRETE_IMPLEMENTATION_TITLE_PREFIXES = (
+    "fix",
+    "add",
+    "implement",
+    "update",
+    "refine",
+    "improve",
+    "roll out",
+    "support",
+    "allow",
+    "track",
+    "record",
+)
+
+CONCRETE_IMPLEMENTATION_HEADINGS = {
+    "feature request",
+    "proposed behavior",
+    "proposed behaviour",
+    "implementation notes",
+    "acceptance criteria",
+    "success criteria",
+}
+
+
+def _issue_body_lines(issue: dict) -> list[str]:
+    body = str(issue.get("body") or "")
+    return [line.strip() for line in body.splitlines() if line.strip()]
+
+
+def _issue_headings(issue: dict) -> list[str]:
+    headings: list[str] = []
+    for line in _issue_body_lines(issue):
+        heading = _normalize_heading(line)
+        if heading is not None:
+            headings.append(heading)
+    return headings
+
+
+def _normalize_heading(line: str) -> str | None:
+    match = re.match(r"^#{1,6}\s+(.+)$", line.strip())
+    if not match:
+        return None
+    heading = re.sub(r"[^a-z0-9]+", " ", match.group(1).strip().lower()).strip()
+    return heading or None
+
+
+def _issue_sectioned_bullets(issue: dict) -> list[tuple[str | None, str]]:
+    bullets: list[tuple[str | None, str]] = []
+    current_heading: str | None = None
+    for line in _issue_body_lines(issue):
+        heading = _normalize_heading(line)
+        if heading is not None:
+            current_heading = heading
+            continue
+        normalized = line.strip()
+        if normalized.startswith(("-", "*")):
+            item = normalized[1:].strip()
+            if item:
+                bullets.append((current_heading, item))
+    return bullets
+
+
+def _issue_scope_bullets(issue: dict) -> list[str]:
+    return [item for _, item in _issue_sectioned_bullets(issue)]
+
+
+def _issue_decomposition_source_bullets(issue: dict) -> list[str]:
+    sectioned_bullets = _issue_sectioned_bullets(issue)
+    preferred = [
+        item
+        for heading, item in sectioned_bullets
+        if heading in DECOMPOSITION_SOURCE_HEADINGS
+    ]
+    if preferred:
+        return preferred
+    return [
+        item
+        for heading, item in sectioned_bullets
+        if heading not in DECOMPOSITION_EXCLUDED_HEADINGS
+    ]
+
+
+def _child_acceptance_criteria(title: str) -> list[str]:
+    return [
+        f"Required changes for '{title}' are implemented.",
+        f"Relevant validation or follow-up checks for '{title}' are recorded.",
+    ]
+
+
+def _looks_like_concrete_implementation_issue(issue: dict) -> bool:
+    title = str(issue.get("title") or "").strip().lower()
+    if not any(title.startswith(prefix) for prefix in CONCRETE_IMPLEMENTATION_TITLE_PREFIXES):
+        return False
+
+    headings = set(_issue_headings(issue))
+    body = str(issue.get("body") or "")
+    return bool(headings & CONCRETE_IMPLEMENTATION_HEADINGS) or "`" in body
+
+
+def assess_issue_decomposition_need(issue: dict) -> dict:
+    title = str(issue.get("title") or "")
+    body = str(issue.get("body") or "")
+    combined = f"{title}\n{body}".lower()
+    bullets = _issue_scope_bullets(issue)
+    decomposition_source_bullets = _issue_decomposition_source_bullets(issue)
+    title_lower = title.strip().lower()
+    hard_reasons: list[str] = []
+    soft_hints: list[str] = []
+
+    if title_lower.startswith(AUTO_DECOMPOSITION_HARD_TITLE_PREFIXES):
+        if title_lower.startswith("epic:"):
+            hard_reasons.append("explicit_epic_title")
+        else:
+            hard_reasons.append("explicit_roadmap_title")
+
+    if len(body) >= 1200:
+        soft_hints.append("long_body")
+    if len(decomposition_source_bullets) >= 5:
+        soft_hints.append("many_implementation_areas")
+
+    matched_keywords = sorted(keyword for keyword in DECOMPOSITION_KEYWORDS if keyword in combined)
+
+    acceptance_like = sum(
+        1
+        for line in _issue_body_lines(issue)
+        if any(token in line.lower() for token in ["acceptance", "success criteria", "scope", "goal"])
+    )
+    if acceptance_like >= 3 and (hard_reasons or len(body) >= 900 or len(decomposition_source_bullets) >= 4):
+        soft_hints.append("multiple_planning_sections")
+
+    concrete_implementation = _looks_like_concrete_implementation_issue(issue)
+    soft_hint_threshold = 3 if concrete_implementation else 2
+    needs_decomposition = bool(hard_reasons) or len(soft_hints) >= soft_hint_threshold
+    reasons = hard_reasons + (soft_hints if needs_decomposition else [])
+
+    return {
+        "needs_decomposition": needs_decomposition,
+        "reasons": reasons,
+        "hard_reasons": hard_reasons,
+        "soft_hints": soft_hints,
+        "concrete_implementation": concrete_implementation,
+        "matched_keywords": matched_keywords,
+        "body_length": len(body),
+        "bullet_count": len(bullets),
+        "implementation_area_count": len(decomposition_source_bullets),
+    }
+
+
+def should_issue_decompose(issue: dict, decompose_mode: str) -> tuple[bool, dict]:
+    assessment = assess_issue_decomposition_need(issue)
+    return decompose_mode == "always" or bool(assessment.get("needs_decomposition")), assessment
+
+
+def should_check_existing_decomposition_plan(issue: dict, assessment: dict) -> bool:
+    title = str(issue.get("title") or "").lower()
+    body = str(issue.get("body") or "").lower()
+    matched_keywords = assessment.get("matched_keywords")
+    matched = matched_keywords if isinstance(matched_keywords, list) else []
+    if "decomposition" in matched:
+        return True
+    if "decomposition" in title or "decomposition" in body:
+        return True
+    if "parent epic:" in body:
+        return True
+    return False
+
+
+def build_decomposition_plan_payload(issue: dict, assessment: dict) -> dict:
+    bullets = _issue_decomposition_source_bullets(issue)
+    proposed_children: list[dict] = []
+    source_items = bullets[:5]
+    if not source_items:
+        source_items = [
+            "Clarify scope and acceptance criteria",
+            "Implement the smallest safe slice",
+            "Validate behavior and update tracker state",
+        ]
+
+    for index, item in enumerate(source_items, start=1):
+        title = item.rstrip(".")
+        proposed_children.append(
+            {
+                "title": title[:120],
+                "order": index,
+                "depends_on": [] if index == 1 else [index - 1],
+                "acceptance": _child_acceptance_criteria(title),
+            }
+        )
+
+    return {
+        "status": "proposed",
+        "parent_issue": issue.get("number"),
+        "reason": assessment.get("reasons", []),
+        "matched_keywords": assessment.get("matched_keywords", []),
+        "proposed_children": proposed_children,
+        "created_children": [],
+        "next_action": "approve_plan_or_rerun_with_decompose_never",
+        "timestamp": utc_now_iso(),
+    }
+
+
+def format_decomposition_plan_comment(payload: dict) -> str:
+    status = str(payload.get("status") or "proposed").strip().lower() or "proposed"
+    reasons = payload.get("reason") if isinstance(payload.get("reason"), list) else []
+    children = payload.get("proposed_children")
+    if not isinstance(children, list):
+        children = []
+    created_children = payload.get("created_children")
+    if not isinstance(created_children, list):
+        created_children = []
+
+    reason_lines = "\n".join(f"- `{reason}`" for reason in reasons) or "- `manual`"
+    child_lines: list[str] = []
+    for child in children:
+        if not isinstance(child, dict):
+            continue
+        order = child.get("order")
+        title = str(child.get("title") or "Untitled child task")
+        deps = child.get("depends_on") if isinstance(child.get("depends_on"), list) else []
+        deps_text = f"; depends on: {', '.join(str(dep) for dep in deps)}" if deps else ""
+        child_lines.append(f"{order}. {title}{deps_text}")
+    children_text = "\n".join(child_lines) or "No child tasks proposed."
+
+    created_lines: list[str] = []
+    for child in created_children:
+        if not isinstance(child, dict):
+            continue
+        order = child.get("order")
+        created_issue_number = child.get("issue_number")
+        issue_url = str(child.get("issue_url") or "").strip()
+        title = str(child.get("title") or f"Child task {order}")
+
+        if isinstance(created_issue_number, int):
+            created_entry = f"- {order}. #{created_issue_number} {title}"
+        elif issue_url:
+            created_entry = f"- {order}. {title} ({issue_url})"
+        else:
+            created_entry = f"- {order}. {title}"
+        created_lines.append(created_entry)
+    created_text = "\n".join(created_lines) or "No child issues created yet."
+
+    if status == "children_created":
+        status_note = (
+            "Status: `children-created`; suggested execution sequence is preserved and "
+            "child links are recorded in this plan payload."
+        )
+        next_action = "Execute child issues in listed order."
+    elif status == "approved":
+        status_note = "Status: `approved`; ready to create child issues."
+        next_action = "Run with --create-child-issues to create linked child issues."
+    else:
+        status_note = "Status: `needs-decomposition`; child tasks were proposed for planning review."
+        next_action = (
+            "approve/edit this plan, then rerun with --create-child-issues, or rerun with "
+            "--decompose never to intentionally bypass planning-only decomposition."
+        )
+
+    if status != "children_created":
+        created_text = f"Created child issues (tracked):\n{created_text}"
+
+    return (
+        "Decomposition plan\n\n"
+        f"{status_note}\n\n"
+        "Reason:\n"
+        f"{reason_lines}\n\n"
+        "Proposed child tasks:\n"
+        f"{children_text}\n\n"
+        f"Created child issues:\n{created_text}\n\n"
+        f"Recommended next action: {next_action}\n\n"
+        f"{DECOMPOSITION_PLAN_MARKER}\n"
+        f"```json\n{json.dumps(payload, ensure_ascii=True, indent=2)}\n```"
+    )
+
+
+def post_decomposition_plan_comment(
+    repo: str,
+    issue_number: int,
+    payload: dict,
+    dry_run: bool,
+) -> None:
+    if dry_run:
+        print(
+            f"[dry-run] Would post decomposition plan to issue #{issue_number}: "
+            f"children={len(payload.get('proposed_children') or [])}"
+        )
+        return
+
+    run_command(
+        [
+            "gh",
+            "issue",
+            "comment",
+            str(issue_number),
+            "--repo",
+            repo,
+            "--body",
+            format_decomposition_plan_comment(payload),
+        ]
     )
 
 
@@ -2095,6 +3576,10 @@ def build_orchestration_state(
     error: str | None,
     workflow_checks: list[dict] | None = None,
     ci_checks: list[dict] | None = None,
+    residual_untracked_files: list[str] | None = None,
+    decomposition: dict | None = None,
+    stats: dict[str, object] | None = None,
+    required_file_validation: dict[str, object] | None = None,
 ) -> dict:
     if status not in ORCHESTRATION_STATE_STATUSES:
         raise RuntimeError(f"Unsupported orchestration state status: {status}")
@@ -2121,6 +3606,16 @@ def build_orchestration_state(
         state["workflow_checks"] = workflow_checks
     if ci_checks is not None:
         state["ci_checks"] = ci_checks
+    if residual_untracked_files is not None:
+        sorted_residual = sorted(residual_untracked_files)
+        state["residual_untracked_files"] = sorted_residual
+        state["residual_untracked_count"] = len(sorted_residual)
+    if stats is not None:
+        state["stats"] = stats
+    if decomposition is not None:
+        state["decomposition"] = decomposition
+    if required_file_validation is not None:
+        state["required_file_validation"] = required_file_validation
     return state
 
 
@@ -2343,6 +3838,178 @@ def choose_execution_mode(
     return "pr-review", f"found linked open PR #{pr_number}"
 
 
+_TOKEN_LINE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)\binput(?:\s+tokens?)\b[:\s=]*([0-9][0-9, _]*)"), "tokens_in"),
+    (re.compile(r"(?i)\bin(?:\s+tokens?)\b[:\s=]*([0-9][0-9, _]*)"), "tokens_in"),
+    (re.compile(r"(?i)\boutput(?:\s+tokens?)\b[:\s=]*([0-9][0-9, _]*)"), "tokens_out"),
+    (re.compile(r"(?i)\bout(?:\s+tokens?)\b[:\s=]*([0-9][0-9, _]*)"), "tokens_out"),
+)
+
+
+_COMBINED_TOKEN_LINE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)~?\s*([0-9][0-9, _]*)\s+in\s*/\s*~?\s*([0-9][0-9, _]*)\s+out"),
+)
+
+
+def _parse_int_value(value: str) -> int | None:
+    normalized = re.sub(r"[ ,_]", "", value)
+    try:
+        return int(normalized)
+    except ValueError:
+        return None
+
+
+def _parse_cost_value(value: str) -> float | None:
+    normalized = value.replace(",", "").strip()
+    normalized = normalized.lstrip("~$ ")
+    if not normalized:
+        return None
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _update_agent_run_stats(
+    line: str,
+    track_tokens: bool,
+    tokens_in: int | None,
+    tokens_out: int | None,
+    cost_usd: float | None,
+) -> tuple[int | None, int | None, float | None]:
+    if not track_tokens:
+        return tokens_in, tokens_out, cost_usd
+
+    for pattern in _COMBINED_TOKEN_LINE_PATTERNS:
+        combined_match = pattern.search(line)
+        if combined_match:
+            if combined_match.group(1):
+                parsed = _parse_int_value(combined_match.group(1))
+                if parsed is not None:
+                    tokens_in = parsed
+            if combined_match.group(2):
+                parsed = _parse_int_value(combined_match.group(2))
+                if parsed is not None:
+                    tokens_out = parsed
+            return tokens_in, tokens_out, cost_usd
+
+    for pattern, metric in _TOKEN_LINE_PATTERNS:
+        match = pattern.search(line)
+        if not match:
+            continue
+
+        parsed = _parse_int_value(match.group(1))
+        if parsed is None:
+            continue
+
+        if metric == "tokens_in":
+            tokens_in = parsed
+        else:
+            tokens_out = parsed
+
+    cost_match = re.search(r"\$([0-9]+(?:\.[0-9]{1,4})?)", line)
+    if cost_match:
+        parsed_cost = _parse_cost_value(cost_match.group(0))
+        if parsed_cost is not None:
+            cost_usd = parsed_cost
+
+    return tokens_in, tokens_out, cost_usd
+
+
+def _total_tracked_tokens(tokens_in: int | None, tokens_out: int | None) -> int | None:
+    if tokens_in is None and tokens_out is None:
+        return None
+    return (tokens_in or 0) + (tokens_out or 0)
+
+
+def _build_agent_run_stats(
+    elapsed_seconds: float,
+    tokens_in: int | None,
+    tokens_out: int | None,
+    cost_usd: float | None,
+) -> dict[str, object]:
+    elapsed = format_elapsed_duration(elapsed_seconds)
+    stats: dict[str, object] = {
+        "elapsed_seconds": int(elapsed_seconds),
+        "elapsed": elapsed,
+    }
+    if tokens_in is not None:
+        stats["tokens_in"] = tokens_in
+    if tokens_out is not None:
+        stats["tokens_out"] = tokens_out
+    total_tokens = _total_tracked_tokens(tokens_in=tokens_in, tokens_out=tokens_out)
+    if total_tokens is not None:
+        stats["tokens_total"] = total_tokens
+    if cost_usd is not None:
+        stats["cost_usd"] = cost_usd
+    return stats
+
+
+def _format_token_count(value: int | str | None) -> str | None:
+    if not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return f"{value:,}"
+
+
+def _format_budget_message_count(value: int | str | None) -> str | None:
+    formatted = _format_token_count(value)
+    if formatted is None:
+        return None
+    return formatted.replace(",", " ")
+
+
+def format_elapsed_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    minutes, secs = divmod(total_seconds, 60)
+    if minutes > 0:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def print_agent_run_summary(item_label: str, stats: dict[str, object]) -> None:
+    elapsed = str(stats.get("elapsed") or "unknown")
+    if not isinstance(elapsed, str):
+        elapsed = "unknown"
+
+    tokens_in = _format_token_count(stats.get("tokens_in"))
+    tokens_out = _format_token_count(stats.get("tokens_out"))
+    if tokens_in is not None and tokens_out is not None:
+        token_text = f"tokens: ~{tokens_in} in / ~{tokens_out} out"
+    else:
+        token_text = "tokens: unavailable"
+
+    cost_text = "cost: unavailable"
+    cost = stats.get("cost_usd")
+    if isinstance(cost, int | float):
+        cost_text = f"cost: ~${cost:.2f}"
+
+    print(f"[{item_label}] elapsed: {elapsed} | {token_text} | {cost_text}")
+
+
+def _record_agent_run_stats(
+    run_stats: dict[str, object] | None,
+    start: float,
+    tokens_in: int | None,
+    tokens_out: int | None,
+    cost_usd: float | None,
+) -> dict[str, object] | None:
+    if run_stats is None:
+        return None
+
+    run_stats.clear()
+    run_stats.update(
+        _build_agent_run_stats(
+            elapsed_seconds=(time.monotonic() - start),
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+        )
+    )
+    return run_stats
+
+
 def run_agent(
     issue: dict,
     runner: str,
@@ -2354,6 +4021,9 @@ def run_agent(
     opencode_auto_approve: bool,
     image_paths: list[str] | None = None,
     prompt_override: str | None = None,
+    track_tokens: bool = False,
+    token_budget: int | None = None,
+    run_stats: dict[str, object] | None = None,
 ) -> int:
     prompt = prompt_override if prompt_override is not None else build_prompt(
         issue=issue,
@@ -2370,6 +4040,9 @@ def run_agent(
         timeout_seconds=timeout_seconds,
         idle_timeout_seconds=idle_timeout_seconds,
         opencode_auto_approve=opencode_auto_approve,
+        track_tokens=track_tokens,
+        token_budget=token_budget,
+        run_stats=run_stats,
     )
 
 
@@ -2426,6 +4099,9 @@ def run_agent_with_prompt(
     idle_timeout_seconds: int | None,
     opencode_auto_approve: bool,
     image_paths: list[str] | None = None,
+    track_tokens: bool = False,
+    token_budget: int | None = None,
+    run_stats: dict[str, object] | None = None,
 ) -> int:
     command = build_agent_command(
         runner=runner,
@@ -2447,9 +4123,13 @@ def run_agent_with_prompt(
             print(f"[dry-run] Would run: {' '.join(command[:4])} ... for {item_label}")
         return 0
 
-    print(f"Running agent for {item_label}")
     start = time.monotonic()
+    print(f"Running agent for {item_label}")
     last_output = start
+    track_tokens = bool(track_tokens or token_budget is not None)
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    cost_usd: float | None = None
 
     process = subprocess.Popen(  # noqa: S603
         command,
@@ -2459,62 +4139,140 @@ def run_agent_with_prompt(
         bufsize=1,
     )
 
-    selector = selectors.DefaultSelector()
-    if process.stdout is not None:
-        selector.register(process.stdout, selectors.EVENT_READ)
-    if process.stderr is not None:
-        selector.register(process.stderr, selectors.EVENT_READ)
+    line_queue: _queue.Queue[tuple[str, str]] = _queue.Queue()
 
-    try:
-        while True:
-            now = time.monotonic()
-            elapsed = now - start
-            idle_elapsed = now - last_output
+    def _raise_if_token_budget_exceeded() -> None:
+        total_tokens = _total_tracked_tokens(tokens_in=tokens_in, tokens_out=tokens_out)
+        if token_budget is None or total_tokens is None or total_tokens <= token_budget:
+            return
 
-            if timeout_seconds > 0 and elapsed > timeout_seconds:
-                process.kill()
-                process.wait(timeout=10)
-                raise RuntimeError(
-                    f"Agent timed out after {timeout_seconds}s for {item_label}. "
-                    "Possible causes: waiting for interactive approval, network stall, "
-                    "or a long-running task. Try increasing --agent-timeout-seconds, "
-                    "setting --agent-idle-timeout-seconds, or using --opencode-auto-approve "
-                    "for OpenCode if safe in your environment."
-                )
+        _record_agent_run_stats(
+            run_stats=run_stats,
+            start=start,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+        )
+        budget_error = TokenBudgetExceededError(
+            budget=token_budget,
+            reached=total_tokens,
+            item_label=item_label,
+        )
+        print(str(budget_error))
+        raise budget_error
 
-            if idle_timeout_seconds and idle_elapsed > idle_timeout_seconds:
-                process.kill()
-                process.wait(timeout=10)
-                raise RuntimeError(
-                    f"Agent produced no output for {idle_timeout_seconds}s on {item_label}; "
-                    "aborting to avoid indefinite hang. Possible causes: waiting for "
-                    "interactive approval or a stuck process. Try --opencode-auto-approve "
-                    "(if safe) or a larger --agent-idle-timeout-seconds."
-                )
+    def _pipe_reader(stream, tag: str) -> None:
+        try:
+            for line in stream:
+                line_queue.put((tag, line))
+        finally:
+            line_queue.put((tag, ""))
 
-            events = selector.select(timeout=1.0)
-            if events:
-                for key, _ in events:
-                    line = key.fileobj.readline()
-                    if line:
-                        last_output = time.monotonic()
-                        if key.fileobj is process.stderr:
-                            print(line, end="", file=sys.stderr)
-                        else:
-                            print(line, end="")
+    stdout_thread = threading.Thread(
+        target=_pipe_reader, args=(process.stdout, "stdout"), daemon=True
+    )
+    stderr_thread = threading.Thread(
+        target=_pipe_reader, args=(process.stderr, "stderr"), daemon=True
+    )
+    stdout_thread.start()
+    stderr_thread.start()
 
-            if process.poll() is not None:
-                if process.stdout is not None:
-                    remainder = process.stdout.read() or ""
-                    if remainder:
-                        print(remainder, end="")
-                if process.stderr is not None:
-                    remainder = process.stderr.read() or ""
-                    if remainder:
-                        print(remainder, end="", file=sys.stderr)
-                return process.returncode
-    finally:
-        selector.close()
+    while True:
+        now = time.monotonic()
+        elapsed = now - start
+        idle_elapsed = now - last_output
+
+        if timeout_seconds > 0 and elapsed > timeout_seconds:
+            process.kill()
+            process.wait(timeout=10)
+            _record_agent_run_stats(
+                run_stats=run_stats,
+                start=start,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost_usd=cost_usd,
+            )
+            raise RuntimeError(
+                f"Agent timed out after {timeout_seconds}s for {item_label}. "
+                "Possible causes: waiting for interactive approval, network stall, "
+                "or a long-running task. Try increasing --agent-timeout-seconds, "
+                "setting --agent-idle-timeout-seconds, or using --opencode-auto-approve "
+                "for OpenCode if safe in your environment."
+            )
+
+        if idle_timeout_seconds and idle_elapsed > idle_timeout_seconds:
+            process.kill()
+            process.wait(timeout=10)
+            _record_agent_run_stats(
+                run_stats=run_stats,
+                start=start,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost_usd=cost_usd,
+            )
+            raise RuntimeError(
+                f"Agent produced no output for {idle_timeout_seconds}s on {item_label}; "
+                "aborting to avoid indefinite hang. Possible causes: waiting for "
+                "interactive approval or a stuck process. Try --opencode-auto-approve "
+                "(if safe) or a larger --agent-idle-timeout-seconds."
+            )
+
+        try:
+            tag, line = line_queue.get(timeout=1.0)
+            if line:
+                last_output = time.monotonic()
+                if track_tokens:
+                    tokens_in, tokens_out, cost_usd = _update_agent_run_stats(
+                        line=line,
+                        track_tokens=track_tokens,
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                        cost_usd=cost_usd,
+                    )
+                    total_tokens = _total_tracked_tokens(tokens_in=tokens_in, tokens_out=tokens_out)
+                    if token_budget is not None and total_tokens is not None and total_tokens > token_budget:
+                        process.kill()
+                        process.wait(timeout=10)
+                        _raise_if_token_budget_exceeded()
+                if tag == "stderr":
+                    print(line, end="", file=sys.stderr)
+                else:
+                    print(line, end="")
+        except _queue.Empty:
+            pass
+
+        if process.poll() is not None:
+            stdout_thread.join()
+            stderr_thread.join()
+            while not line_queue.empty():
+                tag, line = line_queue.get_nowait()
+                if line:
+                    if track_tokens:
+                        tokens_in, tokens_out, cost_usd = _update_agent_run_stats(
+                            line=line,
+                            track_tokens=track_tokens,
+                            tokens_in=tokens_in,
+                            tokens_out=tokens_out,
+                            cost_usd=cost_usd,
+                        )
+                        total_tokens = _total_tracked_tokens(tokens_in=tokens_in, tokens_out=tokens_out)
+                        if token_budget is not None and total_tokens is not None and total_tokens > token_budget:
+                            _raise_if_token_budget_exceeded()
+                    if tag == "stderr":
+                        print(line, end="", file=sys.stderr)
+                    else:
+                        print(line, end="")
+
+            recorded_stats = _record_agent_run_stats(
+                run_stats=run_stats,
+                start=start,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost_usd=cost_usd,
+            )
+            if recorded_stats is not None:
+                print_agent_run_summary(item_label=item_label, stats=recorded_stats)
+            return process.returncode
 
 
 def create_branch(base_branch: str, branch_name: str, dry_run: bool) -> None:
@@ -2704,13 +4462,25 @@ def sync_reused_branch_with_base(
     return synced
 
 
-def commit_changes(issue: dict, dry_run: bool) -> str:
+def commit_changes(
+    issue: dict,
+    dry_run: bool,
+    pre_run_untracked_files: set[str] | None = None,
+) -> str:
     message = issue_commit_title(issue)
     if dry_run:
         print(f"[dry-run] Would commit with message: {message}")
         return message
-    run_command(["git", "add", "-u"])
+    stage_worktree_changes(pre_run_untracked_files)
     run_command(["git", "commit", "-m", message])
+
+    residual_untracked_files = residual_untracked_files_after_baseline(pre_run_untracked_files)
+    if residual_untracked_files:
+        raise ResidualUntrackedFilesError(
+            files=residual_untracked_files,
+            stage="issue_commit_validation",
+        )
+
     return message
 
 
@@ -2737,13 +4507,25 @@ def push_current_branch(dry_run: bool) -> None:
     run_command(["git", "push"])
 
 
-def commit_pr_review_changes(pull_request: dict, dry_run: bool) -> str:
+def commit_pr_review_changes(
+    pull_request: dict,
+    dry_run: bool,
+    pre_run_untracked_files: set[str] | None = None,
+) -> str:
     message = f"Address review comments for PR #{pull_request['number']}"
     if dry_run:
         print(f"[dry-run] Would commit with message: {message}")
         return message
-    run_command(["git", "add", "-A"])
+    stage_worktree_changes(pre_run_untracked_files)
     run_command(["git", "commit", "-m", message])
+
+    residual_untracked_files = residual_untracked_files_after_baseline(pre_run_untracked_files)
+    if residual_untracked_files:
+        raise ResidualUntrackedFilesError(
+            files=residual_untracked_files,
+            stage="pr_review_commit_validation",
+        )
+
     return message
 
 
@@ -2991,7 +4773,17 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
 
 
 def _validate_project_defaults(config: dict, config_path: str) -> None:
-    supported_defaults_keys = {"runner", "agent", "model"}
+    supported_defaults_keys = {
+        "runner",
+        "agent",
+        "model",
+        "track_tokens",
+        "token_budget",
+        "preset",
+        "agent_timeout_seconds",
+        "agent_idle_timeout_seconds",
+        "max_attempts",
+    }
     unsupported_defaults = sorted(set(config) - supported_defaults_keys)
     if unsupported_defaults:
         raise RuntimeError(
@@ -3009,6 +4801,42 @@ def _validate_project_defaults(config: dict, config_path: str) -> None:
 
     if "model" in config and config["model"] is not None and not isinstance(config["model"], str):
         raise RuntimeError("Project config key 'defaults.model' must be a string or null")
+
+    if "track_tokens" in config and not isinstance(config["track_tokens"], bool):
+        raise RuntimeError("Project config key 'defaults.track_tokens' must be a boolean")
+
+    if "token_budget" in config:
+        value = config["token_budget"]
+        if value is not None and (type(value) is not int or value <= 0):
+            raise RuntimeError(
+                "Project config key 'defaults.token_budget' must be a positive integer or null"
+            )
+
+    if "preset" in config:
+        value = config["preset"]
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError("Project config key 'defaults.preset' must be a non-empty string")
+
+    if "agent_timeout_seconds" in config:
+        value = config["agent_timeout_seconds"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError(
+                "Project config key 'defaults.agent_timeout_seconds' must be a positive integer"
+            )
+
+    if "agent_idle_timeout_seconds" in config:
+        value = config["agent_idle_timeout_seconds"]
+        if value is not None and (type(value) is not int or value <= 0):
+            raise RuntimeError(
+                "Project config key 'defaults.agent_idle_timeout_seconds' must be a positive integer or null"
+            )
+
+    if "max_attempts" in config:
+        value = config["max_attempts"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError(
+                "Project config key 'defaults.max_attempts' must be a positive integer"
+            )
 
 
 def _validate_project_scope(config: dict, config_path: str) -> None:
@@ -3068,7 +4896,7 @@ def _validate_project_scope(config: dict, config_path: str) -> None:
 
 
 def _validate_project_retry(config: dict, config_path: str) -> None:
-    supported_retry_keys = {"max_attempts"}
+    supported_retry_keys = {"max_attempts", "escalate_to_preset"}
     unsupported_retry = sorted(set(config) - supported_retry_keys)
     if unsupported_retry:
         raise RuntimeError(
@@ -3080,6 +4908,97 @@ def _validate_project_retry(config: dict, config_path: str) -> None:
         value = config["max_attempts"]
         if type(value) is not int or value <= 0:
             raise RuntimeError("Project config key 'retry.max_attempts' must be a positive integer")
+
+    if "escalate_to_preset" in config:
+        value = config["escalate_to_preset"]
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise RuntimeError(
+                "Project config key 'retry.escalate_to_preset' must be a non-empty string or null"
+            )
+
+
+def _validate_preset_config(config: dict, config_path: str, prefix: str) -> None:
+    supported_preset_keys = {
+        "runner",
+        "agent",
+        "model",
+        "track_tokens",
+        "token_budget",
+        "agent_timeout_seconds",
+        "agent_idle_timeout_seconds",
+        "max_attempts",
+        "escalate_to_preset",
+    }
+    unsupported = sorted(set(config) - supported_preset_keys)
+    if unsupported:
+        raise RuntimeError(
+            f"Unsupported key(s) in project config {config_path} under '{prefix}': "
+            + ", ".join(unsupported)
+        )
+
+    if "runner" in config and config["runner"] not in {"claude", "opencode"}:
+        raise RuntimeError(f"Project config key '{prefix}.runner' must be one of: claude, opencode")
+
+    if "agent" in config:
+        value = config["agent"]
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"Project config key '{prefix}.agent' must be a non-empty string")
+
+    if "model" in config and config["model"] is not None and not isinstance(config["model"], str):
+        raise RuntimeError(f"Project config key '{prefix}.model' must be a string or null")
+
+    if "track_tokens" in config and not isinstance(config["track_tokens"], bool):
+        raise RuntimeError(f"Project config key '{prefix}.track_tokens' must be a boolean")
+
+    if "token_budget" in config:
+        value = config["token_budget"]
+        if value is not None and (type(value) is not int or value <= 0):
+            raise RuntimeError(f"Project config key '{prefix}.token_budget' must be a positive integer or null")
+
+    if "agent_timeout_seconds" in config:
+        value = config["agent_timeout_seconds"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError(f"Project config key '{prefix}.agent_timeout_seconds' must be a positive integer")
+
+    if "agent_idle_timeout_seconds" in config:
+        value = config["agent_idle_timeout_seconds"]
+        if value is not None and (type(value) is not int or value <= 0):
+            raise RuntimeError(
+                f"Project config key '{prefix}.agent_idle_timeout_seconds' must be a positive integer or null"
+            )
+
+    if "max_attempts" in config:
+        value = config["max_attempts"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError(f"Project config key '{prefix}.max_attempts' must be a positive integer")
+
+    if "escalate_to_preset" in config:
+        value = config["escalate_to_preset"]
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise RuntimeError(
+                f"Project config key '{prefix}.escalate_to_preset' must be a non-empty string or null"
+            )
+
+
+def _validate_project_presets(config: dict, config_path: str) -> None:
+    for preset_name, preset_config in config.items():
+        if not isinstance(preset_name, str) or not preset_name.strip():
+            raise RuntimeError(
+                f"Project config {config_path} preset names must be non-empty strings"
+            )
+        if not isinstance(preset_config, dict):
+            raise RuntimeError(
+                f"Project config key 'presets.{preset_name}' must be an object"
+            )
+        _validate_preset_config(preset_config, config_path, f"presets.{preset_name}")
+
+
+def _validate_retry_references(config: dict, preset_names: set[str], config_path: str, prefix: str) -> None:
+    target = _as_optional_string(config.get("escalate_to_preset"))
+    if target is not None and target not in preset_names:
+        raise RuntimeError(
+            f"Project config key '{prefix}.escalate_to_preset' references unknown preset '{target}'"
+        )
 
 
 def _validate_project_communication(config: dict, config_path: str) -> None:
@@ -3138,6 +5057,29 @@ def validate_project_config(config: dict, config_path: str) -> dict:
     if isinstance(communication, dict):
         _validate_project_communication(communication, config_path)
 
+    presets = config.get("presets")
+    if isinstance(presets, dict):
+        _validate_project_presets(presets, config_path)
+
+    preset_names = set(presets) if isinstance(presets, dict) else set()
+    if isinstance(defaults, dict):
+        default_preset = _as_optional_string(defaults.get("preset"))
+        if default_preset is not None and default_preset not in preset_names:
+            raise RuntimeError(
+                f"Project config key 'defaults.preset' references unknown preset '{default_preset}'"
+            )
+    if isinstance(retry, dict):
+        _validate_retry_references(retry, preset_names, config_path, "retry")
+    if isinstance(presets, dict):
+        for preset_name, preset_config in presets.items():
+            if isinstance(preset_config, dict):
+                _validate_retry_references(
+                    preset_config,
+                    preset_names,
+                    config_path,
+                    f"presets.{preset_name}",
+                )
+
     return config
 
 
@@ -3161,13 +5103,27 @@ def load_project_config(config_path: str) -> dict:
 
 def project_cli_defaults(project_config: dict) -> dict:
     defaults = project_config.get("defaults")
-    if not isinstance(defaults, dict):
-        return {}
-
     cli_defaults: dict = {}
-    for key in ["runner", "agent", "model"]:
-        if key in defaults:
-            cli_defaults[key] = defaults[key]
+    if isinstance(defaults, dict):
+        for key in [
+            "runner",
+            "agent",
+            "model",
+            "track_tokens",
+            "token_budget",
+            "preset",
+            "agent_timeout_seconds",
+            "agent_idle_timeout_seconds",
+            "max_attempts",
+        ]:
+            if key in defaults:
+                cli_defaults[key] = defaults[key]
+
+    retry = project_config.get("retry")
+    if isinstance(retry, dict):
+        for key in ["max_attempts", "escalate_to_preset"]:
+            if key in retry:
+                cli_defaults[key] = retry[key]
     return cli_defaults
 
 
@@ -3181,6 +5137,7 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "model",
         "agent_timeout_seconds",
         "agent_idle_timeout_seconds",
+        "token_budget",
         "opencode_auto_approve",
         "branch_prefix",
         "include_empty",
@@ -3193,6 +5150,11 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "sync_reused_branch",
         "sync_strategy",
         "base_branch",
+        "decompose",
+        "create_child_issues",
+        "track_tokens",
+        "preset",
+        "max_attempts",
     }
 
     unsupported = sorted(set(config) - supported_keys)
@@ -3234,6 +5196,11 @@ def validate_local_config(config: dict, config_path: str) -> dict:
             raise RuntimeError("Local config key 'model' must be a string or null")
         validated["model"] = config["model"]
 
+    if "preset" in config:
+        if not isinstance(config["preset"], str) or not config["preset"].strip():
+            raise RuntimeError("Local config key 'preset' must be a non-empty string")
+        validated["preset"] = config["preset"]
+
     if "agent_timeout_seconds" in config:
         value = config["agent_timeout_seconds"]
         if type(value) is not int or value <= 0:
@@ -3250,6 +5217,20 @@ def validate_local_config(config: dict, config_path: str) -> dict:
             )
         validated["agent_idle_timeout_seconds"] = value
 
+    if "token_budget" in config:
+        value = config["token_budget"]
+        if value is not None and (type(value) is not int or value <= 0):
+            raise RuntimeError(
+                "Local config key 'token_budget' must be a positive integer or null"
+            )
+        validated["token_budget"] = value
+
+    if "max_attempts" in config:
+        value = config["max_attempts"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError("Local config key 'max_attempts' must be a positive integer")
+        validated["max_attempts"] = value
+
     for key in [
         "opencode_auto_approve",
         "include_empty",
@@ -3260,11 +5241,17 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "skip_if_branch_exists",
         "force_reprocess",
         "sync_reused_branch",
+        "create_child_issues",
     ]:
         if key in config:
             if not isinstance(config[key], bool):
                 raise RuntimeError(f"Local config key '{key}' must be a boolean")
             validated[key] = config[key]
+
+    if "track_tokens" in config and "track_tokens" not in validated:
+        if not isinstance(config["track_tokens"], bool):
+            raise RuntimeError("Local config key 'track_tokens' must be a boolean")
+        validated["track_tokens"] = config["track_tokens"]
 
     if "branch_prefix" in config:
         if not isinstance(config["branch_prefix"], str) or not config["branch_prefix"].strip():
@@ -3282,6 +5269,11 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         if config["base_branch"] not in {"default", "current"}:
             raise RuntimeError("Local config key 'base_branch' must be one of: default, current")
         validated["base_branch"] = config["base_branch"]
+
+    if "decompose" in config:
+        if config["decompose"] not in {"auto", "never", "always"}:
+            raise RuntimeError("Local config key 'decompose' must be one of: auto, never, always")
+        validated["decompose"] = config["decompose"]
 
     return validated
 
@@ -3302,6 +5294,40 @@ def load_local_config(config_path: str) -> dict:
         raise RuntimeError(f"Local config {config_path} must contain a JSON object")
 
     return validate_local_config(config=data, config_path=config_path)
+
+
+def preset_cli_defaults(project_config: dict, preset_name: str | None) -> dict:
+    normalized_name = _as_optional_string(preset_name)
+    if normalized_name is None:
+        return {}
+
+    presets = project_config.get("presets")
+    if not isinstance(presets, dict) or normalized_name not in presets:
+        raise RuntimeError(f"Unknown preset '{normalized_name}' in project config")
+
+    preset_config = presets.get(normalized_name)
+    if not isinstance(preset_config, dict):
+        raise RuntimeError(f"Project config key 'presets.{normalized_name}' must be an object")
+
+    cli_defaults: dict = {"preset": normalized_name}
+    for key in [
+        "runner",
+        "agent",
+        "model",
+        "track_tokens",
+        "token_budget",
+        "agent_timeout_seconds",
+        "agent_idle_timeout_seconds",
+        "max_attempts",
+        "escalate_to_preset",
+    ]:
+        if key in preset_config:
+            cli_defaults[key] = preset_config[key]
+    return cli_defaults
+
+
+def without_keys(config: dict, *keys: str) -> dict:
+    return {key: value for key, value in config.items() if key not in keys}
 
 
 def _doctor_record(checks: list[dict[str, str]], status: str, name: str, detail: str) -> None:
@@ -3642,6 +5668,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--preset",
+        help=(
+            "Named preset from project config. Presets can set runner/model/agent and "
+            "basic retry or limit defaults before explicit CLI overrides are applied."
+        ),
+    )
+    parser.add_argument(
         "--agent-timeout-seconds",
         type=int,
         default=BUILTIN_DEFAULTS["agent_timeout_seconds"],
@@ -3653,12 +5686,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Abort if agent produces no output for this many seconds.",
     )
     parser.add_argument(
+        "--token-budget",
+        "--max-tokens",
+        dest="token_budget",
+        type=int,
+        default=BUILTIN_DEFAULTS["token_budget"],
+        help="Abort when cumulative tracked token usage exceeds this limit.",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=BUILTIN_DEFAULTS["max_attempts"],
+        help="Retry policy placeholder: maximum attempts before escalation or failure.",
+    )
+    parser.add_argument(
         "--opencode-auto-approve",
         action="store_true",
         help=(
             "For --runner opencode, pass --dangerously-skip-permissions to reduce "
             "interactive approval waits. Use with caution."
         ),
+    )
+    parser.add_argument(
+        "--track-tokens",
+        action="store_true",
+        help="Track token usage from runner output and include it in orchestration state.",
     )
     parser.add_argument(
         "--branch-prefix",
@@ -3795,6 +5847,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--decompose",
+        default=BUILTIN_DEFAULTS["decompose"],
+        choices=["auto", "never", "always"],
+        help=(
+            "Planning-only decomposition preflight for issue-flow: 'auto' proposes a plan "
+            "for large tasks before agent execution, 'never' disables it, and 'always' "
+            "forces a plan-only run."
+        ),
+    )
+    parser.add_argument(
+        "--create-child-issues",
+        action="store_true",
+        help=(
+            "When a decomposed plan is approved in comments, create child issues "
+            "from the plan (idempotent on re-runs)."
+        ),
+    )
+    parser.add_argument(
         "--dir",
         default=BUILTIN_DEFAULTS["dir"],
         help="Path to the local git repository to operate on. Defaults to the current directory.",
@@ -3833,10 +5903,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    bootstrap_parser = argparse.ArgumentParser(add_help=False)
+    bootstrap_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     bootstrap_parser.add_argument("--dir", default=BUILTIN_DEFAULTS["dir"])
     bootstrap_parser.add_argument("--local-config")
     bootstrap_parser.add_argument("--project-config")
+    bootstrap_parser.add_argument("--preset")
     bootstrap_parser.add_argument("--doctor", action="store_true")
     bootstrap_args, _ = bootstrap_parser.parse_known_args(argv)
 
@@ -3847,9 +5918,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     if not bootstrap_args.doctor:
         project_config = load_project_config(project_config_path)
-        parser.set_defaults(**project_cli_defaults(project_config))
         local_defaults = load_local_config(local_config_path)
-        parser.set_defaults(**local_defaults)
+        project_defaults = project_cli_defaults(project_config)
+        project_preset = _as_optional_string(project_defaults.get("preset"))
+        local_preset = _as_optional_string(local_defaults.get("preset"))
+        cli_preset = _as_optional_string(getattr(bootstrap_args, "preset", None))
+
+        parser.set_defaults(**without_keys(project_defaults, "preset"))
+        parser.set_defaults(**preset_cli_defaults(project_config, project_preset))
+        parser.set_defaults(**preset_cli_defaults(project_config, local_preset))
+        parser.set_defaults(**without_keys(local_defaults, "preset"))
+        parser.set_defaults(**preset_cli_defaults(project_config, cli_preset))
     parser.set_defaults(project_config=project_config_path)
     parser.set_defaults(local_config=local_config_path)
     return parser.parse_args(argv)
@@ -3884,7 +5963,22 @@ def main() -> int:
     allow_pr_branch_switch = bool(getattr(args, "allow_pr_branch_switch", False))
     isolate_worktree = bool(getattr(args, "isolate_worktree", False))
     post_pr_summary = bool(getattr(args, "post_pr_summary", False))
+    track_tokens = bool(getattr(args, "track_tokens", False))
+    token_budget = getattr(args, "token_budget", BUILTIN_DEFAULTS["token_budget"])
+    if token_budget is not None and (type(token_budget) is not int or token_budget <= 0):
+        print("Error: --token-budget must be a positive integer", file=sys.stderr)
+        return 1
+    selected_preset = _as_optional_string(getattr(args, "preset", None))
+    max_attempts = getattr(args, "max_attempts", BUILTIN_DEFAULTS["max_attempts"])
+    if type(max_attempts) is not int or max_attempts <= 0:
+        print("Error: --max-attempts must be a positive integer", file=sys.stderr)
+        return 1
+    escalate_to_preset = _as_optional_string(
+        getattr(args, "escalate_to_preset", BUILTIN_DEFAULTS["escalate_to_preset"])
+    )
     base_branch_mode = str(getattr(args, "base_branch", BUILTIN_DEFAULTS["base_branch"]))
+    decompose_mode = str(getattr(args, "decompose", BUILTIN_DEFAULTS["decompose"]))
+    create_child_issues = bool(getattr(args, "create_child_issues", BUILTIN_DEFAULTS["create_child_issues"]))
 
     if force_reprocess:
         skip_if_pr_exists = False
@@ -3918,6 +6012,13 @@ def main() -> int:
                 configured_names = ", ".join(name for name, _ in workflow_checks)
                 prefix = "[dry-run] " if args.dry_run else ""
                 print(f"{prefix}Configured workflow checks: {configured_names}")
+            if selected_preset is not None:
+                print(f"Selected preset: {selected_preset}")
+            if max_attempts != BUILTIN_DEFAULTS["max_attempts"] or escalate_to_preset is not None:
+                policy_text = f"Retry policy: max_attempts={max_attempts}"
+                if escalate_to_preset is not None:
+                    policy_text += f", escalate_to_preset={escalate_to_preset}"
+                print(policy_text)
 
             if issue_number_arg is not None and pr_number_arg is not None:
                 raise RuntimeError("Use either --issue or --pr, not both.")
@@ -3984,6 +6085,8 @@ def main() -> int:
     if pr_mode_requested:
         try:
             failure_stage = "pr_review_init"
+            pr_recovered_decomposition_rollup: dict | None = None
+            pr_agent_run_stats: dict[str, object] | None = None
             workflow_check_results: list[dict] | None = None
             original_cwd = os.getcwd()
             original_branch = current_branch()
@@ -4071,6 +6174,10 @@ def main() -> int:
                     f"{prefix}Recovered orchestration state context: "
                     f"{format_recovered_state_context(recovered_pr_state)}"
                 )
+                pr_recovered_decomposition_rollup = build_decomposition_rollup_from_recovered_state(
+                    recovered_state=recovered_pr_state,
+                    parent_issue=None,
+                )
 
             failure_stage = "fetch_review_feedback"
             threads = fetch_pr_review_threads(repo=repo, number=pr_number_arg)
@@ -4132,6 +6239,7 @@ def main() -> int:
                     stage="agent_run",
                     next_action="wait_for_agent_result",
                     error=None,
+                    decomposition=pr_recovered_decomposition_rollup,
                 ),
             )
 
@@ -4175,9 +6283,12 @@ def main() -> int:
                                 stage="ci_checks",
                                 next_action="wait_for_ci",
                                 error=None,
-                                ci_checks=ci_status.get("checks")
-                                if isinstance(ci_status.get("checks"), list)
-                                else [],
+                                ci_checks=(
+                                    ci_status.get("checks")
+                                    if isinstance(ci_status.get("checks"), list)
+                                    else []
+                                ),
+                                decomposition=pr_recovered_decomposition_rollup,
                             ),
                         )
                         print(
@@ -4205,14 +6316,55 @@ def main() -> int:
                                 model=args.model,
                                 attempt=1,
                                 stage="ci_checks",
-                                next_action="inspect_failing_ci_checks",
-                                error=short_error_text(failing_summary),
+                                 next_action="inspect_failing_ci_checks",
+                                 error=short_error_text(failing_summary),
+                                 ci_checks=ci_status.get("checks")
+                                 if isinstance(ci_status.get("checks"), list)
+                                 else [],
+                                 decomposition=pr_recovered_decomposition_rollup,
+                             ),
+                         )
+                        print(f"PR #{pr_number_arg} has failing CI checks: {failing_summary}")
+                        return 0
+
+                    required_file_validation = validate_required_files_in_pr(
+                        pull_request=pull_request,
+                        linked_issues=load_linked_issue_context(repo=repo, pull_request=pull_request),
+                    )
+
+                    if required_file_validation.get("status") == "blocked":
+                        missing_files = required_file_validation.get("missing_files")
+                        missing_summary = ", ".join(sorted(str(file) for file in missing_files))
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type="pr",
+                            target_number=pr_number_arg,
+                            dry_run=args.dry_run,
+                            state=build_orchestration_state(
+                                status="blocked",
+                                task_type="pr",
+                                issue_number=None,
+                                pr_number=pr_number_arg,
+                                branch=active_branch,
+                                base_branch=str(pr_state_context["base_branch"] or "") or None,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=1,
+                                stage="ci_checks",
+                                next_action="update_pr_with_required_files",
+                                error=f"Missing required file evidence: {missing_summary}",
                                 ci_checks=ci_status.get("checks")
                                 if isinstance(ci_status.get("checks"), list)
                                 else [],
+                                decomposition=pr_recovered_decomposition_rollup,
+                                required_file_validation=required_file_validation,
                             ),
                         )
-                        print(f"PR #{pr_number_arg} has failing CI checks: {failing_summary}")
+                        print(
+                            f"PR #{pr_number_arg} CI passed but required file evidence check failed. "
+                            f"Missing files: {missing_summary}"
+                        )
                         return _finish_main(0, original_process_cwd)
 
                     safe_post_orchestration_state_comment(
@@ -4237,6 +6389,8 @@ def main() -> int:
                             ci_checks=ci_status.get("checks")
                             if isinstance(ci_status.get("checks"), list)
                             else [],
+                            decomposition=pr_recovered_decomposition_rollup,
+                            required_file_validation=required_file_validation,
                         ),
                     )
                     print(
@@ -4260,11 +6414,12 @@ def main() -> int:
                         agent=args.agent,
                         model=args.model,
                         attempt=1,
-                        stage="review_feedback",
-                        next_action="await_new_review_comments",
-                        error="No actionable review comments found",
-                    ),
-                )
+                                 stage="review_feedback",
+                                 next_action="await_new_review_comments",
+                                 error="No actionable review comments found",
+                                 decomposition=pr_recovered_decomposition_rollup,
+                             ),
+                         )
                 print(
                     "No actionable review comments found "
                     f"for PR #{pr_number_arg}; nothing to do."
@@ -4287,6 +6442,10 @@ def main() -> int:
                 )
 
             failure_stage = "agent_run"
+            pre_run_untracked_files: set[str] | None = None
+            if not args.dry_run:
+                pre_run_untracked_files = list_untracked_files()
+            pr_agent_run_stats: dict[str, object] = {}
             exit_code = run_agent_with_prompt(
                 prompt=prompt,
                 item_label=f"PR #{pr_number_arg}",
@@ -4297,11 +6456,22 @@ def main() -> int:
                 timeout_seconds=args.agent_timeout_seconds,
                 idle_timeout_seconds=args.agent_idle_timeout_seconds,
                 opencode_auto_approve=args.opencode_auto_approve,
+                track_tokens=track_tokens,
+                token_budget=token_budget,
+                run_stats=pr_agent_run_stats,
             )
             if exit_code != 0:
-                raise RuntimeError(
-                    f"Agent failed for PR #{pr_number_arg} with exit code {exit_code}"
+                exit_summary = describe_exit_code(exit_code)
+                diagnosis = (
+                    classify_opencode_failure(return_code=exit_code, model=args.model)
+                    if args.runner == "opencode"
+                    else None
                 )
+                message = (
+                    f"Agent failed for PR #{pr_number_arg} with {exit_summary}"
+                    + (f" ({diagnosis})" if diagnosis else "")
+                )
+                raise RuntimeError(message)
 
             if not args.dry_run and not has_changes():
                 safe_post_orchestration_state_comment(
@@ -4323,6 +6493,8 @@ def main() -> int:
                         stage="post_agent_check",
                         next_action="await_more_feedback_or_manual_changes",
                         error="Agent produced no repository changes",
+                        stats=pr_agent_run_stats,
+                        decomposition=pr_recovered_decomposition_rollup,
                     ),
                 )
                 print(f"No changes detected for PR #{pr_number_arg}; skipping commit and push")
@@ -4331,7 +6503,11 @@ def main() -> int:
                 return _finish_main(0, original_process_cwd)
 
             failure_stage = "commit_push"
-            commit_pr_review_changes(pull_request=pull_request, dry_run=args.dry_run)
+            commit_pr_review_changes(
+                pull_request=pull_request,
+                dry_run=args.dry_run,
+                pre_run_untracked_files=pre_run_untracked_files,
+            )
 
             failure_stage = "workflow_checks"
             workflow_check_results = run_configured_workflow_checks(
@@ -4347,28 +6523,30 @@ def main() -> int:
             else:
                 push_branch(branch_name=active_branch, dry_run=args.dry_run)
 
-            safe_post_orchestration_state_comment(
-                repo=repo,
-                target_type="pr",
-                target_number=pr_number_arg,
-                dry_run=args.dry_run,
-                state=build_orchestration_state(
-                    status="waiting-for-ci",
-                    task_type="pr",
-                    issue_number=None,
-                    pr_number=pr_number_arg,
-                    branch=active_branch,
-                    base_branch=str(pr_state_context["base_branch"] or "") or None,
-                    runner=args.runner,
-                    agent=args.agent,
-                    model=args.model,
-                    attempt=1,
-                    stage="changes_pushed",
-                    next_action="wait_for_ci",
-                    error=None,
-                    workflow_checks=workflow_check_results,
-                ),
-            )
+                safe_post_orchestration_state_comment(
+                    repo=repo,
+                    target_type="pr",
+                    target_number=pr_number_arg,
+                    dry_run=args.dry_run,
+                    state=build_orchestration_state(
+                        status="waiting-for-ci",
+                        task_type="pr",
+                        issue_number=None,
+                        pr_number=pr_number_arg,
+                        branch=active_branch,
+                        base_branch=str(pr_state_context["base_branch"] or "") or None,
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        attempt=1,
+                        stage="changes_pushed",
+                        next_action="wait_for_ci",
+                        error=None,
+                        workflow_checks=workflow_check_results,
+                        stats=pr_agent_run_stats,
+                        decomposition=pr_recovered_decomposition_rollup,
+                    ),
+                )
 
             if post_pr_summary:
                 leave_pr_summary_comment(
@@ -4389,14 +6567,18 @@ def main() -> int:
             if pr_number_arg is not None:
                 failed_pr_number = pr_state_context.get("pr")
                 if type(failed_pr_number) is int:
-                    failure_status = "blocked" if failure_stage == "workflow_checks" else "failed"
-                    next_action = (
-                        "fix_workflow_checks_and_retry"
-                        if failure_stage == "workflow_checks"
-                        else "inspect_error_and_retry"
-                    )
+                    if isinstance(exc, ResidualUntrackedFilesError):
+                        failure_stage = "residual_untracked_validation"
+                    elif isinstance(exc, TokenBudgetExceededError):
+                        failure_stage = "token_budget"
+
+                    failure_status = failure_state_for_stage(failure_stage)
+                    next_action = failure_next_action_for_stage(failure_stage)
                     workflow_results = (
                         exc.checks if isinstance(exc, WorkflowCheckFailure) else None
+                    )
+                    residual_untracked_files = (
+                        exc.files if isinstance(exc, ResidualUntrackedFilesError) else None
                     )
                     safe_post_orchestration_state_comment(
                         repo=repo,
@@ -4418,6 +6600,9 @@ def main() -> int:
                             next_action=next_action,
                             error=short_error_text(str(exc)),
                             workflow_checks=workflow_results,
+                            residual_untracked_files=residual_untracked_files,
+                            stats=pr_agent_run_stats,
+                            decomposition=pr_recovered_decomposition_rollup,
                         ),
                     )
             print(f"Error: {exc}", file=sys.stderr)
@@ -4474,6 +6659,13 @@ def main() -> int:
             state_target_type = "issue"
             state_target_number = issue["number"]
             state_pr_number: int | None = None
+            decomposition_rollup: dict | None = None
+            decomposition_parent_issue: dict | None = None
+            decomposition_parent_branch: str | None = None
+            decomposition_parent_payload: dict | None = None
+            decomposition_child_note: str | None = None
+            selected_decomposition_child = False
+            issue_agent_run_stats: dict[str, object] | None = None
             supports_github_issue_ops = issue_tracker(issue) == TRACKER_GITHUB and type(issue["number"]) is int
 
             scope_decision = evaluate_issue_scope(issue=issue, scope_defaults=scope_defaults)
@@ -4629,6 +6821,10 @@ def main() -> int:
                 recovered_state = merge_latest_recovered_state(
                     [recovered_issue_state, recovered_pr_state]
                 )
+                decomposition_rollup = build_decomposition_rollup_from_recovered_state(
+                    recovered_state=recovered_state,
+                    parent_issue=issue["number"],
+                )
                 if recovered_state is not None:
                     prefix = "[dry-run] " if args.dry_run else ""
                     print(
@@ -4678,6 +6874,301 @@ def main() -> int:
             if body_image_reason:
                 print(f"{issue_label.capitalize()} {body_image_reason}")
 
+            if mode == "issue-flow" and decompose_mode != "never":
+                failure_stage = "decomposition_preflight"
+                should_plan, assessment = should_issue_decompose(issue, decompose_mode)
+                latest_plan = None
+                plan_warnings: list[str] = []
+                latest_payload_dict = {}
+                latest_plan_is_execution_ready = False
+                if should_plan or should_check_existing_decomposition_plan(issue, assessment):
+                    issue_comments = fetch_issue_comments(repo=repo, issue_number=issue["number"])
+                    latest_plan, plan_warnings = select_latest_parseable_decomposition_plan(
+                        comments=issue_comments,
+                        source_label=f"issue #{issue['number']}",
+                    )
+                    for warning in plan_warnings:
+                        print(f"Warning: {warning}", file=sys.stderr)
+
+                    if latest_plan is not None:
+                        latest_payload = latest_plan.get("payload")
+                        latest_payload_dict = latest_payload if isinstance(latest_payload, dict) else {}
+                        latest_plan_is_execution_ready = is_decomposition_plan_approved(latest_payload_dict)
+
+                if latest_plan_is_execution_ready or should_plan:
+                    if latest_plan is not None:
+
+                        if is_decomposition_plan_approved(latest_payload_dict):
+                            missing_children = _decomposition_plan_has_missing_children(latest_payload_dict)
+                            if missing_children and create_child_issues:
+                                created_children = _extract_ordered_linked_children(latest_payload_dict)
+                                created_children_updates: list[dict] = []
+                                for child in missing_children:
+                                    created_child = create_decomposition_child_issue(
+                                        repo=repo,
+                                        parent_issue=issue,
+                                        child=child,
+                                        created_dependencies=created_children,
+                                        dry_run=args.dry_run,
+                                    )
+                                    created_order = child.get("order")
+                                    if type(created_order) is int and created_order > 0:
+                                        created_children[created_order] = created_child
+                                    created_children_updates.append(created_child)
+
+                                    if not args.dry_run:
+                                        if isinstance(created_child.get("issue_number"), int):
+                                            print(
+                                                f"Created child issue #{created_child['issue_number']} "
+                                                f"for order {child.get('order')} under issue #{issue['number']}"
+                                            )
+                                        else:
+                                            raise RuntimeError(
+                                                f"Created child issue payload for order {child.get('order')} "
+                                                "was missing an integer issue number"
+                                            )
+
+                                latest_payload_dict = merge_created_children_into_plan_payload(
+                                    latest_payload_dict,
+                                    created_children_updates,
+                                )
+                                all_children_created = all(
+                                    isinstance(child.get("issue_number"), int)
+                                    for child in _normalize_created_children(
+                                        latest_payload_dict.get("created_children")
+                                    )
+                                )
+
+                                if all_children_created:
+                                    latest_payload_dict = dict(latest_payload_dict)
+                                    latest_payload_dict["status"] = "children_created"
+                                    latest_payload_dict["next_action"] = "execute_children_in_order"
+
+                                post_decomposition_plan_comment(
+                                    repo=repo,
+                                    issue_number=issue["number"],
+                                    payload=latest_payload_dict,
+                                    dry_run=args.dry_run,
+                                )
+                                safe_post_orchestration_state_comment(
+                                    repo=repo,
+                                    target_type="issue",
+                                    target_number=issue["number"],
+                                    dry_run=args.dry_run,
+                                    state=build_orchestration_state(
+                                        status="waiting-for-author",
+                                        task_type="issue",
+                                        issue_number=issue["number"],
+                                        pr_number=None,
+                                        branch=issue_branch,
+                                        base_branch=base_branch if base_branch else None,
+                                        runner=args.runner,
+                                        agent=args.agent,
+                                        model=args.model,
+                                        attempt=1,
+                                        stage="decomposition_plan",
+                                        next_action="execute_children_in_order",
+                                        error=(
+                                            "Created child issues from approved decomposition plan"
+                                            if all_children_created
+                                            else "Waiting for all child issue creation in approved plan"
+                                        ),
+                                    ),
+                                )
+                                processed += 1
+                                continue
+
+                            if missing_children:
+                                decomposition_rollup = build_decomposition_rollup_from_plan_payload(
+                                    payload=latest_payload_dict,
+                                )
+                                safe_post_orchestration_state_comment(
+                                    repo=repo,
+                                    target_type="issue",
+                                    target_number=issue["number"],
+                                    dry_run=args.dry_run,
+                                    state=build_orchestration_state(
+                                        status="waiting-for-author",
+                                        task_type="issue",
+                                        issue_number=issue["number"],
+                                        pr_number=None,
+                                        branch=issue_branch,
+                                        base_branch=base_branch if base_branch else None,
+                                        runner=args.runner,
+                                        agent=args.agent,
+                                        model=args.model,
+                                        attempt=1,
+                                        stage="decomposition_plan",
+                                        next_action="create_missing_child_issues",
+                                        error="Approved decomposition plan still has missing child issues",
+                                        decomposition=decomposition_rollup,
+                                    ),
+                                )
+                                print(
+                                    f"Approved decomposition plan for issue #{issue['number']} still has "
+                                    f"{len(missing_children)} missing child issue(s); rerun with "
+                                    "--create-child-issues to continue execution."
+                                )
+                                processed += 1
+                                continue
+
+                            latest_payload_dict = refresh_decomposition_plan_payload_from_child_states(
+                                repo=repo,
+                                plan_payload=latest_payload_dict,
+                            )
+                            decomposition_rollup = build_decomposition_rollup_from_plan_payload(
+                                payload=latest_payload_dict,
+                            )
+                            selected_child = decomposition_rollup.get("next_child")
+                            if not isinstance(selected_child, dict):
+                                post_decomposition_plan_comment(
+                                    repo=repo,
+                                    issue_number=issue["number"],
+                                    payload=latest_payload_dict,
+                                    dry_run=args.dry_run,
+                                )
+                                safe_post_orchestration_state_comment(
+                                    repo=repo,
+                                    target_type="issue",
+                                    target_number=issue["number"],
+                                    dry_run=args.dry_run,
+                                    state=build_orchestration_state(
+                                        status=(
+                                            "ready-for-review"
+                                            if int(decomposition_rollup.get("progress", {}).get("completed") or 0)
+                                            >= int(decomposition_rollup.get("total_children") or 0)
+                                            else "blocked"
+                                        ),
+                                        task_type="issue",
+                                        issue_number=issue["number"],
+                                        pr_number=None,
+                                        branch=issue_branch,
+                                        base_branch=base_branch if base_branch else None,
+                                        runner=args.runner,
+                                        agent=args.agent,
+                                        model=args.model,
+                                        attempt=1,
+                                        stage="decomposition_execution",
+                                        next_action=str(
+                                            latest_payload_dict.get("next_action")
+                                            or "review_completed_children"
+                                        ),
+                                        error=None,
+                                        decomposition=decomposition_rollup,
+                                    ),
+                                )
+                                print(
+                                    f"Issue #{issue['number']} has no unblocked child issues ready to run; "
+                                    f"{format_decomposition_rollup_context(decomposition_rollup)}"
+                                )
+                                processed += 1
+                                continue
+
+                            selected_child_issue_number = _as_positive_int(selected_child.get("issue_number"))
+                            if selected_child_issue_number is None:
+                                raise RuntimeError(
+                                    f"Selected decomposition child for issue #{issue['number']} is missing an issue number"
+                                )
+
+                            decomposition_parent_issue = dict(issue)
+                            decomposition_parent_branch = issue_branch
+                            decomposition_parent_payload = dict(latest_payload_dict)
+                            decomposition_child_note = build_decomposition_child_execution_note(
+                                parent_issue=decomposition_parent_issue,
+                                decomposition_rollup=decomposition_rollup,
+                                selected_child=selected_child,
+                            )
+                            safe_post_orchestration_state_comment(
+                                repo=repo,
+                                target_type="issue",
+                                target_number=decomposition_parent_issue["number"],
+                                dry_run=args.dry_run,
+                                state=build_orchestration_state(
+                                    status="in-progress",
+                                    task_type="issue",
+                                    issue_number=decomposition_parent_issue["number"],
+                                    pr_number=None,
+                                    branch=decomposition_parent_branch,
+                                    base_branch=base_branch if base_branch else None,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    attempt=1,
+                                    stage="decomposition_execution",
+                                    next_action="run_selected_child_issue",
+                                    error=None,
+                                    decomposition=decomposition_rollup,
+                                ),
+                            )
+                            issue = fetch_issue(repo=repo, number=selected_child_issue_number)
+                            issue_image_urls = collect_issue_image_urls(issue)
+                            issue_branch = branch_name_for_issue(
+                                issue=issue,
+                                prefix=args.branch_prefix,
+                            )
+                            state_target_type = "issue"
+                            state_target_number = issue["number"]
+                            state_pr_number = None
+                            print(
+                                f"Executing decomposition child issue #{issue['number']} for parent "
+                                f"#{decomposition_parent_issue['number']}: step {selected_child.get('order')} "
+                                f"{selected_child.get('title')}"
+                            )
+                            selected_decomposition_child = True
+                            should_plan = False
+
+                        if selected_decomposition_child:
+                            pass
+                        elif args.dry_run:
+                            prefix = "[dry-run] "
+                        else:
+                            prefix = ""
+                        if not selected_decomposition_child:
+                            print(
+                                f"{prefix}Decomposition plan already exists for issue #{issue['number']} "
+                                f"({latest_plan.get('url') or 'no url'}); skipping duplicate plan."
+                            )
+                            processed += 1
+                            continue
+
+                    if not selected_decomposition_child:
+                        payload = build_decomposition_plan_payload(issue=issue, assessment=assessment)
+                        post_decomposition_plan_comment(
+                            repo=repo,
+                            issue_number=issue["number"],
+                            payload=payload,
+                            dry_run=args.dry_run,
+                        )
+                        decomposition_rollup = build_decomposition_rollup_from_plan_payload(payload=payload)
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type="issue",
+                            target_number=issue["number"],
+                            dry_run=args.dry_run,
+                            state=build_orchestration_state(
+                                status="waiting-for-author",
+                                task_type="issue",
+                                issue_number=issue["number"],
+                                pr_number=None,
+                                branch=issue_branch,
+                                base_branch=base_branch if base_branch else None,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=1,
+                                stage="decomposition_plan",
+                                next_action="approve_plan_or_rerun_with_decompose_never",
+                                error="Task requires planning-only decomposition before implementation",
+                                decomposition=decomposition_rollup,
+                            ),
+                        )
+                        processed += 1
+                        print(
+                            f"Issue #{issue['number']} needs decomposition; posted planning-only plan "
+                            "and stopped before agent execution."
+                        )
+                        continue
+
             processed += 1
 
             issue_image_paths: list[str] = []
@@ -4706,6 +7197,11 @@ def main() -> int:
                     prompt_override = append_recovered_context_to_prompt(
                         build_prompt(issue, image_paths=issue_image_paths),
                         build_recovered_failure_context_note(recovered_state),
+                    )
+                elif decomposition_child_note:
+                    prompt_override = append_recovered_context_to_prompt(
+                        build_prompt(issue, image_paths=issue_image_paths),
+                        decomposition_child_note,
                     )
                 if mode == "pr-review":
                     if linked_open_pr is None:
@@ -4808,12 +7304,13 @@ def main() -> int:
                                         agent=args.agent,
                                         model=args.model,
                                         attempt=1,
-                                        stage="ci_checks",
-                                        next_action="wait_for_ci",
-                                        error=None,
-                                        ci_checks=ci_checks_payload,
-                                    ),
-                                )
+                                         stage="ci_checks",
+                                         next_action="wait_for_ci",
+                                         error=None,
+                                         ci_checks=ci_checks_payload,
+                                         decomposition=decomposition_rollup,
+                                     ),
+                                 )
                                 print(
                                     f"No actionable review comments for linked PR #{pr_number}; "
                                     f"CI checks are still pending ({pending_checks_count} pending), "
@@ -4848,11 +7345,56 @@ def main() -> int:
                                         next_action="inspect_failing_ci_checks",
                                         error=short_error_text(failing_summary),
                                         ci_checks=ci_checks_payload,
+                                        decomposition=decomposition_rollup,
                                     ),
                                 )
                                 print(
                                     f"No actionable review comments for linked PR #{pr_number}; "
                                     f"CI is failing: {failing_summary}"
+                                )
+                                remove_agent_failure_label_from_issue(
+                                    repo=repo,
+                                    issue_number=issue["number"],
+                                    dry_run=args.dry_run,
+                                )
+                                continue
+
+                            required_file_validation = validate_required_files_in_pr(
+                                pull_request=pull_request,
+                                linked_issues=[issue],
+                            )
+
+                            if required_file_validation.get("status") == "blocked":
+                                missing_files = required_file_validation.get("missing_files")
+                                missing_summary = ", ".join(sorted(str(file) for file in missing_files))
+                                safe_post_orchestration_state_comment(
+                                    repo=repo,
+                                    target_type="pr",
+                                    target_number=state_target_number,
+                                    dry_run=args.dry_run,
+                                    state=build_orchestration_state(
+                                        status="blocked",
+                                        task_type="pr",
+                                        issue_number=issue["number"],
+                                        pr_number=state_pr_number,
+                                        branch=issue_branch,
+                                        base_branch=target_base_branch,
+                                        runner=args.runner,
+                                        agent=args.agent,
+                                        model=args.model,
+                                        attempt=1,
+                                        stage="ci_checks",
+                                        next_action="update_pr_with_required_files",
+                                        error=f"Missing required file evidence: {missing_summary}",
+                                        ci_checks=ci_checks_payload,
+                                        decomposition=decomposition_rollup,
+                                        required_file_validation=required_file_validation,
+                                    ),
+                                )
+                                print(
+                                    f"No actionable review comments for linked PR #{pr_number}; "
+                                    "CI checks passed but required file evidence check failed. "
+                                    f"Missing files: {missing_summary}"
                                 )
                                 remove_agent_failure_label_from_issue(
                                     repo=repo,
@@ -4881,6 +7423,8 @@ def main() -> int:
                                     next_action="ready_for_merge",
                                     error=None,
                                     ci_checks=ci_checks_payload,
+                                    decomposition=decomposition_rollup,
+                                    required_file_validation=required_file_validation,
                                 ),
                             )
                             print(
@@ -4921,11 +7465,12 @@ def main() -> int:
                                     agent=args.agent,
                                     model=args.model,
                                     attempt=1,
-                                    stage="review_feedback",
-                                    next_action="await_new_review_comments",
-                                    error="No actionable review comments found",
-                                ),
-                            )
+                                     stage="review_feedback",
+                                     next_action="await_new_review_comments",
+                                     error="No actionable review comments found",
+                                     decomposition=decomposition_rollup,
+                                 ),
+                             )
                             print(
                                 f"No actionable review comments for linked PR #{pr_number}; "
                                 "skipping issue run."
@@ -4943,21 +7488,22 @@ def main() -> int:
                         target_number=state_target_number,
                         dry_run=args.dry_run,
                         state=build_orchestration_state(
-                            status="in-progress",
-                            task_type="pr",
-                            issue_number=issue["number"],
-                            pr_number=state_pr_number,
+                                status="in-progress",
+                                task_type="pr",
+                                issue_number=issue["number"],
+                                pr_number=state_pr_number,
                             branch=issue_branch,
                             base_branch=target_base_branch,
                             runner=args.runner,
                             agent=args.agent,
                             model=args.model,
                             attempt=1,
-                            stage="agent_run",
-                            next_action="wait_for_agent_result",
-                            error=None,
-                        ),
-                    )
+                                stage="agent_run",
+                                next_action="wait_for_agent_result",
+                                error=None,
+                                decomposition=decomposition_rollup,
+                            ),
+                        )
 
                     if review_items:
                         linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
@@ -5025,6 +7571,7 @@ def main() -> int:
                                 stage="agent_run",
                                 next_action="wait_for_agent_result",
                                 error=None,
+                                decomposition=decomposition_rollup,
                             ),
                         )
 
@@ -5061,6 +7608,10 @@ def main() -> int:
                         f"strategy: '{args.sync_strategy}')"
                     )
 
+                pre_run_untracked_files: set[str] | None = None
+                if not skip_agent_run and not args.dry_run:
+                    pre_run_untracked_files = list_untracked_files()
+
                 if skip_agent_run:
                     print(
                         f"Skipping agent run for {issue_label} in pr-review mode: "
@@ -5068,6 +7619,7 @@ def main() -> int:
                     )
                 else:
                     failure_stage = "agent_run"
+                    issue_agent_run_stats = {}
                     exit_code = run_agent(
                         issue=issue,
                         runner=args.runner,
@@ -5079,12 +7631,21 @@ def main() -> int:
                         opencode_auto_approve=args.opencode_auto_approve,
                         image_paths=issue_image_paths,
                         prompt_override=prompt_override,
+                        track_tokens=track_tokens,
+                        token_budget=token_budget,
+                        run_stats=issue_agent_run_stats,
                     )
                     if exit_code != 0:
-                        raise RuntimeError(
-                            f"Agent failed for {issue_label} with exit code {exit_code}"
+                        exit_summary = describe_exit_code(exit_code)
+                        diagnosis = classify_opencode_failure(
+                            return_code=exit_code,
+                            model=args.model,
+                        ) if args.runner == "opencode" else None
+                        message = (
+                            f"Agent failed for {issue_label} with {exit_summary}"
+                            + (f" ({diagnosis})" if diagnosis else "")
                         )
-
+                        raise RuntimeError(message)
                 if not args.dry_run and not has_changes():
                     if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:
                         print(
@@ -5141,6 +7702,8 @@ def main() -> int:
                                     stage="changes_pushed",
                                     next_action="wait_for_ci",
                                     error=None,
+                                    stats=issue_agent_run_stats,
+                                    decomposition=decomposition_rollup,
                                 ),
                             )
                         elif mode == "issue-flow" and supports_github_issue_ops:
@@ -5163,7 +7726,25 @@ def main() -> int:
                                     stage="pr_ready",
                                     next_action="wait_for_review",
                                     error=None,
+                                    stats=issue_agent_run_stats,
+                                    decomposition=decomposition_rollup,
                                 ),
+                            )
+                        if (
+                            decomposition_parent_issue is not None
+                            and decomposition_parent_branch is not None
+                            and decomposition_parent_payload is not None
+                        ):
+                            decomposition_parent_payload, decomposition_rollup = post_parent_decomposition_rollup_update(
+                                repo=repo,
+                                parent_issue=decomposition_parent_issue,
+                                parent_branch=decomposition_parent_branch,
+                                base_branch=base_branch if base_branch else None,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                plan_payload=decomposition_parent_payload,
+                                dry_run=args.dry_run,
                             )
                         if supports_github_issue_ops:
                             remove_agent_failure_label_from_issue(
@@ -5197,7 +7778,25 @@ def main() -> int:
                                 stage="post_agent_check",
                                 next_action="await_more_context",
                                 error="No changes produced",
+                                stats=issue_agent_run_stats,
+                                decomposition=decomposition_rollup,
                             ),
+                        )
+                    if (
+                        decomposition_parent_issue is not None
+                        and decomposition_parent_branch is not None
+                        and decomposition_parent_payload is not None
+                    ):
+                        decomposition_parent_payload, decomposition_rollup = post_parent_decomposition_rollup_update(
+                            repo=repo,
+                            parent_issue=decomposition_parent_issue,
+                            parent_branch=decomposition_parent_branch,
+                            base_branch=base_branch if base_branch else None,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            plan_payload=decomposition_parent_payload,
+                            dry_run=args.dry_run,
                         )
                     if supports_github_issue_ops:
                         remove_agent_failure_label_from_issue(
@@ -5209,7 +7808,11 @@ def main() -> int:
                     continue
 
                 failure_stage = "commit_push"
-                commit_changes(issue=issue, dry_run=args.dry_run)
+                commit_changes(
+                    issue=issue,
+                    dry_run=args.dry_run,
+                    pre_run_untracked_files=pre_run_untracked_files,
+                )
 
                 failure_stage = "workflow_checks"
                 workflow_check_results = run_configured_workflow_checks(
@@ -5262,8 +7865,10 @@ def main() -> int:
                                 next_action="wait_for_review",
                                 error=None,
                                 workflow_checks=workflow_check_results,
-                            ),
-                        )
+                                stats=issue_agent_run_stats,
+                                decomposition=decomposition_rollup,
+                                ),
+                            )
                     else:
                         safe_post_orchestration_state_comment(
                             repo=repo,
@@ -5285,8 +7890,27 @@ def main() -> int:
                                 next_action="wait_for_ci",
                                 error=None,
                                 workflow_checks=workflow_check_results,
-                            ),
-                        )
+                                stats=issue_agent_run_stats,
+                                decomposition=decomposition_rollup,
+                                ),
+                            )
+
+                if (
+                    decomposition_parent_issue is not None
+                    and decomposition_parent_branch is not None
+                    and decomposition_parent_payload is not None
+                ):
+                    decomposition_parent_payload, decomposition_rollup = post_parent_decomposition_rollup_update(
+                        repo=repo,
+                        parent_issue=decomposition_parent_issue,
+                        parent_branch=decomposition_parent_branch,
+                        base_branch=base_branch if base_branch else None,
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        plan_payload=decomposition_parent_payload,
+                        dry_run=args.dry_run,
+                    )
 
                 if not args.dry_run:
                     run_command(["git", "checkout", base_branch])
@@ -5298,13 +7922,17 @@ def main() -> int:
                     )
         except Exception as exc:  # noqa: BLE001
             failures += 1
-            failure_status = "blocked" if failure_stage == "workflow_checks" else "failed"
-            next_action = (
-                "fix_workflow_checks_and_retry"
-                if failure_stage == "workflow_checks"
-                else "inspect_error_and_retry"
-            )
+            if isinstance(exc, ResidualUntrackedFilesError):
+                failure_stage = "residual_untracked_validation"
+            elif isinstance(exc, TokenBudgetExceededError):
+                failure_stage = "token_budget"
+
+            failure_status = failure_state_for_stage(failure_stage)
+            next_action = failure_next_action_for_stage(failure_stage)
             workflow_results = exc.checks if isinstance(exc, WorkflowCheckFailure) else None
+            residual_untracked_files = (
+                exc.files if isinstance(exc, ResidualUntrackedFilesError) else None
+            )
             if supports_github_issue_ops or mode == "pr-review":
                 safe_post_orchestration_state_comment(
                     repo=repo,
@@ -5326,8 +7954,34 @@ def main() -> int:
                         next_action=next_action,
                         error=short_error_text(str(exc)),
                         workflow_checks=workflow_results,
+                        residual_untracked_files=residual_untracked_files,
+                        stats=issue_agent_run_stats,
+                        decomposition=decomposition_rollup,
                     ),
                 )
+            if (
+                decomposition_parent_issue is not None
+                and decomposition_parent_branch is not None
+                and decomposition_parent_payload is not None
+            ):
+                try:
+                    decomposition_parent_payload, decomposition_rollup = post_parent_decomposition_rollup_update(
+                        repo=repo,
+                        parent_issue=decomposition_parent_issue,
+                        parent_branch=decomposition_parent_branch,
+                        base_branch=base_branch if base_branch else None,
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        plan_payload=decomposition_parent_payload,
+                        dry_run=args.dry_run,
+                    )
+                except Exception as parent_exc:  # noqa: BLE001
+                    print(
+                        "Warning: failed to refresh parent decomposition roll-up for issue "
+                        f"#{decomposition_parent_issue['number']}: {parent_exc}",
+                        file=sys.stderr,
+                    )
             if supports_github_issue_ops:
                 safe_report_issue_automation_failure(
                     repo=repo,
@@ -5340,6 +7994,8 @@ def main() -> int:
                     runner=args.runner,
                     agent=args.agent,
                     model=args.model,
+                    residual_untracked_files=residual_untracked_files,
+                    next_action=next_action,
                     dry_run=args.dry_run,
                     already_reported_issue_numbers=reported_issue_failures,
                 )

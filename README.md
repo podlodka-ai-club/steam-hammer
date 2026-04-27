@@ -7,10 +7,18 @@ Script can run in two modes:
 
 Memo link: https://www.notion.so/Hacker-Sprint-1-33f2db4c860e8064a657e199b4578f66
 
+## Retrospectives
+
+Session retrospectives live in [`retro/`](retro/). They capture lessons from orchestration runs, including worker behavior, blocker handling, PR validation gaps, and follow-up improvements for the autonomous orchestrator loop.
+
 - `gh` (GitHub CLI) authenticated (`gh auth status`)
 - Python 3.10+
 - `claude` (Claude Code CLI) — default runner
 - `opencode` — only if using `--runner opencode`
+
+## For QA teams
+
+When filing Jira issues for AI-assisted fixes, use the [Jira issue description template](docs/jira-issue-template.md) so the agent has enough context to generate accurate patches.
 
 ```text
 .
@@ -35,7 +43,7 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --limit 1 --ru
 
 **With OpenCode auto-approval + explicit timeout (non-interactive friendly):**
 ```bash
-python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 20 --runner opencode --model openai/gpt-5.3-codex --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
+   python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 20 --runner opencode --model openai/gpt-4o --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
 ```
 
 **Issue run with automatic PR-review mode (when linked open PR exists):**
@@ -90,6 +98,45 @@ Exit codes:
 - `0` when there are no failed checks.
 - non-zero when one or more checks fail.
 
+## Go orchestrator CLI
+
+Phase 1 includes a Go CLI wrapper around the existing Python runner. Build or run it with Go:
+
+```bash
+go run ./cmd/orchestrator --help
+```
+
+Available commands:
+
+```bash
+go run ./cmd/orchestrator doctor --repo owner/repo
+go run ./cmd/orchestrator run issue --id 71 --repo owner/repo --dry-run
+go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --dry-run
+```
+
+Common Python-runner examples map to the Go wrapper as follows:
+
+```bash
+go run ./cmd/orchestrator doctor --repo owner/repo
+go run ./cmd/orchestrator doctor --doctor-smoke-check --runner opencode --model openai/gpt-5.3-codex
+go run ./cmd/orchestrator run issue --id 20 --repo owner/repo
+go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --agent build --model openai/gpt-4o
+go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --model openai/gpt-5.3-codex --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
+go run ./cmd/orchestrator run issue --id 31 --repo owner/repo --force-issue-flow
+go run ./cmd/orchestrator run issue --id 45 --repo owner/repo --base current --runner opencode --agent build
+go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --allow-pr-branch-switch
+go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --runner opencode --agent review --model openai/gpt-4o --opencode-auto-approve --agent-timeout-seconds 900 --dry-run
+```
+
+The Go handlers only translate CLI intent into the current Python runner arguments. Use `--help` on any command to inspect flags without invoking the runner, and use `--dry-run` for issue/PR runs to avoid starting agents.
+
+Compatibility boundary for Phase 1:
+
+- `run issue` supports single-issue execution through the Python runner. `--issue N` is accepted as a compatibility alias for `--id N`.
+- `run pr` supports PR review-comments execution. `--pr N` is accepted as a compatibility alias for `--id N`, and `--from-review-comments` is accepted as a no-op because the command always selects that mode.
+- `doctor` accepts `--doctor` as a no-op because the command already selects diagnostics mode.
+- Precedence remains delegated to the Python runner: CLI flags forwarded by Go override local config, local config overrides project config, and project config overrides built-in defaults.
+
 ## Project config scaffold (repository-level)
 
 You can define repository defaults and placeholders for future orchestration policies.
@@ -107,14 +154,23 @@ You can define repository defaults and placeholders for future orchestration pol
 Project config currently supports these sections:
 
 - `workflow.commands.test|lint|build` (non-empty string shell command or `null`)
-- `defaults.tracker|runner|agent|model` (used as parser defaults)
+- `defaults.tracker|preset|runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts` (used as parser defaults)
 - `scope.defaults.labels.allow|deny` (arrays of label names)
 - `scope.defaults.authors.allow|deny` (arrays of GitHub logins; optional placeholder)
-- `retry.max_attempts` (positive integer placeholder)
+- `retry.max_attempts|escalate_to_preset` (positive integer plus escalation placeholder)
 - `communication.verbosity` (`low`, `normal`, `high`)
-- `presets` (object placeholder)
+- `presets.<name>.runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts|escalate_to_preset`
 
 Validation is strict: unsupported keys or invalid value types fail fast with a config error.
+
+Preset resolution order is:
+
+- `--preset`
+- `local-config.json` `preset`
+- `project-config.json` `defaults.preset`
+- legacy non-preset defaults
+
+Selected preset values are applied before explicit CLI flags, so manual `--runner`, `--model`, `--agent`, and similar flags remain the final override layer.
 
 Scope rules are evaluated before any issue-mode agent execution:
 
@@ -165,6 +221,46 @@ Example `project-config.json` scope block:
 }
 ```
 
+Example `project-config.json` preset and retry block:
+
+```json
+{
+  "defaults": {
+    "preset": "default"
+  },
+  "retry": {
+    "max_attempts": 2,
+    "escalate_to_preset": "hard"
+  },
+  "presets": {
+    "cheap": {
+      "runner": "opencode",
+      "agent": "build",
+      "model": "openai/gpt-4o-mini",
+      "token_budget": 8000,
+      "max_attempts": 1,
+      "escalate_to_preset": "default"
+    },
+    "default": {
+      "runner": "opencode",
+      "agent": "build",
+      "model": "openai/gpt-4o",
+      "token_budget": 20000,
+      "max_attempts": 2,
+      "escalate_to_preset": "hard"
+    },
+    "hard": {
+      "runner": "claude",
+      "agent": "build",
+      "model": "claude-sonnet-4-5",
+      "token_budget": 40000,
+      "max_attempts": 3,
+      "escalate_to_preset": null
+    }
+  }
+}
+```
+
 You can also point to a different project config file:
 
 ```bash
@@ -195,8 +291,11 @@ Supported local config keys:
 - `runner` (`claude` or `opencode`)
 - `agent` (string)
 - `model` (string or `null`)
+- `preset` (string)
 - `agent_timeout_seconds` (positive integer)
 - `agent_idle_timeout_seconds` (positive integer or `null`)
+- `token_budget` (positive integer or `null`)
+- `max_attempts` (positive integer)
 - `opencode_auto_approve` (boolean)
 - `branch_prefix` (string)
 - `include_empty` (boolean)
@@ -209,6 +308,7 @@ Supported local config keys:
 - `sync_reused_branch` (boolean)
 - `sync_strategy` (`rebase` or `merge`)
 - `base_branch` (`default` or `current`)
+- `create_child_issues` (boolean)
 
 You can also point to a different local config file:
 
@@ -228,15 +328,16 @@ Workflow per issue:
 2. Out-of-scope issues are blocked (`status=blocked`, stage=`scope_check`) and get a dedicated scope comment; agent run is skipped unless `--force-reprocess` is set
 3. Pre-checks whether issue should be skipped (linked open PR and/or existing deterministic remote branch)
 4. Chooses a base branch (`default`: repository default branch from GitHub; `current`: currently checked-out branch)
-5. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
-6. For reused branches, syncs with the latest selected base branch before agent run (default: `rebase`)
-7. Extracts image attachment references from issue content (or attachment metadata), downloads available images, and runs the AI agent with title/body context plus image files when present.
-8. On changes, creates commit
-9. Pushes issue branch to `origin`
-10. Reuses an existing open PR for the issue branch when present; otherwise creates one to the selected base branch
-11. Posts append-only orchestration state comments to GitHub issue/PR on key transitions
-12. On per-issue failure (agent, commit/push, PR create, etc.), posts a structured failure report comment to the issue and adds label `auto:agent-failed`
-13. On successful issue completion (or no-op completion), removes label `auto:agent-failed` from that issue if present
+5. Runs planning-only decomposition preflight (`--decompose auto` by default); large tasks get a proposed plan comment and stop before branch/agent execution
+6. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
+7. For reused branches, syncs with the latest selected base branch before agent run (default: `rebase`)
+8. Extracts image attachment references from issue content (or attachment metadata), downloads available images, and runs the AI agent with title/body context plus image files when present.
+9. On changes, creates commit
+10. Pushes issue branch to `origin`
+11. Reuses an existing open PR for the issue branch when present; otherwise creates one to the selected base branch
+12. Posts append-only orchestration state comments to GitHub issue/PR on key transitions
+13. On per-issue failure (agent, commit/push, PR create, etc.), posts a structured failure report comment to the issue and adds label `auto:agent-failed`
+14. On successful issue completion (or no-op completion), removes label `auto:agent-failed` from that issue if present
 
 Workflow in PR review mode:
 
@@ -273,9 +374,19 @@ Scope decision comments:
 - Out-of-scope comment includes decision, reason, forced flag, and timestamp in machine-readable JSON
 - Dry-run prints where scope decision comment would be posted
 
+Planning-only decomposition comments:
+
+- Marker: `<!-- orchestration-decomposition:v1 -->`
+- `--decompose auto` proposes a decomposition plan for large/epic/multi-step issues before starting the agent
+- `--decompose always` forces plan-only behavior for an issue, useful for manual planning
+- `--decompose never` bypasses decomposition preflight and keeps the legacy issue-flow path
+- `--create-child-issues` when a decomposition plan is approved, creates child issues and records created child links in the plan payload
+- Existing parseable decomposition comments are treated idempotently and are not duplicated on rerun
+
 Useful options:
 
 - `--runner claude|opencode` to select the AI agent runner (default: `claude`)
+- `--preset name` to apply a named project-config preset before explicit CLI overrides
 - `--state open|closed|all`
 - `--include-empty` to process issues with empty body; image-only issues are now processed automatically when image attachments are detected.
 - Image attachment handling: when issue content includes image URLs or attachment metadata, the script downloads images to a temp directory and passes them to Claude as `--image <path>` arguments.
@@ -293,6 +404,8 @@ Useful options:
 - `--branch-prefix prefix` to customize fix branch names
 - `--agent-timeout-seconds N` hard timeout for agent run (default: `900`)
 - `--agent-idle-timeout-seconds N` fail if agent prints no output for `N` seconds
+- `--token-budget N` (`--max-tokens` alias) stop the agent when cumulative tracked tokens exceed `N`
+- `--max-attempts N` retry policy placeholder for future rerun/escalation logic
 - `--opencode-auto-approve` pass `--dangerously-skip-permissions` to OpenCode (use with caution)
 - `--local-config path` load local JSON defaults (default: `local-config.json` under `--dir`)
 - `--project-config path` load repository JSON defaults scaffold (default: `project-config.json` under `--dir`)
@@ -304,6 +417,8 @@ Useful options:
 - `--sync-reused-branch` / `--no-sync-reused-branch` enable or disable reused-branch sync before agent run (default: enabled)
 - `--sync-strategy rebase|merge` choose how to sync a reused branch with selected base (default: `rebase`)
 - `--base default|current` (`--base-branch` alias) choose issue-flow base mode; `current` enables stacked execution from your current branch (opt-in)
+- `--decompose auto|never|always` control planning-only decomposition preflight before issue-flow agent execution (default: `auto`)
+- `--create-child-issues` create missing approved/decomposition child issues and mark plan as `children_created` when all children are linked
 - `--doctor` run preflight diagnostics only (no agent run)
 - `--doctor-smoke-check` in doctor mode, run a lightweight runner CLI smoke check
 
@@ -356,6 +471,8 @@ python3 -m unittest discover -s tests -p 'test_*.py'
   - `--agent-timeout-seconds 900`
   - `--agent-idle-timeout-seconds 180`
 - If OpenCode may be waiting for interactive permission approvals, try `--opencode-auto-approve` only in trusted environments.
+- If OpenCode exits with `-9`, treat it as SIGKILL by environment/runner (resource exhaustion or hard stop) rather than a model syntax issue. For predictable stability, start with:
+  - `--runner opencode --agent build --model openai/gpt-4o`
 - On timeout/idle-timeout the script now exits with a clear error so normal failure handling (`--stop-on-error`) can proceed.
 
 ## Reruns and conflict resolution

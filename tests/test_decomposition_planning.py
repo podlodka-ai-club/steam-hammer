@@ -6,6 +6,8 @@ import unittest
 from scripts.run_github_issues_to_opencode import (
     BUILTIN_DEFAULTS,
     DECOMPOSITION_PLAN_MARKER,
+    build_decomposition_rollup_from_plan_payload,
+    build_decomposition_rollup_from_recovered_state,
     assess_issue_decomposition_need,
     build_decomposition_plan_payload,
     format_decomposition_plan_comment,
@@ -71,6 +73,71 @@ class DecompositionPlanningTests(unittest.TestCase):
         self.assertEqual(parsed["status"], "proposed")
         self.assertEqual(parsed["parent_issue"], 99)
         self.assertIn(DECOMPOSITION_PLAN_MARKER, body)
+
+    def test_rollup_builder_from_plan_payload(self) -> None:
+        payload = {
+            "parent_issue": 77,
+            "proposed_children": [
+                {"order": "1", "title": "In-progress task", "status": "in-progress", "issue": "111", "pr": "321"},
+                {"order": 2, "title": "Planned task", "status": "planned", "issue": 112},
+                {"title": "Blocked task", "status": "blocked", "issue": "113", "blockers": ["dependency"]},
+                {"title": "Done task", "status": "done", "issue": 114},
+            ],
+            "blockers": ["global-blocker"],
+        }
+
+        rollup = build_decomposition_rollup_from_plan_payload(payload)
+
+        self.assertEqual(rollup["parent_issue"], 77)
+        self.assertEqual(rollup["counts"], {"planned": 1, "created": 0, "in-progress": 1, "done": 1, "blocked": 1})
+        self.assertEqual(rollup["children_by_status"]["blocked"][0]["issue"], 113)
+        self.assertEqual(rollup["blockers"], ["global-blocker", "dependency"])
+        next_target = rollup["next_target_task"]
+        self.assertIsNotNone(next_target)
+        assert next_target is not None
+        self.assertEqual(next_target["order"], 1)
+        self.assertEqual(next_target["status"], "in-progress")
+
+    def test_rollup_builder_from_recovered_children_by_status(self) -> None:
+        recovered_state = {
+            "payload": {
+                "decomposition": {
+                    "children_by_status": {
+                        "planned": [
+                            {"order": 4, "title": "Planned next", "issue": 210, "status": "planned"},
+                        ],
+                        "created": [
+                            {"order": 3, "title": "Created now", "issue": 209, "status": "created"},
+                        ],
+                        "in-progress": [
+                            {"order": 2, "title": "Doing now", "issue": 208, "status": "in-progress"},
+                        ],
+                        "done": [
+                            {"order": 1, "title": "Done earlier", "issue": 207, "status": "done"},
+                        ],
+                        "blocked": [
+                            {"order": 5, "title": "Blocked", "issue": 211, "status": "blocked", "blockers": ["network"]},
+                        ],
+                    },
+                    "blockers": ["overall"]
+                }
+            }
+        }
+
+        rollup = build_decomposition_rollup_from_recovered_state(recovered_state, parent_issue=77)
+
+        self.assertIsNotNone(rollup)
+        assert rollup is not None
+        self.assertEqual(rollup["parent_issue"], 77)
+        self.assertEqual(rollup["counts"], {"planned": 1, "created": 1, "in-progress": 1, "done": 1, "blocked": 1})
+        self.assertEqual(rollup["next_target_task"], {
+            "order": 2,
+            "title": "Doing now",
+            "status": "in-progress",
+            "issue": 208,
+            "pr": None,
+        })
+        self.assertEqual(rollup["blockers"], ["overall", "network"])
 
     def test_latest_decomposition_plan_is_selected(self) -> None:
         first = {

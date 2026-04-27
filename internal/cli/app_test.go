@@ -65,6 +65,18 @@ func TestDoctorCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--doctor", "--repo", "owner/repo", "--dry-run"})
 }
 
+func TestDoctorCommandForwardsProviderFlags(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"doctor", "--tracker", "jira", "--codehost", "github"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--doctor", "--tracker", "jira", "--codehost", "github"})
+}
+
 func TestRunIssueCommandWiresPythonRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -160,6 +172,8 @@ func TestRunIssueCommandMapsCoreCompatibilityFlags(t *testing.T) {
 		"run", "issue",
 		"--id", "20",
 		"--repo", "owner/repo",
+		"--tracker", "jira",
+		"--codehost", "github",
 		"--preset", "hard",
 		"--runner", "opencode",
 		"--agent", "build",
@@ -172,6 +186,8 @@ func TestRunIssueCommandMapsCoreCompatibilityFlags(t *testing.T) {
 	assertCommand(t, runner, []string{
 		runnerScript, "--issue", "20",
 		"--repo", "owner/repo",
+		"--tracker", "jira",
+		"--codehost", "github",
 		"--runner", "opencode",
 		"--agent", "build",
 		"--model", "openai/gpt-4o",
@@ -213,6 +229,8 @@ func TestRunPRCommandMapsCoreCompatibilityFlags(t *testing.T) {
 		"run", "pr",
 		"--id", "72",
 		"--repo", "owner/repo",
+		"--tracker", "jira",
+		"--codehost", "github",
 		"--runner", "opencode",
 		"--agent", "review",
 		"--model", "openai/gpt-4o",
@@ -226,6 +244,8 @@ func TestRunPRCommandMapsCoreCompatibilityFlags(t *testing.T) {
 	assertCommand(t, runner, []string{
 		runnerScript, "--pr", "72", "--from-review-comments",
 		"--repo", "owner/repo",
+		"--tracker", "jira",
+		"--codehost", "github",
 		"--runner", "opencode",
 		"--agent", "review",
 		"--model", "openai/gpt-4o",

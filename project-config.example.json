@@ -1,6 +1,8 @@
 {
   "defaults": {
     "preset": "default",
+    "tracker": "github",
+    "codehost": "github",
     "runner": "opencode",
     "agent": "build",
     "model": "openai/gpt-4o",

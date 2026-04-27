@@ -65,7 +65,67 @@ class JiraTrackerTests(unittest.TestCase):
         self.assertIn("Missing required Jira environment variables", stderr.getvalue())
         ensure_clean_worktree_mock.assert_not_called()
 
-    def test_pr_review_mode_rejects_jira_tracker(self) -> None:
+    def test_pr_review_mode_accepts_jira_tracker_with_github_codehost(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            stdout = io.StringIO()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "JIRA_BASE_URL": "https://example.atlassian.net",
+                        "JIRA_EMAIL": "dev@example.com",
+                        "JIRA_API_TOKEN": "token-123",
+                    },
+                    clear=True,
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "prog",
+                        "--dir",
+                        tmpdir,
+                        "--tracker",
+                        "jira",
+                        "--codehost",
+                        "github",
+                        "--repo",
+                        "owner/repo",
+                        "--pr",
+                        "76",
+                        "--from-review-comments",
+                        "--dry-run",
+                    ],
+                ),
+                patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree") as ensure_clean_worktree_mock,
+                patch("sys.stdout", stdout),
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_pull_request",
+                    return_value={
+                        "number": 76,
+                        "state": "OPEN",
+                        "headRefName": "feature/pr-76",
+                        "baseRefName": "main",
+                        "author": {"login": "dev"},
+                        "reviews": [],
+                        "headRefOid": "deadbeef",
+                    },
+                ),
+                patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]),
+                patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[]),
+                patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
+                patch("scripts.run_github_issues_to_opencode.current_branch", return_value="feature/pr-76"),
+                patch("scripts.run_github_issues_to_opencode.checkout_pr_target_branch"),
+                patch("scripts.run_github_issues_to_opencode.read_pr_ci_status_for_pull_request", return_value={"overall": "success", "checks": [], "failing_checks": [], "pending_checks": []}),
+                patch("scripts.run_github_issues_to_opencode.validate_required_files_in_pr", return_value={"status": "passed"}),
+            ):
+                exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        ensure_clean_worktree_mock.assert_called_once()
+
+    def test_pr_review_mode_rejects_non_github_codehost(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             os.mkdir(os.path.join(tmpdir, ".git"))
             stderr = io.StringIO()
@@ -88,6 +148,8 @@ class JiraTrackerTests(unittest.TestCase):
                         tmpdir,
                         "--tracker",
                         "jira",
+                        "--codehost",
+                        "bitbucket",
                         "--pr",
                         "76",
                         "--from-review-comments",
@@ -99,7 +161,7 @@ class JiraTrackerTests(unittest.TestCase):
                 exit_code = main()
 
         self.assertEqual(exit_code, 1)
-        self.assertIn("only supports --tracker github", stderr.getvalue())
+        self.assertIn("only supports --codehost github", stderr.getvalue())
         ensure_clean_worktree_mock.assert_not_called()
 
     def test_fetch_jira_issue_maps_payload(self) -> None:

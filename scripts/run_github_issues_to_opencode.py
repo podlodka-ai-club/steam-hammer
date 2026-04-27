@@ -70,6 +70,29 @@ ORCHESTRATION_STATE_STATUSES = {
     "ready-to-merge",
 }
 DECOMPOSITION_CHILD_STATUSES = ("planned", "created", "in-progress", "done", "blocked")
+KNOWN_NO_EXTENSION_REQUIRED_FILES = frozenset(
+    {
+        "readme",
+        "changelog",
+        "dockerfile",
+        "docker-compose",
+        "makefile",
+        "gitattributes",
+        "gitignore",
+        "license",
+        "authors",
+    }
+)
+REQUIRED_FILE_SECTION_HEADERS = re.compile(
+    r"(?im)^\s*#{0,6}\s*(?:[\-*]\s*)?(?:required files|required file|files required|acceptance criteria|acceptance|definition of done|done criteria)\b"
+)
+REQUIRED_FILE_SECTION_BREAK_HEADER = re.compile(r"(?im)^\s*#{1,6}\b")
+REQUIRED_FILE_HINT_LINE = re.compile(
+    r"(?i)(?:required|must\s+(?:change|update|modify|touch|add|create)|needs?\s+(?:to\s+)?change|evidence\s+of\s+change)"
+)
+FILE_PATH_TOKEN_RE = re.compile(
+    r"(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)?|[A-Za-z0-9._-]+\.[A-Za-z0-9][A-Za-z0-9._-]+"
+)
 
 
 def _as_positive_int(value: object) -> int | None:
@@ -720,6 +743,185 @@ def split_repo_name(repo: str) -> tuple[str, str]:
     return owner, name
 
 
+def _normalize_required_file_path(value: str) -> str:
+    candidate = value.strip().strip("`\"'()[]{}<>.,;:")
+    if not candidate:
+        return ""
+    candidate = candidate.replace("\\", "/")
+    while "//" in candidate:
+        candidate = candidate.replace("//", "/")
+    return candidate.lstrip("./")
+
+
+def _is_valid_file_path(value: str) -> bool:
+    if not value:
+        return False
+    if "//" in value:
+        return False
+    if value.startswith("http://") or value.startswith("https://"):
+        return False
+    base = os.path.basename(value)
+    if not base:
+        return False
+    if base.startswith(".") and base in {".gitignore", ".gitattributes", ".npmrc"}:
+        return True
+    if "." not in base:
+        return base.lower() in KNOWN_NO_EXTENSION_REQUIRED_FILES
+    if value.endswith("/"):
+        return False
+    if "/" not in value and value.startswith("#"):
+        return False
+    base_without_ext = os.path.basename(value).rpartition(".")
+    extension = base_without_ext[2].lower()
+    if not extension:
+        return False
+    return len(extension) <= 12
+
+
+def extract_required_file_paths_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+
+    required_files: list[str] = []
+    normalized_seen: set[str] = set()
+    in_required_section = False
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if REQUIRED_FILE_SECTION_BREAK_HEADER.match(stripped):
+            if in_required_section:
+                in_required_section = False
+            if REQUIRED_FILE_SECTION_HEADERS.match(stripped):
+                in_required_section = True
+            continue
+
+        if REQUIRED_FILE_SECTION_HEADERS.match(stripped):
+            in_required_section = True
+            continue
+
+        line_candidates = []
+        for code_match in re.finditer(r"`([^`]+)`", stripped):
+            line_candidates.append(code_match.group(1))
+
+        if in_required_section or REQUIRED_FILE_HINT_LINE.search(stripped):
+            line_candidates.append(stripped)
+
+        for raw_candidate in line_candidates:
+            for token_match in FILE_PATH_TOKEN_RE.finditer(raw_candidate):
+                token = _normalize_required_file_path(token_match.group(0))
+                if not token or token in normalized_seen:
+                    continue
+                if _is_valid_file_path(token):
+                    normalized_seen.add(token)
+                    required_files.append(token)
+
+    return required_files
+
+
+def collect_required_file_references_from_pr_context(
+    pull_request: dict,
+    linked_issues: list[dict] | None = None,
+) -> list[str]:
+    references: list[str] = []
+    linked_issues_payload = linked_issues if isinstance(linked_issues, list) else []
+
+    references.extend(extract_required_file_paths_from_text(str(pull_request.get("body") or "")))
+
+    for issue in linked_issues_payload:
+        if not isinstance(issue, dict):
+            continue
+        body = str(issue.get("body") or "").strip()
+        if body:
+            references.extend(extract_required_file_paths_from_text(body))
+
+    return _dedupe_preserve_order(references)
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        normalized = _normalize_required_file_path(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
+def extract_pull_request_changed_file_paths(pull_request: dict) -> list[str]:
+    raw_files = pull_request.get("files")
+    if not isinstance(raw_files, list):
+        return []
+
+    seen: set[str] = set()
+    changed: list[str] = []
+    for file_payload in raw_files:
+        path = None
+        if isinstance(file_payload, str):
+            path = file_payload
+        elif isinstance(file_payload, dict):
+            for key in ("path", "filePath", "filename"):
+                value = file_payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    path = value
+                    break
+        if not isinstance(path, str):
+            continue
+        normalized = _normalize_required_file_path(path)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            changed.append(normalized)
+    return changed
+
+
+def validate_required_files_in_pr(pull_request: dict, linked_issues: list[dict] | None = None) -> dict[str, object]:
+    required_files = collect_required_file_references_from_pr_context(
+        pull_request=pull_request,
+        linked_issues=linked_issues,
+    )
+    changed_paths = extract_pull_request_changed_file_paths(pull_request)
+    changed_lookup = {path: path for path in changed_paths}
+    changed_basenames = {os.path.basename(path): path for path in changed_paths}
+
+    if not required_files:
+        return {
+            "status": "not-applicable",
+            "required_file_count": 0,
+            "required_files": [],
+            "matched_files": [],
+            "missing_files": [],
+            "changed_file_count": len(changed_paths),
+        }
+
+    matched: list[str] = []
+    missing: list[str] = []
+    for required in required_files:
+        required_normalized = _normalize_required_file_path(required)
+        required_basename = os.path.basename(required_normalized)
+        if (
+            required_normalized in changed_lookup
+            or required in changed_lookup
+            or required_basename in changed_basenames
+            or any(path.endswith(f"/{required_normalized}") for path in changed_paths)
+        ):
+            matched.append(required_normalized)
+        else:
+            missing.append(required_normalized)
+
+    return {
+        "status": "passed" if not missing else "blocked",
+        "required_file_count": len(required_files),
+        "required_files": required_files,
+        "matched_files": matched,
+        "missing_files": missing,
+        "changed_file_count": len(changed_paths),
+    }
+
+
 def fetch_pull_request(repo: str, number: int) -> dict:
     output = run_capture(
         [
@@ -730,7 +932,7 @@ def fetch_pull_request(repo: str, number: int) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,url,state,mergeStateStatus,headRefName,headRefOid,baseRefName,author,closingIssuesReferences,reviews",
+            "number,title,body,url,state,mergeStateStatus,headRefName,headRefOid,baseRefName,author,closingIssuesReferences,reviews,files",
         ]
     )
     pull_request = json.loads(output)
@@ -2897,6 +3099,7 @@ def build_orchestration_state(
     residual_untracked_files: list[str] | None = None,
     decomposition: dict | None = None,
     stats: dict[str, object] | None = None,
+    required_file_validation: dict[str, object] | None = None,
 ) -> dict:
     if status not in ORCHESTRATION_STATE_STATUSES:
         raise RuntimeError(f"Unsupported orchestration state status: {status}")
@@ -2931,6 +3134,8 @@ def build_orchestration_state(
         state["stats"] = stats
     if decomposition is not None:
         state["decomposition"] = decomposition
+    if required_file_validation is not None:
+        state["required_file_validation"] = required_file_validation
     return state
 
 
@@ -5279,6 +5484,46 @@ def main() -> int:
                         print(f"PR #{pr_number_arg} has failing CI checks: {failing_summary}")
                         return 0
 
+                    required_file_validation = validate_required_files_in_pr(
+                        pull_request=pull_request,
+                        linked_issues=load_linked_issue_context(repo=repo, pull_request=pull_request),
+                    )
+
+                    if required_file_validation.get("status") == "blocked":
+                        missing_files = required_file_validation.get("missing_files")
+                        missing_summary = ", ".join(sorted(str(file) for file in missing_files))
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type="pr",
+                            target_number=pr_number_arg,
+                            dry_run=args.dry_run,
+                            state=build_orchestration_state(
+                                status="blocked",
+                                task_type="pr",
+                                issue_number=None,
+                                pr_number=pr_number_arg,
+                                branch=active_branch,
+                                base_branch=str(pr_state_context["base_branch"] or "") or None,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=1,
+                                stage="ci_checks",
+                                next_action="update_pr_with_required_files",
+                                error=f"Missing required file evidence: {missing_summary}",
+                                ci_checks=ci_status.get("checks")
+                                if isinstance(ci_status.get("checks"), list)
+                                else [],
+                                decomposition=pr_recovered_decomposition_rollup,
+                                required_file_validation=required_file_validation,
+                            ),
+                        )
+                        print(
+                            f"PR #{pr_number_arg} CI passed but required file evidence check failed. "
+                            f"Missing files: {missing_summary}"
+                        )
+                        return 0
+
                     safe_post_orchestration_state_comment(
                         repo=repo,
                         target_type="pr",
@@ -5296,14 +5541,15 @@ def main() -> int:
                             model=args.model,
                             attempt=1,
                             stage="ci_checks",
-                                 next_action="ready_for_merge",
-                                 error=None,
-                                 ci_checks=ci_status.get("checks")
-                                 if isinstance(ci_status.get("checks"), list)
-                                 else [],
-                                 decomposition=pr_recovered_decomposition_rollup,
-                             ),
-                         )
+                            next_action="ready_for_merge",
+                            error=None,
+                            ci_checks=ci_status.get("checks")
+                            if isinstance(ci_status.get("checks"), list)
+                            else [],
+                            decomposition=pr_recovered_decomposition_rollup,
+                            required_file_validation=required_file_validation,
+                        ),
+                    )
                     print(
                         f"CI checks passed for PR #{pr_number_arg}; marking orchestration state as ready-to-merge."
                     )
@@ -6110,6 +6356,50 @@ def main() -> int:
                                 )
                                 continue
 
+                            required_file_validation = validate_required_files_in_pr(
+                                pull_request=pull_request,
+                                linked_issues=[issue],
+                            )
+
+                            if required_file_validation.get("status") == "blocked":
+                                missing_files = required_file_validation.get("missing_files")
+                                missing_summary = ", ".join(sorted(str(file) for file in missing_files))
+                                safe_post_orchestration_state_comment(
+                                    repo=repo,
+                                    target_type="pr",
+                                    target_number=state_target_number,
+                                    dry_run=args.dry_run,
+                                    state=build_orchestration_state(
+                                        status="blocked",
+                                        task_type="pr",
+                                        issue_number=issue["number"],
+                                        pr_number=state_pr_number,
+                                        branch=issue_branch,
+                                        base_branch=target_base_branch,
+                                        runner=args.runner,
+                                        agent=args.agent,
+                                        model=args.model,
+                                        attempt=1,
+                                        stage="ci_checks",
+                                        next_action="update_pr_with_required_files",
+                                        error=f"Missing required file evidence: {missing_summary}",
+                                        ci_checks=ci_checks_payload,
+                                        decomposition=decomposition_rollup,
+                                        required_file_validation=required_file_validation,
+                                    ),
+                                )
+                                print(
+                                    f"No actionable review comments for linked PR #{pr_number}; "
+                                    "CI checks passed but required file evidence check failed. "
+                                    f"Missing files: {missing_summary}"
+                                )
+                                remove_agent_failure_label_from_issue(
+                                    repo=repo,
+                                    issue_number=issue["number"],
+                                    dry_run=args.dry_run,
+                                )
+                                continue
+
                             safe_post_orchestration_state_comment(
                                 repo=repo,
                                 target_type="pr",
@@ -6126,13 +6416,14 @@ def main() -> int:
                                     agent=args.agent,
                                     model=args.model,
                                     attempt=1,
-                                         stage="ci_checks",
-                                         next_action="ready_for_merge",
-                                         error=None,
-                                         ci_checks=ci_checks_payload,
-                                         decomposition=decomposition_rollup,
-                                     ),
-                                 )
+                                    stage="ci_checks",
+                                    next_action="ready_for_merge",
+                                    error=None,
+                                    ci_checks=ci_checks_payload,
+                                    decomposition=decomposition_rollup,
+                                    required_file_validation=required_file_validation,
+                                ),
+                            )
                             print(
                                 f"No actionable review comments for linked PR #{pr_number}; "
                                 "CI checks passed, marking ready-to-merge."

@@ -61,6 +61,18 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --f
 python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 45 --base current --runner opencode --agent build
 ```
 
+**Use Jira as the issue source:**
+```bash
+export JIRA_BASE_URL=https://mycompany.atlassian.net
+export JIRA_EMAIL=you@example.com
+export JIRA_API_TOKEN=your_token
+
+python scripts/run_github_issues_to_opencode.py \
+  --tracker jira \
+  --issue PROJ-42 \
+  --repo owner/repo
+```
+
 ## Doctor diagnostics
 
 Run environment diagnostics without starting an agent run:
@@ -142,7 +154,7 @@ You can define repository defaults and placeholders for future orchestration pol
 Project config currently supports these sections:
 
 - `workflow.commands.test|lint|build` (non-empty string shell command or `null`)
-- `defaults.preset|runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts` (used as parser defaults)
+- `defaults.tracker|preset|runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts` (used as parser defaults)
 - `scope.defaults.labels.allow|deny` (arrays of label names)
 - `scope.defaults.authors.allow|deny` (arrays of GitHub logins; optional placeholder)
 - `retry.max_attempts|escalate_to_preset` (positive integer plus escalation placeholder)
@@ -273,6 +285,7 @@ You can define local defaults without changing repository defaults.
 
 Supported local config keys:
 
+- `tracker` (`github` or `jira`)
 - `state` (`open`, `closed`, `all`)
 - `limit` (positive integer)
 - `runner` (`claude` or `opencode`)

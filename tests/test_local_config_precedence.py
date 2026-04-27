@@ -13,6 +13,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
             args = parse_args(["--dir", tmpdir])
 
         self.assertEqual(args.runner, BUILTIN_DEFAULTS["runner"])
+        self.assertEqual(args.tracker, BUILTIN_DEFAULTS["tracker"])
         self.assertEqual(args.limit, BUILTIN_DEFAULTS["limit"])
         self.assertEqual(args.branch_prefix, BUILTIN_DEFAULTS["branch_prefix"])
         self.assertEqual(args.fail_on_existing, BUILTIN_DEFAULTS["fail_on_existing"])
@@ -33,27 +34,29 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
             config_path = os.path.join(tmpdir, "local-config.json")
             with open(config_path, "w", encoding="utf-8") as config_file:
                 json.dump(
-                {
-                    "runner": "opencode",
-                    "limit": 3,
-                    "branch_prefix": "my-fixes",
-                    "fail_on_existing": True,
+                    {
+                        "tracker": "jira",
+                        "runner": "opencode",
+                        "limit": 3,
+                        "branch_prefix": "my-fixes",
+                        "fail_on_existing": True,
                         "skip_if_pr_exists": False,
                         "skip_if_branch_exists": False,
                         "force_reprocess": True,
                         "sync_reused_branch": False,
                         "sync_strategy": "merge",
-                    "base_branch": "current",
-                    "decompose": "never",
-                    "track_tokens": True,
-                    "token_budget": 20000,
-                    "create_child_issues": True,
-                },
-                config_file,
+                        "base_branch": "current",
+                        "decompose": "never",
+                        "track_tokens": True,
+                        "token_budget": 20000,
+                        "create_child_issues": True,
+                    },
+                    config_file,
                 )
 
             args = parse_args(["--dir", tmpdir])
 
+        self.assertEqual(args.tracker, "jira")
         self.assertEqual(args.runner, "opencode")
         self.assertEqual(args.limit, 3)
         self.assertEqual(args.branch_prefix, "my-fixes")
@@ -75,14 +78,15 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
             config_path = os.path.join(tmpdir, "local-config.json")
             with open(config_path, "w", encoding="utf-8") as config_file:
                 json.dump(
-                {
-                    "runner": "opencode",
-                    "limit": 2,
-                    "branch_prefix": "my-fixes",
-                    "track_tokens": False,
-                    "token_budget": 15000,
-                },
-                config_file,
+                    {
+                        "tracker": "jira",
+                        "runner": "opencode",
+                        "limit": 2,
+                        "branch_prefix": "my-fixes",
+                        "track_tokens": False,
+                        "token_budget": 15000,
+                    },
+                    config_file,
                 )
 
             args = parse_args(
@@ -99,6 +103,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
                 ]
             )
 
+        self.assertEqual(args.tracker, "jira")
         self.assertEqual(args.runner, "claude")
         self.assertEqual(args.limit, 7)
         self.assertEqual(args.branch_prefix, "my-fixes")

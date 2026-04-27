@@ -6,10 +6,12 @@ import unittest
 from scripts.run_github_issues_to_opencode import (
     BUILTIN_DEFAULTS,
     DECOMPOSITION_PLAN_MARKER,
+    _classify_decomposition_child_execution_status,
     _decomposition_plan_has_missing_children,
     _normalize_created_children,
     assess_issue_decomposition_need,
     build_decomposition_plan_payload,
+    build_decomposition_child_execution_note,
     build_decomposition_rollup_from_plan_payload,
     format_decomposition_rollup_context,
     format_decomposition_plan_comment,
@@ -17,6 +19,7 @@ from scripts.run_github_issues_to_opencode import (
     merge_created_children_into_plan_payload,
     parse_args,
     parse_decomposition_plan_comment_body,
+    refresh_decomposition_plan_payload_from_child_states,
     select_latest_parseable_decomposition_plan,
     should_issue_decompose,
 )
@@ -355,6 +358,108 @@ class DecompositionPlanningTests(unittest.TestCase):
         self.assertIn("decomposition(parent=#150", summary)
         self.assertIn("next=2:Build plan", summary)
         self.assertIn("blockers=waiting on API token", summary)
+
+    def test_rollup_selects_first_dependency_unblocked_child(self) -> None:
+        payload = {
+            "parent_issue": 151,
+            "status": "children_created",
+            "proposed_children": [
+                {"order": 1, "title": "First", "status": "done"},
+                {"order": 2, "title": "Second", "depends_on": [1], "status": "blocked", "issue_number": 402},
+                {"order": 3, "title": "Third", "depends_on": [2], "status": "created", "issue_number": 403},
+                {"order": 4, "title": "Fourth", "depends_on": [1], "status": "created", "issue_number": 404},
+            ],
+        }
+
+        rollup = build_decomposition_rollup_from_plan_payload(payload)
+
+        self.assertIsNotNone(rollup["next_child"])
+        assert rollup["next_child"] is not None
+        self.assertEqual(rollup["next_child"]["order"], 4)
+        self.assertEqual(rollup["next_child"]["issue_number"], 404)
+
+    def test_classify_decomposition_child_execution_status(self) -> None:
+        status, blocker = _classify_decomposition_child_execution_status(
+            child_issue={"state": "open"},
+            recovered_state={"status": "waiting-for-author", "payload": {"error": "needs product answer"}},
+        )
+
+        self.assertEqual(status, "blocked")
+        self.assertEqual(blocker, "needs product answer")
+
+        done_status, done_blocker = _classify_decomposition_child_execution_status(
+            child_issue={"state": "closed"},
+            recovered_state=None,
+        )
+
+        self.assertEqual(done_status, "done")
+        self.assertIsNone(done_blocker)
+
+    def test_refresh_parent_payload_from_child_states_updates_rollup(self) -> None:
+        payload = {
+            "parent_issue": 160,
+            "status": "children_created",
+            "proposed_children": [
+                {"order": 1, "title": "First", "depends_on": [], "status": "created"},
+                {"order": 2, "title": "Second", "depends_on": [1], "status": "created"},
+            ],
+            "created_children": [
+                {"order": 1, "title": "First", "issue_number": 501, "issue_url": "https://example/501"},
+                {"order": 2, "title": "Second", "issue_number": 502, "issue_url": "https://example/502"},
+            ],
+        }
+
+        child_issue_responses = {
+            501: {"number": 501, "title": "First", "url": "https://example/501", "state": "closed"},
+            502: {"number": 502, "title": "Second", "url": "https://example/502", "state": "open"},
+        }
+        child_comments = {
+            501: [],
+            502: [
+                {
+                    "created_at": "2026-04-27T12:00:00Z",
+                    "html_url": "https://example/502#issuecomment-1",
+                    "body": "<!-- orchestration-state:v1 -->\n```json\n{\"status\":\"waiting-for-author\",\"error\":\"awaiting QA\"}\n```",
+                }
+            ],
+        }
+
+        from unittest.mock import patch
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.fetch_issue", side_effect=lambda repo, number: child_issue_responses[number]),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", side_effect=lambda repo, issue_number: child_comments[issue_number]),
+        ):
+            refreshed = refresh_decomposition_plan_payload_from_child_states(
+                repo="owner/repo",
+                plan_payload=payload,
+            )
+
+        created_children = _normalize_created_children(refreshed["created_children"])
+        self.assertEqual(created_children[0]["status"], "done")
+        self.assertEqual(created_children[1]["status"], "blocked")
+        self.assertIn("step 2: awaiting QA", refreshed["blockers"])
+
+        rollup = build_decomposition_rollup_from_plan_payload(refreshed)
+        self.assertIsNone(rollup["next_child"])
+
+    def test_child_execution_note_includes_parent_context(self) -> None:
+        rollup = build_decomposition_rollup_from_plan_payload(
+            {
+                "parent_issue": 170,
+                "proposed_children": [{"order": 1, "title": "Child", "status": "created", "issue_number": 601}],
+                "created_children": [{"order": 1, "title": "Child", "status": "created", "issue_number": 601}],
+            }
+        )
+
+        note = build_decomposition_child_execution_note(
+            parent_issue={"number": 170, "title": "Parent tracker"},
+            decomposition_rollup=rollup,
+            selected_child={"order": 1, "title": "Child", "issue_number": 601},
+        )
+
+        self.assertIn("Parent issue: #170 - Parent tracker", note)
+        self.assertIn("Selected child step: 1: Child", note)
 
 
 

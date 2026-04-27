@@ -198,11 +198,11 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(decomposition)
         assert decomposition is not None
         self.assertEqual(decomposition["counts"]["blocked"], 1)
-        self.assertEqual(decomposition["next_child"]["order"], 2)
+        self.assertEqual(decomposition["next_child"]["order"], 3)
         summary = format_decomposition_rollup_context(decomposition)
         self.assertIn("decomposition(", summary)
         self.assertIn("parent=#210", summary)
-        self.assertIn("next=2:Second", summary)
+        self.assertIn("next=3:Third", summary)
         self.assertIn("blockers=external dependency, qa review", summary)
 
     def test_select_latest_parseable_state_ignores_malformed_comments(self) -> None:
@@ -443,6 +443,110 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         assert prompt_override is not None
         self.assertIn("Recovered previous orchestration failure context", prompt_override)
         self.assertIn("merge conflict while rebasing", prompt_override)
+
+    def test_main_parent_decomposition_executes_selected_child_issue(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=105,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            decompose="auto",
+            create_child_issues=False,
+            dir=".",
+            local_config="local-config.json",
+            project_config="project-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            allow_pr_branch_switch=False,
+            isolate_worktree=True,
+        )
+        parent_issue = {
+            "number": 105,
+            "title": "Decomposition parent",
+            "body": "Parent tracker body",
+            "url": "https://example/issues/105",
+            "state": "open",
+        }
+        child_issue = {
+            "number": 201,
+            "title": "Child implementation",
+            "body": "Implement child step",
+            "url": "https://example/issues/201",
+            "state": "open",
+        }
+        parent_plan_comment = {
+            "created_at": "2026-04-27T12:00:00Z",
+            "html_url": "https://example/issues/105#issuecomment-plan",
+            "body": (
+                "<!-- orchestration-decomposition:v1 -->\n"
+                "```json\n"
+                '{"status":"children_created","parent_issue":105,'
+                '"proposed_children":[{"order":1,"title":"Child implementation","depends_on":[],"status":"created","issue_number":201}],'
+                '"created_children":[{"order":1,"title":"Child implementation","issue_number":201,"issue_url":"https://example/issues/201","status":"created"}]}'
+                "\n```"
+            ),
+        }
+        rollup = build_decomposition_rollup_from_plan_payload(
+            {
+                "status": "children_created",
+                "parent_issue": 105,
+                "proposed_children": [
+                    {"order": 1, "title": "Child implementation", "depends_on": [], "status": "created", "issue_number": 201}
+                ],
+                "created_children": [
+                    {"order": 1, "title": "Child implementation", "issue_number": 201, "issue_url": "https://example/issues/201", "status": "created"}
+                ],
+            }
+        )
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.load_project_config", return_value={}),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue", side_effect=lambda repo, number: parent_issue if number == 105 else child_issue),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_issue_comments",
+                side_effect=lambda repo, issue_number: [parent_plan_comment] if issue_number == 105 else [],
+            ),
+            patch("scripts.run_github_issues_to_opencode.refresh_decomposition_plan_payload_from_child_states", side_effect=lambda repo, plan_payload: plan_payload),
+            patch("scripts.run_github_issues_to_opencode.post_parent_decomposition_rollup_update", return_value=({}, rollup)) as parent_update_mock,
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="created"),
+            patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0) as run_agent_mock,
+            patch("scripts.run_github_issues_to_opencode.commit_changes"),
+            patch("scripts.run_github_issues_to_opencode.push_branch"),
+            patch("scripts.run_github_issues_to_opencode.ensure_pr", return_value=("created", "https://example/pr/201")),
+            patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(run_agent_mock.call_args.kwargs["issue"]["number"], 201)
+        self.assertTrue(parent_update_mock.called)
+        self.assertIn("Executing decomposition child issue #201 for parent #105", stdout_mock.getvalue())
 
     def test_main_pr_mode_dry_run_prints_recovered_state_context(self) -> None:
         args = argparse.Namespace(

@@ -6,9 +6,13 @@ import unittest
 from scripts.run_github_issues_to_opencode import (
     BUILTIN_DEFAULTS,
     DECOMPOSITION_PLAN_MARKER,
+    _decomposition_plan_has_missing_children,
+    _normalize_created_children,
     assess_issue_decomposition_need,
     build_decomposition_plan_payload,
     format_decomposition_plan_comment,
+    is_decomposition_plan_approved,
+    merge_created_children_into_plan_payload,
     parse_args,
     parse_decomposition_plan_comment_body,
     select_latest_parseable_decomposition_plan,
@@ -210,6 +214,51 @@ class DecompositionPlanningTests(unittest.TestCase):
 
         self.assertEqual(configured_args.decompose, "never")
         self.assertEqual(cli_args.decompose, "always")
+
+    def test_approved_decomposition_plan_is_recognized(self) -> None:
+        self.assertTrue(is_decomposition_plan_approved({"status": "approved"}))
+        self.assertTrue(is_decomposition_plan_approved({"status": "execution_plan"}))
+        self.assertFalse(is_decomposition_plan_approved({"status": "proposed"}))
+
+    def test_missing_children_is_computed_from_created_children(self) -> None:
+        payload = {
+            "proposed_children": [
+                {"title": "Parent first", "order": 1},
+                {"title": "Parent second", "order": 2},
+                {"title": "Parent third", "order": 3},
+            ],
+            "created_children": [
+                {"title": "Parent first", "order": 1, "issue_number": 101, "issue_url": "https://x/101"},
+            ],
+        }
+
+        missing = _decomposition_plan_has_missing_children(payload)
+
+        self.assertEqual(len(missing), 2)
+        self.assertEqual(missing[0]["order"], 2)
+        self.assertEqual(missing[1]["order"], 3)
+
+    def test_merge_created_children_is_idempotent(self) -> None:
+        payload = {
+            "proposed_children": [
+                {"title": "Alpha", "order": 1},
+                {"title": "Beta", "order": 2},
+            ],
+            "created_children": [
+                {"title": "Alpha", "order": 1, "issue_number": 10, "issue_url": "https://example/10"}
+            ],
+        }
+        merged = merge_created_children_into_plan_payload(payload, [
+            {"title": "Beta", "order": 2, "issue_number": 20, "issue_url": "https://example/20", "created": True}
+        ])
+
+        created_children = _normalize_created_children(merged.get("created_children"))
+
+        self.assertEqual(len(created_children), 2)
+        self.assertEqual(created_children[0]["order"], 1)
+        self.assertEqual(created_children[1]["order"], 2)
+        self.assertEqual(merged["created_children"][1]["issue_number"], 20)
+
 
 
 if __name__ == "__main__":

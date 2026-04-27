@@ -178,6 +178,7 @@
 - `--sync-strategy rebase|merge`: стратегия синхронизации переиспользованной ветки;
 - `--base default|current` (`--base-branch`): выбор базовой ветки для issue-flow (стабильная default-ветка или stacked запуск от текущей ветки);
 - `--decompose auto|never|always`: planning-only decomposition preflight перед issue-flow agent run; `auto` предлагает план для больших задач, `always` форсирует plan-only режим, `never` отключает preflight;
+- `--create-child-issues`: при утвержденном плане (`status=approved` / `status=execution_plan`) создает связанные child issue по `proposed_children` и сохраняет ссылки в `created_children` внутри `<!-- orchestration-decomposition:v1 -->` payload
 - `--allow-pr-branch-switch`: в PR-mode разрешает переключить текущий worktree на target PR branch;
 - `--isolate-worktree`: в PR-mode запускает работу во временном worktree без переключения текущей ветки;
 - `--dry-run`: печать планируемых действий без выполнения.
@@ -194,6 +195,7 @@
 - issue body пустой и нет `--include-empty` и нет распознанных image-ссылок -> issue пропускается;
 - batch issue с linked open PR или deterministic remote branch -> skip по умолчанию;
 - issue-flow с найденной большой/epic/multi-step задачей при `--decompose auto|always` -> публикуется `<!-- orchestration-decomposition:v1 -->` plan comment, state `waiting-for-author` stage `decomposition_plan`, агент не запускается;
+- если план помечен как `approved`/`execution_plan` и указан `--create-child-issues`, скрипт идемпотентно создает отсутствующие `proposed_children` как отдельные issues и хранит результат в `created_children`
 - PR-mode из нецелевой ветки без `--allow-pr-branch-switch` или `--isolate-worktree` -> ошибка safeguard;
 - если агент не внес изменения и не было sync-only обновления -> commit/push/PR пропускаются.
 

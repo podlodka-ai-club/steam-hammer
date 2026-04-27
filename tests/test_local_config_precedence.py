@@ -23,6 +23,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(args.sync_strategy, BUILTIN_DEFAULTS["sync_strategy"])
         self.assertEqual(args.base_branch, BUILTIN_DEFAULTS["base_branch"])
         self.assertEqual(args.decompose, BUILTIN_DEFAULTS["decompose"])
+        self.assertEqual(args.create_child_issues, BUILTIN_DEFAULTS["create_child_issues"])
 
     def test_local_config_overrides_built_in_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -42,6 +43,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
                         "sync_strategy": "merge",
                         "base_branch": "current",
                         "decompose": "never",
+                        "create_child_issues": True,
                     },
                     config_file,
                 )
@@ -59,6 +61,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(args.sync_strategy, "merge")
         self.assertEqual(args.base_branch, "current")
         self.assertEqual(args.decompose, "never")
+        self.assertTrue(args.create_child_issues)
 
     def test_cli_flags_override_local_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -81,6 +84,14 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(args.runner, "claude")
         self.assertEqual(args.limit, 7)
         self.assertEqual(args.branch_prefix, "my-fixes")
+
+    def test_create_child_issues_flag_overrides_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+
+            args = parse_args(["--dir", tmpdir, "--create-child-issues"])
+
+        self.assertTrue(args.create_child_issues)
 
     def test_explicit_local_config_path_is_supported(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

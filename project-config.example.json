@@ -1,0 +1,53 @@
+{
+  "defaults": {
+    "preset": "default",
+    "runner": "opencode",
+    "agent": "build",
+    "model": "openai/gpt-4o",
+    "track_tokens": false,
+    "token_budget": 20000,
+    "agent_timeout_seconds": 1200,
+    "agent_idle_timeout_seconds": 180,
+    "max_attempts": 2
+  },
+  "workflow": {
+    "commands": {
+      "test": "python -m unittest",
+      "lint": null,
+      "build": null
+    }
+  },
+  "retry": {
+    "max_attempts": 2,
+    "escalate_to_preset": "hard"
+  },
+  "presets": {
+    "cheap": {
+      "runner": "opencode",
+      "agent": "build",
+      "model": "openai/gpt-4o-mini",
+      "token_budget": 8000,
+      "max_attempts": 1,
+      "escalate_to_preset": "default"
+    },
+    "default": {
+      "runner": "opencode",
+      "agent": "build",
+      "model": "openai/gpt-4o",
+      "token_budget": 20000,
+      "max_attempts": 2,
+      "escalate_to_preset": "hard"
+    },
+    "hard": {
+      "runner": "claude",
+      "agent": "build",
+      "model": "claude-sonnet-4-5",
+      "token_budget": 40000,
+      "max_attempts": 3,
+      "escalate_to_preset": null
+    }
+  },
+  "communication": {
+    "verbosity": "normal"
+  }
+}

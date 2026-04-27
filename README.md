@@ -142,14 +142,23 @@ You can define repository defaults and placeholders for future orchestration pol
 Project config currently supports these sections:
 
 - `workflow.commands.test|lint|build` (non-empty string shell command or `null`)
-- `defaults.runner|agent|model|track_tokens|token_budget` (used as parser defaults)
+- `defaults.preset|runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts` (used as parser defaults)
 - `scope.defaults.labels.allow|deny` (arrays of label names)
 - `scope.defaults.authors.allow|deny` (arrays of GitHub logins; optional placeholder)
-- `retry.max_attempts` (positive integer placeholder)
+- `retry.max_attempts|escalate_to_preset` (positive integer plus escalation placeholder)
 - `communication.verbosity` (`low`, `normal`, `high`)
-- `presets` (object placeholder)
+- `presets.<name>.runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts|escalate_to_preset`
 
 Validation is strict: unsupported keys or invalid value types fail fast with a config error.
+
+Preset resolution order is:
+
+- `--preset`
+- `local-config.json` `preset`
+- `project-config.json` `defaults.preset`
+- legacy non-preset defaults
+
+Selected preset values are applied before explicit CLI flags, so manual `--runner`, `--model`, `--agent`, and similar flags remain the final override layer.
 
 Scope rules are evaluated before any issue-mode agent execution:
 
@@ -200,6 +209,46 @@ Example `project-config.json` scope block:
 }
 ```
 
+Example `project-config.json` preset and retry block:
+
+```json
+{
+  "defaults": {
+    "preset": "default"
+  },
+  "retry": {
+    "max_attempts": 2,
+    "escalate_to_preset": "hard"
+  },
+  "presets": {
+    "cheap": {
+      "runner": "opencode",
+      "agent": "build",
+      "model": "openai/gpt-4o-mini",
+      "token_budget": 8000,
+      "max_attempts": 1,
+      "escalate_to_preset": "default"
+    },
+    "default": {
+      "runner": "opencode",
+      "agent": "build",
+      "model": "openai/gpt-4o",
+      "token_budget": 20000,
+      "max_attempts": 2,
+      "escalate_to_preset": "hard"
+    },
+    "hard": {
+      "runner": "claude",
+      "agent": "build",
+      "model": "claude-sonnet-4-5",
+      "token_budget": 40000,
+      "max_attempts": 3,
+      "escalate_to_preset": null
+    }
+  }
+}
+```
+
 You can also point to a different project config file:
 
 ```bash
@@ -229,9 +278,11 @@ Supported local config keys:
 - `runner` (`claude` or `opencode`)
 - `agent` (string)
 - `model` (string or `null`)
+- `preset` (string)
 - `agent_timeout_seconds` (positive integer)
 - `agent_idle_timeout_seconds` (positive integer or `null`)
 - `token_budget` (positive integer or `null`)
+- `max_attempts` (positive integer)
 - `opencode_auto_approve` (boolean)
 - `branch_prefix` (string)
 - `include_empty` (boolean)
@@ -322,6 +373,7 @@ Planning-only decomposition comments:
 Useful options:
 
 - `--runner claude|opencode` to select the AI agent runner (default: `claude`)
+- `--preset name` to apply a named project-config preset before explicit CLI overrides
 - `--state open|closed|all`
 - `--include-empty` to process issues with empty body; image-only issues are now processed automatically when image attachments are detected.
 - Image attachment handling: when issue content includes image URLs or attachment metadata, the script downloads images to a temp directory and passes them to Claude as `--image <path>` arguments.
@@ -340,6 +392,7 @@ Useful options:
 - `--agent-timeout-seconds N` hard timeout for agent run (default: `900`)
 - `--agent-idle-timeout-seconds N` fail if agent prints no output for `N` seconds
 - `--token-budget N` (`--max-tokens` alias) stop the agent when cumulative tracked tokens exceed `N`
+- `--max-attempts N` retry policy placeholder for future rerun/escalation logic
 - `--opencode-auto-approve` pass `--dangerously-skip-permissions` to OpenCode (use with caution)
 - `--local-config path` load local JSON defaults (default: `local-config.json` under `--dir`)
 - `--project-config path` load repository JSON defaults scaffold (default: `project-config.json` under `--dir`)

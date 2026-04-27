@@ -45,6 +45,9 @@ BUILTIN_DEFAULTS = {
     "base_branch": "default",
     "decompose": "auto",
     "create_child_issues": False,
+    "preset": None,
+    "max_attempts": 1,
+    "escalate_to_preset": None,
     "dir": ".",
 }
 
@@ -102,6 +105,17 @@ def _as_positive_int(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     if normalized < 1:
+        return None
+    return normalized
+
+
+def _as_optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
         return None
     return normalized
 
@@ -4519,7 +4533,17 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
 
 
 def _validate_project_defaults(config: dict, config_path: str) -> None:
-    supported_defaults_keys = {"runner", "agent", "model", "track_tokens", "token_budget"}
+    supported_defaults_keys = {
+        "runner",
+        "agent",
+        "model",
+        "track_tokens",
+        "token_budget",
+        "preset",
+        "agent_timeout_seconds",
+        "agent_idle_timeout_seconds",
+        "max_attempts",
+    }
     unsupported_defaults = sorted(set(config) - supported_defaults_keys)
     if unsupported_defaults:
         raise RuntimeError(
@@ -4546,6 +4570,32 @@ def _validate_project_defaults(config: dict, config_path: str) -> None:
         if value is not None and (type(value) is not int or value <= 0):
             raise RuntimeError(
                 "Project config key 'defaults.token_budget' must be a positive integer or null"
+            )
+
+    if "preset" in config:
+        value = config["preset"]
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError("Project config key 'defaults.preset' must be a non-empty string")
+
+    if "agent_timeout_seconds" in config:
+        value = config["agent_timeout_seconds"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError(
+                "Project config key 'defaults.agent_timeout_seconds' must be a positive integer"
+            )
+
+    if "agent_idle_timeout_seconds" in config:
+        value = config["agent_idle_timeout_seconds"]
+        if value is not None and (type(value) is not int or value <= 0):
+            raise RuntimeError(
+                "Project config key 'defaults.agent_idle_timeout_seconds' must be a positive integer or null"
+            )
+
+    if "max_attempts" in config:
+        value = config["max_attempts"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError(
+                "Project config key 'defaults.max_attempts' must be a positive integer"
             )
 
 
@@ -4606,7 +4656,7 @@ def _validate_project_scope(config: dict, config_path: str) -> None:
 
 
 def _validate_project_retry(config: dict, config_path: str) -> None:
-    supported_retry_keys = {"max_attempts"}
+    supported_retry_keys = {"max_attempts", "escalate_to_preset"}
     unsupported_retry = sorted(set(config) - supported_retry_keys)
     if unsupported_retry:
         raise RuntimeError(
@@ -4618,6 +4668,97 @@ def _validate_project_retry(config: dict, config_path: str) -> None:
         value = config["max_attempts"]
         if type(value) is not int or value <= 0:
             raise RuntimeError("Project config key 'retry.max_attempts' must be a positive integer")
+
+    if "escalate_to_preset" in config:
+        value = config["escalate_to_preset"]
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise RuntimeError(
+                "Project config key 'retry.escalate_to_preset' must be a non-empty string or null"
+            )
+
+
+def _validate_preset_config(config: dict, config_path: str, prefix: str) -> None:
+    supported_preset_keys = {
+        "runner",
+        "agent",
+        "model",
+        "track_tokens",
+        "token_budget",
+        "agent_timeout_seconds",
+        "agent_idle_timeout_seconds",
+        "max_attempts",
+        "escalate_to_preset",
+    }
+    unsupported = sorted(set(config) - supported_preset_keys)
+    if unsupported:
+        raise RuntimeError(
+            f"Unsupported key(s) in project config {config_path} under '{prefix}': "
+            + ", ".join(unsupported)
+        )
+
+    if "runner" in config and config["runner"] not in {"claude", "opencode"}:
+        raise RuntimeError(f"Project config key '{prefix}.runner' must be one of: claude, opencode")
+
+    if "agent" in config:
+        value = config["agent"]
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"Project config key '{prefix}.agent' must be a non-empty string")
+
+    if "model" in config and config["model"] is not None and not isinstance(config["model"], str):
+        raise RuntimeError(f"Project config key '{prefix}.model' must be a string or null")
+
+    if "track_tokens" in config and not isinstance(config["track_tokens"], bool):
+        raise RuntimeError(f"Project config key '{prefix}.track_tokens' must be a boolean")
+
+    if "token_budget" in config:
+        value = config["token_budget"]
+        if value is not None and (type(value) is not int or value <= 0):
+            raise RuntimeError(f"Project config key '{prefix}.token_budget' must be a positive integer or null")
+
+    if "agent_timeout_seconds" in config:
+        value = config["agent_timeout_seconds"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError(f"Project config key '{prefix}.agent_timeout_seconds' must be a positive integer")
+
+    if "agent_idle_timeout_seconds" in config:
+        value = config["agent_idle_timeout_seconds"]
+        if value is not None and (type(value) is not int or value <= 0):
+            raise RuntimeError(
+                f"Project config key '{prefix}.agent_idle_timeout_seconds' must be a positive integer or null"
+            )
+
+    if "max_attempts" in config:
+        value = config["max_attempts"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError(f"Project config key '{prefix}.max_attempts' must be a positive integer")
+
+    if "escalate_to_preset" in config:
+        value = config["escalate_to_preset"]
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise RuntimeError(
+                f"Project config key '{prefix}.escalate_to_preset' must be a non-empty string or null"
+            )
+
+
+def _validate_project_presets(config: dict, config_path: str) -> None:
+    for preset_name, preset_config in config.items():
+        if not isinstance(preset_name, str) or not preset_name.strip():
+            raise RuntimeError(
+                f"Project config {config_path} preset names must be non-empty strings"
+            )
+        if not isinstance(preset_config, dict):
+            raise RuntimeError(
+                f"Project config key 'presets.{preset_name}' must be an object"
+            )
+        _validate_preset_config(preset_config, config_path, f"presets.{preset_name}")
+
+
+def _validate_retry_references(config: dict, preset_names: set[str], config_path: str, prefix: str) -> None:
+    target = _as_optional_string(config.get("escalate_to_preset"))
+    if target is not None and target not in preset_names:
+        raise RuntimeError(
+            f"Project config key '{prefix}.escalate_to_preset' references unknown preset '{target}'"
+        )
 
 
 def _validate_project_communication(config: dict, config_path: str) -> None:
@@ -4676,6 +4817,29 @@ def validate_project_config(config: dict, config_path: str) -> dict:
     if isinstance(communication, dict):
         _validate_project_communication(communication, config_path)
 
+    presets = config.get("presets")
+    if isinstance(presets, dict):
+        _validate_project_presets(presets, config_path)
+
+    preset_names = set(presets) if isinstance(presets, dict) else set()
+    if isinstance(defaults, dict):
+        default_preset = _as_optional_string(defaults.get("preset"))
+        if default_preset is not None and default_preset not in preset_names:
+            raise RuntimeError(
+                f"Project config key 'defaults.preset' references unknown preset '{default_preset}'"
+            )
+    if isinstance(retry, dict):
+        _validate_retry_references(retry, preset_names, config_path, "retry")
+    if isinstance(presets, dict):
+        for preset_name, preset_config in presets.items():
+            if isinstance(preset_config, dict):
+                _validate_retry_references(
+                    preset_config,
+                    preset_names,
+                    config_path,
+                    f"presets.{preset_name}",
+                )
+
     return config
 
 
@@ -4699,13 +4863,27 @@ def load_project_config(config_path: str) -> dict:
 
 def project_cli_defaults(project_config: dict) -> dict:
     defaults = project_config.get("defaults")
-    if not isinstance(defaults, dict):
-        return {}
-
     cli_defaults: dict = {}
-    for key in ["runner", "agent", "model", "track_tokens", "token_budget"]:
-        if key in defaults:
-            cli_defaults[key] = defaults[key]
+    if isinstance(defaults, dict):
+        for key in [
+            "runner",
+            "agent",
+            "model",
+            "track_tokens",
+            "token_budget",
+            "preset",
+            "agent_timeout_seconds",
+            "agent_idle_timeout_seconds",
+            "max_attempts",
+        ]:
+            if key in defaults:
+                cli_defaults[key] = defaults[key]
+
+    retry = project_config.get("retry")
+    if isinstance(retry, dict):
+        for key in ["max_attempts", "escalate_to_preset"]:
+            if key in retry:
+                cli_defaults[key] = retry[key]
     return cli_defaults
 
 
@@ -4734,6 +4912,8 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "decompose",
         "create_child_issues",
         "track_tokens",
+        "preset",
+        "max_attempts",
     }
 
     unsupported = sorted(set(config) - supported_keys)
@@ -4772,6 +4952,11 @@ def validate_local_config(config: dict, config_path: str) -> dict:
             raise RuntimeError("Local config key 'model' must be a string or null")
         validated["model"] = config["model"]
 
+    if "preset" in config:
+        if not isinstance(config["preset"], str) or not config["preset"].strip():
+            raise RuntimeError("Local config key 'preset' must be a non-empty string")
+        validated["preset"] = config["preset"]
+
     if "agent_timeout_seconds" in config:
         value = config["agent_timeout_seconds"]
         if type(value) is not int or value <= 0:
@@ -4795,6 +4980,12 @@ def validate_local_config(config: dict, config_path: str) -> dict:
                 "Local config key 'token_budget' must be a positive integer or null"
             )
         validated["token_budget"] = value
+
+    if "max_attempts" in config:
+        value = config["max_attempts"]
+        if type(value) is not int or value <= 0:
+            raise RuntimeError("Local config key 'max_attempts' must be a positive integer")
+        validated["max_attempts"] = value
 
     for key in [
         "opencode_auto_approve",
@@ -4859,6 +5050,40 @@ def load_local_config(config_path: str) -> dict:
         raise RuntimeError(f"Local config {config_path} must contain a JSON object")
 
     return validate_local_config(config=data, config_path=config_path)
+
+
+def preset_cli_defaults(project_config: dict, preset_name: str | None) -> dict:
+    normalized_name = _as_optional_string(preset_name)
+    if normalized_name is None:
+        return {}
+
+    presets = project_config.get("presets")
+    if not isinstance(presets, dict) or normalized_name not in presets:
+        raise RuntimeError(f"Unknown preset '{normalized_name}' in project config")
+
+    preset_config = presets.get(normalized_name)
+    if not isinstance(preset_config, dict):
+        raise RuntimeError(f"Project config key 'presets.{normalized_name}' must be an object")
+
+    cli_defaults: dict = {"preset": normalized_name}
+    for key in [
+        "runner",
+        "agent",
+        "model",
+        "track_tokens",
+        "token_budget",
+        "agent_timeout_seconds",
+        "agent_idle_timeout_seconds",
+        "max_attempts",
+        "escalate_to_preset",
+    ]:
+        if key in preset_config:
+            cli_defaults[key] = preset_config[key]
+    return cli_defaults
+
+
+def without_keys(config: dict, *keys: str) -> dict:
+    return {key: value for key, value in config.items() if key not in keys}
 
 
 def _doctor_record(checks: list[dict[str, str]], status: str, name: str, detail: str) -> None:
@@ -5193,6 +5418,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--preset",
+        help=(
+            "Named preset from project config. Presets can set runner/model/agent and "
+            "basic retry or limit defaults before explicit CLI overrides are applied."
+        ),
+    )
+    parser.add_argument(
         "--agent-timeout-seconds",
         type=int,
         default=BUILTIN_DEFAULTS["agent_timeout_seconds"],
@@ -5210,6 +5442,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=BUILTIN_DEFAULTS["token_budget"],
         help="Abort when cumulative tracked token usage exceeds this limit.",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=BUILTIN_DEFAULTS["max_attempts"],
+        help="Retry policy placeholder: maximum attempts before escalation or failure.",
     )
     parser.add_argument(
         "--opencode-auto-approve",
@@ -5419,6 +5657,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     bootstrap_parser.add_argument("--dir", default=BUILTIN_DEFAULTS["dir"])
     bootstrap_parser.add_argument("--local-config")
     bootstrap_parser.add_argument("--project-config")
+    bootstrap_parser.add_argument("--preset")
     bootstrap_parser.add_argument("--doctor", action="store_true")
     bootstrap_args, _ = bootstrap_parser.parse_known_args(argv)
 
@@ -5429,9 +5668,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     if not bootstrap_args.doctor:
         project_config = load_project_config(project_config_path)
-        parser.set_defaults(**project_cli_defaults(project_config))
         local_defaults = load_local_config(local_config_path)
-        parser.set_defaults(**local_defaults)
+        project_defaults = project_cli_defaults(project_config)
+        project_preset = _as_optional_string(project_defaults.get("preset"))
+        local_preset = _as_optional_string(local_defaults.get("preset"))
+        cli_preset = _as_optional_string(getattr(bootstrap_args, "preset", None))
+
+        parser.set_defaults(**without_keys(project_defaults, "preset"))
+        parser.set_defaults(**preset_cli_defaults(project_config, project_preset))
+        parser.set_defaults(**preset_cli_defaults(project_config, local_preset))
+        parser.set_defaults(**without_keys(local_defaults, "preset"))
+        parser.set_defaults(**preset_cli_defaults(project_config, cli_preset))
     parser.set_defaults(project_config=project_config_path)
     parser.set_defaults(local_config=local_config_path)
     return parser.parse_args(argv)
@@ -5461,6 +5708,14 @@ def main() -> int:
     if token_budget is not None and (type(token_budget) is not int or token_budget <= 0):
         print("Error: --token-budget must be a positive integer", file=sys.stderr)
         return 1
+    selected_preset = _as_optional_string(getattr(args, "preset", None))
+    max_attempts = getattr(args, "max_attempts", BUILTIN_DEFAULTS["max_attempts"])
+    if type(max_attempts) is not int or max_attempts <= 0:
+        print("Error: --max-attempts must be a positive integer", file=sys.stderr)
+        return 1
+    escalate_to_preset = _as_optional_string(
+        getattr(args, "escalate_to_preset", BUILTIN_DEFAULTS["escalate_to_preset"])
+    )
     base_branch_mode = str(getattr(args, "base_branch", BUILTIN_DEFAULTS["base_branch"]))
     decompose_mode = str(getattr(args, "decompose", BUILTIN_DEFAULTS["decompose"]))
     create_child_issues = bool(getattr(args, "create_child_issues", BUILTIN_DEFAULTS["create_child_issues"]))
@@ -5496,6 +5751,13 @@ def main() -> int:
             configured_names = ", ".join(name for name, _ in workflow_checks)
             prefix = "[dry-run] " if args.dry_run else ""
             print(f"{prefix}Configured workflow checks: {configured_names}")
+        if selected_preset is not None:
+            print(f"Selected preset: {selected_preset}")
+        if max_attempts != BUILTIN_DEFAULTS["max_attempts"] or escalate_to_preset is not None:
+            policy_text = f"Retry policy: max_attempts={max_attempts}"
+            if escalate_to_preset is not None:
+                policy_text += f", escalate_to_preset={escalate_to_preset}"
+            print(policy_text)
 
         if issue_number_arg is not None and pr_number_arg is not None:
             raise RuntimeError("Use either --issue or --pr, not both.")

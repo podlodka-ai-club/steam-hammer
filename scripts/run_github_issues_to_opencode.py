@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import signal
 
 
 LOCAL_CONFIG_RELATIVE_PATH = "local-config.json"
@@ -53,6 +54,11 @@ DECOMPOSITION_CHILD_ORDER_PREFIX = "Step"
 AGENT_FAILURE_LABEL_NAME = "auto:agent-failed"
 AGENT_FAILURE_LABEL_COLOR = "B60205"
 AGENT_FAILURE_LABEL_DESCRIPTION = "Automation run failed for this issue"
+RECOMMENDED_OPENCODE_MODEL = "openai/gpt-4o"
+SIGKILL_EXIT_DESCRIPTION = (
+    "This usually indicates a hard kill (SIGKILL), commonly from resource limits or environment-level"
+    " termination rather than an argument/model syntax error."
+)
 ORCHESTRATION_STATE_STATUSES = {
     "in-progress",
     "ready-for-review",
@@ -231,6 +237,38 @@ def run_check_command(command: list[str], cwd: str | None = None) -> tuple[bool,
         (result.stderr or "").strip(),
         result.returncode,
     )
+
+
+def describe_exit_code(return_code: int) -> str:
+    if return_code >= 0:
+        return f"exit code {return_code}"
+
+    signal_number = -return_code
+    try:
+        signal_name = signal.Signals(signal_number).name
+    except ValueError:
+        return f"terminated by signal {signal_number}"
+
+    return f"terminated by {signal_name} ({signal_number})"
+
+
+def classify_opencode_failure(return_code: int, model: str | None) -> str | None:
+    if return_code != -signal.SIGKILL:
+        return None
+
+    details = [
+        SIGKILL_EXIT_DESCRIPTION,
+        f"For stability, run with --runner opencode --agent build --model {RECOMMENDED_OPENCODE_MODEL} first.",
+    ]
+
+    if model and model != RECOMMENDED_OPENCODE_MODEL:
+        details.append(f"This run used model '{model}', which is different from the current recommended baseline.")
+
+    return " ".join(details)
+
+
+def _label_already_exists_error(message: str) -> bool:
+    return "already exists" in str(message).lower()
 
 
 WORKFLOW_COMMAND_ORDER = ["test", "lint", "build"]
@@ -2266,7 +2304,8 @@ def build_issue_failure_report_comment(
 
 
 def ensure_agent_failure_label(repo: str, dry_run: bool) -> None:
-    if command_succeeds(["gh", "label", "view", AGENT_FAILURE_LABEL_NAME, "--repo", repo]):
+    label_view_command = ["gh", "label", "view", AGENT_FAILURE_LABEL_NAME, "--repo", repo]
+    if command_succeeds(label_view_command):
         return
 
     if dry_run:
@@ -2276,19 +2315,27 @@ def ensure_agent_failure_label(repo: str, dry_run: bool) -> None:
         )
         return
 
-    run_command(
-        [
-            "gh",
-            "label",
-            "create",
-            AGENT_FAILURE_LABEL_NAME,
-            "--repo",
-            repo,
-            "--color",
-            AGENT_FAILURE_LABEL_COLOR,
-            "--description",
-            AGENT_FAILURE_LABEL_DESCRIPTION,
-        ]
+    create_command = [
+        "gh",
+        "label",
+        "create",
+        AGENT_FAILURE_LABEL_NAME,
+        "--repo",
+        repo,
+        "--color",
+        AGENT_FAILURE_LABEL_COLOR,
+        "--description",
+        AGENT_FAILURE_LABEL_DESCRIPTION,
+    ]
+    created, _stdout, stderr, _exit_code = run_check_command(create_command)
+    if created:
+        return
+
+    if _label_already_exists_error(stderr) and command_succeeds(label_view_command):
+        return
+
+    raise RuntimeError(
+        f"Failed to create missing failure label '{AGENT_FAILURE_LABEL_NAME}': {stderr or 'unknown error'}"
     )
 
 
@@ -5094,9 +5141,17 @@ def main() -> int:
                 opencode_auto_approve=args.opencode_auto_approve,
             )
             if exit_code != 0:
-                raise RuntimeError(
-                    f"Agent failed for PR #{pr_number_arg} with exit code {exit_code}"
+                exit_summary = describe_exit_code(exit_code)
+                diagnosis = (
+                    classify_opencode_failure(return_code=exit_code, model=args.model)
+                    if args.runner == "opencode"
+                    else None
                 )
+                message = (
+                    f"Agent failed for PR #{pr_number_arg} with {exit_summary}"
+                    + (f" ({diagnosis})" if diagnosis else "")
+                )
+                raise RuntimeError(message)
 
             if not args.dry_run and not has_changes():
                 safe_post_orchestration_state_comment(
@@ -6048,9 +6103,16 @@ def main() -> int:
                         prompt_override=prompt_override,
                     )
                     if exit_code != 0:
-                        raise RuntimeError(
-                            f"Agent failed for issue #{issue['number']} with exit code {exit_code}"
+                        exit_summary = describe_exit_code(exit_code)
+                        diagnosis = classify_opencode_failure(
+                            return_code=exit_code,
+                            model=args.model,
+                        ) if args.runner == "opencode" else None
+                        message = (
+                            f"Agent failed for issue #{issue['number']} with {exit_summary}"
+                            + (f" ({diagnosis})" if diagnosis else "")
                         )
+                        raise RuntimeError(message)
                 if not args.dry_run and not has_changes():
                     if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:
                         print(

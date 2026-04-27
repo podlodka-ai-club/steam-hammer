@@ -1944,21 +1944,79 @@ DECOMPOSITION_KEYWORDS = {
     "large",
 }
 
+DECOMPOSITION_SOURCE_HEADINGS = {
+    "scope",
+    "implementation",
+    "implementation plan",
+    "work items",
+    "tasks",
+    "plan",
+}
+
+DECOMPOSITION_EXCLUDED_HEADINGS = {
+    "acceptance criteria",
+    "success criteria",
+    "validation",
+    "done when",
+    "non-goals",
+    "out of scope",
+}
+
 
 def _issue_body_lines(issue: dict) -> list[str]:
     body = str(issue.get("body") or "")
     return [line.strip() for line in body.splitlines() if line.strip()]
 
 
-def _issue_scope_bullets(issue: dict) -> list[str]:
-    bullets: list[str] = []
+def _normalize_heading(line: str) -> str | None:
+    match = re.match(r"^#{1,6}\s+(.+)$", line.strip())
+    if not match:
+        return None
+    heading = re.sub(r"[^a-z0-9]+", " ", match.group(1).strip().lower()).strip()
+    return heading or None
+
+
+def _issue_sectioned_bullets(issue: dict) -> list[tuple[str | None, str]]:
+    bullets: list[tuple[str | None, str]] = []
+    current_heading: str | None = None
     for line in _issue_body_lines(issue):
+        heading = _normalize_heading(line)
+        if heading is not None:
+            current_heading = heading
+            continue
         normalized = line.strip()
-        if normalized.startswith(('-', '*')):
+        if normalized.startswith(("-", "*")):
             item = normalized[1:].strip()
             if item:
-                bullets.append(item)
+                bullets.append((current_heading, item))
     return bullets
+
+
+def _issue_scope_bullets(issue: dict) -> list[str]:
+    return [item for _, item in _issue_sectioned_bullets(issue)]
+
+
+def _issue_decomposition_source_bullets(issue: dict) -> list[str]:
+    sectioned_bullets = _issue_sectioned_bullets(issue)
+    preferred = [
+        item
+        for heading, item in sectioned_bullets
+        if heading in DECOMPOSITION_SOURCE_HEADINGS
+    ]
+    if preferred:
+        return preferred
+    return [
+        item
+        for heading, item in sectioned_bullets
+        if heading not in DECOMPOSITION_EXCLUDED_HEADINGS
+    ]
+
+
+def _child_acceptance_criteria(title: str) -> list[str]:
+    return [
+        f"Required changes for '{title}' are implemented.",
+        f"Relevant validation or follow-up checks for '{title}' are recorded.",
+    ]
 
 
 def assess_issue_decomposition_need(issue: dict) -> dict:
@@ -1966,23 +2024,26 @@ def assess_issue_decomposition_need(issue: dict) -> dict:
     body = str(issue.get("body") or "")
     combined = f"{title}\n{body}".lower()
     bullets = _issue_scope_bullets(issue)
+    decomposition_source_bullets = _issue_decomposition_source_bullets(issue)
     reasons: list[str] = []
+    explicit_epic_title = title.strip().lower().startswith("epic:")
+
+    if explicit_epic_title:
+        reasons.append("explicit_epic_title")
 
     if len(body) >= 1200:
         reasons.append("long_body")
-    if len(bullets) >= 6:
-        reasons.append("many_bullets")
+    if len(decomposition_source_bullets) >= 5:
+        reasons.append("many_implementation_areas")
 
     matched_keywords = sorted(keyword for keyword in DECOMPOSITION_KEYWORDS if keyword in combined)
-    if matched_keywords:
-        reasons.append("large_scope_keywords")
 
     acceptance_like = sum(
         1
         for line in _issue_body_lines(issue)
         if any(token in line.lower() for token in ["acceptance", "success criteria", "scope", "goal"])
     )
-    if acceptance_like >= 3:
+    if acceptance_like >= 3 and (explicit_epic_title or len(body) >= 900 or len(decomposition_source_bullets) >= 4):
         reasons.append("multiple_planning_sections")
 
     return {
@@ -1991,11 +2052,12 @@ def assess_issue_decomposition_need(issue: dict) -> dict:
         "matched_keywords": matched_keywords,
         "body_length": len(body),
         "bullet_count": len(bullets),
+        "implementation_area_count": len(decomposition_source_bullets),
     }
 
 
 def build_decomposition_plan_payload(issue: dict, assessment: dict) -> dict:
-    bullets = _issue_scope_bullets(issue)
+    bullets = _issue_decomposition_source_bullets(issue)
     proposed_children: list[dict] = []
     source_items = bullets[:5]
     if not source_items:
@@ -2012,7 +2074,7 @@ def build_decomposition_plan_payload(issue: dict, assessment: dict) -> dict:
                 "title": title[:120],
                 "order": index,
                 "depends_on": [] if index == 1 else [index - 1],
-                "acceptance": [f"{title} is completed and validated."],
+                "acceptance": _child_acceptance_criteria(title),
             }
         )
 

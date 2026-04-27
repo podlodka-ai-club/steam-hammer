@@ -49,7 +49,54 @@ class DecompositionPlanningTests(unittest.TestCase):
         assessment = assess_issue_decomposition_need(issue)
 
         self.assertTrue(assessment["needs_decomposition"])
-        self.assertIn("large_scope_keywords", assessment["reasons"])
+        self.assertIn("explicit_epic_title", assessment["reasons"])
+        self.assertIn("many_implementation_areas", assessment["reasons"])
+
+    def test_child_issue_keywords_do_not_trigger_decomposition_on_their_own(self) -> None:
+        issue = {
+            "number": 103,
+            "title": "Refine decomposition auto-gate",
+            "body": "\n".join(
+                [
+                    "Parent epic: #99",
+                    "## Goal",
+                    "Avoid triggering decomposition for child implementation tasks.",
+                    "## Scope",
+                    "- Tighten the auto gate for child tasks.",
+                    "- Keep --decompose always working.",
+                    "## Success criteria",
+                    "- Child tasks under the decomposition epic proceed normally.",
+                    "- Manual decomposition still works.",
+                ]
+            ),
+        }
+
+        assessment = assess_issue_decomposition_need(issue)
+
+        self.assertFalse(assessment["needs_decomposition"])
+        self.assertEqual(assessment["reasons"], [])
+        self.assertIn("decomposition", assessment["matched_keywords"])
+
+    def test_many_implementation_areas_trigger_decomposition_without_epic_title(self) -> None:
+        issue = {
+            "number": 120,
+            "title": "Roll out orchestration recovery improvements",
+            "body": "\n".join(
+                [
+                    "## Scope",
+                    "- Harden state recovery across reruns.",
+                    "- Add guardrails for malformed state markers.",
+                    "- Improve status reporting in CLI output.",
+                    "- Capture recovery warnings in tracker comments.",
+                    "- Expand regression coverage for resumed runs.",
+                ]
+            ),
+        }
+
+        assessment = assess_issue_decomposition_need(issue)
+
+        self.assertTrue(assessment["needs_decomposition"])
+        self.assertIn("many_implementation_areas", assessment["reasons"])
 
     def test_plan_comment_round_trips_machine_payload(self) -> None:
         issue = {
@@ -71,6 +118,48 @@ class DecompositionPlanningTests(unittest.TestCase):
         self.assertEqual(parsed["status"], "proposed")
         self.assertEqual(parsed["parent_issue"], 99)
         self.assertIn(DECOMPOSITION_PLAN_MARKER, body)
+
+    def test_plan_payload_uses_scope_bullets_and_skips_success_criteria(self) -> None:
+        issue = {
+            "number": 106,
+            "title": "Epic: Improve decomposition plan quality",
+            "body": "\n".join(
+                [
+                    "## Scope",
+                    "- Tighten the auto gate for child issues.",
+                    "- Generate child tasks from implementation scope only.",
+                    "## Success criteria",
+                    "- Decomposition is validated on a real large task.",
+                    "- Child tasks are completed and validated.",
+                ]
+            ),
+        }
+        assessment = {
+            "reasons": ["explicit_epic_title"],
+            "matched_keywords": ["epic", "decomposition"],
+        }
+
+        payload = build_decomposition_plan_payload(issue=issue, assessment=assessment)
+
+        child_titles = [child["title"] for child in payload["proposed_children"]]
+        self.assertEqual(
+            child_titles,
+            [
+                "Tighten the auto gate for child issues",
+                "Generate child tasks from implementation scope only",
+            ],
+        )
+        self.assertNotIn(
+            "Decomposition is validated on a real large task",
+            child_titles,
+        )
+        self.assertEqual(
+            payload["proposed_children"][0]["acceptance"],
+            [
+                "Required changes for 'Tighten the auto gate for child issues' are implemented.",
+                "Relevant validation or follow-up checks for 'Tighten the auto gate for child issues' are recorded.",
+            ],
+        )
 
     def test_latest_decomposition_plan_is_selected(self) -> None:
         first = {

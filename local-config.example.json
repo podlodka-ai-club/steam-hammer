@@ -4,6 +4,7 @@
   "model": "openai/gpt-4o",
   "agent_timeout_seconds": 1200,
   "agent_idle_timeout_seconds": 180,
+  "token_budget": 20000,
   "opencode_auto_approve": true,
   "fail_on_existing": false,
   "force_issue_flow": false,

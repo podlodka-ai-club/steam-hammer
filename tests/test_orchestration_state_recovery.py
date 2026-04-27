@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from scripts.run_github_issues_to_opencode import (
     ORCHESTRATION_STATE_MARKER,
+    TokenBudgetExceededError,
     build_decomposition_rollup_from_plan_payload,
     build_decomposition_rollup_from_recovered_state,
     build_orchestration_state,
@@ -707,6 +708,76 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertEqual(posted_state["status"], "waiting-for-ci")
         self.assertEqual(posted_state["stage"], "ci_checks")
         self.assertIn("CI checks are still pending", stdout_mock.getvalue())
+
+    def test_main_issue_flow_posts_blocked_state_when_token_budget_exceeded(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=91,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            token_budget=20000,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=True,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            decompose="never",
+            create_child_issues=False,
+            track_tokens=False,
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            isolate_worktree=True,
+        )
+        issue = {
+            "number": 91,
+            "title": "Add token budget limit",
+            "body": "Stop runaway runs",
+            "url": "https://example/issues/91",
+        }
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="created"),
+            patch(
+                "scripts.run_github_issues_to_opencode.run_agent",
+                side_effect=TokenBudgetExceededError(budget=20000, reached=21400, item_label="issue #91"),
+            ),
+            patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment") as state_post_mock,
+            patch("scripts.run_github_issues_to_opencode.safe_report_issue_automation_failure") as failure_report_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertGreaterEqual(state_post_mock.call_count, 2)
+        posted_state = state_post_mock.call_args.kwargs["state"]
+        self.assertEqual(posted_state["status"], "blocked")
+        self.assertEqual(posted_state["stage"], "token_budget")
+        self.assertEqual(posted_state["next_action"], "raise_token_budget_or_split_issue")
+        self.assertIn("reached ~21 400", posted_state["error"])
+        failure_report_mock.assert_called_once()
+        self.assertEqual(failure_report_mock.call_args.kwargs["stage"], "token_budget")
 
 
 if __name__ == "__main__":

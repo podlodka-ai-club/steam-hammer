@@ -29,6 +29,7 @@ BUILTIN_DEFAULTS = {
     "model": None,
     "agent_timeout_seconds": 900,
     "agent_idle_timeout_seconds": None,
+    "token_budget": None,
     "opencode_auto_approve": False,
     "track_tokens": False,
     "branch_prefix": "issue-fix",
@@ -288,7 +289,7 @@ CI_FAILURE_COMMIT_STATES = {"error", "failure"}
 
 
 def failure_state_for_stage(failure_stage: str) -> str:
-    return "blocked" if failure_stage in {"workflow_checks", "residual_untracked_validation"} else "failed"
+    return "blocked" if failure_stage in {"workflow_checks", "residual_untracked_validation", "token_budget"} else "failed"
 
 
 def failure_next_action_for_stage(failure_stage: str) -> str:
@@ -296,6 +297,8 @@ def failure_next_action_for_stage(failure_stage: str) -> str:
         return "fix_workflow_checks_and_retry"
     if failure_stage == "residual_untracked_validation":
         return "stage_or-remove-residual-untracked-files"
+    if failure_stage == "token_budget":
+        return "raise_token_budget_or_split_issue"
     return "inspect_error_and_retry"
 
 
@@ -328,6 +331,17 @@ class ResidualUntrackedFilesError(RuntimeError):
         super().__init__(
             "Residual untracked files detected during"
             f" {stage}: {', '.join(sorted(files))}"
+        )
+
+
+class TokenBudgetExceededError(RuntimeError):
+    def __init__(self, budget: int, reached: int, item_label: str):
+        self.budget = budget
+        self.reached = reached
+        self.item_label = item_label
+        super().__init__(
+            f"Agent stopped: token budget of {_format_budget_message_count(budget) or budget} exceeded "
+            f"(reached ~{_format_budget_message_count(reached) or reached}). Use --token-budget to raise the limit or split the issue."
         )
 
 
@@ -3231,6 +3245,12 @@ def _update_agent_run_stats(
     return tokens_in, tokens_out, cost_usd
 
 
+def _total_tracked_tokens(tokens_in: int | None, tokens_out: int | None) -> int | None:
+    if tokens_in is None and tokens_out is None:
+        return None
+    return (tokens_in or 0) + (tokens_out or 0)
+
+
 def _build_agent_run_stats(
     elapsed_seconds: float,
     tokens_in: int | None,
@@ -3246,6 +3266,9 @@ def _build_agent_run_stats(
         stats["tokens_in"] = tokens_in
     if tokens_out is not None:
         stats["tokens_out"] = tokens_out
+    total_tokens = _total_tracked_tokens(tokens_in=tokens_in, tokens_out=tokens_out)
+    if total_tokens is not None:
+        stats["tokens_total"] = total_tokens
     if cost_usd is not None:
         stats["cost_usd"] = cost_usd
     return stats
@@ -3257,6 +3280,13 @@ def _format_token_count(value: int | str | None) -> str | None:
     if value < 0:
         return None
     return f"{value:,}"
+
+
+def _format_budget_message_count(value: int | str | None) -> str | None:
+    formatted = _format_token_count(value)
+    if formatted is None:
+        return None
+    return formatted.replace(",", " ")
 
 
 def format_elapsed_duration(seconds: float) -> str:
@@ -3321,6 +3351,7 @@ def run_agent(
     image_paths: list[str] | None = None,
     prompt_override: str | None = None,
     track_tokens: bool = False,
+    token_budget: int | None = None,
     run_stats: dict[str, object] | None = None,
 ) -> int:
     prompt = prompt_override if prompt_override is not None else build_prompt(
@@ -3339,6 +3370,7 @@ def run_agent(
         idle_timeout_seconds=idle_timeout_seconds,
         opencode_auto_approve=opencode_auto_approve,
         track_tokens=track_tokens,
+        token_budget=token_budget,
         run_stats=run_stats,
     )
 
@@ -3397,6 +3429,7 @@ def run_agent_with_prompt(
     opencode_auto_approve: bool,
     image_paths: list[str] | None = None,
     track_tokens: bool = False,
+    token_budget: int | None = None,
     run_stats: dict[str, object] | None = None,
 ) -> int:
     command = build_agent_command(
@@ -3422,6 +3455,7 @@ def run_agent_with_prompt(
     start = time.monotonic()
     print(f"Running agent for {item_label}")
     last_output = start
+    track_tokens = bool(track_tokens or token_budget is not None)
     tokens_in: int | None = None
     tokens_out: int | None = None
     cost_usd: float | None = None
@@ -3435,6 +3469,26 @@ def run_agent_with_prompt(
     )
 
     line_queue: _queue.Queue[tuple[str, str]] = _queue.Queue()
+
+    def _raise_if_token_budget_exceeded() -> None:
+        total_tokens = _total_tracked_tokens(tokens_in=tokens_in, tokens_out=tokens_out)
+        if token_budget is None or total_tokens is None or total_tokens <= token_budget:
+            return
+
+        _record_agent_run_stats(
+            run_stats=run_stats,
+            start=start,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+        )
+        budget_error = TokenBudgetExceededError(
+            budget=token_budget,
+            reached=total_tokens,
+            item_label=item_label,
+        )
+        print(str(budget_error))
+        raise budget_error
 
     def _pipe_reader(stream, tag: str) -> None:
         try:
@@ -3504,6 +3558,11 @@ def run_agent_with_prompt(
                         tokens_out=tokens_out,
                         cost_usd=cost_usd,
                     )
+                    total_tokens = _total_tracked_tokens(tokens_in=tokens_in, tokens_out=tokens_out)
+                    if token_budget is not None and total_tokens is not None and total_tokens > token_budget:
+                        process.kill()
+                        process.wait(timeout=10)
+                        _raise_if_token_budget_exceeded()
                 if tag == "stderr":
                     print(line, end="", file=sys.stderr)
                 else:
@@ -3525,6 +3584,9 @@ def run_agent_with_prompt(
                             tokens_out=tokens_out,
                             cost_usd=cost_usd,
                         )
+                        total_tokens = _total_tracked_tokens(tokens_in=tokens_in, tokens_out=tokens_out)
+                        if token_budget is not None and total_tokens is not None and total_tokens > token_budget:
+                            _raise_if_token_budget_exceeded()
                     if tag == "stderr":
                         print(line, end="", file=sys.stderr)
                     else:
@@ -4038,7 +4100,7 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
 
 
 def _validate_project_defaults(config: dict, config_path: str) -> None:
-    supported_defaults_keys = {"runner", "agent", "model", "track_tokens"}
+    supported_defaults_keys = {"runner", "agent", "model", "track_tokens", "token_budget"}
     unsupported_defaults = sorted(set(config) - supported_defaults_keys)
     if unsupported_defaults:
         raise RuntimeError(
@@ -4059,6 +4121,13 @@ def _validate_project_defaults(config: dict, config_path: str) -> None:
 
     if "track_tokens" in config and not isinstance(config["track_tokens"], bool):
         raise RuntimeError("Project config key 'defaults.track_tokens' must be a boolean")
+
+    if "token_budget" in config:
+        value = config["token_budget"]
+        if value is not None and (type(value) is not int or value <= 0):
+            raise RuntimeError(
+                "Project config key 'defaults.token_budget' must be a positive integer or null"
+            )
 
 
 def _validate_project_scope(config: dict, config_path: str) -> None:
@@ -4215,7 +4284,7 @@ def project_cli_defaults(project_config: dict) -> dict:
         return {}
 
     cli_defaults: dict = {}
-    for key in ["runner", "agent", "model", "track_tokens"]:
+    for key in ["runner", "agent", "model", "track_tokens", "token_budget"]:
         if key in defaults:
             cli_defaults[key] = defaults[key]
     return cli_defaults
@@ -4230,6 +4299,7 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "model",
         "agent_timeout_seconds",
         "agent_idle_timeout_seconds",
+        "token_budget",
         "opencode_auto_approve",
         "branch_prefix",
         "include_empty",
@@ -4298,6 +4368,14 @@ def validate_local_config(config: dict, config_path: str) -> dict:
                 "Local config key 'agent_idle_timeout_seconds' must be a positive integer or null"
             )
         validated["agent_idle_timeout_seconds"] = value
+
+    if "token_budget" in config:
+        value = config["token_budget"]
+        if value is not None and (type(value) is not int or value <= 0):
+            raise RuntimeError(
+                "Local config key 'token_budget' must be a positive integer or null"
+            )
+        validated["token_budget"] = value
 
     for key in [
         "opencode_auto_approve",
@@ -4707,6 +4785,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Abort if agent produces no output for this many seconds.",
     )
     parser.add_argument(
+        "--token-budget",
+        "--max-tokens",
+        dest="token_budget",
+        type=int,
+        default=BUILTIN_DEFAULTS["token_budget"],
+        help="Abort when cumulative tracked token usage exceeds this limit.",
+    )
+    parser.add_argument(
         "--opencode-auto-approve",
         action="store_true",
         help=(
@@ -4952,6 +5038,10 @@ def main() -> int:
     isolate_worktree = bool(getattr(args, "isolate_worktree", False))
     post_pr_summary = bool(getattr(args, "post_pr_summary", False))
     track_tokens = bool(getattr(args, "track_tokens", False))
+    token_budget = getattr(args, "token_budget", BUILTIN_DEFAULTS["token_budget"])
+    if token_budget is not None and (type(token_budget) is not int or token_budget <= 0):
+        print("Error: --token-budget must be a positive integer", file=sys.stderr)
+        return 1
     base_branch_mode = str(getattr(args, "base_branch", BUILTIN_DEFAULTS["base_branch"]))
     decompose_mode = str(getattr(args, "decompose", BUILTIN_DEFAULTS["decompose"]))
     create_child_issues = bool(getattr(args, "create_child_issues", BUILTIN_DEFAULTS["create_child_issues"]))
@@ -5368,6 +5458,7 @@ def main() -> int:
                 idle_timeout_seconds=args.agent_idle_timeout_seconds,
                 opencode_auto_approve=args.opencode_auto_approve,
                 track_tokens=track_tokens,
+                token_budget=token_budget,
                 run_stats=pr_agent_run_stats,
             )
             if exit_code != 0:
@@ -5479,6 +5570,8 @@ def main() -> int:
                 if type(failed_pr_number) is int:
                     if isinstance(exc, ResidualUntrackedFilesError):
                         failure_stage = "residual_untracked_validation"
+                    elif isinstance(exc, TokenBudgetExceededError):
+                        failure_stage = "token_budget"
 
                     failure_status = failure_state_for_stage(failure_stage)
                     next_action = failure_next_action_for_stage(failure_stage)
@@ -6337,6 +6430,7 @@ def main() -> int:
                         image_paths=issue_image_paths,
                         prompt_override=prompt_override,
                         track_tokens=track_tokens,
+                        token_budget=token_budget,
                         run_stats=issue_agent_run_stats,
                     )
                     if exit_code != 0:
@@ -6575,6 +6669,8 @@ def main() -> int:
             failures += 1
             if isinstance(exc, ResidualUntrackedFilesError):
                 failure_stage = "residual_untracked_validation"
+            elif isinstance(exc, TokenBudgetExceededError):
+                failure_stage = "token_budget"
 
             failure_status = failure_state_for_stage(failure_stage)
             next_action = failure_next_action_for_stage(failure_stage)

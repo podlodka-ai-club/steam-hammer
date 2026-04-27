@@ -131,8 +131,6 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 	addCommonFlags(fs, &opts)
 	id := fs.Int("id", 0, "GitHub issue number")
 	issue := fs.Int("issue", 0, "compatibility alias for --id")
-	state := fs.String("state", "", "issue state for batch runs: open, closed, or all")
-	limit := fs.Int("limit", 0, "maximum number of issues to process for batch runs")
 	base := ""
 	fs.StringVar(&base, "base", "", "base branch mode: default or current")
 	fs.StringVar(&base, "base-branch", "", "base branch mode: default or current")
@@ -163,22 +161,13 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 	if *id == 0 {
 		*id = *issue
 	}
-	if *id <= 0 && *state == "" && *limit <= 0 {
-		_, _ = fmt.Fprintln(a.err, "run issue requires --id N, --issue N, --state, or --limit")
+	if *id <= 0 {
+		_, _ = fmt.Fprintln(a.err, "run issue requires --id N")
 		return 2
 	}
 
-	pythonArgs := []string{runnerScript}
-	if *id > 0 {
-		pythonArgs = append(pythonArgs, "--issue", strconv.Itoa(*id))
-	}
+	pythonArgs := []string{runnerScript, "--issue", strconv.Itoa(*id)}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
-	if *state != "" {
-		pythonArgs = append(pythonArgs, "--state", *state)
-	}
-	if *limit > 0 {
-		pythonArgs = append(pythonArgs, "--limit", strconv.Itoa(*limit))
-	}
 	if base != "" {
 		pythonArgs = append(pythonArgs, "--base", base)
 	}
@@ -409,6 +398,8 @@ var unsupportedRunIssueFlags = map[string]string{
 	"from-review-comments": "use `orchestrator run pr --id N` instead",
 	"doctor":               "use `orchestrator doctor` instead",
 	"doctor-smoke-check":   "use `orchestrator doctor --doctor-smoke-check` instead",
+	"limit":                "batch issue selection is not exposed by `orchestrator run issue`; use `--id N`",
+	"state":                "batch issue selection is not exposed by `orchestrator run issue`; use `--id N`",
 }
 
 var unsupportedRunPRFlags = map[string]string{

@@ -61,6 +61,34 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertEqual(payload["issue"], 74)
         self.assertEqual(payload["branch"], "issue-fix/74-state-v1")
 
+    def test_formatted_state_comment_keeps_stats_payload(self) -> None:
+        state = build_orchestration_state(
+            status="ready-for-review",
+            task_type="pr",
+            issue_number=None,
+            pr_number=102,
+            branch="pr-review/102",
+            base_branch="main",
+            runner="opencode",
+            agent="build",
+            model=None,
+            attempt=1,
+            stage="agent_run",
+            next_action="wait_for_agent_result",
+            error=None,
+            stats={"elapsed_seconds": 125, "elapsed": "2m 5s", "tokens_in": 1000},
+        )
+
+        body = format_orchestration_state_comment(state)
+        payload, error = parse_orchestration_state_comment_body(body)
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertIn("stats", payload)
+        self.assertEqual(payload["stats"].get("elapsed_seconds"), 125)
+        self.assertEqual(payload["stats"].get("tokens_in"), 1000)
+
     def test_formatted_state_with_decomposition_round_trips(self) -> None:
         decomposition = build_decomposition_rollup_from_plan_payload(
             {

@@ -262,15 +262,16 @@ Workflow per issue:
 2. Out-of-scope issues are blocked (`status=blocked`, stage=`scope_check`) and get a dedicated scope comment; agent run is skipped unless `--force-reprocess` is set
 3. Pre-checks whether issue should be skipped (linked open PR and/or existing deterministic remote branch)
 4. Chooses a base branch (`default`: repository default branch from GitHub; `current`: currently checked-out branch)
-5. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
-6. For reused branches, syncs with the latest selected base branch before agent run (default: `rebase`)
-7. Extracts image attachment references from issue content (or attachment metadata), downloads available images, and runs the AI agent with title/body context plus image files when present.
-8. On changes, creates commit
-9. Pushes issue branch to `origin`
-10. Reuses an existing open PR for the issue branch when present; otherwise creates one to the selected base branch
-11. Posts append-only orchestration state comments to GitHub issue/PR on key transitions
-12. On per-issue failure (agent, commit/push, PR create, etc.), posts a structured failure report comment to the issue and adds label `auto:agent-failed`
-13. On successful issue completion (or no-op completion), removes label `auto:agent-failed` from that issue if present
+5. Runs planning-only decomposition preflight (`--decompose auto` by default); large tasks get a proposed plan comment and stop before branch/agent execution
+6. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
+7. For reused branches, syncs with the latest selected base branch before agent run (default: `rebase`)
+8. Extracts image attachment references from issue content (or attachment metadata), downloads available images, and runs the AI agent with title/body context plus image files when present.
+9. On changes, creates commit
+10. Pushes issue branch to `origin`
+11. Reuses an existing open PR for the issue branch when present; otherwise creates one to the selected base branch
+12. Posts append-only orchestration state comments to GitHub issue/PR on key transitions
+13. On per-issue failure (agent, commit/push, PR create, etc.), posts a structured failure report comment to the issue and adds label `auto:agent-failed`
+14. On successful issue completion (or no-op completion), removes label `auto:agent-failed` from that issue if present
 
 Workflow in PR review mode:
 
@@ -307,6 +308,14 @@ Scope decision comments:
 - Out-of-scope comment includes decision, reason, forced flag, and timestamp in machine-readable JSON
 - Dry-run prints where scope decision comment would be posted
 
+Planning-only decomposition comments:
+
+- Marker: `<!-- orchestration-decomposition:v1 -->`
+- `--decompose auto` proposes a decomposition plan for large/epic/multi-step issues before starting the agent
+- `--decompose always` forces plan-only behavior for an issue, useful for manual planning
+- `--decompose never` bypasses decomposition preflight and keeps the legacy issue-flow path
+- Existing parseable decomposition comments are treated idempotently and are not duplicated on rerun
+
 Useful options:
 
 - `--runner claude|opencode` to select the AI agent runner (default: `claude`)
@@ -338,6 +347,7 @@ Useful options:
 - `--sync-reused-branch` / `--no-sync-reused-branch` enable or disable reused-branch sync before agent run (default: enabled)
 - `--sync-strategy rebase|merge` choose how to sync a reused branch with selected base (default: `rebase`)
 - `--base default|current` (`--base-branch` alias) choose issue-flow base mode; `current` enables stacked execution from your current branch (opt-in)
+- `--decompose auto|never|always` control planning-only decomposition preflight before issue-flow agent execution (default: `auto`)
 - `--doctor` run preflight diagnostics only (no agent run)
 - `--doctor-smoke-check` in doctor mode, run a lightweight runner CLI smoke check
 

@@ -2398,6 +2398,32 @@ def normalize_review_items(
     return normalized, stats
 
 
+def fetch_actionable_pr_review_feedback(
+    repo: str,
+    pr_number: int,
+    pull_request: dict | None = None,
+) -> tuple[dict, list[dict], dict[str, int]]:
+    current_pull_request = pull_request or fetch_pull_request(repo=repo, number=pr_number)
+    threads = fetch_pr_review_threads(repo=repo, number=pr_number)
+    conversation_comments = fetch_pr_conversation_comments(repo=repo, pr_number=pr_number)
+    reviews = current_pull_request.get("reviews")
+    if not isinstance(reviews, list):
+        reviews = []
+
+    pr_author_payload = current_pull_request.get("author")
+    pr_author_login = ""
+    if isinstance(pr_author_payload, dict):
+        pr_author_login = str(pr_author_payload.get("login") or "")
+
+    review_items, review_stats = normalize_review_items(
+        threads=threads,
+        reviews=reviews,
+        conversation_comments=conversation_comments,
+        pr_author_login=pr_author_login,
+    )
+    return current_pull_request, review_items, review_stats
+
+
 def format_review_filtering_stats(stats: dict[str, int]) -> str:
     inline_summary = (
         "inline="
@@ -6180,25 +6206,10 @@ def main() -> int:
                 )
 
             failure_stage = "fetch_review_feedback"
-            threads = fetch_pr_review_threads(repo=repo, number=pr_number_arg)
-            conversation_comments = fetch_pr_conversation_comments(
+            pull_request, review_items, review_stats = fetch_actionable_pr_review_feedback(
                 repo=repo,
                 pr_number=pr_number_arg,
-            )
-            reviews = pull_request.get("reviews")
-            if not isinstance(reviews, list):
-                reviews = []
-
-            pr_author_payload = pull_request.get("author")
-            pr_author_login = ""
-            if isinstance(pr_author_payload, dict):
-                pr_author_login = str(pr_author_payload.get("login") or "")
-
-            review_items, review_stats = normalize_review_items(
-                threads=threads,
-                reviews=reviews,
-                conversation_comments=conversation_comments,
-                pr_author_login=pr_author_login,
+                pull_request=pull_request,
             )
             print(
                 "Review prompt sources: "
@@ -6426,127 +6437,177 @@ def main() -> int:
                 )
                 return _finish_main(0, original_process_cwd)
 
-            linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
-            prompt = build_pr_review_prompt(
-                pull_request=pull_request,
-                review_items=review_items,
-                linked_issues=linked_issues,
-            )
-            if (
-                recovered_pr_state is not None
-                and str(recovered_pr_state.get("status") or "") == "failed"
-            ):
-                prompt = append_recovered_context_to_prompt(
-                    prompt,
-                    build_recovered_failure_context_note(recovered_pr_state),
+            attempt = 1
+            while True:
+                linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                prompt = build_pr_review_prompt(
+                    pull_request=pull_request,
+                    review_items=review_items,
+                    linked_issues=linked_issues,
                 )
+                if (
+                    recovered_pr_state is not None
+                    and str(recovered_pr_state.get("status") or "") == "failed"
+                    and attempt == 1
+                ):
+                    prompt = append_recovered_context_to_prompt(
+                        prompt,
+                        build_recovered_failure_context_note(recovered_pr_state),
+                    )
 
-            failure_stage = "agent_run"
-            pre_run_untracked_files: set[str] | None = None
-            if not args.dry_run:
-                pre_run_untracked_files = list_untracked_files()
-            pr_agent_run_stats: dict[str, object] = {}
-            exit_code = run_agent_with_prompt(
-                prompt=prompt,
-                item_label=f"PR #{pr_number_arg}",
-                runner=args.runner,
-                agent=args.agent,
-                model=args.model,
-                dry_run=args.dry_run,
-                timeout_seconds=args.agent_timeout_seconds,
-                idle_timeout_seconds=args.agent_idle_timeout_seconds,
-                opencode_auto_approve=args.opencode_auto_approve,
-                track_tokens=track_tokens,
-                token_budget=token_budget,
-                run_stats=pr_agent_run_stats,
-            )
-            if exit_code != 0:
-                exit_summary = describe_exit_code(exit_code)
-                diagnosis = (
-                    classify_opencode_failure(return_code=exit_code, model=args.model)
-                    if args.runner == "opencode"
-                    else None
-                )
-                message = (
-                    f"Agent failed for PR #{pr_number_arg} with {exit_summary}"
-                    + (f" ({diagnosis})" if diagnosis else "")
-                )
-                raise RuntimeError(message)
-
-            if not args.dry_run and not has_changes():
-                safe_post_orchestration_state_comment(
-                    repo=repo,
-                    target_type="pr",
-                    target_number=pr_number_arg,
-                    dry_run=False,
-                    state=build_orchestration_state(
-                        status="waiting-for-author",
-                        task_type="pr",
-                        issue_number=None,
-                        pr_number=pr_number_arg,
-                        branch=active_branch,
-                        base_branch=str(pr_state_context["base_branch"] or "") or None,
-                        runner=args.runner,
-                        agent=args.agent,
-                        model=args.model,
-                        attempt=1,
-                        stage="post_agent_check",
-                        next_action="await_more_feedback_or_manual_changes",
-                        error="Agent produced no repository changes",
-                        stats=pr_agent_run_stats,
-                        decomposition=pr_recovered_decomposition_rollup,
-                    ),
-                )
-                print(f"No changes detected for PR #{pr_number_arg}; skipping commit and push")
-                if pr_followup_branch_prefix:
-                    run_command(["git", "checkout", base_branch_for_run])
-                return _finish_main(0, original_process_cwd)
-
-            failure_stage = "commit_push"
-            commit_pr_review_changes(
-                pull_request=pull_request,
-                dry_run=args.dry_run,
-                pre_run_untracked_files=pre_run_untracked_files,
-            )
-
-            failure_stage = "workflow_checks"
-            workflow_check_results = run_configured_workflow_checks(
-                checks=workflow_checks,
-                dry_run=args.dry_run,
-                cwd=os.getcwd(),
-            )
-
-            failure_stage = "commit_push"
-            if pr_followup_branch_prefix:
-                push_branch(branch_name=active_branch, dry_run=args.dry_run)
-                print(f"Pushed follow-up branch for PR #{pr_number_arg}: {active_branch}")
-            else:
-                push_branch(branch_name=active_branch, dry_run=args.dry_run)
-
-                safe_post_orchestration_state_comment(
-                    repo=repo,
-                    target_type="pr",
-                    target_number=pr_number_arg,
+                failure_stage = "agent_run"
+                pre_run_untracked_files: set[str] | None = None
+                if not args.dry_run:
+                    pre_run_untracked_files = list_untracked_files()
+                pr_agent_run_stats = {}
+                exit_code = run_agent_with_prompt(
+                    prompt=prompt,
+                    item_label=f"PR #{pr_number_arg}",
+                    runner=args.runner,
+                    agent=args.agent,
+                    model=args.model,
                     dry_run=args.dry_run,
-                    state=build_orchestration_state(
-                        status="waiting-for-ci",
-                        task_type="pr",
-                        issue_number=None,
-                        pr_number=pr_number_arg,
-                        branch=active_branch,
-                        base_branch=str(pr_state_context["base_branch"] or "") or None,
-                        runner=args.runner,
-                        agent=args.agent,
-                        model=args.model,
-                        attempt=1,
-                        stage="changes_pushed",
-                        next_action="wait_for_ci",
-                        error=None,
-                        workflow_checks=workflow_check_results,
-                        stats=pr_agent_run_stats,
-                        decomposition=pr_recovered_decomposition_rollup,
-                    ),
+                    timeout_seconds=args.agent_timeout_seconds,
+                    idle_timeout_seconds=args.agent_idle_timeout_seconds,
+                    opencode_auto_approve=args.opencode_auto_approve,
+                    track_tokens=track_tokens,
+                    token_budget=token_budget,
+                    run_stats=pr_agent_run_stats,
                 )
+                if exit_code != 0:
+                    exit_summary = describe_exit_code(exit_code)
+                    diagnosis = (
+                        classify_opencode_failure(return_code=exit_code, model=args.model)
+                        if args.runner == "opencode"
+                        else None
+                    )
+                    message = (
+                        f"Agent failed for PR #{pr_number_arg} with {exit_summary}"
+                        + (f" ({diagnosis})" if diagnosis else "")
+                    )
+                    raise RuntimeError(message)
+
+                if not args.dry_run and not has_changes():
+                    safe_post_orchestration_state_comment(
+                        repo=repo,
+                        target_type="pr",
+                        target_number=pr_number_arg,
+                        dry_run=False,
+                        state=build_orchestration_state(
+                            status="waiting-for-author",
+                            task_type="pr",
+                            issue_number=None,
+                            pr_number=pr_number_arg,
+                            branch=active_branch,
+                            base_branch=str(pr_state_context["base_branch"] or "") or None,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            attempt=attempt,
+                            stage="post_agent_check",
+                            next_action="await_more_feedback_or_manual_changes",
+                            error="Agent produced no repository changes",
+                            stats=pr_agent_run_stats,
+                            decomposition=pr_recovered_decomposition_rollup,
+                        ),
+                    )
+                    print(f"No changes detected for PR #{pr_number_arg}; skipping commit and push")
+                    if pr_followup_branch_prefix:
+                        run_command(["git", "checkout", base_branch_for_run])
+                    return _finish_main(0, original_process_cwd)
+
+                failure_stage = "commit_push"
+                commit_pr_review_changes(
+                    pull_request=pull_request,
+                    dry_run=args.dry_run,
+                    pre_run_untracked_files=pre_run_untracked_files,
+                )
+
+                failure_stage = "workflow_checks"
+                workflow_check_results = run_configured_workflow_checks(
+                    checks=workflow_checks,
+                    dry_run=args.dry_run,
+                    cwd=os.getcwd(),
+                )
+
+                failure_stage = "commit_push"
+                if pr_followup_branch_prefix:
+                    push_branch(branch_name=active_branch, dry_run=args.dry_run)
+                    print(f"Pushed follow-up branch for PR #{pr_number_arg}: {active_branch}")
+                    break
+
+                push_branch(branch_name=active_branch, dry_run=args.dry_run)
+                pull_request, review_items, review_stats = fetch_actionable_pr_review_feedback(
+                    repo=repo,
+                    pr_number=pr_number_arg,
+                )
+                print(
+                    f"Review prompt sources after attempt {attempt}: "
+                    f"{format_review_filtering_stats(review_stats)}"
+                )
+                pr_state_context["base_branch"] = str(pull_request.get("baseRefName") or "").strip() or None
+
+                if not review_items:
+                    safe_post_orchestration_state_comment(
+                        repo=repo,
+                        target_type="pr",
+                        target_number=pr_number_arg,
+                        dry_run=args.dry_run,
+                        state=build_orchestration_state(
+                            status="waiting-for-ci",
+                            task_type="pr",
+                            issue_number=None,
+                            pr_number=pr_number_arg,
+                            branch=active_branch,
+                            base_branch=str(pr_state_context["base_branch"] or "") or None,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            attempt=attempt,
+                            stage="changes_pushed",
+                            next_action="wait_for_ci",
+                            error=None,
+                            workflow_checks=workflow_check_results,
+                            stats=pr_agent_run_stats,
+                            decomposition=pr_recovered_decomposition_rollup,
+                        ),
+                    )
+                    break
+
+                if attempt >= max_attempts:
+                    safe_post_orchestration_state_comment(
+                        repo=repo,
+                        target_type="pr",
+                        target_number=pr_number_arg,
+                        dry_run=args.dry_run,
+                        state=build_orchestration_state(
+                            status="blocked",
+                            task_type="pr",
+                            issue_number=None,
+                            pr_number=pr_number_arg,
+                            branch=active_branch,
+                            base_branch=str(pr_state_context["base_branch"] or "") or None,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            attempt=attempt,
+                            stage="review_feedback",
+                            next_action="manual_review_followup",
+                            error=(
+                                f"Actionable review feedback remains after {attempt} attempt(s)"
+                            ),
+                            workflow_checks=workflow_check_results,
+                            stats=pr_agent_run_stats,
+                            decomposition=pr_recovered_decomposition_rollup,
+                        ),
+                    )
+                    print(
+                        f"PR #{pr_number_arg} still has {len(review_items)} actionable review items "
+                        f"after {attempt} attempt(s); stopping review loop."
+                    )
+                    return _finish_main(0, original_process_cwd)
+
+                attempt += 1
 
             if post_pr_summary:
                 leave_pr_summary_comment(
@@ -7230,24 +7291,10 @@ def main() -> int:
                             f"Linked PR #{pr_number} is not mergeable with base yet "
                             f"(mergeStateStatus={merge_state}); rerun will auto-sync and resolve routine conflicts"
                         )
-                    thread_items = fetch_pr_review_threads(repo=repo, number=pr_number)
-                    conversation_comments = fetch_pr_conversation_comments(
+                    pull_request, review_items, _review_stats = fetch_actionable_pr_review_feedback(
                         repo=repo,
                         pr_number=pr_number,
-                    )
-                    pr_reviews = pull_request.get("reviews")
-                    if not isinstance(pr_reviews, list):
-                        pr_reviews = []
-                    pr_author_payload = pull_request.get("author")
-                    pr_author_login = ""
-                    if isinstance(pr_author_payload, dict):
-                        pr_author_login = str(pr_author_payload.get("login") or "")
-
-                    review_items, _review_stats = normalize_review_items(
-                        threads=thread_items,
-                        reviews=pr_reviews,
-                        conversation_comments=conversation_comments,
-                        pr_author_login=pr_author_login,
+                        pull_request=pull_request,
                     )
                     print(
                         "Review prompt sources: "
@@ -7608,89 +7655,206 @@ def main() -> int:
                         f"strategy: '{args.sync_strategy}')"
                     )
 
-                pre_run_untracked_files: set[str] | None = None
-                if not skip_agent_run and not args.dry_run:
-                    pre_run_untracked_files = list_untracked_files()
-
-                if skip_agent_run:
-                    print(
-                        f"Skipping agent run for {issue_label} in pr-review mode: "
-                        "no actionable review comments; running sync-only path"
-                    )
-                else:
-                    failure_stage = "agent_run"
-                    issue_agent_run_stats = {}
-                    exit_code = run_agent(
-                        issue=issue,
-                        runner=args.runner,
-                        agent=args.agent,
-                        model=args.model,
-                        dry_run=args.dry_run,
-                        timeout_seconds=args.agent_timeout_seconds,
-                        idle_timeout_seconds=args.agent_idle_timeout_seconds,
-                        opencode_auto_approve=args.opencode_auto_approve,
-                        image_paths=issue_image_paths,
-                        prompt_override=prompt_override,
-                        track_tokens=track_tokens,
-                        token_budget=token_budget,
-                        run_stats=issue_agent_run_stats,
-                    )
-                    if exit_code != 0:
-                        exit_summary = describe_exit_code(exit_code)
-                        diagnosis = classify_opencode_failure(
-                            return_code=exit_code,
-                            model=args.model,
-                        ) if args.runner == "opencode" else None
-                        message = (
-                            f"Agent failed for {issue_label} with {exit_summary}"
-                            + (f" ({diagnosis})" if diagnosis else "")
-                        )
-                        raise RuntimeError(message)
-                if not args.dry_run and not has_changes():
-                    if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:
-                        print(
-                            f"No file changes from agent for {issue_label}; "
-                            "pushing sync-only branch updates"
-                        )
-                        used_force_with_lease = args.sync_strategy == "rebase"
-                        push_branch(
-                            branch_name=issue_branch,
-                            dry_run=False,
-                            force_with_lease=used_force_with_lease,
-                        )
-                        print(
-                            f"Sync-only push result for {issue_label}: "
-                            f"branch '{issue_branch}' pushed "
-                            f"(force-with-lease: {'yes' if used_force_with_lease else 'no'})"
-                        )
-                        if mode == "pr-review" and linked_open_pr is not None:
-                            linked_pr_number = linked_open_pr.get("number")
-                            if type(linked_pr_number) is int:
-                                print(
-                                    f"PR #{linked_pr_number} rerun sync pushed; "
-                                    "GitHub mergeability should be recalculated without manual conflict steps"
-                                )
-                        pr_status, pr_url = ensure_pr(
+                review_attempt = 1
+                while True:
+                    if mode == "pr-review" and not skip_agent_run:
+                        safe_post_orchestration_state_comment(
                             repo=repo,
-                            base_branch=target_base_branch,
-                            branch_name=issue_branch,
-                            issue=issue,
-                            dry_run=False,
-                            fail_on_existing=args.fail_on_existing,
-                            stacked_base_context=stacked_base_context,
+                            target_type=state_target_type,
+                            target_number=state_target_number,
+                            dry_run=args.dry_run,
+                            state=build_orchestration_state(
+                                status="in-progress",
+                                task_type="pr",
+                                issue_number=issue["number"],
+                                pr_number=state_pr_number,
+                                branch=issue_branch,
+                                base_branch=target_base_branch,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=review_attempt,
+                                stage="agent_run",
+                                next_action="wait_for_agent_result",
+                                error=None,
+                                decomposition=decomposition_rollup,
+                            ),
                         )
-                        if pr_url:
-                            touched_prs.append(pr_url)
-                            print(f"PR status for {issue_label}: {pr_status} ({pr_url})")
-                        if mode == "pr-review":
+                        linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                        prompt_override = build_pr_review_prompt(
+                            pull_request=pull_request,
+                            review_items=review_items,
+                            linked_issues=linked_issues,
+                        )
+                        if (
+                            recovered_state is not None
+                            and str(recovered_state.get("status") or "") == "failed"
+                            and review_attempt == 1
+                        ):
+                            prompt_override = append_recovered_context_to_prompt(
+                                prompt_override,
+                                build_recovered_failure_context_note(recovered_state),
+                            )
+
+                    pre_run_untracked_files: set[str] | None = None
+                    if not skip_agent_run and not args.dry_run:
+                        pre_run_untracked_files = list_untracked_files()
+
+                    if skip_agent_run:
+                        print(
+                            f"Skipping agent run for {issue_label} in pr-review mode: "
+                            "no actionable review comments; running sync-only path"
+                        )
+                    else:
+                        failure_stage = "agent_run"
+                        issue_agent_run_stats = {}
+                        exit_code = run_agent(
+                            issue=issue,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            dry_run=args.dry_run,
+                            timeout_seconds=args.agent_timeout_seconds,
+                            idle_timeout_seconds=args.agent_idle_timeout_seconds,
+                            opencode_auto_approve=args.opencode_auto_approve,
+                            image_paths=issue_image_paths,
+                            prompt_override=prompt_override,
+                            track_tokens=track_tokens,
+                            token_budget=token_budget,
+                            run_stats=issue_agent_run_stats,
+                        )
+                        if exit_code != 0:
+                            exit_summary = describe_exit_code(exit_code)
+                            diagnosis = classify_opencode_failure(
+                                return_code=exit_code,
+                                model=args.model,
+                            ) if args.runner == "opencode" else None
+                            message = (
+                                f"Agent failed for {issue_label} with {exit_summary}"
+                                + (f" ({diagnosis})" if diagnosis else "")
+                            )
+                            raise RuntimeError(message)
+                    if not args.dry_run and not has_changes():
+                        if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:
+                            print(
+                                f"No file changes from agent for {issue_label}; "
+                                "pushing sync-only branch updates"
+                            )
+                            used_force_with_lease = args.sync_strategy == "rebase"
+                            push_branch(
+                                branch_name=issue_branch,
+                                dry_run=False,
+                                force_with_lease=used_force_with_lease,
+                            )
+                            print(
+                                f"Sync-only push result for {issue_label}: "
+                                f"branch '{issue_branch}' pushed "
+                                f"(force-with-lease: {'yes' if used_force_with_lease else 'no'})"
+                            )
+                            if mode == "pr-review" and linked_open_pr is not None:
+                                linked_pr_number = linked_open_pr.get("number")
+                                if type(linked_pr_number) is int:
+                                    print(
+                                        f"PR #{linked_pr_number} rerun sync pushed; "
+                                        "GitHub mergeability should be recalculated without manual conflict steps"
+                                    )
+                            pr_status, pr_url = ensure_pr(
+                                repo=repo,
+                                base_branch=target_base_branch,
+                                branch_name=issue_branch,
+                                issue=issue,
+                                dry_run=False,
+                                fail_on_existing=args.fail_on_existing,
+                                stacked_base_context=stacked_base_context,
+                            )
+                            if pr_url:
+                                touched_prs.append(pr_url)
+                                print(f"PR status for {issue_label}: {pr_status} ({pr_url})")
+                            if mode == "pr-review":
+                                safe_post_orchestration_state_comment(
+                                    repo=repo,
+                                    target_type="pr",
+                                    target_number=state_target_number,
+                                    dry_run=False,
+                                    state=build_orchestration_state(
+                                        status="waiting-for-ci",
+                                        task_type="pr",
+                                        issue_number=issue["number"],
+                                        pr_number=state_pr_number,
+                                        branch=issue_branch,
+                                        base_branch=target_base_branch,
+                                        runner=args.runner,
+                                        agent=args.agent,
+                                        model=args.model,
+                                        attempt=review_attempt,
+                                        stage="changes_pushed",
+                                        next_action="wait_for_ci",
+                                        error=None,
+                                        stats=issue_agent_run_stats,
+                                        decomposition=decomposition_rollup,
+                                    ),
+                                )
+                            elif mode == "issue-flow" and supports_github_issue_ops:
+                                safe_post_orchestration_state_comment(
+                                    repo=repo,
+                                    target_type="issue",
+                                    target_number=issue["number"],
+                                    dry_run=False,
+                                    state=build_orchestration_state(
+                                        status="ready-for-review",
+                                        task_type="issue",
+                                        issue_number=issue["number"],
+                                        pr_number=parse_pr_number_from_url(pr_url),
+                                        branch=issue_branch,
+                                        base_branch=target_base_branch,
+                                        runner=args.runner,
+                                        agent=args.agent,
+                                        model=args.model,
+                                        attempt=review_attempt,
+                                        stage="pr_ready",
+                                        next_action="wait_for_review",
+                                        error=None,
+                                        stats=issue_agent_run_stats,
+                                        decomposition=decomposition_rollup,
+                                    ),
+                                )
+                            if (
+                                decomposition_parent_issue is not None
+                                and decomposition_parent_branch is not None
+                                and decomposition_parent_payload is not None
+                            ):
+                                decomposition_parent_payload, decomposition_rollup = post_parent_decomposition_rollup_update(
+                                    repo=repo,
+                                    parent_issue=decomposition_parent_issue,
+                                    parent_branch=decomposition_parent_branch,
+                                    base_branch=base_branch if base_branch else None,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    plan_payload=decomposition_parent_payload,
+                                    dry_run=args.dry_run,
+                                )
+                            if supports_github_issue_ops:
+                                remove_agent_failure_label_from_issue(
+                                    repo=repo,
+                                    issue_number=issue["number"],
+                                    dry_run=args.dry_run,
+                                )
+                            run_command(["git", "checkout", base_branch])
+                            continue
+
+                        print(
+                            f"No changes detected for {issue_label}; skipping commit and PR"
+                        )
+                        if supports_github_issue_ops or mode == "pr-review":
                             safe_post_orchestration_state_comment(
                                 repo=repo,
-                                target_type="pr",
+                                target_type=state_target_type,
                                 target_number=state_target_number,
                                 dry_run=False,
                                 state=build_orchestration_state(
-                                    status="waiting-for-ci",
-                                    task_type="pr",
+                                    status="waiting-for-author",
+                                    task_type="issue" if mode == "issue-flow" else "pr",
                                     issue_number=issue["number"],
                                     pr_number=state_pr_number,
                                     branch=issue_branch,
@@ -7698,34 +7862,10 @@ def main() -> int:
                                     runner=args.runner,
                                     agent=args.agent,
                                     model=args.model,
-                                    attempt=1,
-                                    stage="changes_pushed",
-                                    next_action="wait_for_ci",
-                                    error=None,
-                                    stats=issue_agent_run_stats,
-                                    decomposition=decomposition_rollup,
-                                ),
-                            )
-                        elif mode == "issue-flow" and supports_github_issue_ops:
-                            safe_post_orchestration_state_comment(
-                                repo=repo,
-                                target_type="issue",
-                                target_number=issue["number"],
-                                dry_run=False,
-                                state=build_orchestration_state(
-                                    status="ready-for-review",
-                                    task_type="issue",
-                                    issue_number=issue["number"],
-                                    pr_number=parse_pr_number_from_url(pr_url),
-                                    branch=issue_branch,
-                                    base_branch=target_base_branch,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
-                                    attempt=1,
-                                    stage="pr_ready",
-                                    next_action="wait_for_review",
-                                    error=None,
+                                    attempt=review_attempt,
+                                    stage="post_agent_check",
+                                    next_action="await_more_context",
+                                    error="No changes produced",
                                     stats=issue_agent_run_stats,
                                     decomposition=decomposition_rollup,
                                 ),
@@ -7755,95 +7895,94 @@ def main() -> int:
                         run_command(["git", "checkout", base_branch])
                         continue
 
-                    print(
-                        f"No changes detected for {issue_label}; skipping commit and PR"
+                    failure_stage = "commit_push"
+                    commit_changes(
+                        issue=issue,
+                        dry_run=args.dry_run,
+                        pre_run_untracked_files=pre_run_untracked_files,
                     )
-                    if supports_github_issue_ops or mode == "pr-review":
-                        safe_post_orchestration_state_comment(
-                            repo=repo,
-                            target_type=state_target_type,
-                            target_number=state_target_number,
-                            dry_run=False,
-                            state=build_orchestration_state(
-                                status="waiting-for-author",
-                                task_type="issue" if mode == "issue-flow" else "pr",
-                                issue_number=issue["number"],
-                                pr_number=state_pr_number,
-                                branch=issue_branch,
-                                base_branch=target_base_branch,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
-                                attempt=1,
-                                stage="post_agent_check",
-                                next_action="await_more_context",
-                                error="No changes produced",
-                                stats=issue_agent_run_stats,
-                                decomposition=decomposition_rollup,
-                            ),
-                        )
-                    if (
-                        decomposition_parent_issue is not None
-                        and decomposition_parent_branch is not None
-                        and decomposition_parent_payload is not None
-                    ):
-                        decomposition_parent_payload, decomposition_rollup = post_parent_decomposition_rollup_update(
-                            repo=repo,
-                            parent_issue=decomposition_parent_issue,
-                            parent_branch=decomposition_parent_branch,
-                            base_branch=base_branch if base_branch else None,
-                            runner=args.runner,
-                            agent=args.agent,
-                            model=args.model,
-                            plan_payload=decomposition_parent_payload,
-                            dry_run=args.dry_run,
-                        )
-                    if supports_github_issue_ops:
-                        remove_agent_failure_label_from_issue(
-                            repo=repo,
-                            issue_number=issue["number"],
-                            dry_run=args.dry_run,
-                        )
-                    run_command(["git", "checkout", base_branch])
-                    continue
 
-                failure_stage = "commit_push"
-                commit_changes(
-                    issue=issue,
-                    dry_run=args.dry_run,
-                    pre_run_untracked_files=pre_run_untracked_files,
-                )
+                    failure_stage = "workflow_checks"
+                    workflow_check_results = run_configured_workflow_checks(
+                        checks=workflow_checks,
+                        dry_run=args.dry_run,
+                        cwd=os.getcwd(),
+                    )
 
-                failure_stage = "workflow_checks"
-                workflow_check_results = run_configured_workflow_checks(
-                    checks=workflow_checks,
-                    dry_run=args.dry_run,
-                    cwd=os.getcwd(),
-                )
+                    failure_stage = "commit_push"
+                    push_branch(
+                        branch_name=issue_branch,
+                        dry_run=args.dry_run,
+                        force_with_lease=(
+                            branch_status == "reused"
+                            and args.sync_reused_branch
+                            and args.sync_strategy == "rebase"
+                            and reused_branch_sync_changed
+                        ),
+                    )
+                    pr_status, pr_url = ensure_pr(
+                        repo=repo,
+                        base_branch=target_base_branch,
+                        branch_name=issue_branch,
+                        issue=issue,
+                        dry_run=args.dry_run,
+                        fail_on_existing=args.fail_on_existing,
+                        stacked_base_context=stacked_base_context,
+                    )
+                    if pr_url:
+                        touched_prs.append(pr_url)
+                        print(f"PR status for {issue_label}: {pr_status} ({pr_url})")
 
-                failure_stage = "commit_push"
-                push_branch(
-                    branch_name=issue_branch,
-                    dry_run=args.dry_run,
-                    force_with_lease=(
-                        branch_status == "reused"
-                        and args.sync_reused_branch
-                        and args.sync_strategy == "rebase"
-                        and reused_branch_sync_changed
-                    ),
-                )
-                pr_status, pr_url = ensure_pr(
-                    repo=repo,
-                    base_branch=target_base_branch,
-                    branch_name=issue_branch,
-                    issue=issue,
-                    dry_run=args.dry_run,
-                    fail_on_existing=args.fail_on_existing,
-                    stacked_base_context=stacked_base_context,
-                )
-                if pr_url:
-                    touched_prs.append(pr_url)
-                    print(f"PR status for {issue_label}: {pr_status} ({pr_url})")
+                    if mode == "pr-review" and not args.dry_run and state_pr_number is not None:
+                        pull_request, review_items, _review_stats = fetch_actionable_pr_review_feedback(
+                            repo=repo,
+                            pr_number=state_pr_number,
+                        )
+                        target_base_branch = (
+                            str(pull_request.get("baseRefName") or target_base_branch).strip()
+                            or target_base_branch
+                        )
+                        print(
+                            f"Review prompt sources after attempt {review_attempt}: "
+                            f"{format_review_filtering_stats(_review_stats)}"
+                        )
+                        if review_items:
+                            if review_attempt >= max_attempts:
+                                safe_post_orchestration_state_comment(
+                                    repo=repo,
+                                    target_type="pr",
+                                    target_number=state_target_number,
+                                    dry_run=False,
+                                    state=build_orchestration_state(
+                                        status="blocked",
+                                        task_type="pr",
+                                        issue_number=issue["number"],
+                                        pr_number=state_pr_number,
+                                        branch=issue_branch,
+                                        base_branch=target_base_branch,
+                                        runner=args.runner,
+                                        agent=args.agent,
+                                        model=args.model,
+                                        attempt=review_attempt,
+                                        stage="review_feedback",
+                                        next_action="manual_review_followup",
+                                        error=(
+                                            f"Actionable review feedback remains after {review_attempt} attempt(s)"
+                                        ),
+                                        workflow_checks=workflow_check_results,
+                                        stats=issue_agent_run_stats,
+                                        decomposition=decomposition_rollup,
+                                    ),
+                                )
+                                print(
+                                    f"Linked PR #{state_pr_number} still has {len(review_items)} actionable review items "
+                                    f"after {review_attempt} attempt(s); stopping review loop."
+                                )
+                                break
+                            review_attempt += 1
+                            skip_agent_run = False
+                            continue
+
                     if mode == "issue-flow" and supports_github_issue_ops:
                         safe_post_orchestration_state_comment(
                             repo=repo,
@@ -7860,15 +7999,15 @@ def main() -> int:
                                 runner=args.runner,
                                 agent=args.agent,
                                 model=args.model,
-                                attempt=1,
+                                attempt=review_attempt,
                                 stage="pr_ready",
                                 next_action="wait_for_review",
                                 error=None,
                                 workflow_checks=workflow_check_results,
                                 stats=issue_agent_run_stats,
                                 decomposition=decomposition_rollup,
-                                ),
-                            )
+                            ),
+                        )
                     else:
                         safe_post_orchestration_state_comment(
                             repo=repo,
@@ -7885,15 +8024,16 @@ def main() -> int:
                                 runner=args.runner,
                                 agent=args.agent,
                                 model=args.model,
-                                attempt=1,
+                                attempt=review_attempt,
                                 stage="changes_pushed",
                                 next_action="wait_for_ci",
                                 error=None,
                                 workflow_checks=workflow_check_results,
                                 stats=issue_agent_run_stats,
                                 decomposition=decomposition_rollup,
-                                ),
-                            )
+                            ),
+                        )
+                    break
 
                 if (
                     decomposition_parent_issue is not None

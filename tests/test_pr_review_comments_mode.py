@@ -605,6 +605,155 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertIn("[dry-run] PR mode target branch: issue-fix/23", output)
         self.assertIn("[dry-run] PR mode execution: isolated worktree", output)
 
+    def test_main_pr_mode_rechecks_feedback_after_push(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pathlib.Path(tmpdir, ".git").mkdir()
+            argv = [
+                "runner",
+                "--pr",
+                "23",
+                "--from-review-comments",
+                "--allow-pr-branch-switch",
+                "--dir",
+                tmpdir,
+            ]
+            pull_request = {
+                "number": 23,
+                "title": "PR title",
+                "url": "https://example/pr/23",
+                "state": "OPEN",
+                "headRefName": "issue-fix/23",
+                "headRefOid": "abc123",
+                "baseRefName": "main",
+                "reviews": [],
+                "author": {"login": "owner"},
+            }
+            actionable_threads = [
+                {
+                    "isResolved": False,
+                    "comments": {
+                        "nodes": [
+                            {
+                                "body": "Please add a regression test",
+                                "path": "tests/test_tool.py",
+                                "line": 10,
+                                "outdated": False,
+                                "author": {"login": "reviewer"},
+                            }
+                        ]
+                    },
+                }
+            ]
+
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(self.mod, "ensure_clean_worktree"),
+                mock.patch.object(self.mod, "current_branch", return_value="issue-fix/23"),
+                mock.patch.object(self.mod, "detect_repo", return_value="owner/repo"),
+                mock.patch.object(self.mod, "checkout_pr_target_branch"),
+                mock.patch.object(self.mod, "fetch_issue_comments", return_value=[]),
+                mock.patch.object(self.mod, "fetch_pull_request", side_effect=[pull_request, pull_request]),
+                mock.patch.object(self.mod, "fetch_pr_review_threads", side_effect=[actionable_threads, []]) as threads_mock,
+                mock.patch.object(self.mod, "fetch_pr_conversation_comments", side_effect=[[], []]),
+                mock.patch.object(self.mod, "list_untracked_files", return_value=set()),
+                mock.patch.object(self.mod, "run_agent_with_prompt", return_value=0) as run_agent_mock,
+                mock.patch.object(self.mod, "has_changes", return_value=True),
+                mock.patch.object(self.mod, "commit_pr_review_changes"),
+                mock.patch.object(self.mod, "run_configured_workflow_checks", return_value=[]),
+                mock.patch.object(self.mod, "push_branch"),
+                mock.patch.object(self.mod, "safe_post_orchestration_state_comment") as state_post_mock,
+            ):
+                previous_cwd = os.getcwd()
+                try:
+                    exit_code = self.mod.main()
+                finally:
+                    os.chdir(previous_cwd)
+
+        self.assertEqual(exit_code, 0)
+        run_agent_mock.assert_called_once()
+        self.assertEqual(threads_mock.call_count, 2)
+        final_state = state_post_mock.call_args.kwargs["state"]
+        self.assertEqual(final_state["status"], "waiting-for-ci")
+        self.assertEqual(final_state["attempt"], 1)
+
+    def test_main_pr_mode_blocks_when_feedback_persists_past_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pathlib.Path(tmpdir, ".git").mkdir()
+            argv = [
+                "runner",
+                "--pr",
+                "23",
+                "--from-review-comments",
+                "--allow-pr-branch-switch",
+                "--max-attempts",
+                "2",
+                "--dir",
+                tmpdir,
+            ]
+            pull_request = {
+                "number": 23,
+                "title": "PR title",
+                "url": "https://example/pr/23",
+                "state": "OPEN",
+                "headRefName": "issue-fix/23",
+                "headRefOid": "abc123",
+                "baseRefName": "main",
+                "reviews": [],
+                "author": {"login": "owner"},
+            }
+            actionable_threads = [
+                {
+                    "isResolved": False,
+                    "comments": {
+                        "nodes": [
+                            {
+                                "body": "Please add a regression test",
+                                "path": "tests/test_tool.py",
+                                "line": 10,
+                                "outdated": False,
+                                "author": {"login": "reviewer"},
+                            }
+                        ]
+                    },
+                }
+            ]
+
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(self.mod, "ensure_clean_worktree"),
+                mock.patch.object(self.mod, "current_branch", return_value="issue-fix/23"),
+                mock.patch.object(self.mod, "detect_repo", return_value="owner/repo"),
+                mock.patch.object(self.mod, "checkout_pr_target_branch"),
+                mock.patch.object(self.mod, "fetch_issue_comments", return_value=[]),
+                mock.patch.object(self.mod, "fetch_pull_request", side_effect=[pull_request, pull_request, pull_request]),
+                mock.patch.object(
+                    self.mod,
+                    "fetch_pr_review_threads",
+                    side_effect=[actionable_threads, actionable_threads, actionable_threads],
+                ) as threads_mock,
+                mock.patch.object(self.mod, "fetch_pr_conversation_comments", side_effect=[[], [], []]),
+                mock.patch.object(self.mod, "list_untracked_files", return_value=set()),
+                mock.patch.object(self.mod, "run_agent_with_prompt", return_value=0) as run_agent_mock,
+                mock.patch.object(self.mod, "has_changes", return_value=True),
+                mock.patch.object(self.mod, "commit_pr_review_changes"),
+                mock.patch.object(self.mod, "run_configured_workflow_checks", return_value=[]),
+                mock.patch.object(self.mod, "push_branch"),
+                mock.patch.object(self.mod, "safe_post_orchestration_state_comment") as state_post_mock,
+            ):
+                previous_cwd = os.getcwd()
+                try:
+                    exit_code = self.mod.main()
+                finally:
+                    os.chdir(previous_cwd)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(run_agent_mock.call_count, 2)
+        self.assertEqual(threads_mock.call_count, 3)
+        final_state = state_post_mock.call_args.kwargs["state"]
+        self.assertEqual(final_state["status"], "blocked")
+        self.assertEqual(final_state["attempt"], 2)
+        self.assertEqual(final_state["stage"], "review_feedback")
+
     def test_issue_mode_auto_switch_uses_actionable_conversation_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             pathlib.Path(tmpdir, ".git").mkdir()

@@ -12,5 +12,6 @@
   "force_reprocess": false,
   "sync_reused_branch": true,
   "sync_strategy": "rebase",
-  "base_branch": "default"
+  "base_branch": "default",
+  "create_child_issues": false
 }

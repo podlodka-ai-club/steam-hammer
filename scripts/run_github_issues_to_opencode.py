@@ -41,6 +41,7 @@ BUILTIN_DEFAULTS = {
     "sync_strategy": "rebase",
     "base_branch": "default",
     "decompose": "auto",
+    "create_child_issues": False,
     "dir": ".",
 }
 
@@ -48,6 +49,7 @@ ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"
 AGENT_FAILURE_REPORT_MARKER = "<!-- orchestration-agent-failure:v1 -->"
 SCOPE_DECISION_MARKER = "<!-- orchestration-scope:v1 -->"
 DECOMPOSITION_PLAN_MARKER = "<!-- orchestration-decomposition:v1 -->"
+DECOMPOSITION_CHILD_ORDER_PREFIX = "Step"
 AGENT_FAILURE_LABEL_NAME = "auto:agent-failed"
 AGENT_FAILURE_LABEL_COLOR = "B60205"
 AGENT_FAILURE_LABEL_DESCRIPTION = "Automation run failed for this issue"
@@ -880,251 +882,270 @@ def select_latest_parseable_decomposition_plan(
     return latest, warnings
 
 
-def _normalize_decomposition_status(raw_status: str) -> str:
-    normalized = str(raw_status or "").strip().lower()
-    if normalized in DECOMPOSITION_CHILD_STATUSES:
-        return normalized
-    return "planned"
+def _normalize_decomposition_plan_child(child: dict, fallback_order: int) -> dict | None:
+    if not isinstance(child, dict):
+        return None
+
+    raw_order = child.get("order")
+    try:
+        order = int(raw_order)
+    except (TypeError, ValueError):
+        order = fallback_order
+    if order <= 0:
+        order = fallback_order
+
+    title = str(child.get("title") or "").strip() or f"Child task {order}"
+    depends_raw = child.get("depends_on")
+    depends_on: list[int] = []
+    if isinstance(depends_raw, list):
+        for dep in depends_raw:
+            try:
+                dep_order = int(dep)
+            except (TypeError, ValueError):
+                continue
+            if dep_order > 0:
+                depends_on.append(dep_order)
+
+    acceptance_raw = child.get("acceptance")
+    acceptance: list[str] = []
+    if isinstance(acceptance_raw, list):
+        acceptance = [str(item).strip() for item in acceptance_raw if str(item).strip()]
+    if not acceptance:
+        acceptance = [f"{title} is completed and validated."]
+
+    return {
+        "title": title,
+        "order": order,
+        "depends_on": sorted(set(depends_on)),
+        "acceptance": acceptance,
+    }
 
 
-def _coerce_decomposition_int(value: object) -> int | None:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        text = value.strip()
-        if text.isdigit():
-            return int(text)
-    return None
+def normalize_decomposition_proposed_children(plan_payload: dict) -> list[dict]:
+    raw_children = plan_payload.get("proposed_children")
+    if not isinstance(raw_children, list):
+        return []
 
-
-def _normalize_string_list(value: object) -> list[str]:
-    normalized: list[str] = []
-    for item in value if isinstance(value, list) else []:
-        if not isinstance(item, str):
+    normalized: list[dict] = []
+    for index, child in enumerate(raw_children, start=1):
+        normalized_child = _normalize_decomposition_plan_child(child, fallback_order=index)
+        if normalized_child is None:
             continue
-        text = item.strip()
-        if text:
-            normalized.append(text)
+        normalized.append(normalized_child)
+
+    return sorted(normalized, key=lambda item: int(item.get("order") or 0))
+
+
+def _extract_ordered_linked_children(plan_payload: dict) -> dict[int, dict]:
+    raw_created = plan_payload.get("created_children")
+    if not isinstance(raw_created, list):
+        return {}
+
+    created_by_order: dict[int, dict] = {}
+    for child in raw_created:
+        if not isinstance(child, dict):
+            continue
+        try:
+            order = int(child.get("order"))
+        except (TypeError, ValueError):
+            continue
+
+        if order <= 0:
+            continue
+        child_copy = dict(child)
+        child_copy["order"] = order
+        created_by_order[order] = child_copy
+
+    return created_by_order
+
+
+def _normalize_created_children(raw_created_children: list[dict] | dict[int, dict]) -> list[dict]:
+    created_children_values: list[dict] = []
+    if isinstance(raw_created_children, dict):
+        created_children_values = [
+            child for child in raw_created_children.values() if isinstance(child, dict)
+        ]
+    elif isinstance(raw_created_children, list):
+        created_children_values = [
+            child for child in raw_created_children if isinstance(child, dict)
+        ]
+    else:
+        return []
+
+    normalized: list[dict] = []
+    for child in created_children_values:
+        child_copy = dict(child)
+        try:
+            order = int(child_copy.get("order"))
+        except (TypeError, ValueError):
+            continue
+
+        if order <= 0:
+            continue
+        child_copy["order"] = order
+        normalized.append(child_copy)
+
+    normalized.sort(key=lambda item: int(item.get("order") or 0))
     return normalized
 
 
-def build_decomposition_rollup_from_plan_payload(
-    plan_payload: dict,
-    explicit_blockers: list[str] | None = None,
-    explicit_next_target_task: dict | None = None,
-) -> dict:
-    if not isinstance(plan_payload, dict):
-        return {
-            "parent_issue": None,
-            "counts": {status: 0 for status in DECOMPOSITION_CHILD_STATUSES},
-            "children_by_status": {status: [] for status in DECOMPOSITION_CHILD_STATUSES},
-            "blockers": [],
-            "next_target_task": None,
-        }
+def is_decomposition_plan_approved(plan_payload: dict) -> bool:
+    status = str(plan_payload.get("status") or "").strip().lower()
+    return status in {"approved", "children_created", "execution_plan"}
 
-    parent_issue = plan_payload.get("parent_issue")
-    if not isinstance(parent_issue, int):
-        parent_issue = None
 
-    explicit_plan_blockers = _normalize_string_list(plan_payload.get("blockers"))
-    merged_blockers = explicit_blockers if explicit_blockers is not None else explicit_plan_blockers
+def _build_child_issue_body(
+    parent_issue: dict,
+    child: dict,
+    created_dependencies: dict[int, dict],
+) -> str:
+    parent_number = parent_issue.get("number")
+    parent_title = str(parent_issue.get("title") or "(untitled)").strip()
+    order = child.get("order")
+    depends_on = child.get("depends_on")
+    if isinstance(depends_on, list):
+        dependency_lines: list[str] = []
+        for dep in depends_on:
+            try:
+                dep_order = int(dep)
+            except (TypeError, ValueError):
+                continue
 
-    return build_decomposition_rollup_state(
-        parent_issue=parent_issue,
-        proposed_children=plan_payload.get("proposed_children"),
-        explicit_blockers=merged_blockers,
-        explicit_next_target_task=explicit_next_target_task,
+            dependency_child = created_dependencies.get(dep_order)
+            dependency_ref = f"step {dep_order}"
+            dep_issue_number = dependency_child.get("issue_number")
+            dep_issue_url = str(dependency_child.get("issue_url") or "").strip()
+            if isinstance(dep_issue_number, int):
+                dependency_ref = f"[{DECOMPOSITION_CHILD_ORDER_PREFIX} {dep_order}: #{dep_issue_number}]({dep_issue_url})"
+            elif dep_issue_url:
+                dependency_ref = f"[{DECOMPOSITION_CHILD_ORDER_PREFIX} {dep_order}: {dep_issue_url}]"
+            dependency_lines.append(dependency_ref)
+    else:
+        dependency_lines = []
+
+    execution_order_text = str(order) if isinstance(order, int) else "unknown"
+    dependency_text = (
+        "\nDepends on: " + ", ".join(dependency_lines)
+        if dependency_lines
+        else "\nDepends on: none"
+    )
+
+    acceptance = child.get("acceptance")
+    acceptance_lines: list[str] = []
+    if isinstance(acceptance, list):
+        for criterion in acceptance:
+            criterion_text = str(criterion or "").strip()
+            if criterion_text:
+                acceptance_lines.append(f"- {criterion_text}")
+
+    if not acceptance_lines:
+        acceptance_lines = ["- Implementation is complete and validated."]
+
+    return (
+        "Child task generated from decomposition plan\n\n"
+        f"Parent issue: #{parent_number} ({parent_title})\n"
+        f"Execution order: {execution_order_text}\n"
+        f"{dependency_text}\n\n"
+        f"Suggested acceptance criteria:\n" + "\n".join(acceptance_lines)
     )
 
 
-def _find_next_target_task(children_by_status: dict[str, list[dict]]) -> dict | None:
-    candidate_statuses = ["in-progress", "created", "planned", "blocked"]
-    for status in candidate_statuses:
-        for child in children_by_status.get(status, []):
-            return {
-                "order": child.get("order"),
-                "title": child.get("title"),
-                "status": status,
-                "issue": child.get("issue"),
-                "pr": child.get("pr"),
-            }
-    return None
-
-
-def build_decomposition_rollup_state(
-    parent_issue: int | None,
-    proposed_children: list[dict] | None,
-    explicit_blockers: list[str] | None = None,
-    explicit_next_target_task: dict | None = None,
+def create_decomposition_child_issue(
+    repo: str,
+    parent_issue: dict,
+    child: dict,
+    created_dependencies: dict[int, dict],
+    dry_run: bool,
 ) -> dict:
-    children_by_status: dict[str, list[dict]] = {
-        status: [] for status in DECOMPOSITION_CHILD_STATUSES
-    }
+    child_title = str(child.get("title") or "")[:120]
+    if not child_title:
+        raise RuntimeError("Cannot create child issue with empty title")
 
-    blockers: list[str] = []
-    blockers.extend(_normalize_string_list(explicit_blockers))
-
-    for child in proposed_children or []:
-        if not isinstance(child, dict):
-            continue
-
-        status = _normalize_decomposition_status(child.get("status"))
-        title = str(child.get("title") or "Untitled child task").strip()
-        if not title:
-            title = "Untitled child task"
-
-        order = child.get("order")
-        if isinstance(order, str) and order.isdigit():
-            order = int(order)
-
-        issue = _coerce_decomposition_int(
-            child.get("issue")
-            if isinstance(child.get("issue"), (int, str))
-            else child.get("issue_number")
-        )
-        if issue is None:
-            issue = _coerce_decomposition_int(child.get("issue_number"))
-
-        pr = _coerce_decomposition_int(
-            child.get("pr")
-            if isinstance(child.get("pr"), (int, str))
-            else child.get("pr_number")
-        )
-        if pr is None:
-            pr = _coerce_decomposition_int(child.get("pr_number"))
-
-        child_entry = {
-            "order": order,
-            "title": title,
-            "status": status,
-            "issue": issue,
-            "pr": pr,
-            "blockers": _normalize_string_list(child.get("blockers")),
+    body = _build_child_issue_body(parent_issue, child, created_dependencies)
+    if dry_run:
+        print(f"[dry-run] Would create child issue for order {child.get('order')} of parent #{parent_issue.get('number')}")
+        return {
+            "title": child_title,
+            "order": child.get("order"),
+            "issue_number": None,
+            "issue_url": None,
+            "created": False,
         }
 
-        if status == "blocked":
-            blockers.extend(_normalize_string_list(child_entry["blockers"]))
+    output = run_capture(
+        [
+            "gh",
+            "issue",
+            "create",
+            "--repo",
+            repo,
+            "--title",
+            child_title,
+            "--body",
+            body,
+            "--json",
+            "number,url",
+        ]
+    )
+    created = json.loads(output)
+    if not isinstance(created, dict):
+        raise RuntimeError("Unexpected response from gh issue create")
 
-        if status in children_by_status:
-            children_by_status[status].append(child_entry)
-        else:
-            children_by_status["planned"].append(child_entry)
-
-    normalized_blockers: list[str] = []
-    for blocker in blockers:
-        if blocker in normalized_blockers:
-            continue
-        normalized_blockers.append(blocker)
-
-    if explicit_next_target_task is not None:
-        next_target_task = {
-            "order": explicit_next_target_task.get("order"),
-            "title": str(explicit_next_target_task.get("title") or "Next child task").strip(),
-            "status": _normalize_decomposition_status(explicit_next_target_task.get("status")),
-            "issue": _coerce_decomposition_int(
-                explicit_next_target_task.get("issue")
-                if isinstance(explicit_next_target_task.get("issue"), (int, str))
-                else explicit_next_target_task.get("issue_number")
-            ),
-            "pr": _coerce_decomposition_int(
-                explicit_next_target_task.get("pr")
-                if isinstance(explicit_next_target_task.get("pr"), (int, str))
-                else explicit_next_target_task.get("pr_number")
-            ),
-        }
-    else:
-        next_target_task = _find_next_target_task(children_by_status)
-
-    if not next_target_task:
-        next_target_task = None
-
-    counts = {status: len(children_by_status[status]) for status in DECOMPOSITION_CHILD_STATUSES}
+    issue_number = created.get("number")
+    if type(issue_number) is not int:
+        raise RuntimeError("Created child issue response missing integer number")
 
     return {
-        "parent_issue": parent_issue,
-        "counts": counts,
-        "children_by_status": children_by_status,
-        "blockers": normalized_blockers,
-        "next_target_task": next_target_task,
+        "title": child_title,
+        "order": child.get("order"),
+        "issue_number": issue_number,
+        "issue_url": str(created.get("url") or ""),
+        "created": True,
     }
 
 
-def build_decomposition_rollup_from_recovered_state(
-    recovered_state: dict | None,
-    parent_issue: int | None,
-) -> dict | None:
-    if not isinstance(recovered_state, dict):
-        return None
+def _decomposition_plan_has_missing_children(plan_payload: dict) -> list[dict]:
+    proposed_children = normalize_decomposition_proposed_children(plan_payload)
+    created_children = _extract_ordered_linked_children(plan_payload)
 
-    recovered_decomposition = recovered_state.get("decomposition")
-    if not isinstance(recovered_decomposition, dict):
-        state_payload = recovered_state.get("payload")
-        if isinstance(state_payload, dict):
-            recovered_decomposition = state_payload.get("decomposition")
+    missing_children: list[dict] = []
+    for child in proposed_children:
+        order = child.get("order")
+        if order not in created_children:
+            missing_children.append(child)
 
-    if not isinstance(recovered_decomposition, dict):
-        return None
-
-    recovered_children = recovered_decomposition.get("proposed_children")
-    if not isinstance(recovered_children, list):
-        rollup_children_by_status = recovered_decomposition.get("children_by_status")
-        if isinstance(rollup_children_by_status, dict):
-            recovered_children = []
-            for status, entries in rollup_children_by_status.items():
-                if not isinstance(entries, list):
-                    continue
-                for child in entries:
-                    if not isinstance(child, dict):
-                        continue
-                    normalized_child = dict(child)
-                    if not normalized_child.get("status"):
-                        normalized_child["status"] = status
-                    recovered_children.append(normalized_child)
-
-    return build_decomposition_rollup_state(
-        parent_issue=parent_issue,
-        proposed_children=recovered_children if isinstance(recovered_children, list) else None,
-        explicit_blockers=_normalize_string_list(recovered_decomposition.get("blockers")),
-        explicit_next_target_task= (
-            recovered_decomposition.get("next_target_task")
-            if isinstance(recovered_decomposition.get("next_target_task"), dict)
-            else None
-        ),
-    )
+    return missing_children
 
 
-def format_decomposition_rollup_context(decomposition: dict) -> str:
-    if not isinstance(decomposition, dict):
-        return ""
+def merge_created_children_into_plan_payload(
+    plan_payload: dict,
+    created_children: list[dict],
+) -> dict:
+    merged_children: list[dict] = []
+    existing_children = _extract_ordered_linked_children(plan_payload)
+    for order in sorted(existing_children):
+        merged_children.append(dict(existing_children[order]))
 
-    counts = decomposition.get("counts")
-    if not isinstance(counts, dict):
-        return ""
+    for child in created_children:
+        order = child.get("order")
+        if type(order) is not int:
+            continue
+        if order < 1:
+            continue
+        child_copy = dict(child)
+        child_copy["order"] = order
+        merged_children = [
+            existing
+            for existing in merged_children
+            if existing.get("order") != order
+        ] + [child_copy]
 
-    blockers = _normalize_string_list(decomposition.get("blockers"))
-    next_target_task = decomposition.get("next_target_task")
-    next_target = "none"
-    if isinstance(next_target_task, dict):
-        order = next_target_task.get("order")
-        title = str(next_target_task.get("title") or "").strip()
-        status = _normalize_decomposition_status(next_target_task.get("status"))
-        if isinstance(order, int):
-            next_target = f"{order}:{title}:{status}"
-        elif title:
-            next_target = f"{title}:{status}"
-        else:
-            next_target = status
+    merged_children.sort(key=lambda item: int(item.get("order") or 0))
 
-    summary_parts = [
-        f"planned={counts.get('planned', 0)}",
-        f"created={counts.get('created', 0)}",
-        f"in_progress={counts.get('in-progress', 0)}",
-        f"done={counts.get('done', 0)}",
-        f"blocked={counts.get('blocked', 0)}",
-        f"blockers={len(blockers)}",
-        f"next={next_target}",
-    ]
-    return "decomposition(" + ", ".join(summary_parts) + ")"
+    merged_payload = dict(plan_payload)
+    merged_payload["created_children"] = merged_children
+    merged_payload["timestamp"] = utc_now_iso()
+    return merged_payload
 
 
 def merge_latest_recovered_state(states: list[dict | None]) -> dict | None:
@@ -2203,21 +2224,79 @@ DECOMPOSITION_KEYWORDS = {
     "large",
 }
 
+DECOMPOSITION_SOURCE_HEADINGS = {
+    "scope",
+    "implementation",
+    "implementation plan",
+    "work items",
+    "tasks",
+    "plan",
+}
+
+DECOMPOSITION_EXCLUDED_HEADINGS = {
+    "acceptance criteria",
+    "success criteria",
+    "validation",
+    "done when",
+    "non-goals",
+    "out of scope",
+}
+
 
 def _issue_body_lines(issue: dict) -> list[str]:
     body = str(issue.get("body") or "")
     return [line.strip() for line in body.splitlines() if line.strip()]
 
 
-def _issue_scope_bullets(issue: dict) -> list[str]:
-    bullets: list[str] = []
+def _normalize_heading(line: str) -> str | None:
+    match = re.match(r"^#{1,6}\s+(.+)$", line.strip())
+    if not match:
+        return None
+    heading = re.sub(r"[^a-z0-9]+", " ", match.group(1).strip().lower()).strip()
+    return heading or None
+
+
+def _issue_sectioned_bullets(issue: dict) -> list[tuple[str | None, str]]:
+    bullets: list[tuple[str | None, str]] = []
+    current_heading: str | None = None
     for line in _issue_body_lines(issue):
+        heading = _normalize_heading(line)
+        if heading is not None:
+            current_heading = heading
+            continue
         normalized = line.strip()
-        if normalized.startswith(('-', '*')):
+        if normalized.startswith(("-", "*")):
             item = normalized[1:].strip()
             if item:
-                bullets.append(item)
+                bullets.append((current_heading, item))
     return bullets
+
+
+def _issue_scope_bullets(issue: dict) -> list[str]:
+    return [item for _, item in _issue_sectioned_bullets(issue)]
+
+
+def _issue_decomposition_source_bullets(issue: dict) -> list[str]:
+    sectioned_bullets = _issue_sectioned_bullets(issue)
+    preferred = [
+        item
+        for heading, item in sectioned_bullets
+        if heading in DECOMPOSITION_SOURCE_HEADINGS
+    ]
+    if preferred:
+        return preferred
+    return [
+        item
+        for heading, item in sectioned_bullets
+        if heading not in DECOMPOSITION_EXCLUDED_HEADINGS
+    ]
+
+
+def _child_acceptance_criteria(title: str) -> list[str]:
+    return [
+        f"Required changes for '{title}' are implemented.",
+        f"Relevant validation or follow-up checks for '{title}' are recorded.",
+    ]
 
 
 def assess_issue_decomposition_need(issue: dict) -> dict:
@@ -2225,23 +2304,26 @@ def assess_issue_decomposition_need(issue: dict) -> dict:
     body = str(issue.get("body") or "")
     combined = f"{title}\n{body}".lower()
     bullets = _issue_scope_bullets(issue)
+    decomposition_source_bullets = _issue_decomposition_source_bullets(issue)
     reasons: list[str] = []
+    explicit_epic_title = title.strip().lower().startswith("epic:")
+
+    if explicit_epic_title:
+        reasons.append("explicit_epic_title")
 
     if len(body) >= 1200:
         reasons.append("long_body")
-    if len(bullets) >= 6:
-        reasons.append("many_bullets")
+    if len(decomposition_source_bullets) >= 5:
+        reasons.append("many_implementation_areas")
 
     matched_keywords = sorted(keyword for keyword in DECOMPOSITION_KEYWORDS if keyword in combined)
-    if matched_keywords:
-        reasons.append("large_scope_keywords")
 
     acceptance_like = sum(
         1
         for line in _issue_body_lines(issue)
         if any(token in line.lower() for token in ["acceptance", "success criteria", "scope", "goal"])
     )
-    if acceptance_like >= 3:
+    if acceptance_like >= 3 and (explicit_epic_title or len(body) >= 900 or len(decomposition_source_bullets) >= 4):
         reasons.append("multiple_planning_sections")
 
     return {
@@ -2250,11 +2332,12 @@ def assess_issue_decomposition_need(issue: dict) -> dict:
         "matched_keywords": matched_keywords,
         "body_length": len(body),
         "bullet_count": len(bullets),
+        "implementation_area_count": len(decomposition_source_bullets),
     }
 
 
 def build_decomposition_plan_payload(issue: dict, assessment: dict) -> dict:
-    bullets = _issue_scope_bullets(issue)
+    bullets = _issue_decomposition_source_bullets(issue)
     proposed_children: list[dict] = []
     source_items = bullets[:5]
     if not source_items:
@@ -2271,7 +2354,7 @@ def build_decomposition_plan_payload(issue: dict, assessment: dict) -> dict:
                 "title": title[:120],
                 "order": index,
                 "depends_on": [] if index == 1 else [index - 1],
-                "acceptance": [f"{title} is completed and validated."],
+                "acceptance": _child_acceptance_criteria(title),
             }
         )
 
@@ -2281,16 +2364,21 @@ def build_decomposition_plan_payload(issue: dict, assessment: dict) -> dict:
         "reason": assessment.get("reasons", []),
         "matched_keywords": assessment.get("matched_keywords", []),
         "proposed_children": proposed_children,
+        "created_children": [],
         "next_action": "approve_plan_or_rerun_with_decompose_never",
         "timestamp": utc_now_iso(),
     }
 
 
 def format_decomposition_plan_comment(payload: dict) -> str:
+    status = str(payload.get("status") or "proposed").strip().lower() or "proposed"
     reasons = payload.get("reason") if isinstance(payload.get("reason"), list) else []
     children = payload.get("proposed_children")
     if not isinstance(children, list):
         children = []
+    created_children = payload.get("created_children")
+    if not isinstance(created_children, list):
+        created_children = []
 
     reason_lines = "\n".join(f"- `{reason}`" for reason in reasons) or "- `manual`"
     child_lines: list[str] = []
@@ -2304,15 +2392,52 @@ def format_decomposition_plan_comment(payload: dict) -> str:
         child_lines.append(f"{order}. {title}{deps_text}")
     children_text = "\n".join(child_lines) or "No child tasks proposed."
 
+    created_lines: list[str] = []
+    for child in created_children:
+        if not isinstance(child, dict):
+            continue
+        order = child.get("order")
+        created_issue_number = child.get("issue_number")
+        issue_url = str(child.get("issue_url") or "").strip()
+        title = str(child.get("title") or f"Child task {order}")
+
+        if isinstance(created_issue_number, int):
+            created_entry = f"- {order}. #{created_issue_number} {title}"
+        elif issue_url:
+            created_entry = f"- {order}. {title} ({issue_url})"
+        else:
+            created_entry = f"- {order}. {title}"
+        created_lines.append(created_entry)
+    created_text = "\n".join(created_lines) or "No child issues created yet."
+
+    if status == "children_created":
+        status_note = (
+            "Status: `children-created`; suggested execution sequence is preserved and "
+            "child links are recorded in this plan payload."
+        )
+        next_action = "Execute child issues in listed order."
+    elif status == "approved":
+        status_note = "Status: `approved`; ready to create child issues."
+        next_action = "Run with --create-child-issues to create linked child issues."
+    else:
+        status_note = "Status: `needs-decomposition`; child tasks were proposed for planning review."
+        next_action = (
+            "approve/edit this plan, then rerun with --create-child-issues, or rerun with "
+            "--decompose never to intentionally bypass planning-only decomposition."
+        )
+
+    if status != "children_created":
+        created_text = f"Created child issues (tracked):\n{created_text}"
+
     return (
-        "Decomposition plan proposed\n\n"
-        "Status: `needs-decomposition`\n\n"
+        "Decomposition plan\n\n"
+        f"{status_note}\n\n"
         "Reason:\n"
         f"{reason_lines}\n\n"
         "Proposed child tasks:\n"
         f"{children_text}\n\n"
-        "Recommended next action: approve/edit this plan, or rerun with `--decompose never` "
-        "to intentionally bypass planning-only decomposition.\n\n"
+        f"Created child issues:\n{created_text}\n\n"
+        f"Recommended next action: {next_action}\n\n"
         f"{DECOMPOSITION_PLAN_MARKER}\n"
         f"```json\n{json.dumps(payload, ensure_ascii=True, indent=2)}\n```"
     )
@@ -3548,6 +3673,7 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "sync_strategy",
         "base_branch",
         "decompose",
+        "create_child_issues",
     }
 
     unsupported = sorted(set(config) - supported_keys)
@@ -3612,6 +3738,7 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         "skip_if_branch_exists",
         "force_reprocess",
         "sync_reused_branch",
+        "create_child_issues",
     ]:
         if key in config:
             if not isinstance(config[key], bool):
@@ -4156,6 +4283,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--create-child-issues",
+        action="store_true",
+        help=(
+            "When a decomposed plan is approved in comments, create child issues "
+            "from the plan (idempotent on re-runs)."
+        ),
+    )
+    parser.add_argument(
         "--dir",
         default=BUILTIN_DEFAULTS["dir"],
         help="Path to the local git repository to operate on. Defaults to the current directory.",
@@ -4237,6 +4372,7 @@ def main() -> int:
     post_pr_summary = bool(getattr(args, "post_pr_summary", False))
     base_branch_mode = str(getattr(args, "base_branch", BUILTIN_DEFAULTS["base_branch"]))
     decompose_mode = str(getattr(args, "decompose", BUILTIN_DEFAULTS["decompose"]))
+    create_child_issues = bool(getattr(args, "create_child_issues", BUILTIN_DEFAULTS["create_child_issues"]))
 
     if force_reprocess:
         skip_if_pr_exists = False
@@ -5053,34 +5189,101 @@ def main() -> int:
                         print(f"Warning: {warning}", file=sys.stderr)
 
                     if latest_plan is not None:
-                        prefix = "[dry-run] " if args.dry_run else ""
-                        latest_plan_payload = latest_plan.get("payload")
-                        if isinstance(latest_plan_payload, dict):
-                            decomposition_rollup = build_decomposition_rollup_from_plan_payload(
-                                plan_payload=latest_plan_payload,
-                            )
-                            safe_post_orchestration_state_comment(
-                                repo=repo,
-                                target_type="issue",
-                                target_number=issue["number"],
-                                dry_run=args.dry_run,
-                                state=build_orchestration_state(
-                                    status="waiting-for-author",
-                                    task_type="issue",
+                        latest_payload = latest_plan.get("payload")
+                        latest_payload_dict = latest_payload if isinstance(latest_payload, dict) else {}
+
+                        if create_child_issues and is_decomposition_plan_approved(latest_payload_dict):
+                            missing_children = _decomposition_plan_has_missing_children(latest_payload_dict)
+                            if missing_children:
+                                created_children = _extract_ordered_linked_children(latest_payload_dict)
+                                created_children_updates: list[dict] = []
+                                for child in missing_children:
+                                    created_child = create_decomposition_child_issue(
+                                        repo=repo,
+                                        parent_issue=issue,
+                                        child=child,
+                                        created_dependencies=created_children,
+                                        dry_run=args.dry_run,
+                                    )
+                                    created_order = child.get("order")
+                                    if type(created_order) is int and created_order > 0:
+                                        created_children[created_order] = created_child
+                                    created_children_updates.append(created_child)
+
+                                    if not args.dry_run:
+                                        if isinstance(created_child.get("issue_number"), int):
+                                            print(
+                                                f"Created child issue #{created_child['issue_number']} "
+                                                f"for order {child.get('order')} under issue #{issue['number']}"
+                                            )
+                                        else:
+                                            raise RuntimeError(
+                                                f"Created child issue payload for order {child.get('order')} "
+                                                "was missing an integer issue number"
+                                            )
+
+                                latest_payload_dict = merge_created_children_into_plan_payload(
+                                    latest_payload_dict,
+                                    created_children_updates,
+                                )
+                                all_children_created = all(
+                                    isinstance(child.get("issue_number"), int)
+                                    for child in _normalize_created_children(
+                                        latest_payload_dict.get("created_children")
+                                    )
+                                )
+
+                                if all_children_created:
+                                    latest_payload_dict = dict(latest_payload_dict)
+                                    latest_payload_dict["status"] = "children_created"
+                                    latest_payload_dict["next_action"] = "execute_children_in_order"
+
+                                post_decomposition_plan_comment(
+                                    repo=repo,
                                     issue_number=issue["number"],
-                                    pr_number=None,
-                                    branch=issue_branch,
-                                    base_branch=base_branch if base_branch else None,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
-                                    attempt=1,
-                                    stage="decomposition_plan",
-                                    next_action="approve_plan_or_rerun_with_decompose_never",
-                                    error="Task requires planning-only decomposition before implementation",
-                                    decomposition=decomposition_rollup,
-                                ),
+                                    payload=latest_payload_dict,
+                                    dry_run=args.dry_run,
+                                )
+                                safe_post_orchestration_state_comment(
+                                    repo=repo,
+                                    target_type="issue",
+                                    target_number=issue["number"],
+                                    dry_run=args.dry_run,
+                                    state=build_orchestration_state(
+                                        status="waiting-for-author",
+                                        task_type="issue",
+                                        issue_number=issue["number"],
+                                        pr_number=None,
+                                        branch=issue_branch,
+                                        base_branch=base_branch if base_branch else None,
+                                        runner=args.runner,
+                                        agent=args.agent,
+                                        model=args.model,
+                                        attempt=1,
+                                        stage="decomposition_plan",
+                                        next_action="execute_children_in_order",
+                                        error=(
+                                            "Created child issues from approved decomposition plan"
+                                            if all_children_created
+                                            else "Waiting for all child issue creation in approved plan"
+                                        ),
+                                    ),
+                                )
+                                processed += 1
+                                continue
+
+                            prefix = "[dry-run] " if args.dry_run else ""
+                            print(
+                                f"{prefix}All child issues for issue #{issue['number']} are already "
+                                "created from approved decomposition plan; skipping duplicate run."
                             )
+                            processed += 1
+                            continue
+
+                        if args.dry_run:
+                            prefix = "[dry-run] "
+                        else:
+                            prefix = ""
                         print(
                             f"{prefix}Decomposition plan already exists for issue #{issue['number']} "
                             f"({latest_plan.get('url') or 'no url'}); skipping duplicate plan."

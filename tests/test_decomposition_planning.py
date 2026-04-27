@@ -6,11 +6,13 @@ import unittest
 from scripts.run_github_issues_to_opencode import (
     BUILTIN_DEFAULTS,
     DECOMPOSITION_PLAN_MARKER,
-    build_decomposition_rollup_from_plan_payload,
-    build_decomposition_rollup_from_recovered_state,
+    _decomposition_plan_has_missing_children,
+    _normalize_created_children,
     assess_issue_decomposition_need,
     build_decomposition_plan_payload,
     format_decomposition_plan_comment,
+    is_decomposition_plan_approved,
+    merge_created_children_into_plan_payload,
     parse_args,
     parse_decomposition_plan_comment_body,
     select_latest_parseable_decomposition_plan,
@@ -51,7 +53,54 @@ class DecompositionPlanningTests(unittest.TestCase):
         assessment = assess_issue_decomposition_need(issue)
 
         self.assertTrue(assessment["needs_decomposition"])
-        self.assertIn("large_scope_keywords", assessment["reasons"])
+        self.assertIn("explicit_epic_title", assessment["reasons"])
+        self.assertIn("many_implementation_areas", assessment["reasons"])
+
+    def test_child_issue_keywords_do_not_trigger_decomposition_on_their_own(self) -> None:
+        issue = {
+            "number": 103,
+            "title": "Refine decomposition auto-gate",
+            "body": "\n".join(
+                [
+                    "Parent epic: #99",
+                    "## Goal",
+                    "Avoid triggering decomposition for child implementation tasks.",
+                    "## Scope",
+                    "- Tighten the auto gate for child tasks.",
+                    "- Keep --decompose always working.",
+                    "## Success criteria",
+                    "- Child tasks under the decomposition epic proceed normally.",
+                    "- Manual decomposition still works.",
+                ]
+            ),
+        }
+
+        assessment = assess_issue_decomposition_need(issue)
+
+        self.assertFalse(assessment["needs_decomposition"])
+        self.assertEqual(assessment["reasons"], [])
+        self.assertIn("decomposition", assessment["matched_keywords"])
+
+    def test_many_implementation_areas_trigger_decomposition_without_epic_title(self) -> None:
+        issue = {
+            "number": 120,
+            "title": "Roll out orchestration recovery improvements",
+            "body": "\n".join(
+                [
+                    "## Scope",
+                    "- Harden state recovery across reruns.",
+                    "- Add guardrails for malformed state markers.",
+                    "- Improve status reporting in CLI output.",
+                    "- Capture recovery warnings in tracker comments.",
+                    "- Expand regression coverage for resumed runs.",
+                ]
+            ),
+        }
+
+        assessment = assess_issue_decomposition_need(issue)
+
+        self.assertTrue(assessment["needs_decomposition"])
+        self.assertIn("many_implementation_areas", assessment["reasons"])
 
     def test_plan_comment_round_trips_machine_payload(self) -> None:
         issue = {
@@ -74,70 +123,47 @@ class DecompositionPlanningTests(unittest.TestCase):
         self.assertEqual(parsed["parent_issue"], 99)
         self.assertIn(DECOMPOSITION_PLAN_MARKER, body)
 
-    def test_rollup_builder_from_plan_payload(self) -> None:
-        payload = {
-            "parent_issue": 77,
-            "proposed_children": [
-                {"order": "1", "title": "In-progress task", "status": "in-progress", "issue": "111", "pr": "321"},
-                {"order": 2, "title": "Planned task", "status": "planned", "issue": 112},
-                {"title": "Blocked task", "status": "blocked", "issue": "113", "blockers": ["dependency"]},
-                {"title": "Done task", "status": "done", "issue": 114},
+    def test_plan_payload_uses_scope_bullets_and_skips_success_criteria(self) -> None:
+        issue = {
+            "number": 106,
+            "title": "Epic: Improve decomposition plan quality",
+            "body": "\n".join(
+                [
+                    "## Scope",
+                    "- Tighten the auto gate for child issues.",
+                    "- Generate child tasks from implementation scope only.",
+                    "## Success criteria",
+                    "- Decomposition is validated on a real large task.",
+                    "- Child tasks are completed and validated.",
+                ]
+            ),
+        }
+        assessment = {
+            "reasons": ["explicit_epic_title"],
+            "matched_keywords": ["epic", "decomposition"],
+        }
+
+        payload = build_decomposition_plan_payload(issue=issue, assessment=assessment)
+
+        child_titles = [child["title"] for child in payload["proposed_children"]]
+        self.assertEqual(
+            child_titles,
+            [
+                "Tighten the auto gate for child issues",
+                "Generate child tasks from implementation scope only",
             ],
-            "blockers": ["global-blocker"],
-        }
-
-        rollup = build_decomposition_rollup_from_plan_payload(payload)
-
-        self.assertEqual(rollup["parent_issue"], 77)
-        self.assertEqual(rollup["counts"], {"planned": 1, "created": 0, "in-progress": 1, "done": 1, "blocked": 1})
-        self.assertEqual(rollup["children_by_status"]["blocked"][0]["issue"], 113)
-        self.assertEqual(rollup["blockers"], ["global-blocker", "dependency"])
-        next_target = rollup["next_target_task"]
-        self.assertIsNotNone(next_target)
-        assert next_target is not None
-        self.assertEqual(next_target["order"], 1)
-        self.assertEqual(next_target["status"], "in-progress")
-
-    def test_rollup_builder_from_recovered_children_by_status(self) -> None:
-        recovered_state = {
-            "payload": {
-                "decomposition": {
-                    "children_by_status": {
-                        "planned": [
-                            {"order": 4, "title": "Planned next", "issue": 210, "status": "planned"},
-                        ],
-                        "created": [
-                            {"order": 3, "title": "Created now", "issue": 209, "status": "created"},
-                        ],
-                        "in-progress": [
-                            {"order": 2, "title": "Doing now", "issue": 208, "status": "in-progress"},
-                        ],
-                        "done": [
-                            {"order": 1, "title": "Done earlier", "issue": 207, "status": "done"},
-                        ],
-                        "blocked": [
-                            {"order": 5, "title": "Blocked", "issue": 211, "status": "blocked", "blockers": ["network"]},
-                        ],
-                    },
-                    "blockers": ["overall"]
-                }
-            }
-        }
-
-        rollup = build_decomposition_rollup_from_recovered_state(recovered_state, parent_issue=77)
-
-        self.assertIsNotNone(rollup)
-        assert rollup is not None
-        self.assertEqual(rollup["parent_issue"], 77)
-        self.assertEqual(rollup["counts"], {"planned": 1, "created": 1, "in-progress": 1, "done": 1, "blocked": 1})
-        self.assertEqual(rollup["next_target_task"], {
-            "order": 2,
-            "title": "Doing now",
-            "status": "in-progress",
-            "issue": 208,
-            "pr": None,
-        })
-        self.assertEqual(rollup["blockers"], ["overall", "network"])
+        )
+        self.assertNotIn(
+            "Decomposition is validated on a real large task",
+            child_titles,
+        )
+        self.assertEqual(
+            payload["proposed_children"][0]["acceptance"],
+            [
+                "Required changes for 'Tighten the auto gate for child issues' are implemented.",
+                "Relevant validation or follow-up checks for 'Tighten the auto gate for child issues' are recorded.",
+            ],
+        )
 
     def test_latest_decomposition_plan_is_selected(self) -> None:
         first = {
@@ -188,6 +214,51 @@ class DecompositionPlanningTests(unittest.TestCase):
 
         self.assertEqual(configured_args.decompose, "never")
         self.assertEqual(cli_args.decompose, "always")
+
+    def test_approved_decomposition_plan_is_recognized(self) -> None:
+        self.assertTrue(is_decomposition_plan_approved({"status": "approved"}))
+        self.assertTrue(is_decomposition_plan_approved({"status": "execution_plan"}))
+        self.assertFalse(is_decomposition_plan_approved({"status": "proposed"}))
+
+    def test_missing_children_is_computed_from_created_children(self) -> None:
+        payload = {
+            "proposed_children": [
+                {"title": "Parent first", "order": 1},
+                {"title": "Parent second", "order": 2},
+                {"title": "Parent third", "order": 3},
+            ],
+            "created_children": [
+                {"title": "Parent first", "order": 1, "issue_number": 101, "issue_url": "https://x/101"},
+            ],
+        }
+
+        missing = _decomposition_plan_has_missing_children(payload)
+
+        self.assertEqual(len(missing), 2)
+        self.assertEqual(missing[0]["order"], 2)
+        self.assertEqual(missing[1]["order"], 3)
+
+    def test_merge_created_children_is_idempotent(self) -> None:
+        payload = {
+            "proposed_children": [
+                {"title": "Alpha", "order": 1},
+                {"title": "Beta", "order": 2},
+            ],
+            "created_children": [
+                {"title": "Alpha", "order": 1, "issue_number": 10, "issue_url": "https://example/10"}
+            ],
+        }
+        merged = merge_created_children_into_plan_payload(payload, [
+            {"title": "Beta", "order": 2, "issue_number": 20, "issue_url": "https://example/20", "created": True}
+        ])
+
+        created_children = _normalize_created_children(merged.get("created_children"))
+
+        self.assertEqual(len(created_children), 2)
+        self.assertEqual(created_children[0]["order"], 1)
+        self.assertEqual(created_children[1]["order"], 2)
+        self.assertEqual(merged["created_children"][1]["issue_number"], 20)
+
 
 
 if __name__ == "__main__":

@@ -200,6 +200,50 @@ func TestRunPRCommandAcceptsPythonPRFlags(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments"})
 }
 
+func TestRunPRCommandMapsCoreCompatibilityFlags(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{
+		"run", "pr",
+		"--id", "72",
+		"--repo", "owner/repo",
+		"--runner", "opencode",
+		"--agent", "review",
+		"--model", "openai/gpt-4o",
+		"--opencode-auto-approve",
+		"--agent-timeout-seconds", "900",
+		"--dry-run",
+	})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{
+		runnerScript, "--pr", "72", "--from-review-comments",
+		"--repo", "owner/repo",
+		"--runner", "opencode",
+		"--agent", "review",
+		"--model", "openai/gpt-4o",
+		"--opencode-auto-approve",
+		"--dry-run",
+		"--agent-timeout-seconds", "900",
+	})
+}
+
+func TestRunPRRequiresID(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	if code := app.Run([]string{"run", "pr", "--dry-run"}); code != 2 {
+		t.Fatalf("Run() code = %d, want 2", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+}
+
 func TestUnsupportedPythonFlagFailsFastWithActionableError(t *testing.T) {
 	runner := &recordingRunner{}
 	var errOut strings.Builder

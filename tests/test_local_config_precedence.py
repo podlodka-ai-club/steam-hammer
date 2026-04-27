@@ -25,6 +25,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(args.decompose, BUILTIN_DEFAULTS["decompose"])
         self.assertEqual(args.create_child_issues, BUILTIN_DEFAULTS["create_child_issues"])
         self.assertEqual(args.track_tokens, BUILTIN_DEFAULTS["track_tokens"])
+        self.assertEqual(args.token_budget, BUILTIN_DEFAULTS["token_budget"])
 
     def test_local_config_overrides_built_in_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -45,6 +46,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
                     "base_branch": "current",
                     "decompose": "never",
                     "track_tokens": True,
+                    "token_budget": 20000,
                     "create_child_issues": True,
                 },
                 config_file,
@@ -61,6 +63,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
         self.assertTrue(args.force_reprocess)
         self.assertFalse(args.sync_reused_branch)
         self.assertTrue(args.track_tokens)
+        self.assertEqual(args.token_budget, 20000)
         self.assertEqual(args.sync_strategy, "merge")
         self.assertEqual(args.base_branch, "current")
         self.assertEqual(args.decompose, "never")
@@ -77,18 +80,30 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
                     "limit": 2,
                     "branch_prefix": "my-fixes",
                     "track_tokens": False,
+                    "token_budget": 15000,
                 },
                 config_file,
                 )
 
             args = parse_args(
-                ["--dir", tmpdir, "--runner", "claude", "--limit", "7", "--track-tokens"]
+                [
+                    "--dir",
+                    tmpdir,
+                    "--runner",
+                    "claude",
+                    "--limit",
+                    "7",
+                    "--track-tokens",
+                    "--token-budget",
+                    "25000",
+                ]
             )
 
         self.assertEqual(args.runner, "claude")
         self.assertEqual(args.limit, 7)
         self.assertEqual(args.branch_prefix, "my-fixes")
         self.assertTrue(args.track_tokens)
+        self.assertEqual(args.token_budget, 25000)
 
     def test_project_config_track_tokens_default_is_applied(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -100,6 +115,17 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
             args = parse_args(["--dir", tmpdir, "--project-config", project_config_path])
 
         self.assertTrue(args.track_tokens)
+
+    def test_project_config_token_budget_default_is_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            project_config_path = os.path.join(tmpdir, "project-config.json")
+            with open(project_config_path, "w", encoding="utf-8") as config_file:
+                json.dump({"defaults": {"token_budget": 18000}}, config_file)
+
+            args = parse_args(["--dir", tmpdir, "--project-config", project_config_path])
+
+        self.assertEqual(args.token_budget, 18000)
 
     def test_local_config_overrides_project_config_track_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -116,6 +142,22 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
             )
 
         self.assertFalse(args.track_tokens)
+
+    def test_local_config_overrides_project_config_token_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            project_config_path = os.path.join(tmpdir, "project-config.json")
+            local_config_path = os.path.join(tmpdir, "local-config.json")
+            with open(project_config_path, "w", encoding="utf-8") as project_config_file:
+                json.dump({"defaults": {"token_budget": 18000}}, project_config_file)
+            with open(local_config_path, "w", encoding="utf-8") as local_config_file:
+                json.dump({"token_budget": 12000}, local_config_file)
+
+            args = parse_args(
+                ["--dir", tmpdir, "--project-config", project_config_path, "--local-config", local_config_path]
+            )
+
+        self.assertEqual(args.token_budget, 12000)
 
     def test_cli_track_tokens_overrides_project_and_local_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -140,6 +182,31 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
             )
 
         self.assertTrue(args.track_tokens)
+
+    def test_cli_token_budget_overrides_project_and_local_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            project_config_path = os.path.join(tmpdir, "project-config.json")
+            local_config_path = os.path.join(tmpdir, "local-config.json")
+            with open(project_config_path, "w", encoding="utf-8") as project_config_file:
+                json.dump({"defaults": {"token_budget": 9000}}, project_config_file)
+            with open(local_config_path, "w", encoding="utf-8") as local_config_file:
+                json.dump({"token_budget": 12000}, local_config_file)
+
+            args = parse_args(
+                [
+                    "--dir",
+                    tmpdir,
+                    "--project-config",
+                    project_config_path,
+                    "--local-config",
+                    local_config_path,
+                    "--token-budget",
+                    "25000",
+                ]
+            )
+
+        self.assertEqual(args.token_budget, 25000)
 
     def test_create_child_issues_flag_overrides_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

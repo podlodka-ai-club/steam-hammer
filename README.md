@@ -141,7 +141,7 @@ You can define repository defaults and placeholders for future orchestration pol
 Project config currently supports these sections:
 
 - `workflow.commands.test|lint|build` (non-empty string shell command or `null`)
-- `defaults.runner|agent|model` (used as parser defaults)
+- `defaults.runner|agent|model|track_tokens|token_budget` (used as parser defaults)
 - `scope.defaults.labels.allow|deny` (arrays of label names)
 - `scope.defaults.authors.allow|deny` (arrays of GitHub logins; optional placeholder)
 - `retry.max_attempts` (positive integer placeholder)
@@ -230,6 +230,7 @@ Supported local config keys:
 - `model` (string or `null`)
 - `agent_timeout_seconds` (positive integer)
 - `agent_idle_timeout_seconds` (positive integer or `null`)
+- `token_budget` (positive integer or `null`)
 - `opencode_auto_approve` (boolean)
 - `branch_prefix` (string)
 - `include_empty` (boolean)
@@ -337,6 +338,7 @@ Useful options:
 - `--branch-prefix prefix` to customize fix branch names
 - `--agent-timeout-seconds N` hard timeout for agent run (default: `900`)
 - `--agent-idle-timeout-seconds N` fail if agent prints no output for `N` seconds
+- `--token-budget N` (`--max-tokens` alias) stop the agent when cumulative tracked tokens exceed `N`
 - `--opencode-auto-approve` pass `--dangerously-skip-permissions` to OpenCode (use with caution)
 - `--local-config path` load local JSON defaults (default: `local-config.json` under `--dir`)
 - `--project-config path` load repository JSON defaults scaffold (default: `project-config.json` under `--dir`)

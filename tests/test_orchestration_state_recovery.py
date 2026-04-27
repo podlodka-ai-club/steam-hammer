@@ -548,6 +548,90 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertTrue(parent_update_mock.called)
         self.assertIn("Executing decomposition child issue #201 for parent #105", stdout_mock.getvalue())
 
+    def test_main_northstar_epic_issue_posts_planning_comment(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=99,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            token_budget=20000,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=True,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            decompose="auto",
+            create_child_issues=False,
+            track_tokens=False,
+            dir=".",
+            local_config="local-config.json",
+            project_config="project-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            isolate_worktree=True,
+        )
+
+        epic_issue = {
+            "number": 99,
+            "title": "Epic: Northstar MVP rollout",
+            "body": "\n".join(
+                [
+                    "## Goal",
+                    "Deliver one production-ready northstar decomposition flow.",
+                    "## Scope",
+                    "- Add real-state markers for plan and execution",
+                    "- Execute decomposition children with dependency ordering",
+                    "- Track blockers and roll up child statuses",
+                    "- Resume from child completion state",
+                    "- Post transparent execution notes",
+                    "- Keep PR validation and cleanup stable",
+                ]
+            ),
+            "url": "https://example/issues/99",
+            "state": "open",
+        }
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.load_project_config", return_value={}),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=epic_issue),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
+            patch("scripts.run_github_issues_to_opencode.post_decomposition_plan_comment") as plan_comment_mock,
+            patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment") as state_comment_mock,
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="created"),
+            patch("scripts.run_github_issues_to_opencode.run_agent") as run_agent_mock,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        run_agent_mock.assert_not_called()
+        plan_comment_mock.assert_called_once()
+        self.assertIn("needs decomposition; posted planning-only plan", stdout_mock.getvalue())
+
+        state_payload = state_comment_mock.call_args.kwargs["state"]
+        self.assertEqual(state_payload["status"], "waiting-for-author")
+        self.assertEqual(state_payload["stage"], "decomposition_plan")
+        self.assertIn("approve_plan_or_rerun_with_decompose_never", state_payload["next_action"])
+
     def test_main_pr_mode_dry_run_prints_recovered_state_context(self) -> None:
         args = argparse.Namespace(
             repo="owner/repo",

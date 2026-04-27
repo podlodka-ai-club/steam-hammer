@@ -21,6 +21,30 @@
     "max_attempts": 2,
     "escalate_to_preset": "hard"
   },
+  "routing": {
+    "default_preset": "default",
+    "rules": [
+      {
+        "when": {
+          "labels": ["docs", "chore"],
+          "task_types": ["issue"]
+        },
+        "preset": "cheap"
+      },
+      {
+        "when": {
+          "needs_decomposition": true
+        },
+        "preset": "hard"
+      }
+    ]
+  },
+  "budgets": {
+    "max_attempts_per_task": 3,
+    "max_runtime_minutes": 20,
+    "max_cost_usd": 2.5,
+    "max_model_tier": "hard"
+  },
   "presets": {
     "cheap": {
       "runner": "opencode",

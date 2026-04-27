@@ -68,6 +68,7 @@ ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"
 AGENT_FAILURE_REPORT_MARKER = "<!-- orchestration-agent-failure:v1 -->"
 SCOPE_DECISION_MARKER = "<!-- orchestration-scope:v1 -->"
 DECOMPOSITION_PLAN_MARKER = "<!-- orchestration-decomposition:v1 -->"
+CLARIFICATION_REQUEST_MARKER = "<!-- orchestration-clarification-request:v1 -->"
 DECOMPOSITION_CHILD_ORDER_PREFIX = "Step"
 AGENT_FAILURE_LABEL_NAME = "auto:agent-failed"
 AGENT_FAILURE_LABEL_COLOR = "B60205"
@@ -1282,6 +1283,45 @@ def _first_json_object(raw: str) -> dict:
     return payload
 
 
+def parse_clarification_request_text(raw: str) -> tuple[dict | None, str | None]:
+    if CLARIFICATION_REQUEST_MARKER not in raw:
+        return None, None
+
+    after_marker = raw.split(CLARIFICATION_REQUEST_MARKER, maxsplit=1)[1].strip()
+    if not after_marker:
+        return None, "marker found but payload is empty"
+
+    fenced_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", after_marker, flags=re.DOTALL)
+    candidates = fenced_matches if fenced_matches else [after_marker]
+
+    parse_errors: list[str] = []
+    for candidate in candidates:
+        try:
+            payload = _first_json_object(candidate)
+        except (ValueError, json.JSONDecodeError) as exc:
+            parse_errors.append(str(exc))
+            continue
+
+        question = _as_optional_string(payload.get("question"))
+        if not question:
+            parse_errors.append("clarification payload must include a non-empty 'question'")
+            continue
+
+        normalized_payload = dict(payload)
+        normalized_payload["question"] = question
+        normalized_payload["reason"] = _as_optional_string(payload.get("reason")) or question
+        return normalized_payload, None
+
+    if parse_errors:
+        return None, parse_errors[-1]
+    return None, "unable to parse clarification payload"
+
+
+def latest_clarification_request_from_agent_output(output: str) -> dict | None:
+    payload, _error = parse_clarification_request_text(output)
+    return payload
+
+
 def parse_orchestration_state_comment_body(body: str) -> tuple[dict | None, str | None]:
     if ORCHESTRATION_STATE_MARKER not in body:
         return None, None
@@ -2128,6 +2168,111 @@ def format_recovered_state_context(state: dict) -> str:
     if url:
         details += f"; comment={url}"
     return details
+
+
+def _comment_author_login(comment: dict) -> str:
+    user = comment.get("user") if isinstance(comment, dict) else None
+    if isinstance(user, dict):
+        login = str(user.get("login") or "").strip().lower()
+        if login:
+            return login
+
+    author = comment.get("author") if isinstance(comment, dict) else None
+    if isinstance(author, dict):
+        login = str(author.get("login") or "").strip().lower()
+        if login:
+            return login
+    if isinstance(author, str):
+        return author.strip().lower()
+    return ""
+
+
+def _is_orchestration_machine_comment(body: str) -> bool:
+    return any(
+        marker in body
+        for marker in (
+            ORCHESTRATION_STATE_MARKER,
+            DECOMPOSITION_PLAN_MARKER,
+            AGENT_FAILURE_REPORT_MARKER,
+            SCOPE_DECISION_MARKER,
+        )
+    )
+
+
+def find_waiting_for_author_answer(
+    comments: list[dict],
+    recovered_state: dict | None,
+    author_login: str | None = None,
+) -> dict | None:
+    if not isinstance(recovered_state, dict):
+        return None
+    if str(recovered_state.get("status") or "") != "waiting-for-author":
+        return None
+
+    waiting_created_at = str(recovered_state.get("created_at") or "")
+    waiting_comment_id = recovered_state.get("comment_id")
+    normalized_author = str(author_login or "").strip().lower()
+
+    latest_answer: dict | None = None
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        body = str(comment.get("body") or "").strip()
+        if not body or _is_orchestration_machine_comment(body):
+            continue
+
+        created_at = str(comment.get("created_at") or "")
+        comment_id = comment.get("id")
+        if waiting_created_at and created_at and created_at < waiting_created_at:
+            continue
+        if waiting_comment_id is not None and comment_id is not None:
+            try:
+                if int(comment_id) <= int(waiting_comment_id):
+                    continue
+            except (TypeError, ValueError):
+                pass
+
+        comment_author = _comment_author_login(comment)
+        if normalized_author and comment_author and comment_author != normalized_author:
+            continue
+
+        latest_answer = {
+            "body": body,
+            "created_at": created_at,
+            "url": str(comment.get("html_url") or "").strip(),
+            "author": comment_author or normalized_author or "unknown",
+            "comment_id": comment_id,
+        }
+
+    return latest_answer
+
+
+def build_clarification_context_note(state: dict, answer: dict | None = None) -> str:
+    payload = state.get("payload") if isinstance(state, dict) else None
+    if not isinstance(payload, dict):
+        payload = {}
+
+    question = _as_optional_string(payload.get("question")) or _as_optional_string(payload.get("reason")) or "Clarification requested"
+    reason = _as_optional_string(payload.get("reason"))
+    lines = [
+        "Recovered clarification context:",
+        f"- {format_recovered_state_context(state)}",
+    ]
+    if reason and reason != question:
+        lines.append(f"- why clarification was needed: {reason}")
+    lines.append(f"- question asked to the task author: {question}")
+    if isinstance(answer, dict):
+        answer_text = _as_optional_string(answer.get("body")) or ""
+        answer_author = _as_optional_string(answer.get("author")) or "unknown"
+        answer_url = _as_optional_string(answer.get("url"))
+        answer_context = f" by {answer_author}"
+        if answer_url:
+            answer_context += f" ({answer_url})"
+        lines.append(f"- answer received{answer_context}: {answer_text}")
+        lines.append("- use this answer as authoritative context for the resumed run")
+    else:
+        lines.append("- no answer has been posted yet; do not guess beyond the current requirements")
+    return "\n".join(lines)
 
 
 def build_recovered_failure_context_note(state: dict) -> str:
@@ -3634,6 +3779,75 @@ def format_orchestration_state_comment(state: dict) -> str:
     )
 
 
+def format_clarification_request_comment(question: str, reason: str | None = None) -> str:
+    lines = [
+        "Automation needs clarification before it can continue safely.",
+        "",
+        f"Question: {question}",
+    ]
+    if reason and reason.strip() and reason.strip() != question.strip():
+        lines.extend(["", f"Why this is blocked: {reason.strip()}"])
+    lines.extend(["", "Next action: reply here and rerun the orchestrator."])
+    return "\n".join(lines)
+
+
+def post_clarification_request_comment(
+    repo: str,
+    target_type: str,
+    target_number: int,
+    question: str,
+    reason: str | None,
+    dry_run: bool,
+) -> None:
+    if target_type not in {"issue", "pr"}:
+        raise RuntimeError(f"Unsupported clarification comment target type: {target_type}")
+
+    body = format_clarification_request_comment(question=question, reason=reason)
+    if dry_run:
+        print(
+            f"[dry-run] Would post clarification request to {target_type} #{target_number}: "
+            f"question={question}"
+        )
+        return
+
+    run_command(
+        [
+            "gh",
+            target_type,
+            "comment",
+            str(target_number),
+            "--repo",
+            repo,
+            "--body",
+            body,
+        ]
+    )
+
+
+def safe_post_clarification_request_comment(
+    repo: str,
+    target_type: str,
+    target_number: int,
+    question: str,
+    reason: str | None,
+    dry_run: bool,
+) -> None:
+    try:
+        post_clarification_request_comment(
+            repo=repo,
+            target_type=target_type,
+            target_number=target_number,
+            question=question,
+            reason=reason,
+            dry_run=dry_run,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Warning: failed to post clarification request to {target_type} #{target_number}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def post_orchestration_state_comment(
     repo: str,
     target_type: str,
@@ -3702,6 +3916,9 @@ def build_prompt(issue: dict, image_paths: list[str] | None = None) -> str:
         "You are working on an issue in the current git branch.\n"
         "Implement the fix for the issue in the repository files.\n"
         "Do not run git commands; git actions are handled by orchestration script.\n\n"
+        "If the task is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. "
+        f"Instead, stop and print {CLARIFICATION_REQUEST_MARKER} followed by a JSON object like "
+        '{"question":"<focused question>","reason":"<why clarification is required>"}.\n\n'
         f"Issue: {format_issue_ref_from_issue(issue)} - {issue['title']}\n"
         f"URL: {issue['url']}\n\n"
         "Issue body:\n"
@@ -3787,6 +4004,9 @@ def build_pr_review_prompt(
         "You are working on an existing GitHub pull request review cycle in the current git branch.\n"
         "Implement the fix requested in PR review comments in repository files.\n"
         "Do not run git commands; git actions are handled by orchestration script.\n\n"
+        "If the requested change is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. "
+        f"Instead, stop and print {CLARIFICATION_REQUEST_MARKER} followed by a JSON object like "
+        '{"question":"<focused question>","reason":"<why clarification is required>"}.\n\n'
         f"Pull Request: #{pr_number} - {pr_title}\n"
         f"PR URL: {pr_url}\n\n"
         "PR description:\n"
@@ -3803,6 +4023,7 @@ def choose_execution_mode(
     linked_open_pr: dict | None,
     force_issue_flow: bool,
     recovered_state: dict | None = None,
+    clarification_answer: dict | None = None,
 ) -> tuple[str, str]:
     if force_issue_flow:
         return "issue-flow", "--force-issue-flow is set"
@@ -3810,6 +4031,16 @@ def choose_execution_mode(
     recovered_status = ""
     if isinstance(recovered_state, dict):
         recovered_status = str(recovered_state.get("status") or "")
+
+    if recovered_status == "waiting-for-author" and clarification_answer is not None:
+        recovered_payload = recovered_state.get("payload") if isinstance(recovered_state, dict) else None
+        recovered_task_type = ""
+        if isinstance(recovered_payload, dict):
+            recovered_task_type = str(recovered_payload.get("task_type") or "")
+        if linked_open_pr is not None and recovered_task_type == "pr":
+            pr_number = linked_open_pr.get("number")
+            return "pr-review", f"recovered waiting-for-author state has a newer author answer for linked PR #{pr_number}"
+        return "issue-flow", "recovered waiting-for-author state has a newer author answer"
 
     if recovered_status in {"waiting-for-author", "blocked"}:
         return (
@@ -4024,6 +4255,7 @@ def run_agent(
     track_tokens: bool = False,
     token_budget: int | None = None,
     run_stats: dict[str, object] | None = None,
+    agent_result: dict[str, object] | None = None,
 ) -> int:
     prompt = prompt_override if prompt_override is not None else build_prompt(
         issue=issue,
@@ -4043,6 +4275,7 @@ def run_agent(
         track_tokens=track_tokens,
         token_budget=token_budget,
         run_stats=run_stats,
+        agent_result=agent_result,
     )
 
 
@@ -4102,6 +4335,7 @@ def run_agent_with_prompt(
     track_tokens: bool = False,
     token_budget: int | None = None,
     run_stats: dict[str, object] | None = None,
+    agent_result: dict[str, object] | None = None,
 ) -> int:
     command = build_agent_command(
         runner=runner,
@@ -4130,6 +4364,7 @@ def run_agent_with_prompt(
     tokens_in: int | None = None
     tokens_out: int | None = None
     cost_usd: float | None = None
+    captured_output: list[str] = []
 
     process = subprocess.Popen(  # noqa: S603
         command,
@@ -4235,8 +4470,10 @@ def run_agent_with_prompt(
                         process.wait(timeout=10)
                         _raise_if_token_budget_exceeded()
                 if tag == "stderr":
+                    captured_output.append(line)
                     print(line, end="", file=sys.stderr)
                 else:
+                    captured_output.append(line)
                     print(line, end="")
         except _queue.Empty:
             pass
@@ -4259,8 +4496,10 @@ def run_agent_with_prompt(
                         if token_budget is not None and total_tokens is not None and total_tokens > token_budget:
                             _raise_if_token_budget_exceeded()
                     if tag == "stderr":
+                        captured_output.append(line)
                         print(line, end="", file=sys.stderr)
                     else:
+                        captured_output.append(line)
                         print(line, end="")
 
             recorded_stats = _record_agent_run_stats(
@@ -4270,6 +4509,14 @@ def run_agent_with_prompt(
                 tokens_out=tokens_out,
                 cost_usd=cost_usd,
             )
+            if agent_result is not None:
+                agent_result.clear()
+                agent_result["output"] = "".join(captured_output)
+                clarification_request = latest_clarification_request_from_agent_output(
+                    agent_result["output"]
+                )
+                if clarification_request is not None:
+                    agent_result["clarification_request"] = clarification_request
             if recorded_stats is not None:
                 print_agent_run_summary(item_label=item_label, stats=recorded_stats)
             return process.returncode
@@ -6154,11 +6401,17 @@ def main() -> int:
                 switched_branch = (not args.dry_run) and original_branch != target_pr_branch
 
             recovered_pr_state: dict | None = None
+            pr_clarification_answer: dict | None = None
             try:
                 pr_comments = fetch_issue_comments(repo=repo, issue_number=pr_number_arg)
                 recovered_pr_state, pr_state_warnings = select_latest_parseable_orchestration_state(
                     comments=pr_comments,
                     source_label=f"pr #{pr_number_arg}",
+                )
+                pr_clarification_answer = find_waiting_for_author_answer(
+                    comments=pr_comments,
+                    recovered_state=recovered_pr_state,
+                    author_login=pr_author_login if "pr_author_login" in locals() else None,
                 )
                 for warning in pr_state_warnings:
                     print(f"Warning: {warning}", file=sys.stderr)
@@ -6193,6 +6446,12 @@ def main() -> int:
             pr_author_login = ""
             if isinstance(pr_author_payload, dict):
                 pr_author_login = str(pr_author_payload.get("login") or "")
+            if pr_clarification_answer is None:
+                pr_clarification_answer = find_waiting_for_author_answer(
+                    comments=pr_comments if "pr_comments" in locals() else [],
+                    recovered_state=recovered_pr_state,
+                    author_login=pr_author_login,
+                )
 
             review_items, review_stats = normalize_review_items(
                 threads=threads,
@@ -6440,12 +6699,22 @@ def main() -> int:
                     prompt,
                     build_recovered_failure_context_note(recovered_pr_state),
                 )
+            elif (
+                recovered_pr_state is not None
+                and str(recovered_pr_state.get("status") or "") == "waiting-for-author"
+                and pr_clarification_answer is not None
+            ):
+                prompt = append_recovered_context_to_prompt(
+                    prompt,
+                    build_clarification_context_note(recovered_pr_state, pr_clarification_answer),
+                )
 
             failure_stage = "agent_run"
             pre_run_untracked_files: set[str] | None = None
             if not args.dry_run:
                 pre_run_untracked_files = list_untracked_files()
             pr_agent_run_stats: dict[str, object] = {}
+            pr_agent_result: dict[str, object] = {}
             exit_code = run_agent_with_prompt(
                 prompt=prompt,
                 item_label=f"PR #{pr_number_arg}",
@@ -6459,6 +6728,7 @@ def main() -> int:
                 track_tokens=track_tokens,
                 token_budget=token_budget,
                 run_stats=pr_agent_run_stats,
+                agent_result=pr_agent_result,
             )
             if exit_code != 0:
                 exit_summary = describe_exit_code(exit_code)
@@ -6472,6 +6742,47 @@ def main() -> int:
                     + (f" ({diagnosis})" if diagnosis else "")
                 )
                 raise RuntimeError(message)
+
+            clarification_request = pr_agent_result.get("clarification_request")
+            if isinstance(clarification_request, dict):
+                question = str(clarification_request.get("question") or "").strip()
+                reason = _as_optional_string(clarification_request.get("reason"))
+                if question:
+                    safe_post_clarification_request_comment(
+                        repo=repo,
+                        target_type="pr",
+                        target_number=pr_number_arg,
+                        question=question,
+                        reason=reason,
+                        dry_run=args.dry_run,
+                    )
+                    safe_post_orchestration_state_comment(
+                        repo=repo,
+                        target_type="pr",
+                        target_number=pr_number_arg,
+                        dry_run=args.dry_run,
+                        state=build_orchestration_state(
+                            status="waiting-for-author",
+                            task_type="pr",
+                            issue_number=None,
+                            pr_number=pr_number_arg,
+                            branch=active_branch,
+                            base_branch=str(pr_state_context["base_branch"] or "") or None,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            attempt=1,
+                            stage="agent_run",
+                            next_action="await_author_reply",
+                            error=reason or question,
+                            stats=pr_agent_run_stats,
+                            decomposition=pr_recovered_decomposition_rollup,
+                        ) | {"question": question, "reason": reason},
+                    )
+                    print(f"Paused PR #{pr_number_arg} for author clarification: {question}")
+                    if pr_followup_branch_prefix and not args.dry_run:
+                        run_command(["git", "checkout", base_branch_for_run])
+                    return _finish_main(0, original_process_cwd)
 
             if not args.dry_run and not has_changes():
                 safe_post_orchestration_state_comment(
@@ -6821,6 +7132,13 @@ def main() -> int:
                 recovered_state = merge_latest_recovered_state(
                     [recovered_issue_state, recovered_pr_state]
                 )
+                clarification_answer: dict | None = None
+                if recovered_issue_state is not None:
+                    clarification_answer = find_waiting_for_author_answer(
+                        comments=issue_comments,
+                        recovered_state=recovered_issue_state,
+                        author_login=_issue_author_login(issue),
+                    )
                 decomposition_rollup = build_decomposition_rollup_from_recovered_state(
                     recovered_state=recovered_state,
                     parent_issue=issue["number"],
@@ -6830,6 +7148,11 @@ def main() -> int:
                     print(
                         f"{prefix}Recovered orchestration state context: "
                         f"{format_recovered_state_context(recovered_state)}"
+                    )
+                if clarification_answer is not None:
+                    print(
+                        f"Found author clarification reply for {issue_label}: "
+                        f"{clarification_answer.get('body')}"
                     )
 
                 if recovered_state is not None:
@@ -6846,6 +7169,7 @@ def main() -> int:
                     linked_open_pr=linked_open_pr,
                     force_issue_flow=force_issue_flow,
                     recovered_state=recovered_state,
+                    clarification_answer=clarification_answer,
                 )
                 if mode == "skip":
                     print(
@@ -7198,6 +7522,15 @@ def main() -> int:
                         build_prompt(issue, image_paths=issue_image_paths),
                         build_recovered_failure_context_note(recovered_state),
                     )
+                elif (
+                    recovered_state is not None
+                    and str(recovered_state.get("status") or "") == "waiting-for-author"
+                    and clarification_answer is not None
+                ):
+                    prompt_override = append_recovered_context_to_prompt(
+                        build_prompt(issue, image_paths=issue_image_paths),
+                        build_clarification_context_note(recovered_state, clarification_answer),
+                    )
                 elif decomposition_child_note:
                     prompt_override = append_recovered_context_to_prompt(
                         build_prompt(issue, image_paths=issue_image_paths),
@@ -7520,6 +7853,15 @@ def main() -> int:
                                 prompt_override,
                                 build_recovered_failure_context_note(recovered_state),
                             )
+                        elif (
+                            recovered_state is not None
+                            and str(recovered_state.get("status") or "") == "waiting-for-author"
+                            and clarification_answer is not None
+                        ):
+                            prompt_override = append_recovered_context_to_prompt(
+                                prompt_override,
+                                build_clarification_context_note(recovered_state, clarification_answer),
+                            )
 
                     review_comment_count = len(review_items)
                     if args.dry_run:
@@ -7620,6 +7962,7 @@ def main() -> int:
                 else:
                     failure_stage = "agent_run"
                     issue_agent_run_stats = {}
+                    agent_result: dict[str, object] = {}
                     exit_code = run_agent(
                         issue=issue,
                         runner=args.runner,
@@ -7634,6 +7977,7 @@ def main() -> int:
                         track_tokens=track_tokens,
                         token_budget=token_budget,
                         run_stats=issue_agent_run_stats,
+                        agent_result=agent_result,
                     )
                     if exit_code != 0:
                         exit_summary = describe_exit_code(exit_code)
@@ -7646,6 +7990,64 @@ def main() -> int:
                             + (f" ({diagnosis})" if diagnosis else "")
                         )
                         raise RuntimeError(message)
+                    clarification_request = agent_result.get("clarification_request")
+                    if isinstance(clarification_request, dict):
+                        question = str(clarification_request.get("question") or "").strip()
+                        reason = _as_optional_string(clarification_request.get("reason"))
+                        if question:
+                            safe_post_clarification_request_comment(
+                                repo=repo,
+                                target_type=state_target_type,
+                                target_number=state_target_number,
+                                question=question,
+                                reason=reason,
+                                dry_run=args.dry_run,
+                            )
+                            safe_post_orchestration_state_comment(
+                                repo=repo,
+                                target_type=state_target_type,
+                                target_number=state_target_number,
+                                dry_run=args.dry_run,
+                                state=build_orchestration_state(
+                                    status="waiting-for-author",
+                                    task_type="issue" if mode == "issue-flow" else "pr",
+                                    issue_number=issue["number"],
+                                    pr_number=state_pr_number,
+                                    branch=issue_branch,
+                                    base_branch=target_base_branch,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    attempt=1,
+                                    stage="agent_run",
+                                    next_action="await_author_reply",
+                                    error=reason or question,
+                                    stats=issue_agent_run_stats,
+                                    decomposition=decomposition_rollup,
+                                ) | {"question": question, "reason": reason},
+                            )
+                            print(
+                                f"Paused {issue_label} for author clarification: {question}"
+                            )
+                            if (
+                                decomposition_parent_issue is not None
+                                and decomposition_parent_branch is not None
+                                and decomposition_parent_payload is not None
+                            ):
+                                decomposition_parent_payload, decomposition_rollup = post_parent_decomposition_rollup_update(
+                                    repo=repo,
+                                    parent_issue=decomposition_parent_issue,
+                                    parent_branch=decomposition_parent_branch,
+                                    base_branch=base_branch if base_branch else None,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    plan_payload=decomposition_parent_payload,
+                                    dry_run=args.dry_run,
+                                )
+                            if not args.dry_run:
+                                run_command(["git", "checkout", base_branch])
+                            continue
                 if not args.dry_run and not has_changes():
                     if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:
                         print(

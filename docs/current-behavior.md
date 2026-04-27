@@ -58,8 +58,9 @@
 2. Загружается одна issue (`--issue`) или список (`--state` + `--limit`).
 3. Выполняются pre-checks идемпотентности:
    - в batch-режиме issue с linked open PR пропускается по умолчанию (`--skip-if-pr-exists`);
-   - issue с deterministic remote branch пропускается по умолчанию (`--skip-if-branch-exists`);
+   - issue с deterministic remote branch пропускается по умолчанию (`--skip-if-branch-exists`) в batch-режиме;
    - `--force-reprocess` отключает оба skip guard;
+   - для одиночного `--issue` existing remote branch не hard-skip'ается, а переиспользуется как branch context recovery path;
    - для одиночного `--issue` linked open PR не hard-skip'ается, а используется state-aware mode selection / PR-review progression.
 4. Для issue с пустым body выполняется пропуск, если не включен `--include-empty` **и** нет найденных ссылок на изображения.
    - Изображения извлекаются из тел issue (`![](...)`, `<img src=...>`, прямые URL).

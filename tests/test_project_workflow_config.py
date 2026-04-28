@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -10,7 +11,9 @@ from scripts.run_github_issues_to_opencode import (
     configured_setup_command,
     configured_workflow_commands,
     evaluate_pr_readiness,
+    main,
     parse_args,
+    run_configured_workflow_hooks,
     run_doctor,
     validate_project_config,
     workflow_hooks,
@@ -167,6 +170,111 @@ class ProjectWorkflowConfigTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("[PASS] Project config:", stdout.getvalue())
         self.assertIn("commands=setup, test, e2e", stdout.getvalue())
+
+    def test_run_configured_workflow_hooks_runs_all_commands_with_merged_env(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def fake_run(*, kind: str, name: str, command_text: str, dry_run: bool, cwd: str | None = None, env: dict[str, str] | None = None) -> dict[str, object]:
+            calls.append(
+                {
+                    "kind": kind,
+                    "name": name,
+                    "command_text": command_text,
+                    "dry_run": dry_run,
+                    "cwd": cwd,
+                    "env": env,
+                }
+            )
+            return {"name": name, "command": command_text, "status": "passed", "exit_code": 0}
+
+        with patch("scripts.run_github_issues_to_opencode._run_workflow_shell_command", side_effect=fake_run):
+            results = run_configured_workflow_hooks(
+                hook_name="pre_pr_update",
+                configured_hooks={"pre_pr_update": ["./hooks/one.sh", "./hooks/two.sh"]},
+                dry_run=False,
+                cwd="/repo",
+                env={"ORCHESTRATOR_MODE": "issue-flow"},
+                context={"hook_target": "issue", "repo_dir": "/repo"},
+            )
+
+        self.assertEqual([call["name"] for call in calls], ["pre_pr_update[1]", "pre_pr_update[2]"])
+        self.assertEqual([call["command_text"] for call in calls], ["./hooks/one.sh", "./hooks/two.sh"])
+        self.assertEqual(results[0]["hook"], "pre_pr_update")
+        self.assertEqual(results[1]["hook"], "pre_pr_update")
+        first_env = calls[0]["env"]
+        self.assertIsInstance(first_env, dict)
+        self.assertEqual(first_env["ORCHESTRATOR_MODE"], "issue-flow")
+        self.assertEqual(first_env["hook_target"], "issue")
+        self.assertEqual(first_env["repo_dir"], "/repo")
+
+    def test_main_runs_all_configured_issue_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            project_config_path = os.path.join(tmpdir, "project-config.json")
+            with open(project_config_path, "w", encoding="utf-8") as config_file:
+                json.dump(
+                    {
+                        "workflow": {
+                            "hooks": {
+                                "pre_agent": ["./hooks/pre-one.sh", "./hooks/pre-two.sh"],
+                                "post_agent": ["./hooks/post-one.sh", "./hooks/post-two.sh"],
+                            }
+                        }
+                    },
+                    config_file,
+                )
+
+            issue = {
+                "number": 42,
+                "title": "Title",
+                "body": "Body",
+                "url": "https://github.com/owner/repo/issues/42",
+            }
+            hook_calls: list[tuple[str, str]] = []
+
+            def fake_run(*, kind: str, name: str, command_text: str, dry_run: bool, cwd: str | None = None, env: dict[str, str] | None = None) -> dict[str, object]:
+                hook_calls.append((name, command_text))
+                return {"name": name, "command": command_text, "status": "passed", "exit_code": 0}
+
+            previous_cwd = os.getcwd()
+            try:
+                with (
+                    patch.object(
+                        sys,
+                        "argv",
+                        ["prog", "--dir", tmpdir, "--project-config", project_config_path, "--issue", "42", "--dry-run"],
+                    ),
+                    patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+                    patch("scripts.run_github_issues_to_opencode.detect_repo", return_value="owner/repo"),
+                    patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+                    patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue),
+                    patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
+                    patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+                    patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False),
+                    patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="created"),
+                    patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0),
+                    patch("scripts.run_github_issues_to_opencode.commit_changes"),
+                    patch("scripts.run_github_issues_to_opencode.push_branch"),
+                    patch("scripts.run_github_issues_to_opencode.ensure_pr", return_value=("created", "")),
+                    patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"),
+                    patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"),
+                    patch("scripts.run_github_issues_to_opencode.run_configured_workflow_checks", return_value=[]),
+                    patch("scripts.run_github_issues_to_opencode._run_workflow_shell_command", side_effect=fake_run),
+                ):
+                    exit_code = main()
+            finally:
+                os.chdir(previous_cwd)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            hook_calls,
+            [
+                ("pre_agent[1]", "./hooks/pre-one.sh"),
+                ("pre_agent[2]", "./hooks/pre-two.sh"),
+                ("post_agent[1]", "./hooks/post-one.sh"),
+                ("post_agent[2]", "./hooks/post-two.sh"),
+            ],
+        )
 
 
 if __name__ == "__main__":

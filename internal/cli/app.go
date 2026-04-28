@@ -21,6 +21,8 @@ const defaultLocalConfigName = "local-config.json"
 const projectConfigScaffold = `{
   "defaults": {
     "preset": "default",
+    "tracker": "github",
+    "codehost": "github",
     "runner": "opencode",
     "agent": "build",
     "model": "openai/gpt-4o",
@@ -60,6 +62,25 @@ const projectConfigScaffold = `{
     "max_attempts": 2,
     "escalate_to_preset": "hard"
   },
+  "scope": {
+    "defaults": {
+      "labels": {
+        "allow": ["autonomous", "bug"],
+        "deny": ["manual-only"]
+      },
+      "assignees": {
+        "deny": ["human-only"]
+      },
+      "priority": {
+        "allow": ["priority:high", "priority:medium"],
+        "order": ["priority:high", "priority:medium", "priority:low"]
+      },
+      "freshness": {
+        "max_age_days": 30,
+        "max_idle_days": 14
+      }
+    }
+  },
   "presets": {
     "cheap": {
       "runner": "opencode",
@@ -94,6 +115,8 @@ const projectConfigScaffold = `{
 
 const localConfigScaffold = `{
   "preset": "default",
+  "tracker": "github",
+  "codehost": "github",
   "runner": "opencode",
   "agent": "build",
   "model": "openai/gpt-4o",
@@ -167,6 +190,8 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 		return a.runInit(args[1:])
 	case "doctor":
 		return a.runDoctor(ctx, args[1:])
+	case "autodoctor":
+		return a.runAutoDoctor(ctx, args[1:])
 	case "run":
 		return a.runRun(ctx, args[1:])
 	default:
@@ -250,6 +275,10 @@ func (a *App) runDoctor(ctx context.Context, args []string) int {
 		pythonArgs = append(pythonArgs, "--doctor-smoke-check")
 	}
 	return a.runPython(ctx, pythonArgs)
+}
+
+func (a *App) runAutoDoctor(ctx context.Context, args []string) int {
+	return a.runDoctor(ctx, args)
 }
 
 func (a *App) runRun(ctx context.Context, args []string) int {
@@ -557,7 +586,6 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	return a.runPython(ctx, pythonArgs)
 }
 
-
 func (a *App) runPython(ctx context.Context, args []string) int {
 	if err := a.runner.Run(ctx, "python3", args...); err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -824,13 +852,15 @@ func usage() string {
 	return `Usage:
 	  orchestrator init [flags]
 	  orchestrator doctor [flags]
+	  orchestrator autodoctor [flags]
 	  orchestrator run issue --id N [flags]
 	  orchestrator run pr --id N [flags]
 	  orchestrator run daemon [flags]
 
-Commands:
+	Commands:
 	  init       Create local/project config scaffolds.
 	  doctor     Run environment diagnostics via the current Python runner.
+	  autodoctor Run doctor diagnostics with the same current checks.
 	  run issue  Run issue orchestration via the current Python runner.
 	  run pr     Run PR review-comment orchestration via the current Python runner.
 	  run daemon Poll for issue work via the current Python runner.

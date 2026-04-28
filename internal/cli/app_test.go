@@ -67,6 +67,18 @@ func TestDoctorCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--doctor", "--repo", "owner/repo", "--dry-run"})
 }
 
+func TestAutoDoctorCommandWiresPythonRunner(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"autodoctor", "--repo", "owner/repo", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--doctor", "--repo", "owner/repo", "--dry-run"})
+}
+
 func TestInitCreatesConfigScaffolds(t *testing.T) {
 	targetDir := t.TempDir()
 	var out strings.Builder
@@ -89,6 +101,24 @@ func TestInitCreatesConfigScaffolds(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), filepath.Join(targetDir, defaultProjectConfigName)) {
 		t.Fatalf("stdout = %q, want created project-config path", out.String())
+	}
+}
+
+func TestScaffoldsMatchExampleConfigs(t *testing.T) {
+	projectExample, err := os.ReadFile(filepath.Join("..", "..", "project-config.example.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(project example) error = %v", err)
+	}
+	if got := strings.TrimSpace(projectConfigScaffold); got != strings.TrimSpace(string(projectExample)) {
+		t.Fatalf("project scaffold drifted from example config")
+	}
+
+	localExample, err := os.ReadFile(filepath.Join("..", "..", "local-config.example.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(local example) error = %v", err)
+	}
+	if got := strings.TrimSpace(localConfigScaffold); got != strings.TrimSpace(string(localExample)) {
+		t.Fatalf("local scaffold drifted from example config")
 	}
 }
 

@@ -108,14 +108,15 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 	if strings.TrimSpace(*worker) != "" {
 		return a.runDetachedStatus(*workerDir, *worker, *asJSON)
 	}
+	if strings.TrimSpace(*autonomousSessionFile) != "" {
+		return a.runAutonomousSessionStatus(*autonomousSessionFile, *asJSON)
+	}
 
 	pythonArgs := []string{runnerScript, "--status"}
 	if *issue > 0 {
 		pythonArgs = append(pythonArgs, "--issue", strconv.Itoa(*issue))
 	} else if *pr > 0 {
 		pythonArgs = append(pythonArgs, "--pr", strconv.Itoa(*pr))
-	} else {
-		pythonArgs = append(pythonArgs, "--autonomous-session-file", *autonomousSessionFile)
 	}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
 	return a.runPython(ctx, pythonArgs)

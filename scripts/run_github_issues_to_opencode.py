@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import signal
+from typing import Callable
 
 if __package__ in {None, ""}:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -5376,6 +5377,9 @@ def build_ci_failure_prompt(
             ).strip()
         )
 
+    _issue_context = "\n".join(issue_context_lines)
+    _failing = "\n".join(failing_lines) if failing_lines else "- No failing checks supplied."
+    _diagnostics = "\n\n".join(diagnostics_lines) if diagnostics_lines else "No CI diagnostics available."
     return (
         "You are working on an existing GitHub pull request CI failure cycle in the current git branch.\n"
         "Diagnose the failing CI checks using the provided logs and implement the safest repository fix in files.\n"
@@ -5385,11 +5389,11 @@ def build_ci_failure_prompt(
         "PR description:\n"
         f"{pr_body}\n\n"
         "Linked issue context:\n"
-        f"{'\n'.join(issue_context_lines)}\n\n"
+        f"{_issue_context}\n\n"
         "Failing CI checks:\n"
-        f"{'\n'.join(failing_lines) if failing_lines else '- No failing checks supplied.'}\n\n"
+        f"{_failing}\n\n"
         "CI diagnostics and failing logs:\n\n"
-        f"{'\n\n'.join(diagnostics_lines) if diagnostics_lines else 'No CI diagnostics available.'}\n"
+        f"{_diagnostics}\n"
     )
 
 

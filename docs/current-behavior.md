@@ -59,6 +59,7 @@
 
 - `run daemon` уже существует и повторно вызывает batch issue flow по polling interval.
 - Текущий daemon режим остается осторожным: GitHub-only, с ограниченной concurrency и опорой на существующий Python runner.
+- Safe bounded smoke path для текущего entrypoint задокументирован в `docs/daemon-smoke-test.md`.
 - Это рабочий автономный entrypoint ранней стадии, а не финальный service-grade orchestrator.
 
 ## Что еще не доведено до North Star

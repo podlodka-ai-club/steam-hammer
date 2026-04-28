@@ -133,6 +133,8 @@ go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --dry-run
 go run ./cmd/orchestrator run daemon --repo owner/repo --dry-run
 ```
 
+Bounded daemon smoke-test guidance, including the exact safe operator command and observed output, is documented in [`docs/daemon-smoke-test.md`](docs/daemon-smoke-test.md).
+
 Common Python-runner examples map to the Go wrapper as follows:
 
 ```bash
@@ -158,6 +160,7 @@ Compatibility boundary for Phase 1:
 - `run daemon` polls tracker issues through the Python runner in autonomous batch mode, reuses orchestration state, and keeps concurrency at one worktree task at a time.
 - `run pr` supports PR review-comments execution. `--pr N` is accepted as a compatibility alias for `--id N`, and `--from-review-comments` is accepted as a no-op because the command always selects that mode.
 - `run daemon` repeatedly invokes the existing Python batch issue flow with `--limit` / `--state` polling semantics; use `--dry-run` to execute a single poll without looping.
+- `run daemon` does not write a dedicated logfile today; operator evidence comes from terminal `stdout` / `stderr` unless you redirect it explicitly.
 - `doctor` accepts `--doctor` as a no-op because the command already selects diagnostics mode.
 - `autodoctor` currently routes to the same diagnostics as `doctor`, so workflow-config validation is available from both entrypoints.
 - `init` creates local scaffolds for `project-config.json` and `local-config.json` so users can start with the Go CLI instead of copying files manually.

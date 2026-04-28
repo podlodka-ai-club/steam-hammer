@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -228,13 +231,60 @@ type detachedWorkerState struct {
 	TargetKind  string   `json:"target_kind"`
 	TargetID    string   `json:"target_id,omitempty"`
 	Repo        string   `json:"repo,omitempty"`
+	Tracker     string   `json:"tracker,omitempty"`
+	CodeHost    string   `json:"codehost,omitempty"`
+	Runner      string   `json:"runner,omitempty"`
+	Agent       string   `json:"agent,omitempty"`
+	Model       string   `json:"model,omitempty"`
 	Command     []string `json:"command"`
 	StartedAt   string   `json:"started_at"`
 	PID         int      `json:"pid"`
 	LogPath     string   `json:"log_path"`
 	SessionPath string   `json:"session_path,omitempty"`
 	StatePath   string   `json:"state_path"`
+	ClonePath   string   `json:"clone_path,omitempty"`
 	WorkDir     string   `json:"work_dir"`
+}
+
+type detachedWorkerLogStatus struct {
+	Path       string `json:"path"`
+	Exists     bool   `json:"exists"`
+	Lines      int    `json:"lines"`
+	SizeBytes  int64  `json:"size_bytes"`
+	UpdatedAt  string `json:"updated_at,omitempty"`
+	ReadError  string `json:"read_error,omitempty"`
+	Stale      bool   `json:"stale"`
+	StaleSince string `json:"stale_since,omitempty"`
+}
+
+type detachedWorkerSessionStatus struct {
+	Path          string `json:"path"`
+	Exists        bool   `json:"exists"`
+	Phase         string `json:"phase,omitempty"`
+	Current       string `json:"current,omitempty"`
+	Next          string `json:"next,omitempty"`
+	UpdatedAt     string `json:"updated_at,omitempty"`
+	Processed     int    `json:"processed"`
+	Failures      int    `json:"failures"`
+	Summary       string `json:"summary,omitempty"`
+	Error         string `json:"error,omitempty"`
+	RawCheckpoint any    `json:"raw_checkpoint,omitempty"`
+}
+
+type detachedWorkerTargetStatus struct {
+	Command string            `json:"command"`
+	Lines   map[string]string `json:"lines,omitempty"`
+	Raw     string            `json:"raw,omitempty"`
+	Error   string            `json:"error,omitempty"`
+}
+
+type detachedWorkerReport struct {
+	Worker        detachedWorkerState          `json:"worker"`
+	ProcessStatus string                       `json:"process_status"`
+	Log           detachedWorkerLogStatus      `json:"log"`
+	Session       *detachedWorkerSessionStatus `json:"session,omitempty"`
+	TargetStatus  *detachedWorkerTargetStatus  `json:"target_status,omitempty"`
+	Next          string                       `json:"next"`
 }
 
 func (a *App) Run(args []string) int {
@@ -379,8 +429,10 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 	issue := fs.Int("issue", 0, "GitHub issue number")
 	pr := fs.Int("pr", 0, "GitHub pull request number")
 	worker := fs.String("worker", "", "detached worker name: issue-N, pr-N, or daemon")
+	workers := fs.Bool("workers", false, "list detached worker status from the worker registry")
 	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
 	autonomousSessionFile := fs.String("autonomous-session-file", "", "read daemon batch status from a session checkpoint file")
+	jsonOutput := fs.Bool("json", false, "print detached worker status as JSON")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -399,15 +451,25 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 	if strings.TrimSpace(*worker) != "" {
 		targets++
 	}
+	if *workers {
+		targets++
+	}
 	if strings.TrimSpace(*autonomousSessionFile) != "" {
 		targets++
 	}
 	if targets != 1 {
-		_, _ = fmt.Fprintln(a.err, "status requires exactly one of --issue N, --pr N, --worker NAME, or --autonomous-session-file PATH")
+		_, _ = fmt.Fprintln(a.err, "status requires exactly one of --issue N, --pr N, --worker NAME, --workers, or --autonomous-session-file PATH")
+		return 2
+	}
+	if *jsonOutput && strings.TrimSpace(*worker) == "" && !*workers {
+		_, _ = fmt.Fprintln(a.err, "status --json is currently supported only with --worker or --workers")
 		return 2
 	}
 	if strings.TrimSpace(*worker) != "" {
-		return a.runDetachedStatus(*workerDir, *worker)
+		return a.runDetachedStatus(ctx, *workerDir, *worker, *jsonOutput)
+	}
+	if *workers {
+		return a.runDetachedWorkersStatus(ctx, *workerDir, *jsonOutput)
 	}
 
 	pythonArgs := []string{runnerScript, "--status"}
@@ -576,10 +638,16 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 			Mode:        "run daemon",
 			TargetKind:  "daemon",
 			Repo:        strings.TrimSpace(*opts.repo),
+			Tracker:     strings.TrimSpace(*opts.tracker),
+			CodeHost:    strings.TrimSpace(*opts.codehost),
+			Runner:      strings.TrimSpace(*opts.runner),
+			Agent:       strings.TrimSpace(*opts.agent),
+			Model:       strings.TrimSpace(*opts.model),
 			Command:     append([]string{"python3"}, pythonArgs...),
 			LogPath:     workerPaths.logPath,
 			SessionPath: workerPaths.sessionPath,
 			StatePath:   workerPaths.statePath,
+			ClonePath:   workerPaths.workDir,
 			WorkDir:     workerPaths.workDir,
 		})
 	}
@@ -738,9 +806,15 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 			TargetKind: "issue",
 			TargetID:   strconv.Itoa(*id),
 			Repo:       strings.TrimSpace(*opts.repo),
+			Tracker:    strings.TrimSpace(*opts.tracker),
+			CodeHost:   strings.TrimSpace(*opts.codehost),
+			Runner:     strings.TrimSpace(*opts.runner),
+			Agent:      strings.TrimSpace(*opts.agent),
+			Model:      strings.TrimSpace(*opts.model),
 			Command:    append([]string{"python3"}, pythonArgs...),
 			LogPath:    workerPaths.logPath,
 			StatePath:  workerPaths.statePath,
+			ClonePath:  workerPaths.workDir,
 			WorkDir:    workerPaths.workDir,
 		})
 	}
@@ -819,9 +893,15 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 			TargetKind: "pr",
 			TargetID:   strconv.Itoa(*id),
 			Repo:       strings.TrimSpace(*opts.repo),
+			Tracker:    strings.TrimSpace(*opts.tracker),
+			CodeHost:   strings.TrimSpace(*opts.codehost),
+			Runner:     strings.TrimSpace(*opts.runner),
+			Agent:      strings.TrimSpace(*opts.agent),
+			Model:      strings.TrimSpace(*opts.model),
 			Command:    append([]string{"python3"}, pythonArgs...),
 			LogPath:    workerPaths.logPath,
 			StatePath:  workerPaths.statePath,
+			ClonePath:  workerPaths.workDir,
 			WorkDir:    workerPaths.workDir,
 		})
 	}
@@ -953,10 +1033,13 @@ func readDetachedWorkerState(path string) (detachedWorkerState, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return detachedWorkerState{}, err
 	}
+	if state.ClonePath == "" {
+		state.ClonePath = state.WorkDir
+	}
 	return state, nil
 }
 
-func (a *App) runDetachedStatus(configuredRoot, name string) int {
+func (a *App) runDetachedStatus(ctx context.Context, configuredRoot, name string, jsonOutput bool) int {
 	workerPaths, err := resolveDetachedWorkerPaths(configuredRoot, ".", normalizeWorkerLookupName(name), workerLookupID(name))
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
@@ -971,31 +1054,37 @@ func (a *App) runDetachedStatus(configuredRoot, name string) int {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to read detached worker state: %v\n", err)
 		return 1
 	}
-	running, runErr := processRunning(state.PID)
-	processStatus := "stopped"
-	if running {
-		processStatus = "running"
-	} else if runErr != nil {
-		processStatus = "unknown"
+	report := buildDetachedWorkerReport(ctx, state)
+	if jsonOutput {
+		return writeJSON(a.out, report, a.err)
 	}
-	_, _ = fmt.Fprintf(a.out, "worker: %s\n", state.Name)
-	if state.TargetKind == "daemon" {
-		_, _ = fmt.Fprintln(a.out, "target: daemon")
-	} else {
-		_, _ = fmt.Fprintf(a.out, "target: %s #%s\n", state.TargetKind, state.TargetID)
+	writeDetachedWorkerTextReport(a.out, report)
+	return 0
+}
+
+func (a *App) runDetachedWorkersStatus(ctx context.Context, configuredRoot string, jsonOutput bool) int {
+	states, err := listDetachedWorkerStates(configuredRoot)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to list detached workers: %v\n", err)
+		return 1
 	}
-	if state.Repo != "" {
-		_, _ = fmt.Fprintf(a.out, "repo: %s\n", state.Repo)
+	reports := make([]detachedWorkerReport, 0, len(states))
+	for _, state := range states {
+		reports = append(reports, buildDetachedWorkerReport(ctx, state))
 	}
-	_, _ = fmt.Fprintf(a.out, "process: %s\n", processStatus)
-	_, _ = fmt.Fprintf(a.out, "pid: %d\n", state.PID)
-	_, _ = fmt.Fprintf(a.out, "started: %s\n", state.StartedAt)
-	_, _ = fmt.Fprintf(a.out, "log: %s\n", state.LogPath)
-	_, _ = fmt.Fprintf(a.out, "state: %s\n", state.StatePath)
-	if state.SessionPath != "" {
-		_, _ = fmt.Fprintf(a.out, "session: %s\n", state.SessionPath)
+	if jsonOutput {
+		return writeJSON(a.out, map[string]any{"workers": reports}, a.err)
 	}
-	_, _ = fmt.Fprintf(a.out, "next: %s\n", detachedWorkerNextAction(state, processStatus))
+	if len(reports) == 0 {
+		_, _ = fmt.Fprintln(a.out, "no detached workers found")
+		return 0
+	}
+	for i, report := range reports {
+		if i > 0 {
+			_, _ = fmt.Fprintln(a.out)
+		}
+		writeDetachedWorkerTextReport(a.out, report)
+	}
 	return 0
 }
 
@@ -1029,6 +1118,329 @@ func processRunning(pid int) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+func buildDetachedWorkerReport(ctx context.Context, state detachedWorkerState) detachedWorkerReport {
+	processStatus := detachedWorkerProcessStatus(state.PID)
+	logStatus := inspectDetachedWorkerLog(state.LogPath)
+	report := detachedWorkerReport{
+		Worker:        state,
+		ProcessStatus: processStatus,
+		Log:           logStatus,
+		Next:          detachedWorkerNextAction(state, processStatus),
+	}
+	if state.SessionPath != "" {
+		sessionStatus := inspectDetachedWorkerSession(state.SessionPath)
+		report.Session = &sessionStatus
+	}
+	if status := inspectDetachedTargetStatus(ctx, state); status != nil {
+		report.TargetStatus = status
+	}
+	return report
+}
+
+func detachedWorkerProcessStatus(pid int) string {
+	running, err := processRunning(pid)
+	if running {
+		return "running"
+	}
+	if err != nil {
+		return "unknown"
+	}
+	return "exited"
+}
+
+func inspectDetachedWorkerLog(path string) detachedWorkerLogStatus {
+	status := detachedWorkerLogStatus{Path: path}
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return status
+		}
+		status.ReadError = err.Error()
+		return status
+	}
+	status.Exists = true
+	status.SizeBytes = info.Size()
+	status.UpdatedAt = info.ModTime().UTC().Format(time.RFC3339)
+	if time.Since(info.ModTime()) > 3*time.Minute {
+		status.Stale = true
+		status.StaleSince = info.ModTime().UTC().Format(time.RFC3339)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		status.ReadError = err.Error()
+		return status
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		status.Lines++
+	}
+	if err := scanner.Err(); err != nil {
+		status.ReadError = err.Error()
+	}
+	return status
+}
+
+func inspectDetachedWorkerSession(path string) detachedWorkerSessionStatus {
+	status := detachedWorkerSessionStatus{Path: path}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			status.Error = err.Error()
+		}
+		return status
+	}
+	status.Exists = true
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		status.Error = err.Error()
+		return status
+	}
+	processed := payload["processed_issues"]
+	if processedMap, ok := processed.(map[string]any); ok {
+		status.Processed = len(processedMap)
+	}
+	checkpoint, ok := payload["checkpoint"].(map[string]any)
+	if !ok {
+		status.Summary = fmt.Sprintf("processed=%d, no active checkpoint", status.Processed)
+		return status
+	}
+	status.RawCheckpoint = checkpoint
+	status.Phase = stringFromAny(checkpoint["phase"])
+	status.Current = stringFromAny(checkpoint["current"])
+	status.Next = strings.Join(stringListFromAny(checkpoint["next"]), "; ")
+	status.UpdatedAt = stringFromAny(checkpoint["updated_at"])
+	if counts, ok := checkpoint["counts"].(map[string]any); ok {
+		status.Failures = intFromAny(counts["failures"])
+		if processedCount := intFromAny(counts["processed"]); processedCount > 0 {
+			status.Processed = processedCount
+		}
+	}
+	summaryParts := []string{}
+	if status.Phase != "" {
+		summaryParts = append(summaryParts, status.Phase)
+	}
+	if status.Current != "" {
+		summaryParts = append(summaryParts, "current="+status.Current)
+	}
+	summaryParts = append(summaryParts, fmt.Sprintf("processed=%d", status.Processed))
+	if status.Failures > 0 {
+		summaryParts = append(summaryParts, fmt.Sprintf("failures=%d", status.Failures))
+	}
+	status.Summary = strings.Join(summaryParts, ", ")
+	return status
+}
+
+func inspectDetachedTargetStatus(ctx context.Context, state detachedWorkerState) *detachedWorkerTargetStatus {
+	command := detachedTargetStatusCommand(state)
+	if state.TargetKind == "daemon" {
+		return &detachedWorkerTargetStatus{Command: command}
+	}
+	args := []string{runnerScript, "--status"}
+	if state.TargetKind == "issue" {
+		args = append(args, "--issue", state.TargetID)
+	} else if state.TargetKind == "pr" {
+		args = append(args, "--pr", state.TargetID)
+	} else {
+		return &detachedWorkerTargetStatus{Command: command}
+	}
+	if state.Repo != "" {
+		args = append(args, "--repo", state.Repo)
+	}
+	if state.Tracker != "" {
+		args = append(args, "--tracker", state.Tracker)
+	}
+	if state.CodeHost != "" {
+		args = append(args, "--codehost", state.CodeHost)
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(commandCtx, "python3", args...)
+	if state.ClonePath != "" {
+		cmd.Dir = state.ClonePath
+	} else {
+		cmd.Dir = state.WorkDir
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	status := &detachedWorkerTargetStatus{Command: command}
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		status.Error = detail
+		status.Raw = strings.TrimSpace(stdout.String())
+		return status
+	}
+	raw := strings.TrimSpace(stdout.String())
+	status.Raw = raw
+	status.Lines = parseStatusSummaryLines(raw)
+	return status
+}
+
+func parseStatusSummaryLines(raw string) map[string]string {
+	parsed := map[string]string{}
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(parts[0]))
+		key = strings.ReplaceAll(key, " ", "_")
+		parsed[key] = strings.TrimSpace(parts[1])
+	}
+	if len(parsed) == 0 {
+		return nil
+	}
+	return parsed
+}
+
+func listDetachedWorkerStates(configuredRoot string) ([]detachedWorkerState, error) {
+	root := strings.TrimSpace(configuredRoot)
+	if root == "" {
+		root = filepath.Join(".", ".orchestrator", "workers")
+	}
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	states := make([]detachedWorkerState, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		statePath := filepath.Join(root, entry.Name(), "worker.json")
+		state, err := readDetachedWorkerState(statePath)
+		if err != nil {
+			continue
+		}
+		states = append(states, state)
+	}
+	sort.Slice(states, func(i, j int) bool {
+		return states[i].StartedAt > states[j].StartedAt
+	})
+	return states, nil
+}
+
+func writeDetachedWorkerTextReport(w io.Writer, report detachedWorkerReport) {
+	state := report.Worker
+	_, _ = fmt.Fprintf(w, "worker: %s\n", state.Name)
+	if state.TargetKind == "daemon" {
+		_, _ = fmt.Fprintln(w, "target: daemon")
+	} else {
+		_, _ = fmt.Fprintf(w, "target: %s #%s\n", state.TargetKind, state.TargetID)
+	}
+	if state.Repo != "" {
+		_, _ = fmt.Fprintf(w, "repo: %s\n", state.Repo)
+	}
+	if state.Runner != "" || state.Agent != "" || state.Model != "" {
+		_, _ = fmt.Fprintf(w, "agent: runner=%s agent=%s model=%s\n", valueOrUnknown(state.Runner), valueOrUnknown(state.Agent), valueOrUnknown(state.Model))
+	}
+	_, _ = fmt.Fprintf(w, "process: %s\n", report.ProcessStatus)
+	_, _ = fmt.Fprintf(w, "pid: %d\n", state.PID)
+	_, _ = fmt.Fprintf(w, "started: %s\n", state.StartedAt)
+	if state.ClonePath != "" {
+		_, _ = fmt.Fprintf(w, "clone: %s\n", state.ClonePath)
+	}
+	_, _ = fmt.Fprintf(w, "log: %s\n", state.LogPath)
+	_, _ = fmt.Fprintf(w, "log-progress: lines=%d size=%dB", report.Log.Lines, report.Log.SizeBytes)
+	if report.Log.UpdatedAt != "" {
+		_, _ = fmt.Fprintf(w, " updated=%s", report.Log.UpdatedAt)
+	}
+	if report.Log.Stale {
+		_, _ = fmt.Fprint(w, " stale=true")
+	}
+	if report.Log.ReadError != "" {
+		_, _ = fmt.Fprintf(w, " error=%s", report.Log.ReadError)
+	}
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintf(w, "state: %s\n", state.StatePath)
+	if state.SessionPath != "" {
+		_, _ = fmt.Fprintf(w, "session: %s\n", state.SessionPath)
+	}
+	if report.Session != nil && report.Session.Summary != "" {
+		_, _ = fmt.Fprintf(w, "session-status: %s\n", report.Session.Summary)
+	}
+	if report.TargetStatus != nil {
+		if report.TargetStatus.Error != "" {
+			_, _ = fmt.Fprintf(w, "linked-status: unavailable (%s)\n", report.TargetStatus.Error)
+		} else if len(report.TargetStatus.Lines) > 0 {
+			for _, key := range []string{"latest_state", "current", "next", "blockers", "pr", "issue", "pr_readiness", "updated"} {
+				if value := report.TargetStatus.Lines[key]; value != "" {
+					_, _ = fmt.Fprintf(w, "linked-%s: %s\n", strings.ReplaceAll(key, "_", "-"), value)
+				}
+			}
+		}
+	}
+	_, _ = fmt.Fprintf(w, "next: %s\n", report.Next)
+}
+
+func writeJSON(out io.Writer, payload any, errOut io.Writer) int {
+	encoded, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		_, _ = fmt.Fprintf(errOut, "orchestrator: failed to encode JSON output: %v\n", err)
+		return 1
+	}
+	encoded = append(encoded, '\n')
+	_, _ = out.Write(encoded)
+	return 0
+}
+
+func stringListFromAny(value any) []string {
+	raw, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	items := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		if text := stringFromAny(entry); text != "" {
+			items = append(items, text)
+		}
+	}
+	return items
+}
+
+func stringFromAny(value any) string {
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text)
+	}
+	return ""
+}
+
+func intFromAny(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	default:
+		return 0
+	}
+}
+
+func valueOrUnknown(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "default"
+	}
+	return value
 }
 
 func detachedWorkerNextAction(state detachedWorkerState, processStatus string) string {
@@ -1328,7 +1740,7 @@ func usage() string {
 	  orchestrator doctor [flags]
 	  orchestrator autodoctor [flags]
 	  orchestrator verify [flags]
-	  orchestrator status (--issue N | --pr N | --worker NAME | --autonomous-session-file PATH) [flags]
+	  orchestrator status (--issue N | --pr N | --worker NAME | --workers | --autonomous-session-file PATH) [flags]
 	  orchestrator run issue --id N [flags]
 	  orchestrator run pr --id N [flags]
 	  orchestrator run daemon [flags]

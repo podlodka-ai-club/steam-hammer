@@ -192,6 +192,8 @@ go run ./cmd/orchestrator verify --repo owner/repo --create-followup-issue
 go run ./cmd/orchestrator status --issue 20 --repo owner/repo
 go run ./cmd/orchestrator status --pr 22 --repo owner/repo
 go run ./cmd/orchestrator status --worker issue-20
+go run ./cmd/orchestrator status --workers
+go run ./cmd/orchestrator status --workers --json
 go run ./cmd/orchestrator status --autonomous-session-file .orchestrator/workers/daemon/session.json
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --detach
@@ -210,13 +212,13 @@ go run ./cmd/orchestrator run daemon --repo owner/repo --limit 1 --poll-interval
 
 The Go handlers translate CLI intent into the current Python runner arguments, except `init`, which creates config scaffolds directly in Go. Use `--help` on any command to inspect flags without invoking the runner, and use `--dry-run` for issue/PR/daemon runs to avoid starting agents.
 
-Detached worker files live under `<repo>/.orchestrator/workers/` by default, or under `--worker-dir` if you override it. The predictable worker names are `issue-N`, `pr-N`, and `daemon`, each with `worker.json` metadata and `worker.log`; detached daemon runs also keep `session.json` in the same directory.
+Detached worker files live under `<repo>/.orchestrator/workers/` by default, or under `--worker-dir` if you override it. The predictable worker names are `issue-N`, `pr-N`, and `daemon`, each with `worker.json` metadata and `worker.log`; detached daemon runs also keep `session.json` in the same directory. `worker.json` now keeps the target, pid, log path, clone path, start time, and selected runner/agent/model metadata so later status checks do not need manual `ps` or log-path reconstruction.
 
 Compatibility boundary for Phase 1:
 
 - `run issue` supports single-issue execution through the Python runner. `--issue N` is accepted as a compatibility alias for `--id N`.
 - `run issue --conflict-recovery-only` reuses an existing issue or linked PR branch, syncs it with base, reports whether it was already current, synced cleanly, auto-resolved, or needs manual intervention, and then stops before agent execution.
-- `status` prints a concise summary from the latest parseable orchestration state comment for a single issue or PR, including current state, next action, blockers, source thread/comment, and PR readiness when available. It also accepts `--worker NAME` for detached runtime/process metadata and `--autonomous-session-file PATH` for daemon batch checkpoints.
+- `status` prints a concise summary from the latest parseable orchestration state comment for a single issue or PR, including current state, next action, blockers, source thread/comment, and PR readiness when available. It also accepts `--worker NAME` for detached runtime/process metadata, log progress, and linked issue/PR state, `--workers` to list the detached worker registry, and `--autonomous-session-file PATH` for daemon batch checkpoints. Add `--json` with `--worker` or `--workers` for structured output.
 - `run daemon` polls tracker issues through the Python runner in autonomous batch mode, reuses orchestration state, and keeps concurrency at one worktree task at a time.
 - A single `run daemon` invocation now keeps a per-run batch session so later poll cycles skip issues that already reached handoff states such as `ready-for-review`, `waiting-for-ci`, or `ready-to-merge`; this lets bounded runs make progress across distinct selected issues.
 - `verify` runs the repository post-batch verification path (`python3 -m unittest discover -s tests -q` and `go test ./...` when available), prints a concise pass/fail summary, and can create a GitHub follow-up issue on failure.

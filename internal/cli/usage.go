@@ -8,6 +8,7 @@ func usage() string {
 	  orchestrator verify [flags]
 	  orchestrator status (--issue N | --pr N | --worker NAME | --autonomous-session-file PATH) [flags]
 	  orchestrator run issue --id N [flags]
+	  orchestrator run batch --ids N[,M...] [flags]
 	  orchestrator run pr --id N [flags]
 	  orchestrator run daemon [flags]
 
@@ -18,6 +19,7 @@ func usage() string {
 	  verify     Run post-batch repository verification checks.
 	  status     Print a concise orchestration status summary.
 	  run issue  Run issue orchestration via the current Python runner.
+	  run batch  Launch explicit issue batches via the current Python runner.
 	  run pr     Run PR review-comment orchestration via the current Python runner.
 	  run daemon Poll for issue work via the current Python runner.
 
@@ -28,6 +30,7 @@ func usage() string {
 func runUsage() string {
 	return `Usage:
 	  orchestrator run issue --id N [flags]
+	  orchestrator run batch --ids N[,M...] [flags]
 	  orchestrator run pr --id N [flags]
 	  orchestrator run daemon [flags]
 `

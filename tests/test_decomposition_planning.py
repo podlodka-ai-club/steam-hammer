@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from scripts.run_github_issues_to_opencode import (
     BUILTIN_DEFAULTS,
@@ -14,6 +15,7 @@ from scripts.run_github_issues_to_opencode import (
     attach_decomposition_resume_context,
     build_decomposition_plan_payload,
     build_decomposition_child_execution_note,
+    create_decomposition_child_issue,
     build_decomposition_rollup_from_plan_payload,
     format_decomposition_rollup_context,
     format_decomposition_plan_comment,
@@ -352,6 +354,40 @@ class DecompositionPlanningTests(unittest.TestCase):
         self.assertEqual(created_children[0]["order"], 1)
         self.assertEqual(created_children[1]["order"], 2)
         self.assertEqual(merged["created_children"][1]["issue_number"], 20)
+
+    def test_create_decomposition_child_issue_falls_back_when_gh_create_json_is_unsupported(self) -> None:
+        parent_issue = {
+            "number": 183,
+            "title": "Parent decomposition task",
+            "body": "Implement the parent task.",
+        }
+        child = {
+            "order": 2,
+            "title": "Create child issue using legacy gh output",
+            "acceptance": ["Child issue is created successfully."],
+        }
+
+        with patch(
+            "scripts.run_github_issues_to_opencode.run_capture",
+            side_effect=[
+                RuntimeError("Command failed: gh issue create --json number,url\nunknown flag: --json"),
+                "https://github.com/owner/repo/issues/186\n",
+            ],
+        ) as run_capture_mock:
+            created = create_decomposition_child_issue(
+                repo="owner/repo",
+                parent_issue=parent_issue,
+                child=child,
+                created_dependencies={},
+                dry_run=False,
+                parent_branch="issue-fix/183-parent",
+                base_branch="main",
+            )
+
+        self.assertTrue(created["created"])
+        self.assertEqual(created["issue_number"], 186)
+        self.assertEqual(created["issue_url"], "https://github.com/owner/repo/issues/186")
+        self.assertEqual(run_capture_mock.call_count, 2)
 
     def test_rollup_build_includes_counts_next_child_and_progress(self) -> None:
         payload = {

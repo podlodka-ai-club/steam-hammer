@@ -75,8 +75,8 @@ func (a *App) runRun(ctx context.Context, args []string) int {
 	}
 }
 
-func buildIssuePythonArgs(opts commonOptions, id int, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch bool, syncStrategy string, fs flagState) []string {
-	pythonArgs := []string{runnerScript, "--issue", strconv.Itoa(id)}
+func buildIssuePythonArgs(script string, opts commonOptions, id int, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch bool, syncStrategy string, fs flagState) []string {
+	pythonArgs := []string{script, "--issue", strconv.Itoa(id)}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
 	if base != "" {
 		pythonArgs = append(pythonArgs, "--base", base)
@@ -152,7 +152,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 
 	fs := newFlagSet("run daemon", a.err)
 	opts := commonOptions{}
-	addCommonFlags(fs, &opts)
+	addCommonFlags(fs, &opts, a.runtime)
 	state := fs.String("state", "open", "issue state to poll: open, closed, or all")
 	limit := fs.Int("limit", 10, "maximum number of issues to scan per poll")
 	pollIntervalSeconds := fs.Int("poll-interval-seconds", 120, "delay between autonomous polls")
@@ -174,7 +174,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	fs.StringVar(&base, "base", "", "base branch mode: default or current")
 	fs.StringVar(&base, "base-branch", "", "base branch mode: default or current")
 	postBatchVerify := fs.Bool("post-batch-verify", false, "run post-batch verification after the daemon cycle completes")
-	createFollowupIssue := fs.Bool("create-followup-issue", false, "create a GitHub follow-up issue automatically when post-batch verification fails")
+	createFollowupIssue := fs.Bool("create-followup-issue", false, a.runtime.FollowUpIssueFlagDescription("post-batch verification"))
 	detach := fs.Bool("detach", false, "start the worker in the background and write logs/state to a predictable path")
 	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
 
@@ -206,7 +206,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		return 2
 	}
 
-	pythonArgs := []string{runnerScript, "--autonomous", "--state", *state, "--limit", strconv.Itoa(*limit)}
+	pythonArgs := []string{a.runtime.RunnerScript(), "--autonomous", "--state", *state, "--limit", strconv.Itoa(*limit)}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
 	if base != "" {
 		pythonArgs = append(pythonArgs, "--base", base)
@@ -336,7 +336,7 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 
 	fs := newFlagSet("run batch", a.err)
 	opts := commonOptions{}
-	addCommonFlags(fs, &opts)
+	addCommonFlags(fs, &opts, a.runtime)
 	ids := &issueIDListFlag{}
 	fs.Var(ids, "ids", "comma-separated issue IDs")
 	fs.Var(ids, "id", "issue ID; repeatable and accepts comma-separated values")
@@ -402,6 +402,7 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 			issueOpts = withCommonOptionsDir(issueOpts, clonePath)
 		}
 		pythonArgs := buildIssuePythonArgs(
+			a.runtime.RunnerScript(),
 			issueOpts,
 			id,
 			base,
@@ -469,8 +470,8 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 
 	fs := newFlagSet("run issue", a.err)
 	opts := commonOptions{}
-	addCommonFlags(fs, &opts)
-	id := fs.Int("id", 0, "GitHub issue number")
+	addCommonFlags(fs, &opts, a.runtime)
+	id := fs.Int("id", 0, a.runtime.IssueFlagDescription())
 	issue := fs.Int("issue", 0, "compatibility alias for --id")
 	base := ""
 	fs.StringVar(&base, "base", "", "base branch mode: default or current")
@@ -511,6 +512,7 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 	}
 
 	pythonArgs := buildIssuePythonArgs(
+		a.runtime.RunnerScript(),
 		opts,
 		*id,
 		base,
@@ -578,8 +580,8 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 
 	fs := newFlagSet("run pr", a.err)
 	opts := commonOptions{}
-	addCommonFlags(fs, &opts)
-	id := fs.Int("id", 0, "GitHub pull request number")
+	addCommonFlags(fs, &opts, a.runtime)
+	id := fs.Int("id", 0, a.runtime.PullRequestFlagDescription())
 	pr := fs.Int("pr", 0, "compatibility alias for --id")
 	_ = fs.Bool("from-review-comments", false, "compatibility no-op; PR review-comments mode is selected by the command")
 	allowBranchSwitch := fs.Bool("allow-pr-branch-switch", false, "allow switching to the target PR branch")
@@ -610,7 +612,7 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 		return 2
 	}
 
-	pythonArgs := []string{runnerScript, "--pr", strconv.Itoa(*id), "--from-review-comments"}
+	pythonArgs := []string{a.runtime.RunnerScript(), "--pr", strconv.Itoa(*id), "--from-review-comments"}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
 	if *allowBranchSwitch {
 		pythonArgs = append(pythonArgs, "--allow-pr-branch-switch")

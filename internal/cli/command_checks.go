@@ -17,7 +17,7 @@ func (a *App) runDoctor(ctx context.Context, args []string) int {
 
 	fs := newFlagSet("doctor", a.err)
 	opts := commonOptions{}
-	addCommonFlags(fs, &opts)
+	addCommonFlags(fs, &opts, a.runtime)
 	_ = fs.Bool("doctor", false, "compatibility no-op; doctor mode is selected by the command")
 	doctorSmokeCheck := fs.Bool("doctor-smoke-check", false, "run a lightweight runner CLI smoke check")
 
@@ -29,7 +29,7 @@ func (a *App) runDoctor(ctx context.Context, args []string) int {
 		return 2
 	}
 
-	pythonArgs := []string{runnerScript, "--doctor"}
+	pythonArgs := []string{a.runtime.RunnerScript(), "--doctor"}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
 	if *doctorSmokeCheck {
 		pythonArgs = append(pythonArgs, "--doctor-smoke-check")
@@ -44,8 +44,8 @@ func (a *App) runAutoDoctor(ctx context.Context, args []string) int {
 func (a *App) runVerify(ctx context.Context, args []string) int {
 	fs := newFlagSet("verify", a.err)
 	opts := commonOptions{}
-	addCommonFlags(fs, &opts)
-	createFollowupIssue := fs.Bool("create-followup-issue", false, "create a GitHub follow-up issue automatically when verification fails")
+	addCommonFlags(fs, &opts, a.runtime)
+	createFollowupIssue := fs.Bool("create-followup-issue", false, a.runtime.FollowUpIssueFlagDescription("verification"))
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -55,7 +55,7 @@ func (a *App) runVerify(ctx context.Context, args []string) int {
 		return 2
 	}
 
-	pythonArgs := []string{runnerScript, "--post-batch-verify"}
+	pythonArgs := []string{a.runtime.RunnerScript(), "--post-batch-verify"}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
 	if *createFollowupIssue {
 		pythonArgs = append(pythonArgs, "--create-followup-issue")
@@ -66,9 +66,9 @@ func (a *App) runVerify(ctx context.Context, args []string) int {
 func (a *App) runStatus(ctx context.Context, args []string) int {
 	fs := newFlagSet("status", a.err)
 	opts := commonOptions{}
-	addCommonFlags(fs, &opts)
-	issue := fs.Int("issue", 0, "GitHub issue number")
-	pr := fs.Int("pr", 0, "GitHub pull request number")
+	addCommonFlags(fs, &opts, a.runtime)
+	issue := fs.Int("issue", 0, a.runtime.IssueFlagDescription())
+	pr := fs.Int("pr", 0, a.runtime.PullRequestFlagDescription())
 	worker := fs.String("worker", "", "detached worker name: issue-N, pr-N, or daemon")
 	workers := fs.Bool("workers", false, "list detached workers from the local registry")
 	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
@@ -112,7 +112,7 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 		return a.runAutonomousSessionStatus(*autonomousSessionFile, *asJSON)
 	}
 
-	pythonArgs := []string{runnerScript, "--status"}
+	pythonArgs := []string{a.runtime.RunnerScript(), "--status"}
 	if *issue > 0 {
 		pythonArgs = append(pythonArgs, "--issue", strconv.Itoa(*issue))
 	} else if *pr > 0 {

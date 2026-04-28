@@ -6,23 +6,23 @@ import (
 	"io"
 )
 
-const runnerScript = "scripts/run_github_issues_to_opencode.py"
-
 type App struct {
-	out    io.Writer
-	err    io.Writer
-	runner Runner
-	start  DetachedStarter
-	clone  BatchClonePreparer
+	out     io.Writer
+	err     io.Writer
+	runner  Runner
+	start   DetachedStarter
+	clone   BatchClonePreparer
+	runtime runtimeProvider
 }
 
 func NewApp(out, err io.Writer) *App {
 	return &App{
-		out:    out,
-		err:    err,
-		runner: ExecRunner{Stdout: out, Stderr: err},
-		start:  ExecDetachedStarter{},
-		clone:  ExecBatchClonePreparer{},
+		out:     out,
+		err:     err,
+		runner:  ExecRunner{Stdout: out, Stderr: err},
+		start:   ExecDetachedStarter{},
+		clone:   ExecBatchClonePreparer{},
+		runtime: defaultRuntimeProvider(),
 	}
 }
 
@@ -36,6 +36,14 @@ func (a *App) SetDetachedStarter(starter DetachedStarter) {
 
 func (a *App) SetBatchClonePreparer(preparer BatchClonePreparer) {
 	a.clone = preparer
+}
+
+func (a *App) SetRuntimeProvider(provider runtimeProvider) {
+	if provider == nil {
+		a.runtime = defaultRuntimeProvider()
+		return
+	}
+	a.runtime = provider
 }
 
 func (a *App) Run(args []string) int {

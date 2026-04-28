@@ -316,16 +316,16 @@ func TestRunPRCommandMapsCoreCompatibilityFlags(t *testing.T) {
 	})
 }
 
-func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
+func TestRunDaemonCommandSupportsAllState(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
 
-	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--state", "all", "--dry-run", "--poll-interval-seconds", "0"})
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--state", "all", "--dry-run", "--poll-interval-seconds", "1"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--limit", "3", "--state", "all", "--repo", "owner/repo", "--dry-run"})
+	assertCommand(t, runner, []string{runnerScript, "--autonomous", "--state", "all", "--limit", "3", "--repo", "owner/repo", "--dry-run"})
 }
 
 func TestRunDaemonCommandMapsIssueFlowFlags(t *testing.T) {
@@ -353,7 +353,7 @@ func TestRunDaemonCommandMapsIssueFlowFlags(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{
-		runnerScript, "--limit", "1", "--state", "open",
+		runnerScript, "--autonomous", "--state", "open", "--limit", "1",
 		"--dry-run",
 		"--base", "current",
 		"--include-empty",

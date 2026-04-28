@@ -175,7 +175,10 @@ You can define repository defaults and placeholders for future orchestration pol
 
 Project config currently supports these sections:
 
-- `workflow.commands.test|lint|build` (non-empty string shell command or `null`)
+- `workflow.commands.setup|test|lint|build|e2e` (non-empty string shell command or `null`)
+- `workflow.hooks.pre_agent|post_agent|pre_pr_update|post_pr_update` (non-empty string shell command or `null`)
+- `workflow.readiness.required_checks|required_approvals|require_review|require_mergeable|require_required_file_evidence`
+- `workflow.merge.auto|method` (`method` is `merge`, `squash`, or `rebase`)
 - `defaults.tracker|preset|runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts` (used as parser defaults)
 - `scope.defaults.labels.allow|deny` (arrays of label names)
 - `scope.defaults.authors.allow|deny` (arrays of GitHub logins; optional placeholder)
@@ -207,11 +210,14 @@ Scope rules are evaluated before any issue-mode agent execution:
 
 Workflow checks are evaluated after agent changes are committed and before final PR-ready states are posted:
 
-- commands run in this order when configured: `test`, `lint`, `build`;
+- `setup` runs once before orchestration starts for the selected repository;
+- checks run in this order when configured: `test`, `lint`, `build`, `e2e`;
+- hooks can run before/after agent execution and before/after PR updates;
 - each command is executed via `bash -lc "<command>"` from repository `--dir`;
 - in `--dry-run`, checks are not executed and the script prints which checks would run;
 - on failure, orchestration posts a state update with `stage=workflow_checks` and a `workflow_checks` payload containing command, exit code, and output excerpts;
 - workflow-check failures block readiness transitions (`ready-for-review` / `waiting-for-ci`) and follow existing stop policy (`--stop-on-error`).
+- PR readiness can additionally require named CI checks, approvals, mergeability, and required-file evidence before the orchestrator posts `ready-to-merge`.
 
 Example `project-config.json` workflow block:
 
@@ -219,9 +225,28 @@ Example `project-config.json` workflow block:
 {
   "workflow": {
     "commands": {
+      "setup": "python -m pip install -r requirements.txt",
       "test": "python -m unittest",
       "lint": "ruff check .",
-      "build": null
+      "build": null,
+      "e2e": null
+    },
+    "hooks": {
+      "pre_agent": null,
+      "post_agent": null,
+      "pre_pr_update": null,
+      "post_pr_update": null
+    },
+    "readiness": {
+      "required_checks": ["ci / test"],
+      "required_approvals": 1,
+      "require_review": true,
+      "require_mergeable": true,
+      "require_required_file_evidence": true
+    },
+    "merge": {
+      "auto": false,
+      "method": "squash"
     }
   }
 }

@@ -32,9 +32,28 @@ const projectConfigScaffold = `{
   },
   "workflow": {
     "commands": {
+      "setup": "python -m pip install -r requirements.txt",
       "test": "python -m unittest",
       "lint": null,
-      "build": null
+      "build": null,
+      "e2e": null
+    },
+    "hooks": {
+      "pre_agent": null,
+      "post_agent": null,
+      "pre_pr_update": null,
+      "post_pr_update": null
+    },
+    "readiness": {
+      "required_checks": [],
+      "required_approvals": 1,
+      "require_review": true,
+      "require_mergeable": true,
+      "require_required_file_evidence": true
+    },
+    "merge": {
+      "auto": false,
+      "method": "squash"
     }
   },
   "retry": {
@@ -249,8 +268,6 @@ func (a *App) runRun(ctx context.Context, args []string) int {
 		return a.runDaemon(ctx, args[1:])
 	case "pr":
 		return a.runPR(ctx, args[1:])
-	case "daemon":
-		return a.runDaemon(ctx, args[1:])
 	default:
 		_, _ = fmt.Fprintf(a.err, "unknown run target %q\n\n%s", args[0], runUsage())
 		return 2
@@ -273,7 +290,19 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	maxCycles := fs.Int("max-cycles", 0, "optional test/debug bound on daemon polling cycles")
 	includeEmpty := fs.Bool("include-empty", false, "process issues even if body is empty")
 	stopOnError := fs.Bool("stop-on-error", false, "stop after the first failed poll cycle")
+	failOnExisting := fs.Bool("fail-on-existing", false, "fail if issue branch or PR already exists")
+	forceIssueFlow := fs.Bool("force-issue-flow", false, "disable auto-switch to PR-review mode")
+	skipIfPRExists := fs.Bool("skip-if-pr-exists", true, "skip issue processing when a linked open PR exists")
+	noSkipIfPRExists := fs.Bool("no-skip-if-pr-exists", false, "do not skip issue processing when a linked open PR exists")
+	skipIfBranchExists := fs.Bool("skip-if-branch-exists", true, "skip issue processing when deterministic issue branch exists on origin")
+	noSkipIfBranchExists := fs.Bool("no-skip-if-branch-exists", false, "do not skip issue processing when deterministic issue branch exists on origin")
 	forceReprocess := fs.Bool("force-reprocess", false, "override skip guards during autonomous polling")
+	syncReusedBranch := fs.Bool("sync-reused-branch", true, "sync reused issue branches before running the agent")
+	noSyncReusedBranch := fs.Bool("no-sync-reused-branch", false, "disable sync for reused issue branches before the agent step")
+	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
+	base := ""
+	fs.StringVar(&base, "base", "", "base branch mode: default or current")
+	fs.StringVar(&base, "base-branch", "", "base branch mode: default or current")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -282,8 +311,12 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintf(a.err, "unexpected run daemon argument: %s\n", fs.Arg(0))
 		return 2
 	}
-	if *pollIntervalSeconds <= 0 {
-		_, _ = fmt.Fprintln(a.err, "run daemon requires --poll-interval-seconds > 0")
+	if *pollIntervalSeconds < 0 {
+		_, _ = fmt.Fprintln(a.err, "run daemon requires --poll-interval-seconds to be zero or greater")
+		return 2
+	}
+	if *pollIntervalSeconds == 0 && !*opts.dryRun && *maxCycles != 1 {
+		_, _ = fmt.Fprintln(a.err, "run daemon requires --poll-interval-seconds > 0 unless dry-run or --max-cycles=1")
 		return 2
 	}
 	if *limit <= 0 {
@@ -294,17 +327,58 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintln(a.err, "run daemon currently supports only --max-parallel-tasks=1")
 		return 2
 	}
+	if *state != "open" && *state != "closed" && *state != "all" {
+		_, _ = fmt.Fprintln(a.err, "run daemon requires --state to be one of: open, closed, all")
+		return 2
+	}
 
 	pythonArgs := []string{runnerScript, "--autonomous", "--state", *state, "--limit", strconv.Itoa(*limit)}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
+	if base != "" {
+		pythonArgs = append(pythonArgs, "--base", base)
+	}
 	if *includeEmpty {
 		pythonArgs = append(pythonArgs, "--include-empty")
 	}
 	if *stopOnError {
 		pythonArgs = append(pythonArgs, "--stop-on-error")
 	}
+	if *failOnExisting {
+		pythonArgs = append(pythonArgs, "--fail-on-existing")
+	}
+	if *forceIssueFlow {
+		pythonArgs = append(pythonArgs, "--force-issue-flow")
+	}
+	if *noSkipIfPRExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
+	} else if flagWasPassed(fs, "skip-if-pr-exists") && *skipIfPRExists {
+		pythonArgs = append(pythonArgs, "--skip-if-pr-exists")
+	} else if !*skipIfPRExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
+	}
+	if *noSkipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
+	} else if flagWasPassed(fs, "skip-if-branch-exists") && *skipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--skip-if-branch-exists")
+	} else if !*skipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
+	}
 	if *forceReprocess {
 		pythonArgs = append(pythonArgs, "--force-reprocess")
+	}
+	if *noSyncReusedBranch {
+		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
+	} else if flagWasPassed(fs, "sync-reused-branch") && *syncReusedBranch {
+		pythonArgs = append(pythonArgs, "--sync-reused-branch")
+	} else if !*syncReusedBranch {
+		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
+	}
+	if *syncStrategy != "" {
+		pythonArgs = append(pythonArgs, "--sync-strategy", *syncStrategy)
+	}
+	effectiveMaxCycles := *maxCycles
+	if *opts.dryRun && effectiveMaxCycles == 0 {
+		effectiveMaxCycles = 1
 	}
 
 	cycles := 0
@@ -317,7 +391,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 			}
 			_, _ = fmt.Fprintf(a.err, "orchestrator: daemon poll cycle %d exited with code %d\n", cycles, code)
 		}
-		if *maxCycles > 0 && cycles >= *maxCycles {
+		if effectiveMaxCycles > 0 && cycles >= effectiveMaxCycles {
 			return code
 		}
 
@@ -483,121 +557,6 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	return a.runPython(ctx, pythonArgs)
 }
 
-func (a *App) runDaemon(ctx context.Context, args []string) int {
-	if unsupported := firstUnsupportedFlag(args, unsupportedRunDaemonFlags); unsupported != "" {
-		_, _ = fmt.Fprintln(a.err, unsupported)
-		return 2
-	}
-
-	fs := newFlagSet("run daemon", a.err)
-	opts := commonOptions{}
-	addCommonFlags(fs, &opts)
-	limit := fs.Int("limit", 1, "maximum number of issues to process per poll")
-	state := fs.String("state", "open", "issue state filter: open, closed, or all")
-	interval := fs.Int("poll-interval-seconds", 120, "delay between daemon polls")
-	includeEmpty := fs.Bool("include-empty", false, "process issues even if body is empty")
-	stopOnError := fs.Bool("stop-on-error", false, "stop after first failed agent run inside a poll")
-	failOnExisting := fs.Bool("fail-on-existing", false, "fail if issue branch or PR already exists")
-	forceIssueFlow := fs.Bool("force-issue-flow", false, "disable auto-switch to PR-review mode")
-	skipIfPRExists := fs.Bool("skip-if-pr-exists", true, "skip issue processing when a linked open PR exists")
-	noSkipIfPRExists := fs.Bool("no-skip-if-pr-exists", false, "do not skip issue processing when a linked open PR exists")
-	skipIfBranchExists := fs.Bool("skip-if-branch-exists", true, "skip issue processing when deterministic issue branch exists on origin")
-	noSkipIfBranchExists := fs.Bool("no-skip-if-branch-exists", false, "do not skip issue processing when deterministic issue branch exists on origin")
-	forceReprocess := fs.Bool("force-reprocess", false, "override skip guards")
-	syncReusedBranch := fs.Bool("sync-reused-branch", true, "sync reused issue branches before running the agent")
-	noSyncReusedBranch := fs.Bool("no-sync-reused-branch", false, "disable sync for reused issue branches before the agent step")
-	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
-	base := ""
-	fs.StringVar(&base, "base", "", "base branch mode: default or current")
-	fs.StringVar(&base, "base-branch", "", "base branch mode: default or current")
-
-	if err := fs.Parse(args); err != nil {
-		return flagExitCode(err)
-	}
-	if fs.NArg() != 0 {
-		_, _ = fmt.Fprintf(a.err, "unexpected run daemon argument: %s\n", fs.Arg(0))
-		return 2
-	}
-	if *limit <= 0 {
-		_, _ = fmt.Fprintln(a.err, "run daemon requires --limit to be greater than zero")
-		return 2
-	}
-	if *interval < 0 {
-		_, _ = fmt.Fprintln(a.err, "run daemon requires --poll-interval-seconds to be zero or greater")
-		return 2
-	}
-	if *state != "open" && *state != "closed" && *state != "all" {
-		_, _ = fmt.Fprintln(a.err, "run daemon requires --state to be one of: open, closed, all")
-		return 2
-	}
-
-	pythonArgs := []string{runnerScript, "--limit", strconv.Itoa(*limit), "--state", *state}
-	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
-	if base != "" {
-		pythonArgs = append(pythonArgs, "--base", base)
-	}
-	if *includeEmpty {
-		pythonArgs = append(pythonArgs, "--include-empty")
-	}
-	if *stopOnError {
-		pythonArgs = append(pythonArgs, "--stop-on-error")
-	}
-	if *failOnExisting {
-		pythonArgs = append(pythonArgs, "--fail-on-existing")
-	}
-	if *forceIssueFlow {
-		pythonArgs = append(pythonArgs, "--force-issue-flow")
-	}
-	if *noSkipIfPRExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
-	} else if flagWasPassed(fs, "skip-if-pr-exists") && *skipIfPRExists {
-		pythonArgs = append(pythonArgs, "--skip-if-pr-exists")
-	} else if !*skipIfPRExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
-	}
-	if *noSkipIfBranchExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
-	} else if flagWasPassed(fs, "skip-if-branch-exists") && *skipIfBranchExists {
-		pythonArgs = append(pythonArgs, "--skip-if-branch-exists")
-	} else if !*skipIfBranchExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
-	}
-	if *forceReprocess {
-		pythonArgs = append(pythonArgs, "--force-reprocess")
-	}
-	if *noSyncReusedBranch {
-		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
-	} else if flagWasPassed(fs, "sync-reused-branch") && *syncReusedBranch {
-		pythonArgs = append(pythonArgs, "--sync-reused-branch")
-	} else if !*syncReusedBranch {
-		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
-	}
-	if *syncStrategy != "" {
-		pythonArgs = append(pythonArgs, "--sync-strategy", *syncStrategy)
-	}
-
-	for {
-		code := a.runPython(ctx, pythonArgs)
-		if code != 0 {
-			return code
-		}
-		if *opts.dryRun {
-			return 0
-		}
-		if err := sleepContext(ctx, time.Duration(*interval)*time.Second); err != nil {
-			if errors.Is(err, context.Canceled) {
-				_, _ = fmt.Fprintln(a.err, "orchestrator: daemon canceled")
-				return 130
-			}
-			if errors.Is(err, context.DeadlineExceeded) {
-				_, _ = fmt.Fprintln(a.err, "orchestrator: daemon timed out")
-				return 124
-			}
-			_, _ = fmt.Fprintf(a.err, "orchestrator: daemon sleep failed: %v\n", err)
-			return 1
-		}
-	}
-}
 
 func (a *App) runPython(ctx context.Context, args []string) int {
 	if err := a.runner.Run(ctx, "python3", args...); err != nil {

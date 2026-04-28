@@ -115,6 +115,24 @@ class AutonomousDaemonSelectionTests(unittest.TestCase):
 
         self.assertEqual(dependencies, [157, 156, 159])
 
+    def test_parse_issue_dependency_references_supports_jira_marker_and_comments(self) -> None:
+        issue = {
+            "number": "PROJ-44",
+            "tracker": "jira",
+            "body": (
+                "Blocked by PROJ-42\n\n"
+                "<!-- orchestration-dependencies:v1 -->\n"
+                "```json\n"
+                '{"depends_on":["PROJ-41"],"blocked_by":["PROJ-42","PROJ-43"]}\n'
+                "```"
+            ),
+        }
+        comments = [{"body": "Depends on PROJ-45"}]
+
+        dependencies = parse_issue_dependency_references(issue, comments=comments)
+
+        self.assertEqual(dependencies, ["PROJ-41", "PROJ-42", "PROJ-43", "PROJ-45"])
+
     def test_split_autonomous_issues_by_dependency_state_skips_open_dependencies(self) -> None:
         prerequisite = {
             "number": 156,

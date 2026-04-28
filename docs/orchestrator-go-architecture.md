@@ -12,6 +12,12 @@
 - One-shot и daemon используют один execution core, отличаются только способом выбора задач и жизненным циклом процесса.
 - Миграция должна быть инкрементальной: Go CLI сначала может вызывать текущий Python-runner через adapter, затем логика переносится в Go по слоям.
 
+## Текущий миграционный срез
+
+- Первый чистый Go core slice расположен в `internal/core/dependencies`.
+- Он пока дублирует Python-логику `parse_issue_dependency_references` и остается provider-agnostic: на входе tracker, self ref и тексты issue/comments; на выходе нормализованные dependency refs.
+- Следующий безопасный шаг после этого среза: использовать пакет в Go task-intake/readiness логике, не меняя текущий Python execution path.
+
 ## Верхнеуровневая схема
 
 ```text

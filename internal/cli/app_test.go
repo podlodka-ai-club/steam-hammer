@@ -159,20 +159,33 @@ func TestStatusPRCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--status", "--pr", "72", "--repo", "owner/repo"})
 }
 
-func TestStatusAutonomousSessionCommandWiresPythonRunner(t *testing.T) {
+func TestStatusAutonomousSessionCommandReadsSessionWithGoCore(t *testing.T) {
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(sessionPath, []byte("{\n  \"processed_issues\": {\"71\": {\"status\": \"ready-for-review\"}},\n  \"checkpoint\": {\n    \"phase\": \"completed\",\n    \"batch_index\": 2,\n    \"total_batches\": 2,\n    \"current\": \"Idle between autonomous runs\",\n    \"counts\": {\"processed\": 1, \"failures\": 0},\n    \"updated_at\": \"2026-04-28T12:10:00Z\",\n    \"verification\": {\"status\": \"passed\", \"summary\": \"passed (2/2 commands)\", \"follow_up_issue\": {\"status\": \"not-needed\"}}\n  }\n}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(session) error = %v", err)
+	}
+	var out strings.Builder
 	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app := NewApp(&out, &strings.Builder{})
 	app.SetRunner(runner)
 
-	code := app.Run([]string{"status", "--autonomous-session-file", ".orchestrator/workers/daemon/session.json"})
+	code := app.Run([]string{"status", "--autonomous-session-file", sessionPath})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	if runner.calls != 1 {
-		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
 	}
-	if !reflect.DeepEqual(runner.args, []string{runnerScript, "--status", "--autonomous-session-file", ".orchestrator/workers/daemon/session.json"}) {
-		t.Fatalf("runner args = %#v", runner.args)
+	for _, want := range []string{
+		"Autonomous session status: completed",
+		"Batch: 2/2",
+		"Current: Idle between autonomous runs",
+		"Counts: processed=1, failures=0",
+		"Verification: passed (2/2 commands); follow-up=not-needed",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output missing %q\n%s", want, out.String())
+		}
 	}
 }
 

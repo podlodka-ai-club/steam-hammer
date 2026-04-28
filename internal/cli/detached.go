@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/workers"
 	"os"
 	"os/exec"
@@ -247,6 +248,29 @@ func (a *App) runDetachedStatus(configuredRoot, name string, asJSON bool) int {
 	return 0
 }
 
+func (a *App) runAutonomousSessionStatus(path string, asJSON bool) int {
+	state, err := orchestration.LoadState(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: autonomous session file not found: %s\n", path)
+			return 1
+		}
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect autonomous session file: %v\n", err)
+		return 1
+	}
+	if asJSON {
+		payload, err := json.MarshalIndent(state, "", "  ")
+		if err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to encode autonomous session state: %v\n", err)
+			return 1
+		}
+		_, _ = fmt.Fprintf(a.out, "%s\n", payload)
+		return 0
+	}
+	_, _ = fmt.Fprintln(a.out, state.Summary())
+	return 0
+}
+
 func (a *App) runDetachedStatusList(configuredRoot string, asJSON bool) int {
 	reports, err := detachedWorkerReports(configuredRoot)
 	if err != nil {
@@ -457,39 +481,30 @@ func detachedWorkerSessionStatus(path string) (*detachedWorkerSessionReport, err
 	if strings.TrimSpace(path) == "" {
 		return nil, nil
 	}
-	data, err := os.ReadFile(path)
+	state, err := orchestration.LoadState(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	var payload struct {
-		Checkpoint struct {
-			Phase     string   `json:"phase"`
-			Current   string   `json:"current"`
-			Next      []string `json:"next"`
-			UpdatedAt string   `json:"updated_at"`
-			Counts    struct {
-				Processed int `json:"processed"`
-				Failures  int `json:"failures"`
-			} `json:"counts"`
-		} `json:"checkpoint"`
-		ProcessedIssues map[string]json.RawMessage `json:"processed_issues"`
+	if state.Checkpoint == nil {
+		if len(state.ProcessedIssues) == 0 {
+			return nil, nil
+		}
+		return &detachedWorkerSessionReport{Processed: len(state.ProcessedIssues)}, nil
 	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return nil, err
-	}
+	checkpoint := state.Checkpoint
 	report := &detachedWorkerSessionReport{
-		Phase:     payload.Checkpoint.Phase,
-		Current:   payload.Checkpoint.Current,
-		Next:      payload.Checkpoint.Next,
-		Processed: payload.Checkpoint.Counts.Processed,
-		Failures:  payload.Checkpoint.Counts.Failures,
-		UpdatedAt: payload.Checkpoint.UpdatedAt,
+		Phase:     checkpoint.Phase,
+		Current:   checkpoint.Current,
+		Next:      checkpoint.Next,
+		Processed: checkpoint.Counts.Processed,
+		Failures:  checkpoint.Counts.Failures,
+		UpdatedAt: checkpoint.UpdatedAt,
 	}
-	if report.Processed == 0 && len(payload.ProcessedIssues) > 0 {
-		report.Processed = len(payload.ProcessedIssues)
+	if report.Processed == 0 && len(state.ProcessedIssues) > 0 {
+		report.Processed = len(state.ProcessedIssues)
 	}
 	if report.Phase == "" && report.Current == "" && len(report.Next) == 0 && report.Processed == 0 && report.Failures == 0 && report.UpdatedAt == "" {
 		return nil, nil

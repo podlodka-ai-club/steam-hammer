@@ -336,6 +336,10 @@ class CodeHostProvider(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    def load_pr_linked_issue_context(self, repo: str, pull_request: dict) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def ensure_pr(
         self,
         repo: str,
@@ -575,6 +579,9 @@ class GitHubCodeHostProvider(CodeHostProvider):
     def read_pr_ci_status_for_pull_request(self, repo: str, pull_request: dict) -> dict:
         return read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
 
+    def load_pr_linked_issue_context(self, repo: str, pull_request: dict) -> list[dict]:
+        return load_linked_issue_context(repo=repo, pull_request=pull_request)
+
     def ensure_pr(
         self,
         repo: str,
@@ -650,6 +657,10 @@ class UnsupportedCodeHostProvider(CodeHostProvider):
         raise self._unsupported()
 
     def read_pr_ci_status_for_pull_request(self, repo: str, pull_request: dict) -> dict:
+        _ = (repo, pull_request)
+        raise self._unsupported()
+
+    def load_pr_linked_issue_context(self, repo: str, pull_request: dict) -> list[dict]:
         _ = (repo, pull_request)
         raise self._unsupported()
 
@@ -4099,7 +4110,10 @@ def wait_for_pr_ci_status(
     poll_interval_seconds: int = CI_WAIT_POLL_INTERVAL_SECONDS,
     max_polls: int = CI_WAIT_MAX_POLLS,
 ) -> dict:
-    latest = read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
+    latest = current_codehost_provider().read_pr_ci_status_for_pull_request(
+        repo=repo,
+        pull_request=pull_request,
+    )
     polls = 1
     while str(latest.get("overall") or "") == "pending" and polls < max_polls:
         pending_checks = latest.get("pending_checks")
@@ -4110,7 +4124,10 @@ def wait_for_pr_ci_status(
             f"({pending_count} pending); waiting {poll_interval_seconds}s before retry {polls + 1}/{max_polls}."
         )
         time.sleep(poll_interval_seconds)
-        latest = read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
+        latest = current_codehost_provider().read_pr_ci_status_for_pull_request(
+            repo=repo,
+            pull_request=pull_request,
+        )
         polls += 1
     latest = dict(latest)
     latest["poll_count"] = polls
@@ -5336,39 +5353,34 @@ def safe_post_orchestration_state_comment(
 def format_orchestration_claim_comment(claim: dict) -> str:
     status = str(claim.get("status") or "unknown")
     issue_number = claim.get("issue")
+    tracker_name = current_tracker_provider().name
     return (
-        f"Orchestration claim update: {status} for issue #{issue_number}.\n\n"
+        f"Orchestration claim update: {status} for issue {format_issue_ref(issue_number, tracker=tracker_name)}.\n\n"
         f"{ORCHESTRATION_CLAIM_MARKER}\n"
         f"```json\n{json.dumps(claim, ensure_ascii=True, indent=2)}\n```"
     )
 
 
-def post_orchestration_claim_comment(repo: str, issue_number: int, claim: dict, dry_run: bool) -> None:
+def post_orchestration_claim_comment(repo: str, issue_number: int | str, claim: dict, dry_run: bool) -> None:
     body = format_orchestration_claim_comment(claim)
+    issue_ref = format_issue_ref(issue_number, tracker=current_tracker_provider().name)
     if dry_run:
         print(
-            f"[dry-run] Would post orchestration claim to issue #{issue_number}: "
+            f"[dry-run] Would post orchestration claim to issue {issue_ref}: "
             f"status={claim.get('status')}"
         )
         return
 
-    run_command(
-        [
-            "gh",
-            "issue",
-            "comment",
-            str(issue_number),
-            "--repo",
-            repo,
-            "--body",
-            body,
-        ]
+    current_tracker_provider().post_issue_comment(
+        repo=repo,
+        issue_id=issue_number,
+        body=body,
     )
 
 
 def safe_post_orchestration_claim_comment(
     repo: str,
-    issue_number: int,
+    issue_number: int | str,
     claim: dict,
     dry_run: bool,
 ) -> None:
@@ -5381,7 +5393,7 @@ def safe_post_orchestration_claim_comment(
         )
     except Exception as exc:  # noqa: BLE001
         print(
-            f"Warning: failed to post orchestration claim to issue #{issue_number}: {exc}",
+            f"Warning: failed to post orchestration claim to issue {format_issue_ref(issue_number, tracker=current_tracker_provider().name)}: {exc}",
             file=sys.stderr,
         )
 
@@ -7902,7 +7914,6 @@ def main() -> int:
     pr_number_arg = getattr(args, "pr", None)
     from_review_comments = bool(getattr(args, "from_review_comments", False))
     force_issue_flow = bool(getattr(args, "force_issue_flow", False))
-    has_force_issue_flow_flag = hasattr(args, "force_issue_flow")
     skip_if_pr_exists = bool(getattr(args, "skip_if_pr_exists", False))
     skip_if_branch_exists = bool(getattr(args, "skip_if_branch_exists", False))
     force_reprocess = bool(getattr(args, "force_reprocess", False))
@@ -8019,7 +8030,7 @@ def main() -> int:
                     print(f"Warning: {warning}", file=sys.stderr)
 
             ensure_clean_worktree()
-            repo = args.repo or detect_repo()
+            repo = args.repo or codehost_provider.detect_repo()
             if setup_command is not None:
                 failure_stage = "workflow_setup"
                 _run_workflow_shell_command(
@@ -8369,7 +8380,10 @@ def main() -> int:
 
                         retry_attempt = current_attempt + 1
                         pr_attempt = retry_attempt
-                        linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                        linked_issues = current_codehost_provider().load_pr_linked_issue_context(
+                            repo=repo,
+                            pull_request=pull_request,
+                        )
                         ci_prompt_override = build_ci_failure_prompt(
                             pull_request=pull_request,
                             failing_checks=failing_checks_list,
@@ -8408,7 +8422,10 @@ def main() -> int:
                     if ci_overall == "success":
                         required_file_validation = validate_required_files_in_pr(
                             pull_request=pull_request,
-                            linked_issues=load_linked_issue_context(repo=repo, pull_request=pull_request),
+                            linked_issues=current_codehost_provider().load_pr_linked_issue_context(
+                                repo=repo,
+                                pull_request=pull_request,
+                            ),
                         )
                         readiness = evaluate_pr_readiness(
                             pull_request=pull_request,
@@ -8490,7 +8507,10 @@ def main() -> int:
                 )
                 return _finish_main(0, original_process_cwd)
 
-            linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+            linked_issues = current_codehost_provider().load_pr_linked_issue_context(
+                repo=repo,
+                pull_request=pull_request,
+            )
             prompt = ci_prompt_override if 'ci_prompt_override' in locals() and ci_prompt_override is not None else build_pr_review_prompt(
                 pull_request=pull_request,
                 review_items=review_items,
@@ -8817,7 +8837,7 @@ def main() -> int:
             mode_reason = "batch issue processing"
             force_override_applied = False
             skip_agent_run = False
-            supports_issue_tracker_ops = False
+            supports_issue_tracker_ops = True
             issue_label = format_issue_label_from_issue(issue)
             issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
             state_target_type = "issue"
@@ -8894,8 +8914,8 @@ def main() -> int:
                     )
                     continue
 
-            if skip_if_pr_exists and supports_github_issue_ops and not autonomous_mode:
-                linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
+            if skip_if_pr_exists and not autonomous_mode:
+                linked_open_pr = current_codehost_provider().find_open_pr_for_issue(repo=repo, issue=issue)
                 if linked_open_pr is not None:
                     if issue_number_arg is not None:
                         linked_pr_number = linked_open_pr.get("number")
@@ -8942,7 +8962,7 @@ def main() -> int:
                     )
                     continue
 
-            if (issue_number_arg is not None or autonomous_mode) and has_force_issue_flow_flag and supports_github_issue_ops:
+            if issue_number_arg is not None or autonomous_mode:
                 if linked_open_pr is None:
                     linked_open_pr = current_codehost_provider().find_open_pr_for_issue(repo=repo, issue=issue)
 
@@ -9859,7 +9879,10 @@ def main() -> int:
                         )
 
                     if review_items:
-                        linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                        linked_issues = current_codehost_provider().load_pr_linked_issue_context(
+                            repo=repo,
+                            pull_request=pull_request,
+                        )
                         prompt_override = build_pr_review_prompt(
                             pull_request=pull_request,
                             review_items=review_items,

@@ -74,6 +74,8 @@ AGENT_FAILURE_LABEL_NAME = "auto:agent-failed"
 AGENT_FAILURE_LABEL_COLOR = "B60205"
 AGENT_FAILURE_LABEL_DESCRIPTION = "Automation run failed for this issue"
 RECOMMENDED_OPENCODE_MODEL = "openai/gpt-4o"
+OLLAMA_MODEL_PREFIX = "ollama/"
+OLLAMA_PREFLIGHT_TIMEOUT_SECONDS = 30
 SIGKILL_EXIT_DESCRIPTION = (
     "This usually indicates a hard kill (SIGKILL), commonly from resource limits or environment-level"
     " termination rather than an argument/model syntax error."
@@ -535,6 +537,60 @@ def classify_opencode_failure(return_code: int, model: str | None) -> str | None
         details.append(f"This run used model '{model}', which is different from the current recommended baseline.")
 
     return " ".join(details)
+
+
+def _ollama_model_name(model: str | None) -> str | None:
+    normalized_model = str(model or "").strip()
+    if not normalized_model.startswith(OLLAMA_MODEL_PREFIX):
+        return None
+
+    local_model = normalized_model[len(OLLAMA_MODEL_PREFIX):].strip()
+    if not local_model:
+        raise RuntimeError(
+            "OpenCode model 'ollama/' is missing the local Ollama model name. "
+            "Use a value like 'ollama/qwen3.5:2b'."
+        )
+    return local_model
+
+
+def validate_opencode_model_backend(runner: str, model: str | None) -> None:
+    if runner != "opencode":
+        return
+
+    local_model = _ollama_model_name(model)
+    if local_model is None:
+        return
+
+    ollama_path = shutil.which("ollama")
+    if not ollama_path:
+        raise RuntimeError(
+            f"OpenCode model '{model}' requires the local `ollama` CLI, but it was not found in PATH. "
+            "Install/start Ollama or use a known-working non-Ollama model/backend."
+        )
+
+    try:
+        result = subprocess.run(
+            [ollama_path, "show", local_model],
+            capture_output=True,
+            text=True,
+            timeout=OLLAMA_PREFLIGHT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Timed out after {OLLAMA_PREFLIGHT_TIMEOUT_SECONDS}s while validating local Ollama model "
+            f"'{local_model}' for OpenCode. Confirm the Ollama backend is healthy, then retry, "
+            "or use a known-working model/backend."
+        ) from exc
+
+    if result.returncode == 0:
+        return
+
+    detail = (result.stderr or "").strip() or (result.stdout or "").strip() or "ollama show failed"
+    raise RuntimeError(
+        f"Unable to validate local Ollama model '{local_model}' for OpenCode: {detail}. "
+        f"Confirm `ollama show {local_model}` succeeds, pull the model if needed, then retry, "
+        "or use a known-working model/backend."
+    )
 
 
 def _label_already_exists_error(message: str) -> bool:
@@ -4709,6 +4765,8 @@ def run_agent_with_prompt(
             print(f"[dry-run] Would run: {' '.join(command[:4])} ... for {item_label}")
         return 0
 
+    validate_opencode_model_backend(runner=runner, model=model)
+
     start = time.monotonic()
     print(f"Running agent for {item_label}")
     last_output = start
@@ -6108,6 +6166,24 @@ def run_doctor(args: argparse.Namespace, raw_argv: list[str] | None = None) -> i
         _doctor_record(checks, "PASS", "Runner availability (opencode)", "installed")
     else:
         _doctor_record(checks, "WARN", "Runner availability (opencode)", "not installed")
+
+    if runner == "opencode":
+        try:
+            local_ollama_model = _ollama_model_name(model)
+        except RuntimeError as exc:
+            _doctor_record(checks, "FAIL", "Ollama model availability", str(exc))
+        else:
+            if local_ollama_model is not None:
+                try:
+                    validate_opencode_model_backend(runner=runner, model=model)
+                    _doctor_record(
+                        checks,
+                        "PASS",
+                        "Ollama model availability",
+                        f"validated local model '{local_ollama_model}'",
+                    )
+                except RuntimeError as exc:
+                    _doctor_record(checks, "FAIL", "Ollama model availability", str(exc))
 
     if smoke_enabled:
         smoke_command: list[str]

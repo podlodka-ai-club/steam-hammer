@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import abc
 import base64
 from datetime import datetime, timezone
 import hashlib
@@ -25,6 +26,7 @@ LOCAL_CONFIG_RELATIVE_PATH = "local-config.json"
 PROJECT_CONFIG_RELATIVE_PATH = "project-config.json"
 BUILTIN_DEFAULTS = {
     "tracker": "github",
+    "codehost": "github",
     "state": "open",
     "limit": 10,
     "runner": "claude",
@@ -57,6 +59,11 @@ BUILTIN_DEFAULTS = {
 TRACKER_GITHUB = "github"
 TRACKER_JIRA = "jira"
 TRACKER_CHOICES = {TRACKER_GITHUB, TRACKER_JIRA}
+
+CODEHOST_GITHUB = "github"
+CODEHOST_BITBUCKET = "bitbucket"
+CODEHOST_CUSTOM_PROXY = "custom-proxy"
+CODEHOST_CHOICES = {CODEHOST_GITHUB, CODEHOST_BITBUCKET, CODEHOST_CUSTOM_PROXY}
 
 JIRA_ENV_VARS = {
     "base_url": "JIRA_BASE_URL",
@@ -170,7 +177,7 @@ def is_trackable_issue_number(value: object) -> bool:
     if isinstance(value, int):
         return value > 0
     if isinstance(value, str):
-        return value.strip().isdigit()
+        return bool(value.strip())
     return False
 
 
@@ -208,6 +215,15 @@ def _parse_tracker(tracker: object) -> str:
     return normalized
 
 
+def _parse_codehost(codehost: object) -> str:
+    normalized = str(codehost or "").strip().lower()
+    if normalized not in CODEHOST_CHOICES:
+        raise RuntimeError(
+            f"Unsupported code host '{codehost}'. Expected one of: {', '.join(sorted(CODEHOST_CHOICES))}"
+        )
+    return normalized
+
+
 def issue_tracker(issue: dict) -> str:
     return _parse_tracker(issue.get("tracker") or TRACKER_GITHUB)
 
@@ -229,6 +245,475 @@ def format_issue_ref_from_issue(issue: dict) -> str:
 
 def format_issue_label_from_issue(issue: dict) -> str:
     return format_issue_label(issue.get("number"), tracker=issue_tracker(issue))
+
+
+class TrackerProvider(abc.ABC):
+    @property
+    @abc.abstractmethod
+    def name(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def supports_issue_labels(self) -> bool:
+        return False
+
+    @abc.abstractmethod
+    def get_issue(self, repo: str, issue_id: int | str) -> dict:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def list_issues(self, repo: str, state: str, limit: int) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def list_issue_comments(self, repo: str, issue_id: int | str) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def post_issue_comment(self, repo: str, issue_id: int | str, body: str) -> None:
+        raise NotImplementedError
+
+    def create_child_issue(
+        self,
+        repo: str,
+        parent_issue: dict,
+        child: dict,
+        created_dependencies: dict[int, dict],
+        dry_run: bool,
+        parent_branch: str | None = None,
+        base_branch: str | None = None,
+    ) -> dict:
+        _ = (parent_branch, base_branch)
+        raise RuntimeError(f"Tracker provider '{self.name}' does not support child issue creation yet")
+
+    def add_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
+        _ = (repo, issue_id, label_name, dry_run)
+
+    def remove_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
+        _ = (repo, issue_id, label_name, dry_run)
+
+    def issue_has_label(self, repo: str, issue_id: int | str, label_name: str) -> bool:
+        _ = (repo, issue_id, label_name)
+        return False
+
+
+class CodeHostProvider(abc.ABC):
+    @property
+    @abc.abstractmethod
+    def name(self) -> str:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def detect_repo(self) -> str:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def detect_default_branch(self, repo: str) -> str:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def find_open_pr_for_issue(self, repo: str, issue: dict) -> dict | None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def fetch_pull_request(self, repo: str, number: int) -> dict:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def list_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def fetch_pr_review_threads(self, repo: str, number: int) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def fetch_pr_conversation_comments(self, repo: str, pr_number: int) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def read_pr_ci_status_for_pull_request(self, repo: str, pull_request: dict) -> dict:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def load_pr_linked_issue_context(self, repo: str, pull_request: dict) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def ensure_pr(
+        self,
+        repo: str,
+        base_branch: str,
+        branch_name: str,
+        issue: dict,
+        dry_run: bool,
+        fail_on_existing: bool,
+        stacked_base_context: str | None = None,
+    ) -> tuple[str, str]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def post_pr_comment(self, repo: str, pr_number: int, body: str) -> None:
+        raise NotImplementedError
+
+
+class GitHubTrackerProvider(TrackerProvider):
+    @property
+    def name(self) -> str:
+        return TRACKER_GITHUB
+
+    @property
+    def supports_issue_labels(self) -> bool:
+        return True
+
+    def get_issue(self, repo: str, issue_id: int | str) -> dict:
+        if type(issue_id) is not int:
+            raise RuntimeError(f"GitHub tracker requires integer issue numbers, got {issue_id!r}")
+        return fetch_issue(repo=repo, number=issue_id)
+
+    def list_issues(self, repo: str, state: str, limit: int) -> list[dict]:
+        return fetch_issues(repo=repo, state=state, limit=limit)
+
+    def list_issue_comments(self, repo: str, issue_id: int | str) -> list[dict]:
+        return fetch_issue_comments(repo=repo, issue_number=issue_id)
+
+    def post_issue_comment(self, repo: str, issue_id: int | str, body: str) -> None:
+        run_command([
+            "gh",
+            "issue",
+            "comment",
+            str(issue_id),
+            "--repo",
+            repo,
+            "--body",
+            body,
+        ])
+
+    def create_child_issue(
+        self,
+        repo: str,
+        parent_issue: dict,
+        child: dict,
+        created_dependencies: dict[int, dict],
+        dry_run: bool,
+        parent_branch: str | None = None,
+        base_branch: str | None = None,
+    ) -> dict:
+        return create_decomposition_child_issue(
+            repo=repo,
+            parent_issue=parent_issue,
+            child=child,
+            created_dependencies=created_dependencies,
+            dry_run=dry_run,
+            parent_branch=parent_branch,
+            base_branch=base_branch,
+        )
+
+    def add_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
+        ensure_agent_failure_label(repo=repo, dry_run=dry_run)
+        if dry_run:
+            print(f"[dry-run] Would add label '{label_name}' to issue {format_issue_ref(issue_id, tracker=self.name)}")
+            return
+        run_command([
+            "gh",
+            "issue",
+            "edit",
+            str(issue_id),
+            "--repo",
+            repo,
+            "--add-label",
+            label_name,
+        ])
+
+    def remove_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
+        if dry_run:
+            print(f"[dry-run] Would remove label '{label_name}' from issue {format_issue_ref(issue_id, tracker=self.name)} if present")
+            return
+        if not self.issue_has_label(repo=repo, issue_id=issue_id, label_name=label_name):
+            return
+        run_command([
+            "gh",
+            "issue",
+            "edit",
+            str(issue_id),
+            "--repo",
+            repo,
+            "--remove-label",
+            label_name,
+        ])
+
+    def issue_has_label(self, repo: str, issue_id: int | str, label_name: str) -> bool:
+        labels_output = run_capture([
+            "gh",
+            "issue",
+            "view",
+            str(issue_id),
+            "--repo",
+            repo,
+            "--json",
+            "labels",
+            "--jq",
+            ".labels[].name",
+        ])
+        labels = [line.strip() for line in labels_output.splitlines() if line.strip()]
+        return label_name in labels
+
+
+def _jira_comment_to_internal_shape(comment_payload: dict, issue_key: str, base_url: str) -> dict:
+    author = comment_payload.get("author") if isinstance(comment_payload.get("author"), dict) else {}
+    comment_id = comment_payload.get("id")
+    comment_url = ""
+    if comment_id is not None:
+        comment_url = f"{base_url}/browse/{issue_key}?focusedCommentId={comment_id}#comment-{comment_id}"
+    return {
+        "id": comment_id,
+        "body": jira_description_to_text(comment_payload.get("body")),
+        "created_at": str(comment_payload.get("created") or ""),
+        "html_url": comment_url,
+        "author": str(author.get("displayName") or author.get("accountId") or "unknown"),
+    }
+
+
+def jira_text_to_adf(body: str) -> dict:
+    paragraphs: list[dict] = []
+    for line in body.splitlines():
+        if line.strip():
+            paragraphs.append(
+                {
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": line}],
+                }
+            )
+        else:
+            paragraphs.append({"type": "paragraph", "content": []})
+    if not paragraphs:
+        paragraphs.append({"type": "paragraph", "content": []})
+    return {"type": "doc", "version": 1, "content": paragraphs}
+
+
+def fetch_jira_issue_comments(issue_key: str) -> list[dict]:
+    credentials = _jira_credentials_from_env()
+    normalized_key = str(normalize_issue_number(issue_key, TRACKER_JIRA))
+    payload = _jira_request_json(
+        method="GET",
+        url=(
+            f"{credentials['base_url']}/rest/api/3/issue/"
+            f"{urllib.parse.quote(normalized_key)}/comment?maxResults=100"
+        ),
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected response fetching Jira comments for {normalized_key}")
+    comments = payload.get("comments")
+    if not isinstance(comments, list):
+        raise RuntimeError(f"Unexpected Jira comments payload for {normalized_key}")
+    return [
+        _jira_comment_to_internal_shape(item, issue_key=normalized_key, base_url=credentials["base_url"])
+        for item in comments
+        if isinstance(item, dict)
+    ]
+
+
+def post_jira_issue_comment(issue_key: str, body: str) -> None:
+    credentials = _jira_credentials_from_env()
+    normalized_key = str(normalize_issue_number(issue_key, TRACKER_JIRA))
+    _jira_request_json(
+        method="POST",
+        url=f"{credentials['base_url']}/rest/api/3/issue/{urllib.parse.quote(normalized_key)}/comment",
+        payload={"body": jira_text_to_adf(body)},
+    )
+
+
+class JiraTrackerProvider(TrackerProvider):
+    @property
+    def name(self) -> str:
+        return TRACKER_JIRA
+
+    def get_issue(self, repo: str, issue_id: int | str) -> dict:
+        _ = repo
+        return fetch_jira_issue(issue_key=str(issue_id))
+
+    def list_issues(self, repo: str, state: str, limit: int) -> list[dict]:
+        _ = repo
+        jira_jql = {
+            "open": "status != Done ORDER BY created DESC",
+            "closed": "status = Done ORDER BY created DESC",
+            "all": "ORDER BY created DESC",
+        }[state]
+        return fetch_jira_issues(jql=jira_jql, limit=limit)
+
+    def list_issue_comments(self, repo: str, issue_id: int | str) -> list[dict]:
+        _ = repo
+        return fetch_jira_issue_comments(issue_key=str(issue_id))
+
+    def post_issue_comment(self, repo: str, issue_id: int | str, body: str) -> None:
+        _ = repo
+        post_jira_issue_comment(issue_key=str(issue_id), body=body)
+
+
+class GitHubCodeHostProvider(CodeHostProvider):
+    @property
+    def name(self) -> str:
+        return CODEHOST_GITHUB
+
+    def detect_repo(self) -> str:
+        return detect_repo()
+
+    def detect_default_branch(self, repo: str) -> str:
+        return detect_default_branch(repo)
+
+    def find_open_pr_for_issue(self, repo: str, issue: dict) -> dict | None:
+        return find_open_pr_for_issue(repo=repo, issue=issue)
+
+    def fetch_pull_request(self, repo: str, number: int) -> dict:
+        return fetch_pull_request(repo=repo, number=number)
+
+    def list_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
+        return fetch_issue_comments(repo=repo, issue_number=pr_number)
+
+    def fetch_pr_review_threads(self, repo: str, number: int) -> list[dict]:
+        return fetch_pr_review_threads(repo=repo, number=number)
+
+    def fetch_pr_conversation_comments(self, repo: str, pr_number: int) -> list[dict]:
+        return fetch_pr_conversation_comments(repo=repo, pr_number=pr_number)
+
+    def read_pr_ci_status_for_pull_request(self, repo: str, pull_request: dict) -> dict:
+        return read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
+
+    def load_pr_linked_issue_context(self, repo: str, pull_request: dict) -> list[dict]:
+        return load_linked_issue_context(repo=repo, pull_request=pull_request)
+
+    def ensure_pr(
+        self,
+        repo: str,
+        base_branch: str,
+        branch_name: str,
+        issue: dict,
+        dry_run: bool,
+        fail_on_existing: bool,
+        stacked_base_context: str | None = None,
+    ) -> tuple[str, str]:
+        return ensure_pr(
+            repo=repo,
+            base_branch=base_branch,
+            branch_name=branch_name,
+            issue=issue,
+            dry_run=dry_run,
+            fail_on_existing=fail_on_existing,
+            stacked_base_context=stacked_base_context,
+        )
+
+    def post_pr_comment(self, repo: str, pr_number: int, body: str) -> None:
+        run_command([
+            "gh",
+            "pr",
+            "comment",
+            str(pr_number),
+            "--repo",
+            repo,
+            "--body",
+            body,
+        ])
+
+
+class UnsupportedCodeHostProvider(CodeHostProvider):
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def _unsupported(self) -> RuntimeError:
+        return RuntimeError(
+            f"Code host provider '{self._name}' is not implemented yet. "
+            "Core orchestration now routes through the provider interface, so add a provider adapter instead of rewriting the flow."
+        )
+
+    def detect_repo(self) -> str:
+        raise self._unsupported()
+
+    def detect_default_branch(self, repo: str) -> str:
+        _ = repo
+        raise self._unsupported()
+
+    def find_open_pr_for_issue(self, repo: str, issue: dict) -> dict | None:
+        _ = (repo, issue)
+        raise self._unsupported()
+
+    def fetch_pull_request(self, repo: str, number: int) -> dict:
+        _ = (repo, number)
+        raise self._unsupported()
+
+    def list_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
+        _ = (repo, pr_number)
+        raise self._unsupported()
+
+    def fetch_pr_review_threads(self, repo: str, number: int) -> list[dict]:
+        _ = (repo, number)
+        raise self._unsupported()
+
+    def fetch_pr_conversation_comments(self, repo: str, pr_number: int) -> list[dict]:
+        _ = (repo, pr_number)
+        raise self._unsupported()
+
+    def read_pr_ci_status_for_pull_request(self, repo: str, pull_request: dict) -> dict:
+        _ = (repo, pull_request)
+        raise self._unsupported()
+
+    def load_pr_linked_issue_context(self, repo: str, pull_request: dict) -> list[dict]:
+        _ = (repo, pull_request)
+        raise self._unsupported()
+
+    def ensure_pr(
+        self,
+        repo: str,
+        base_branch: str,
+        branch_name: str,
+        issue: dict,
+        dry_run: bool,
+        fail_on_existing: bool,
+        stacked_base_context: str | None = None,
+    ) -> tuple[str, str]:
+        _ = (repo, base_branch, branch_name, issue, dry_run, fail_on_existing, stacked_base_context)
+        raise self._unsupported()
+
+    def post_pr_comment(self, repo: str, pr_number: int, body: str) -> None:
+        _ = (repo, pr_number, body)
+        raise self._unsupported()
+
+
+ACTIVE_TRACKER_PROVIDER: TrackerProvider | None = None
+ACTIVE_CODEHOST_PROVIDER: CodeHostProvider | None = None
+
+
+def resolve_tracker_provider(tracker: str) -> TrackerProvider:
+    normalized = _parse_tracker(tracker)
+    if normalized == TRACKER_GITHUB:
+        return GitHubTrackerProvider()
+    if normalized == TRACKER_JIRA:
+        return JiraTrackerProvider()
+    raise RuntimeError(f"Unsupported tracker provider '{tracker}'")
+
+
+def resolve_codehost_provider(codehost: str) -> CodeHostProvider:
+    normalized = _parse_codehost(codehost)
+    if normalized == CODEHOST_GITHUB:
+        return GitHubCodeHostProvider()
+    return UnsupportedCodeHostProvider(normalized)
+
+
+def configure_active_providers(tracker_provider: TrackerProvider, codehost_provider: CodeHostProvider) -> None:
+    global ACTIVE_TRACKER_PROVIDER, ACTIVE_CODEHOST_PROVIDER
+    ACTIVE_TRACKER_PROVIDER = tracker_provider
+    ACTIVE_CODEHOST_PROVIDER = codehost_provider
+
+
+def current_tracker_provider() -> TrackerProvider:
+    return ACTIVE_TRACKER_PROVIDER or GitHubTrackerProvider()
+
+
+def current_codehost_provider() -> CodeHostProvider:
+    return ACTIVE_CODEHOST_PROVIDER or GitHubCodeHostProvider()
 
 
 def issue_commit_title(issue: dict) -> str:
@@ -257,10 +742,11 @@ def _jira_credentials_from_env() -> dict[str, str]:
     return credentials
 
 
-def validate_tracker_requirements(tracker: str, pr_mode_requested: bool) -> None:
+def validate_provider_requirements(tracker: str, codehost: str, pr_mode_requested: bool) -> None:
     normalized_tracker = _parse_tracker(tracker)
-    if pr_mode_requested and normalized_tracker != TRACKER_GITHUB:
-        raise RuntimeError("--pr / --from-review-comments mode only supports --tracker github")
+    normalized_codehost = _parse_codehost(codehost)
+    if pr_mode_requested and normalized_codehost != CODEHOST_GITHUB:
+        raise RuntimeError("--pr / --from-review-comments mode only supports --codehost github")
     if normalized_tracker == TRACKER_JIRA:
         _jira_credentials_from_env()
 
@@ -763,6 +1249,7 @@ WORKFLOW_HOOK_ALIASES = {
     "after_pr_update": "post_pr_update",
 }
 MERGE_METHOD_CHOICES = {"merge", "squash", "rebase"}
+MERGE_METHOD_FLAGS = {"merge": "--merge", "squash": "--squash", "rebase": "--rebase"}
 MERGEABLE_READY_STATES = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
 
 CI_PENDING_CHECK_RUN_STATUSES = {"queued", "in_progress", "requested", "waiting", "pending"}
@@ -800,8 +1287,8 @@ def failure_next_action_for_stage(failure_stage: str) -> str:
         return "fix_workflow_hook_and_retry"
     if failure_stage == "workflow_checks":
         return "fix_workflow_checks_and_retry"
-    if failure_stage == "workflow_hooks":
-        return "fix_workflow_hooks_and_retry"
+    if failure_stage == "merge_execution":
+        return "inspect_merge_requirements_and_retry"
     if failure_stage == "residual_untracked_validation":
         return "stage_or-remove-residual-untracked-files"
     if failure_stage == "token_budget":
@@ -868,6 +1355,14 @@ class TokenBudgetExceededError(RuntimeError):
             f"Agent stopped: token budget of {_format_budget_message_count(budget) or budget} exceeded "
             f"(reached ~{_format_budget_message_count(reached) or reached}). Use --token-budget to raise the limit or split the issue."
         )
+
+
+class MergeRequestNotAcceptedError(RuntimeError):
+    def __init__(self, *, status: str, next_action: str, message: str):
+        self.status = status
+        self.next_action = next_action
+        self.message = message
+        super().__init__(message)
 
 
 def configured_workflow_commands(project_config: dict) -> list[tuple[str, str]]:
@@ -1905,7 +2400,7 @@ def fetch_pull_request(repo: str, number: int) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,title,body,url,state,mergeStateStatus,headRefName,headRefOid,baseRefName,author,closingIssuesReferences,reviews,files",
+            "number,title,body,url,state,mergeStateStatus,mergeable,isDraft,reviewDecision,headRefName,headRefOid,baseRefName,author,closingIssuesReferences,reviews,files",
         ]
     )
     pull_request = json.loads(output)
@@ -1981,6 +2476,401 @@ def _submitted_at_key(review: dict) -> str:
     if not isinstance(value, str):
         return ""
     return value
+
+
+def latest_reviews_by_author(reviews: list[dict]) -> dict[str, dict]:
+    latest_review_by_author: dict[str, dict] = {}
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        review_author = "unknown"
+        author_payload = review.get("author")
+        if isinstance(author_payload, dict):
+            review_author = str(author_payload.get("login") or "unknown")
+        key = review_author.lower()
+
+        existing = latest_review_by_author.get(key)
+        if existing is None or _submitted_at_key(review) >= _submitted_at_key(existing):
+            latest_review_by_author[key] = review
+    return latest_review_by_author
+
+
+def derive_pr_review_decision(pull_request: dict) -> str:
+    explicit = str(pull_request.get("reviewDecision") or "").strip().upper()
+    if explicit in {"APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"}:
+        return explicit
+
+    reviews = pull_request.get("reviews")
+    if not isinstance(reviews, list):
+        return "UNKNOWN"
+
+    latest_by_author = latest_reviews_by_author(reviews)
+    latest_states = {
+        str(review.get("state") or "").strip().upper()
+        for review in latest_by_author.values()
+        if isinstance(review, dict)
+    }
+    if "CHANGES_REQUESTED" in latest_states:
+        return "CHANGES_REQUESTED"
+    if "APPROVED" in latest_states:
+        return "APPROVED"
+    return "UNKNOWN"
+
+
+def evaluate_pr_merge_readiness(pull_request: dict, merge_policy: dict) -> dict:
+    merge_state = str(pull_request.get("mergeStateStatus") or "").strip().upper() or "UNKNOWN"
+    mergeable = str(pull_request.get("mergeable") or "").strip().upper() or "UNKNOWN"
+    is_draft = bool(pull_request.get("isDraft")) or merge_state == "DRAFT"
+    review_decision = derive_pr_review_decision(pull_request)
+    auto_merge_enabled = bool(merge_policy.get("auto", False))
+    merge_method = str(merge_policy.get("method") or "squash")
+
+    readiness = {
+        "merge_state_status": merge_state,
+        "mergeable": mergeable,
+        "review_decision": review_decision,
+        "is_draft": is_draft,
+        "auto_merge_enabled": auto_merge_enabled,
+        "merge_method": merge_method,
+        "status": "ready-to-merge",
+        "stage": "merge_gate",
+        "next_action": "ready_for_merge",
+        "error": None,
+    }
+
+    if is_draft:
+        readiness.update(
+            {
+                "status": "waiting-for-author",
+                "next_action": "mark_pr_ready_for_review",
+                "error": "PR is still marked as draft",
+            }
+        )
+        return readiness
+
+    if mergeable == "CONFLICTING" or merge_state in {"DIRTY", "CONFLICTING"}:
+        readiness.update(
+            {
+                "status": "blocked",
+                "next_action": "resolve_merge_conflicts",
+                "error": f"PR is not mergeable yet (mergeStateStatus={merge_state})",
+            }
+        )
+        return readiness
+
+    if review_decision == "CHANGES_REQUESTED":
+        readiness.update(
+            {
+                "status": "waiting-for-author",
+                "next_action": "address_requested_changes",
+                "error": "Review state still has requested changes",
+            }
+        )
+        return readiness
+
+    if review_decision == "REVIEW_REQUIRED":
+        readiness.update(
+            {
+                "status": "waiting-for-author",
+                "next_action": "await_required_approval",
+                "error": "Required approving review is still missing",
+            }
+        )
+        return readiness
+
+    if merge_state in {"BLOCKED", "BEHIND", "UNKNOWN"} and mergeable != "MERGEABLE":
+        readiness.update(
+            {
+                "status": "blocked",
+                "next_action": "inspect_merge_requirements",
+                "error": f"GitHub has not marked this PR mergeable yet (mergeStateStatus={merge_state})",
+            }
+        )
+        return readiness
+
+    return readiness
+
+
+def run_merge_for_pull_request(repo: str, pr_number: int, merge_policy: dict, dry_run: bool) -> None:
+    method = str(merge_policy.get("method") or "squash").strip().lower() or "squash"
+    merge_flag = MERGE_METHOD_FLAGS[method]
+    command = ["gh", "pr", "merge", str(pr_number), "--repo", repo, "--auto", merge_flag]
+    if dry_run:
+        print(
+            f"[dry-run] Would request GitHub auto-merge for PR #{pr_number} "
+            f"using method '{method}'"
+        )
+        return
+
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+
+    stderr = str(result.stderr or "").strip()
+    stdout = str(result.stdout or "").strip()
+    detail = stderr or stdout or f"Command failed: {' '.join(command)}"
+    normalized = detail.lower()
+    if "auto-merge" in normalized and (
+        "not enabled" in normalized
+        or "not allowed" in normalized
+        or "enablepullrequestautomerge" in normalized
+        or "disabled" in normalized
+    ):
+        raise MergeRequestNotAcceptedError(
+            status="ready-to-merge",
+            next_action="merge_manually_or_enable_auto_merge",
+            message=short_error_text(
+                "Repository policy rejected GitHub auto-merge; merge manually or enable auto-merge for this repository."
+            ),
+        )
+    if (
+        "review required" in normalized
+        or "required approving review" in normalized
+        or "required status check" in normalized
+        or "protected branch" in normalized
+        or "pull request is not mergeable" in normalized
+        or "base branch policy" in normalized
+    ):
+        raise MergeRequestNotAcceptedError(
+            status="blocked",
+            next_action="inspect_merge_requirements",
+            message=short_error_text(detail),
+        )
+    raise RuntimeError(detail)
+
+
+def finalize_pr_after_ci_success(
+    repo: str,
+    pr_number: int,
+    linked_issues: list[dict] | None,
+    merge_policy: dict,
+    target_type: str,
+    target_number: int,
+    issue_number: int | None,
+    branch: str | None,
+    base_branch: str | None,
+    runner: str,
+    agent: str,
+    model: str | None,
+    attempt: int,
+    ci_checks: list[dict] | None,
+    decomposition: dict | None,
+    project_config: dict,
+    dry_run: bool,
+) -> dict:
+    pull_request = fetch_pull_request(repo=repo, number=pr_number)
+    required_file_validation = validate_required_files_in_pr(
+        pull_request=pull_request,
+        linked_issues=linked_issues,
+    )
+    if required_file_validation.get("status") == "blocked":
+        missing_files = required_file_validation.get("missing_files")
+        missing_summary = ", ".join(sorted(str(file) for file in missing_files))
+        state = build_orchestration_state(
+            status="blocked",
+            task_type="pr",
+            issue_number=issue_number,
+            pr_number=pr_number,
+            branch=branch,
+            base_branch=base_branch,
+            runner=runner,
+            agent=agent,
+            model=model,
+            attempt=attempt,
+            stage="ci_checks",
+            next_action="update_pr_with_required_files",
+            error=f"Missing required file evidence: {missing_summary}",
+            ci_checks=ci_checks,
+            decomposition=decomposition,
+            required_file_validation=required_file_validation,
+            merge_policy=merge_policy,
+        )
+        safe_post_orchestration_state_comment(
+            repo=repo,
+            target_type=target_type,
+            target_number=target_number,
+            dry_run=dry_run,
+            state=state,
+        )
+        print(
+            f"PR #{pr_number} CI passed but required file evidence check failed. "
+            f"Missing files: {missing_summary}"
+        )
+        return state
+
+    readiness = evaluate_pr_readiness(
+        pull_request=pull_request,
+        ci_status={"checks": ci_checks or []},
+        required_file_validation=required_file_validation,
+        project_config=project_config,
+    )
+    readiness_status = str(readiness.get("status") or "blocked")
+    if readiness_status != "ready-to-merge":
+        state = build_orchestration_state(
+            status=readiness_status,
+            task_type="pr",
+            issue_number=issue_number,
+            pr_number=pr_number,
+            branch=branch,
+            base_branch=base_branch,
+            runner=runner,
+            agent=agent,
+            model=model,
+            attempt=attempt,
+            stage="ci_checks",
+            next_action=str(readiness.get("next_action") or "ready_for_merge"),
+            error=_as_optional_string(readiness.get("error")),
+            ci_checks=ci_checks,
+            decomposition=decomposition,
+            required_file_validation=required_file_validation,
+            merge_policy=merge_policy,
+        )
+        safe_post_orchestration_state_comment(
+            repo=repo,
+            target_type=target_type,
+            target_number=target_number,
+            dry_run=dry_run,
+            state=state,
+        )
+        if readiness_status == "ready-for-review":
+            print(
+                f"CI checks passed for PR #{pr_number}, but review requirements are not met yet: "
+                f"{_as_optional_string(readiness.get('error')) or 'waiting for review'}"
+            )
+        elif readiness_status == "waiting-for-ci":
+            print(
+                f"PR #{pr_number} is still waiting for required checks: "
+                f"{_as_optional_string(readiness.get('error')) or 'waiting for CI'}"
+            )
+        else:
+            print(
+                f"PR #{pr_number} is not ready to merge yet: "
+                f"{_as_optional_string(readiness.get('error')) or 'readiness policy blocked'}"
+            )
+        return state
+
+    merge_readiness = evaluate_pr_merge_readiness(
+        pull_request=pull_request,
+        merge_policy=merge_policy,
+    )
+    readiness_status = str(merge_readiness.get("status") or "blocked")
+    next_action = str(merge_readiness.get("next_action") or "inspect_merge_requirements")
+    error = _as_optional_string(merge_readiness.get("error"))
+
+    if readiness_status != "ready-to-merge":
+        state = build_orchestration_state(
+            status=readiness_status,
+            task_type="pr",
+            issue_number=issue_number,
+            pr_number=pr_number,
+            branch=branch,
+            base_branch=base_branch,
+            runner=runner,
+            agent=agent,
+            model=model,
+            attempt=attempt,
+            stage="merge_gate",
+            next_action=next_action,
+            error=error,
+            ci_checks=ci_checks,
+            decomposition=decomposition,
+            required_file_validation=required_file_validation,
+            merge_readiness=merge_readiness,
+            merge_policy=merge_policy,
+        )
+        safe_post_orchestration_state_comment(
+            repo=repo,
+            target_type=target_type,
+            target_number=target_number,
+            dry_run=dry_run,
+            state=state,
+        )
+        if readiness_status == "waiting-for-author":
+            print(
+                f"CI checks passed for PR #{pr_number}, but merge is waiting on human action: {error}"
+            )
+        else:
+            print(f"CI checks passed for PR #{pr_number}, but merge is blocked: {error}")
+        return state
+
+    state_stage = "merge_gate"
+    state_next_action = "ready_for_merge"
+    if merge_policy.get("auto"):
+        try:
+            run_merge_for_pull_request(
+                repo=repo,
+                pr_number=pr_number,
+                merge_policy=merge_policy,
+                dry_run=dry_run,
+            )
+            state_stage = "merge_execution"
+            state_next_action = "await_github_auto_merge"
+            print(
+                f"CI checks passed for PR #{pr_number}; merge gate passed and GitHub auto-merge was requested."
+            )
+        except MergeRequestNotAcceptedError as exc:
+            state = build_orchestration_state(
+                status=exc.status,
+                task_type="pr",
+                issue_number=issue_number,
+                pr_number=pr_number,
+                branch=branch,
+                base_branch=base_branch,
+                runner=runner,
+                agent=agent,
+                model=model,
+                attempt=attempt,
+                stage="merge_gate",
+                next_action=exc.next_action,
+                error=exc.message,
+                ci_checks=ci_checks,
+                decomposition=decomposition,
+                required_file_validation=required_file_validation,
+                merge_readiness=merge_readiness,
+                merge_policy=merge_policy,
+            )
+            safe_post_orchestration_state_comment(
+                repo=repo,
+                target_type=target_type,
+                target_number=target_number,
+                dry_run=dry_run,
+                state=state,
+            )
+            print(f"CI checks passed for PR #{pr_number}, but auto-merge was not accepted: {exc.message}")
+            return state
+    else:
+        print(
+            f"CI checks passed for PR #{pr_number}; merge gate passed and auto-merge is disabled, marking ready-to-merge."
+        )
+
+    state = build_orchestration_state(
+        status="ready-to-merge",
+        task_type="pr",
+        issue_number=issue_number,
+        pr_number=pr_number,
+        branch=branch,
+        base_branch=base_branch,
+        runner=runner,
+        agent=agent,
+        model=model,
+        attempt=attempt,
+        stage=state_stage,
+        next_action=state_next_action,
+        error=None,
+        ci_checks=ci_checks,
+        decomposition=decomposition,
+        required_file_validation=required_file_validation,
+        merge_readiness=merge_readiness,
+        merge_policy=merge_policy,
+    )
+    safe_post_orchestration_state_comment(
+        repo=repo,
+        target_type=target_type,
+        target_number=target_number,
+        dry_run=dry_run,
+        state=state,
+    )
+    return state
 
 
 def _first_json_object(raw: str) -> dict:
@@ -2663,6 +3553,7 @@ def refresh_decomposition_plan_payload_from_child_states(
     repo: str,
     plan_payload: dict,
 ) -> dict:
+    tracker_provider = current_tracker_provider()
     refreshed_payload = dict(plan_payload)
     refreshed_created_children = _normalize_created_children(plan_payload.get("created_children") or [])
     blockers: list[str] = []
@@ -2672,8 +3563,8 @@ def refresh_decomposition_plan_payload_from_child_states(
         if issue_number is None:
             continue
 
-        child_issue = fetch_issue(repo=repo, number=issue_number)
-        child_comments = fetch_issue_comments(repo=repo, issue_number=issue_number)
+        child_issue = tracker_provider.get_issue(repo=repo, issue_id=issue_number)
+        child_comments = tracker_provider.list_issue_comments(repo=repo, issue_id=issue_number)
         recovered_state, _warnings = select_latest_parseable_orchestration_state(
             comments=child_comments,
             source_label=f"issue #{issue_number}",
@@ -3366,25 +4257,11 @@ def normalize_review_items(
             )
             stats["comments_used"] += 1
 
-    latest_review_by_author: dict[str, dict] = {}
+    latest_review_by_author = latest_reviews_by_author(reviews)
     for review in reviews:
-        if not isinstance(review, dict):
-            continue
-        stats["reviews_total"] += 1
-        review_author = "unknown"
-        author_payload = review.get("author")
-        if isinstance(author_payload, dict):
-            review_author = str(author_payload.get("login") or "unknown")
-        key = review_author.lower()
-
-        existing = latest_review_by_author.get(key)
-        if existing is None:
-            latest_review_by_author[key] = review
-            continue
-
-        if _submitted_at_key(review) >= _submitted_at_key(existing):
-            latest_review_by_author[key] = review
-        stats["reviews_superseded"] += 1
+        if isinstance(review, dict):
+            stats["reviews_total"] += 1
+    stats["reviews_superseded"] = max(0, stats["reviews_total"] - len(latest_review_by_author))
 
     for key, review in latest_review_by_author.items():
         review_author = "unknown"
@@ -3454,9 +4331,10 @@ def fetch_actionable_pr_review_feedback(
     pr_number: int,
     pull_request: dict | None = None,
 ) -> tuple[dict, list[dict], dict[str, int]]:
-    current_pull_request = pull_request or fetch_pull_request(repo=repo, number=pr_number)
-    threads = fetch_pr_review_threads(repo=repo, number=pr_number)
-    conversation_comments = fetch_pr_conversation_comments(repo=repo, pr_number=pr_number)
+    codehost_provider = current_codehost_provider()
+    current_pull_request = pull_request or codehost_provider.fetch_pull_request(repo=repo, number=pr_number)
+    threads = codehost_provider.fetch_pr_review_threads(repo=repo, number=pr_number)
+    conversation_comments = codehost_provider.fetch_pr_conversation_comments(repo=repo, pr_number=pr_number)
     reviews = current_pull_request.get("reviews")
     if not isinstance(reviews, list):
         reviews = []
@@ -3544,27 +4422,34 @@ def load_linked_issue_context(repo: str, pull_request: dict) -> list[dict]:
     return linked_issues
 
 
-def pr_links_issue(pr: dict, issue_number: int) -> bool:
+def pr_links_issue(pr: dict, issue: dict) -> bool:
     references = pr.get("closingIssuesReferences")
     if isinstance(references, list):
         for reference in references:
-            if isinstance(reference, dict) and reference.get("number") == issue_number:
+            if not isinstance(reference, dict):
+                continue
+            if issue_tracker(issue) == TRACKER_GITHUB and reference.get("number") == issue.get("number"):
                 return True
 
-    token = f"#{issue_number}"
+    issue_ref = format_issue_ref_from_issue(issue)
+    issue_ref_lower = issue_ref.lower()
     title = str(pr.get("title") or "")
     body = str(pr.get("body") or "")
-    if token in title or token in body:
+    if issue_ref_lower in title.lower() or issue_ref_lower in body.lower():
         return True
 
     head_ref = str(pr.get("headRefName") or "")
-    if re.search(rf"(^|[^0-9]){issue_number}([^0-9]|$)", head_ref):
+    if issue_tracker(issue) == TRACKER_GITHUB:
+        issue_number = issue.get("number")
+        if re.search(rf"(^|[^0-9]){issue_number}([^0-9]|$)", head_ref):
+            return True
+    elif issue_ref_lower in head_ref.lower():
         return True
 
     return False
 
 
-def find_open_pr_for_issue(repo: str, issue_number: int) -> dict | None:
+def find_open_pr_for_issue(repo: str, issue: dict) -> dict | None:
     output = run_capture(
         [
             "gh",
@@ -3585,7 +4470,7 @@ def find_open_pr_for_issue(repo: str, issue_number: int) -> dict | None:
         raise RuntimeError("Unexpected response from gh pr list while searching linked PR")
 
     for pr in prs:
-        if isinstance(pr, dict) and pr_links_issue(pr, issue_number=issue_number):
+        if isinstance(pr, dict) and pr_links_issue(pr, issue=issue):
             return pr
     return None
 
@@ -3805,7 +4690,10 @@ def wait_for_pr_ci_status(
     poll_interval_seconds: int = CI_WAIT_POLL_INTERVAL_SECONDS,
     max_polls: int = CI_WAIT_MAX_POLLS,
 ) -> dict:
-    latest = read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
+    latest = current_codehost_provider().read_pr_ci_status_for_pull_request(
+        repo=repo,
+        pull_request=pull_request,
+    )
     polls = 1
     while str(latest.get("overall") or "") == "pending" and polls < max_polls:
         pending_checks = latest.get("pending_checks")
@@ -3816,7 +4704,10 @@ def wait_for_pr_ci_status(
             f"({pending_count} pending); waiting {poll_interval_seconds}s before retry {polls + 1}/{max_polls}."
         )
         time.sleep(poll_interval_seconds)
-        latest = read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
+        latest = current_codehost_provider().read_pr_ci_status_for_pull_request(
+            repo=repo,
+            pull_request=pull_request,
+        )
         polls += 1
     latest = dict(latest)
     latest["poll_count"] = polls
@@ -4305,67 +5196,42 @@ def ensure_agent_failure_label(repo: str, dry_run: bool) -> None:
 
 
 def add_agent_failure_label_to_issue(repo: str, issue_number: int, dry_run: bool) -> None:
-    ensure_agent_failure_label(repo=repo, dry_run=dry_run)
-    if dry_run:
-        print(
-            f"[dry-run] Would add label '{AGENT_FAILURE_LABEL_NAME}' to issue #{issue_number}"
-        )
+    tracker_provider = current_tracker_provider()
+    if not tracker_provider.supports_issue_labels:
         return
-    run_command(
-        [
-            "gh",
-            "issue",
-            "edit",
-            str(issue_number),
-            "--repo",
-            repo,
-            "--add-label",
-            AGENT_FAILURE_LABEL_NAME,
-        ]
+    tracker_provider.add_issue_label(
+        repo=repo,
+        issue_id=issue_number,
+        label_name=AGENT_FAILURE_LABEL_NAME,
+        dry_run=dry_run,
     )
 
 
 def issue_has_label(repo: str, issue_number: int, label_name: str) -> bool:
-    labels_output = run_capture(
-        [
-            "gh",
-            "issue",
-            "view",
-            str(issue_number),
-            "--repo",
-            repo,
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ]
+    return current_tracker_provider().issue_has_label(
+        repo=repo,
+        issue_id=issue_number,
+        label_name=label_name,
     )
-    labels = [line.strip() for line in labels_output.splitlines() if line.strip()]
-    return label_name in labels
 
 
 def remove_agent_failure_label_from_issue(repo: str, issue_number: int, dry_run: bool) -> None:
-    if dry_run:
-        print(
-            f"[dry-run] Would remove label '{AGENT_FAILURE_LABEL_NAME}' from issue #{issue_number} if present"
-        )
-        return
-
     try:
-        if not issue_has_label(repo=repo, issue_number=issue_number, label_name=AGENT_FAILURE_LABEL_NAME):
+        tracker_provider = current_tracker_provider()
+        if not tracker_provider.supports_issue_labels:
+            return
+        if not tracker_provider.issue_has_label(
+            repo=repo,
+            issue_id=issue_number,
+            label_name=AGENT_FAILURE_LABEL_NAME,
+        ):
             return
 
-        run_command(
-            [
-                "gh",
-                "issue",
-                "edit",
-                str(issue_number),
-                "--repo",
-                repo,
-                "--remove-label",
-                AGENT_FAILURE_LABEL_NAME,
-            ]
+        tracker_provider.remove_issue_label(
+            repo=repo,
+            issue_id=issue_number,
+            label_name=AGENT_FAILURE_LABEL_NAME,
+            dry_run=dry_run,
         )
     except Exception as exc:  # noqa: BLE001
         print(
@@ -4376,7 +5242,7 @@ def remove_agent_failure_label_from_issue(repo: str, issue_number: int, dry_run:
 
 def safe_report_issue_automation_failure(
     repo: str,
-    issue_number: int,
+    issue_number: int | str,
     run_id: str,
     stage: str,
     error: str,
@@ -4409,21 +5275,14 @@ def safe_report_issue_automation_failure(
         )
         if dry_run:
             print(
-                f"[dry-run] Would post agent failure report comment to issue #{issue_number}: "
+                f"[dry-run] Would post agent failure report comment to issue {format_issue_ref(issue_number, tracker=current_tracker_provider().name)}: "
                 f"stage={stage} run_id={run_id}"
             )
         else:
-            run_command(
-                [
-                    "gh",
-                    "issue",
-                    "comment",
-                    str(issue_number),
-                    "--repo",
-                    repo,
-                    "--body",
-                    body,
-                ]
+            current_tracker_provider().post_issue_comment(
+                repo=repo,
+                issue_id=issue_number,
+                body=body,
             )
         add_agent_failure_label_to_issue(
             repo=repo,
@@ -4438,7 +5297,7 @@ def safe_report_issue_automation_failure(
         )
 
 
-def build_issue_scope_skip_comment(issue_number: int, reason: str, forced: bool) -> str:
+def build_issue_scope_skip_comment(issue_number: int | str, reason: str, forced: bool) -> str:
     payload = {
         "status": "forced-in-scope" if forced else "out-of-scope",
         "issue": issue_number,
@@ -4810,7 +5669,7 @@ def format_decomposition_plan_comment(payload: dict) -> str:
 
 def post_decomposition_plan_comment(
     repo: str,
-    issue_number: int,
+    issue_number: int | str,
     payload: dict,
     dry_run: bool,
 ) -> None:
@@ -4821,23 +5680,16 @@ def post_decomposition_plan_comment(
         )
         return
 
-    run_command(
-        [
-            "gh",
-            "issue",
-            "comment",
-            str(issue_number),
-            "--repo",
-            repo,
-            "--body",
-            format_decomposition_plan_comment(payload),
-        ]
+    current_tracker_provider().post_issue_comment(
+        repo=repo,
+        issue_id=issue_number,
+        body=format_decomposition_plan_comment(payload),
     )
 
 
 def safe_post_issue_scope_skip_comment(
     repo: str,
-    issue_number: int,
+    issue_number: int | str,
     reason: str,
     forced: bool,
     dry_run: bool,
@@ -4850,22 +5702,15 @@ def safe_post_issue_scope_skip_comment(
         )
         if dry_run:
             print(
-                f"[dry-run] Would post scope decision comment to issue #{issue_number}: "
+                f"[dry-run] Would post scope decision comment to issue {format_issue_ref(issue_number, tracker=current_tracker_provider().name)}: "
                 f"decision={'forced-in-scope' if forced else 'out-of-scope'}"
             )
             return
 
-        run_command(
-            [
-                "gh",
-                "issue",
-                "comment",
-                str(issue_number),
-                "--repo",
-                repo,
-                "--body",
-                body,
-            ]
+        current_tracker_provider().post_issue_comment(
+            repo=repo,
+            issue_id=issue_number,
+            body=body,
         )
     except Exception as exc:  # noqa: BLE001
         print(
@@ -4905,6 +5750,8 @@ def build_orchestration_state(
     decomposition: dict | None = None,
     stats: dict[str, object] | None = None,
     required_file_validation: dict[str, object] | None = None,
+    merge_readiness: dict[str, object] | None = None,
+    merge_policy: dict[str, object] | None = None,
 ) -> dict:
     if status not in ORCHESTRATION_STATE_STATUSES:
         raise RuntimeError(f"Unsupported orchestration state status: {status}")
@@ -4943,6 +5790,10 @@ def build_orchestration_state(
         state["decomposition"] = decomposition
     if required_file_validation is not None:
         state["required_file_validation"] = required_file_validation
+    if merge_readiness is not None:
+        state["merge_readiness"] = merge_readiness
+    if merge_policy is not None:
+        state["merge_policy"] = merge_policy
     return state
 
 
@@ -5033,7 +5884,7 @@ def safe_post_clarification_request_comment(
 def post_orchestration_state_comment(
     repo: str,
     target_type: str,
-    target_number: int,
+    target_number: int | str,
     state: dict,
     dry_run: bool,
 ) -> None:
@@ -5048,24 +5899,25 @@ def post_orchestration_state_comment(
         )
         return
 
-    run_command(
-        [
-            "gh",
-            target_type,
-            "comment",
-            str(target_number),
-            "--repo",
-            repo,
-            "--body",
-            body,
-        ]
+    if target_type == "issue":
+        current_tracker_provider().post_issue_comment(
+            repo=repo,
+            issue_id=target_number,
+            body=body,
+        )
+        return
+
+    current_codehost_provider().post_pr_comment(
+        repo=repo,
+        pr_number=int(target_number),
+        body=body,
     )
 
 
 def safe_post_orchestration_state_comment(
     repo: str,
     target_type: str,
-    target_number: int,
+    target_number: int | str,
     state: dict,
     dry_run: bool,
 ) -> None:
@@ -5087,39 +5939,34 @@ def safe_post_orchestration_state_comment(
 def format_orchestration_claim_comment(claim: dict) -> str:
     status = str(claim.get("status") or "unknown")
     issue_number = claim.get("issue")
+    tracker_name = current_tracker_provider().name
     return (
-        f"Orchestration claim update: {status} for issue #{issue_number}.\n\n"
+        f"Orchestration claim update: {status} for issue {format_issue_ref(issue_number, tracker=tracker_name)}.\n\n"
         f"{ORCHESTRATION_CLAIM_MARKER}\n"
         f"```json\n{json.dumps(claim, ensure_ascii=True, indent=2)}\n```"
     )
 
 
-def post_orchestration_claim_comment(repo: str, issue_number: int, claim: dict, dry_run: bool) -> None:
+def post_orchestration_claim_comment(repo: str, issue_number: int | str, claim: dict, dry_run: bool) -> None:
     body = format_orchestration_claim_comment(claim)
+    issue_ref = format_issue_ref(issue_number, tracker=current_tracker_provider().name)
     if dry_run:
         print(
-            f"[dry-run] Would post orchestration claim to issue #{issue_number}: "
+            f"[dry-run] Would post orchestration claim to issue {issue_ref}: "
             f"status={claim.get('status')}"
         )
         return
 
-    run_command(
-        [
-            "gh",
-            "issue",
-            "comment",
-            str(issue_number),
-            "--repo",
-            repo,
-            "--body",
-            body,
-        ]
+    current_tracker_provider().post_issue_comment(
+        repo=repo,
+        issue_id=issue_number,
+        body=body,
     )
 
 
 def safe_post_orchestration_claim_comment(
     repo: str,
-    issue_number: int,
+    issue_number: int | str,
     claim: dict,
     dry_run: bool,
 ) -> None:
@@ -5132,7 +5979,7 @@ def safe_post_orchestration_claim_comment(
         )
     except Exception as exc:  # noqa: BLE001
         print(
-            f"Warning: failed to post orchestration claim to issue #{issue_number}: {exc}",
+            f"Warning: failed to post orchestration claim to issue {format_issue_ref(issue_number, tracker=current_tracker_provider().name)}: {exc}",
             file=sys.stderr,
         )
 
@@ -5283,11 +6130,11 @@ def choose_execution_mode(
             f"recovered orchestration state is {recovered_status}; skipping until explicitly forced",
         )
 
-    if recovered_status == "waiting-for-ci" and linked_open_pr is not None:
+    if recovered_status in {"waiting-for-ci", "ready-to-merge"} and linked_open_pr is not None:
         pr_number = linked_open_pr.get("number")
         return (
             "pr-review",
-            f"recovered orchestration state is waiting-for-ci and linked open PR #{pr_number} exists",
+            f"recovered orchestration state is {recovered_status} and linked open PR #{pr_number} exists",
         )
 
     if recovered_status == "ready-for-review" and linked_open_pr is not None:
@@ -6235,6 +7082,7 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
     if commands is not None:
         if not isinstance(commands, dict):
             raise RuntimeError("Project config key 'workflow.commands' must be an object")
+
         supported_commands = set(WORKFLOW_COMMAND_ORDER)
         unsupported_commands = sorted(set(commands) - supported_commands)
         if unsupported_commands:
@@ -6242,6 +7090,16 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
                 f"Unsupported key(s) in project config {config_path} under 'workflow.commands': "
                 + ", ".join(unsupported_commands)
             )
+
+        for key in supported_commands:
+            if key in commands and commands[key] is not None and not isinstance(commands[key], str):
+                raise RuntimeError(
+                    f"Project config key 'workflow.commands.{key}' must be a string or null"
+                )
+            if key in commands and isinstance(commands[key], str) and not commands[key].strip():
+                raise RuntimeError(
+                    f"Project config key 'workflow.commands.{key}' must be a non-empty string or null"
+                )
 
         for key in supported_commands:
             if key in commands and commands[key] is not None and not isinstance(commands[key], str):
@@ -6351,6 +7209,8 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
 
 def _validate_project_defaults(config: dict, config_path: str) -> None:
     supported_defaults_keys = {
+        "tracker",
+        "codehost",
         "runner",
         "agent",
         "model",
@@ -6367,6 +7227,12 @@ def _validate_project_defaults(config: dict, config_path: str) -> None:
             f"Unsupported key(s) in project config {config_path} under 'defaults': "
             + ", ".join(unsupported_defaults)
         )
+
+    if "tracker" in config:
+        _parse_tracker(config["tracker"])
+
+    if "codehost" in config:
+        _parse_codehost(config["codehost"])
 
     if "runner" in config and config["runner"] not in {"claude", "opencode"}:
         raise RuntimeError("Project config key 'defaults.runner' must be one of: claude, opencode")
@@ -6705,6 +7571,8 @@ def project_cli_defaults(project_config: dict) -> dict:
     cli_defaults: dict = {}
     if isinstance(defaults, dict):
         for key in [
+            "tracker",
+            "codehost",
             "runner",
             "agent",
             "model",
@@ -6729,6 +7597,7 @@ def project_cli_defaults(project_config: dict) -> dict:
 def validate_local_config(config: dict, config_path: str) -> dict:
     supported_keys = {
         "tracker",
+        "codehost",
         "state",
         "limit",
         "runner",
@@ -6767,6 +7636,9 @@ def validate_local_config(config: dict, config_path: str) -> dict:
 
     if "tracker" in config:
         validated["tracker"] = _parse_tracker(config["tracker"])
+
+    if "codehost" in config:
+        validated["codehost"] = _parse_codehost(config["codehost"])
 
     if "state" in config:
         if config["state"] not in {"open", "closed", "all"}:
@@ -7337,16 +8209,22 @@ def run_doctor(args: argparse.Namespace, raw_argv: list[str] | None = None) -> i
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fetch GitHub issues with gh and run an AI agent for each issue body."
+        description="Fetch tracker items, coordinate code-host operations, and run an AI agent for each task body."
     )
     parser.add_argument(
-        "--repo", help="GitHub repo in owner/name format. Defaults to current gh repo."
+        "--repo", help="Repository slug for the active code host. Defaults to the current authenticated repo context."
     )
     parser.add_argument(
         "--tracker",
         default=BUILTIN_DEFAULTS["tracker"],
         choices=sorted(TRACKER_CHOICES),
         help="Issue tracker to fetch from (default: github).",
+    )
+    parser.add_argument(
+        "--codehost",
+        default=BUILTIN_DEFAULTS["codehost"],
+        choices=sorted(CODEHOST_CHOICES),
+        help="Code host provider for PR/MR operations (default: github).",
     )
     parser.add_argument(
         "--issue",
@@ -7688,7 +8566,6 @@ def main() -> int:
     pr_number_arg = getattr(args, "pr", None)
     from_review_comments = bool(getattr(args, "from_review_comments", False))
     force_issue_flow = bool(getattr(args, "force_issue_flow", False))
-    has_force_issue_flow_flag = hasattr(args, "force_issue_flow")
     skip_if_pr_exists = bool(getattr(args, "skip_if_pr_exists", False))
     skip_if_branch_exists = bool(getattr(args, "skip_if_branch_exists", False))
     force_reprocess = bool(getattr(args, "force_reprocess", False))
@@ -7744,6 +8621,7 @@ def main() -> int:
             workflow_checks = configured_workflow_commands(project_config)
             configured_hooks = workflow_hooks(project_config)
             readiness_policy = workflow_readiness_policy(project_config)
+            merge_policy = workflow_merge_policy(project_config)
 
             configured_command_names: list[str] = []
             if setup_command is not None:
@@ -7773,6 +8651,14 @@ def main() -> int:
                     readiness_parts.append("require_mergeable=true")
                 if readiness_parts:
                     print("Readiness policy: " + "; ".join(readiness_parts))
+            if merge_policy:
+                merge_parts: list[str] = []
+                if "method" in merge_policy:
+                    merge_parts.append(f"method={merge_policy['method']}")
+                if "auto" in merge_policy:
+                    merge_parts.append(f"auto={str(bool(merge_policy['auto'])).lower()}")
+                if merge_parts:
+                    print("Merge policy: " + "; ".join(merge_parts))
             if selected_preset is not None:
                 print(f"Selected preset: {selected_preset}")
             if max_attempts != BUILTIN_DEFAULTS["max_attempts"] or escalate_to_preset is not None:
@@ -7788,7 +8674,15 @@ def main() -> int:
                 raise RuntimeError("--from-review-comments requires --pr <number>.")
             if pr_number_arg is not None and not from_review_comments:
                 raise RuntimeError("--pr requires --from-review-comments.")
-            validate_tracker_requirements(tracker=tracker, pr_mode_requested=pr_mode_requested)
+            codehost = _parse_codehost(getattr(args, "codehost", BUILTIN_DEFAULTS["codehost"]))
+            validate_provider_requirements(
+                tracker=tracker,
+                codehost=codehost,
+                pr_mode_requested=pr_mode_requested,
+            )
+            tracker_provider = resolve_tracker_provider(tracker)
+            codehost_provider = resolve_codehost_provider(codehost)
+            configure_active_providers(tracker_provider, codehost_provider)
             if issue_number_arg is not None:
                 issue_number_arg = normalize_issue_number(issue_number_arg, tracker=tracker)
 
@@ -7797,7 +8691,7 @@ def main() -> int:
                     print(f"Warning: {warning}", file=sys.stderr)
 
             ensure_clean_worktree()
-            repo = args.repo or detect_repo()
+            repo = args.repo or codehost_provider.detect_repo()
             if setup_command is not None:
                 failure_stage = "workflow_setup"
                 _run_workflow_shell_command(
@@ -7815,7 +8709,7 @@ def main() -> int:
                 if base_branch_mode == "current":
                     base_branch = current_branch()
                 else:
-                    base_branch = detect_default_branch(repo)
+                    base_branch = codehost_provider.detect_default_branch(repo)
                 mode_label = "[dry-run]" if args.dry_run else ""
                 if base_branch_mode == "current":
                     if mode_label:
@@ -7833,20 +8727,9 @@ def main() -> int:
                         print("Base mode: default (stack on current branch: no)")
 
                 if issue_number_arg is not None:
-                    if tracker == TRACKER_JIRA:
-                        issues = [fetch_jira_issue(issue_key=str(issue_number_arg))]
-                    else:
-                        issues = [fetch_issue(repo=repo, number=issue_number_arg)]
+                    issues = [tracker_provider.get_issue(repo=repo, issue_id=issue_number_arg)]
                 else:
-                    if tracker == TRACKER_JIRA:
-                        jira_jql = {
-                            "open": "status != Done ORDER BY created DESC",
-                            "closed": "status = Done ORDER BY created DESC",
-                            "all": "ORDER BY created DESC",
-                        }[args.state]
-                        issues = fetch_jira_issues(jql=jira_jql, limit=args.limit)
-                    else:
-                        issues = fetch_issues(repo=repo, state=args.state, limit=args.limit)
+                    issues = tracker_provider.list_issues(repo=repo, state=args.state, limit=args.limit)
         except Exception:
             raise
     except Exception as exc:  # noqa: BLE001
@@ -7874,7 +8757,7 @@ def main() -> int:
                 raise RuntimeError("--pr must be an integer pull request number")
 
             failure_stage = "fetch_pr"
-            pull_request = fetch_pull_request(repo=repo, number=pr_number_arg)
+            pull_request = current_codehost_provider().fetch_pull_request(repo=repo, number=pr_number_arg)
             pr_state_context["pr"] = pr_number_arg
             pr_state = str(pull_request.get("state") or "").strip().upper()
             if pr_state != "OPEN":
@@ -7928,7 +8811,10 @@ def main() -> int:
             recovered_pr_state: dict | None = None
             pr_clarification_answer: dict | None = None
             try:
-                pr_comments = fetch_issue_comments(repo=repo, issue_number=pr_number_arg)
+                pr_comments = current_codehost_provider().list_pr_comments(
+                    repo=repo,
+                    pr_number=pr_number_arg,
+                )
                 recovered_pr_state, pr_state_warnings = select_latest_parseable_orchestration_state(
                     comments=pr_comments,
                     source_label=f"pr #{pr_number_arg}",
@@ -8002,13 +8888,16 @@ def main() -> int:
             while True:
                 pr_attempt = attempt
                 ci_prompt_override: str | None = None
-                linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                linked_issues = current_codehost_provider().load_pr_linked_issue_context(
+                    repo=repo,
+                    pull_request=pull_request,
+                )
                 recovered_pr_status = ""
                 if isinstance(recovered_pr_state, dict):
                     recovered_pr_status = str(recovered_pr_state.get("status") or "")
 
                 if not review_items:
-                    if recovered_pr_status == "waiting-for-ci":
+                    if recovered_pr_status in {"waiting-for-ci", "ready-to-merge"}:
                         current_attempt = orchestration_attempt_from_state(recovered_pr_state)
                         ci_status = wait_for_pr_ci_status(
                             repo=repo,
@@ -8165,60 +9054,25 @@ def main() -> int:
                                 f"Running CI fix attempt {retry_attempt}/{max_attempts}."
                             )
                         elif ci_overall == "success":
-                            required_file_validation = validate_required_files_in_pr(
-                                pull_request=pull_request,
-                                linked_issues=linked_issues,
-                            )
-                            readiness = evaluate_pr_readiness(
-                                pull_request=pull_request,
-                                ci_status=ci_status,
-                                required_file_validation=required_file_validation,
-                                project_config=project_config,
-                            )
-                            safe_post_orchestration_state_comment(
+                            finalize_pr_after_ci_success(
                                 repo=repo,
+                                pr_number=pr_number_arg,
+                                linked_issues=linked_issues,
+                                merge_policy=merge_policy,
                                 target_type="pr",
                                 target_number=pr_number_arg,
+                                issue_number=None,
+                                branch=active_branch,
+                                base_branch=str(pr_state_context["base_branch"] or "") or None,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=current_attempt,
+                                ci_checks=ci_checks_payload,
+                                decomposition=pr_recovered_decomposition_rollup,
+                                project_config=project_config,
                                 dry_run=args.dry_run,
-                                state=build_orchestration_state(
-                                    status=str(readiness.get("status") or "ready-to-merge"),
-                                    task_type="pr",
-                                    issue_number=None,
-                                    pr_number=pr_number_arg,
-                                    branch=active_branch,
-                                    base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
-                                    attempt=current_attempt,
-                                    stage="ci_checks",
-                                    next_action=str(readiness.get("next_action") or "ready_for_merge"),
-                                    error=_as_optional_string(readiness.get("error")),
-                                    ci_checks=ci_checks_payload,
-                                    decomposition=pr_recovered_decomposition_rollup,
-                                    required_file_validation=required_file_validation,
-                                ),
                             )
-                            readiness_status = str(readiness.get("status") or "ready-to-merge")
-                            if readiness_status == "ready-to-merge":
-                                print(
-                                    f"CI checks passed for PR #{pr_number_arg}; marking orchestration state as ready-to-merge."
-                                )
-                            elif readiness_status == "ready-for-review":
-                                print(
-                                    f"CI checks passed for PR #{pr_number_arg}, but review requirements are not met yet: "
-                                    f"{_as_optional_string(readiness.get('error')) or 'waiting for review'}"
-                                )
-                            elif readiness_status == "waiting-for-ci":
-                                print(
-                                    f"PR #{pr_number_arg} is still waiting for required checks: "
-                                    f"{_as_optional_string(readiness.get('error')) or 'waiting for CI'}"
-                                )
-                            else:
-                                print(
-                                    f"PR #{pr_number_arg} is not ready to merge yet: "
-                                    f"{_as_optional_string(readiness.get('error')) or 'readiness policy blocked'}"
-                                )
                             return _finish_main(0, original_process_cwd)
                     elif recovered_pr_status == "ready-for-review":
                         print(
@@ -8660,7 +9514,7 @@ def main() -> int:
             mode_reason = "batch issue processing"
             force_override_applied = False
             skip_agent_run = False
-            supports_github_issue_ops = False
+            supports_issue_tracker_ops = True
             issue_label = format_issue_label_from_issue(issue)
             issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
             state_target_type = "issue"
@@ -8692,7 +9546,7 @@ def main() -> int:
                         f"Continuing {issue_label} despite out-of-scope decision "
                         "because --force-reprocess is set."
                     )
-                    if supports_github_issue_ops:
+                    if supports_issue_tracker_ops:
                         safe_post_issue_scope_skip_comment(
                             repo=repo,
                             issue_number=issue["number"],
@@ -8702,7 +9556,7 @@ def main() -> int:
                         )
                 else:
                     skipped_out_of_scope += 1
-                    if supports_github_issue_ops:
+                    if supports_issue_tracker_ops:
                         safe_post_orchestration_state_comment(
                             repo=repo,
                             target_type="issue",
@@ -8737,8 +9591,8 @@ def main() -> int:
                     )
                     continue
 
-            if skip_if_pr_exists and supports_github_issue_ops and not autonomous_mode:
-                linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
+            if skip_if_pr_exists and not autonomous_mode:
+                linked_open_pr = current_codehost_provider().find_open_pr_for_issue(repo=repo, issue=issue)
                 if linked_open_pr is not None:
                     if issue_number_arg is not None:
                         linked_pr_number = linked_open_pr.get("number")
@@ -8785,14 +9639,14 @@ def main() -> int:
                     )
                     continue
 
-            if (issue_number_arg is not None or autonomous_mode) and has_force_issue_flow_flag and supports_github_issue_ops:
+            if issue_number_arg is not None or autonomous_mode:
                 if linked_open_pr is None:
-                    linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
+                    linked_open_pr = current_codehost_provider().find_open_pr_for_issue(repo=repo, issue=issue)
 
                 recovered_issue_state: dict | None = None
                 issue_comments: list[dict] = []
                 try:
-                    issue_comments = fetch_issue_comments(repo=repo, issue_number=issue["number"])
+                    issue_comments = current_tracker_provider().list_issue_comments(repo=repo, issue_id=issue["number"])
                     (
                         recovered_issue_state,
                         issue_state_warnings,
@@ -8814,9 +9668,9 @@ def main() -> int:
                     linked_pr_number = linked_open_pr.get("number")
                     if type(linked_pr_number) is int:
                         try:
-                            linked_pr_comments = fetch_issue_comments(
+                            linked_pr_comments = current_codehost_provider().list_pr_comments(
                                 repo=repo,
-                                issue_number=linked_pr_number,
+                                pr_number=linked_pr_number,
                             )
                             (
                                 recovered_pr_state,
@@ -8947,7 +9801,7 @@ def main() -> int:
                 latest_payload_dict = {}
                 latest_plan_is_execution_ready = False
                 if should_plan or should_check_existing_decomposition_plan(issue, assessment):
-                    issue_comments = fetch_issue_comments(repo=repo, issue_number=issue["number"])
+                    issue_comments = current_tracker_provider().list_issue_comments(repo=repo, issue_id=issue["number"])
                     latest_plan, plan_warnings = select_latest_parseable_decomposition_plan(
                         comments=issue_comments,
                         source_label=f"issue #{issue['number']}",
@@ -8969,7 +9823,7 @@ def main() -> int:
                                 created_children = _extract_ordered_linked_children(latest_payload_dict)
                                 created_children_updates: list[dict] = []
                                 for child in missing_children:
-                                    created_child = create_decomposition_child_issue(
+                                    created_child = current_tracker_provider().create_child_issue(
                                         repo=repo,
                                         parent_issue=issue,
                                         child=child,
@@ -9205,7 +10059,10 @@ def main() -> int:
                                     decomposition=decomposition_rollup,
                                 ),
                             )
-                            issue = fetch_issue(repo=repo, number=selected_child_issue_number)
+                            issue = current_tracker_provider().get_issue(
+                                repo=repo,
+                                issue_id=selected_child_issue_number,
+                            )
                             issue_image_urls = collect_issue_image_urls(issue)
                             issue_branch = branch_name_for_issue(
                                 issue=issue,
@@ -9343,7 +10200,7 @@ def main() -> int:
                     print(
                         f"Auto-switch to PR-review mode for {issue_label}: {mode_reason}."
                     )
-                    pull_request = fetch_pull_request(repo=repo, number=pr_number)
+                    pull_request = current_codehost_provider().fetch_pull_request(repo=repo, number=pr_number)
                     merge_state = str(pull_request.get("mergeStateStatus") or "").strip().upper()
                     should_force_sync_rerun = merge_state in {"DIRTY", "CONFLICTING"}
                     if should_force_sync_rerun:
@@ -9376,7 +10233,7 @@ def main() -> int:
                                 f"No actionable review comments for linked PR #{pr_number}; "
                                 f"continuing with sync-only rerun because mergeStateStatus={merge_state}"
                             )
-                        elif recovered_status == "waiting-for-ci":
+                        elif recovered_status in {"waiting-for-ci", "ready-to-merge"}:
                             current_attempt = orchestration_attempt_from_state(recovered_state)
                             ci_status = wait_for_pr_ci_status(
                                 repo=repo,
@@ -9544,6 +10401,7 @@ def main() -> int:
                                         ci_checks=ci_checks_payload,
                                         ci_diagnostics=ci_diagnostics,
                                         decomposition=decomposition_rollup,
+                                        merge_policy=merge_policy,
                                     ),
                                 )
                                 print(
@@ -9553,64 +10411,25 @@ def main() -> int:
                                 )
 
                             if ci_overall == "success":
-                                required_file_validation = validate_required_files_in_pr(
-                                    pull_request=pull_request,
-                                    linked_issues=[issue],
-                                )
-                                readiness = evaluate_pr_readiness(
-                                    pull_request=pull_request,
-                                    ci_status=ci_status,
-                                    required_file_validation=required_file_validation,
-                                    project_config=project_config,
-                                )
-                                safe_post_orchestration_state_comment(
+                                finalize_pr_after_ci_success(
                                     repo=repo,
+                                    pr_number=pr_number,
+                                    linked_issues=[issue],
+                                    merge_policy=merge_policy,
                                     target_type="pr",
                                     target_number=state_target_number,
+                                    issue_number=issue["number"],
+                                    branch=issue_branch,
+                                    base_branch=target_base_branch,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    attempt=current_attempt,
+                                    ci_checks=ci_checks_payload,
+                                    decomposition=decomposition_rollup,
+                                    project_config=project_config,
                                     dry_run=args.dry_run,
-                                    state=build_orchestration_state(
-                                        status=str(readiness.get("status") or "ready-to-merge"),
-                                        task_type="pr",
-                                        issue_number=issue["number"],
-                                        pr_number=state_pr_number,
-                                        branch=issue_branch,
-                                        base_branch=target_base_branch,
-                                        runner=args.runner,
-                                        agent=args.agent,
-                                        model=args.model,
-                                        attempt=current_attempt,
-                                        stage="ci_checks",
-                                        next_action=str(readiness.get("next_action") or "ready_for_merge"),
-                                        error=_as_optional_string(readiness.get("error")),
-                                        ci_checks=ci_checks_payload,
-                                        decomposition=decomposition_rollup,
-                                        required_file_validation=required_file_validation,
-                                    ),
                                 )
-                                readiness_status = str(readiness.get("status") or "ready-to-merge")
-                                if readiness_status == "ready-to-merge":
-                                    print(
-                                        f"No actionable review comments for linked PR #{pr_number}; "
-                                        "CI checks passed, marking ready-to-merge."
-                                    )
-                                elif readiness_status == "ready-for-review":
-                                    print(
-                                        f"No actionable review comments for linked PR #{pr_number}; "
-                                        f"CI passed, but review requirements are not met yet: "
-                                        f"{_as_optional_string(readiness.get('error')) or 'waiting for review'}"
-                                    )
-                                elif readiness_status == "waiting-for-ci":
-                                    print(
-                                        f"No actionable review comments for linked PR #{pr_number}; "
-                                        f"still waiting for required checks: "
-                                        f"{_as_optional_string(readiness.get('error')) or 'waiting for CI'}"
-                                    )
-                                else:
-                                    print(
-                                        f"No actionable review comments for linked PR #{pr_number}; "
-                                        f"readiness policy is blocking merge: "
-                                        f"{_as_optional_string(readiness.get('error')) or 'blocked'}"
-                                    )
                                 remove_agent_failure_label_from_issue(
                                     repo=repo,
                                     issue_number=issue["number"],
@@ -9686,7 +10505,10 @@ def main() -> int:
                         )
 
                     if review_items:
-                        linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                        linked_issues = current_codehost_provider().load_pr_linked_issue_context(
+                            repo=repo,
+                            pull_request=pull_request,
+                        )
                         prompt_override = build_pr_review_prompt(
                             pull_request=pull_request,
                             review_items=review_items,
@@ -9740,7 +10562,7 @@ def main() -> int:
                 )
 
                 if mode == "issue-flow":
-                    if supports_github_issue_ops:
+                    if supports_issue_tracker_ops:
                         safe_post_orchestration_state_comment(
                             repo=repo,
                             target_type=state_target_type,
@@ -10009,7 +10831,7 @@ def main() -> int:
                                     decomposition=decomposition_rollup,
                                 ),
                             )
-                        elif mode == "issue-flow" and supports_github_issue_ops:
+                        elif mode == "issue-flow" and supports_issue_tracker_ops:
                             safe_post_orchestration_state_comment(
                                 repo=repo,
                                 target_type="issue",
@@ -10057,7 +10879,7 @@ def main() -> int:
                                 plan_payload=decomposition_parent_payload,
                                 dry_run=args.dry_run,
                             )
-                        if supports_github_issue_ops:
+                        if supports_issue_tracker_ops:
                             remove_agent_failure_label_from_issue(
                                 repo=repo,
                                 issue_number=issue["number"],
@@ -10111,7 +10933,7 @@ def main() -> int:
                         and reused_branch_sync_changed
                     ),
                 )
-                pr_status, pr_url = ensure_pr(
+                pr_status, pr_url = current_codehost_provider().ensure_pr(
                     repo=repo,
                     base_branch=target_base_branch,
                     branch_name=issue_branch,
@@ -10225,7 +11047,7 @@ def main() -> int:
 
                 if not args.dry_run:
                     run_command(["git", "checkout", base_branch])
-                if supports_github_issue_ops:
+                if supports_issue_tracker_ops:
                     remove_agent_failure_label_from_issue(
                         repo=repo,
                         issue_number=issue["number"],
@@ -10246,7 +11068,7 @@ def main() -> int:
             residual_untracked_files = (
                 exc.files if isinstance(exc, ResidualUntrackedFilesError) else None
             )
-            if supports_github_issue_ops or mode == "pr-review":
+            if supports_issue_tracker_ops or mode == "pr-review":
                 safe_post_orchestration_state_comment(
                     repo=repo,
                     target_type=state_target_type,
@@ -10295,7 +11117,7 @@ def main() -> int:
                         f"#{decomposition_parent_issue['number']}: {parent_exc}",
                         file=sys.stderr,
                     )
-            if supports_github_issue_ops:
+            if supports_issue_tracker_ops:
                 safe_report_issue_automation_failure(
                     repo=repo,
                     issue_number=issue["number"],

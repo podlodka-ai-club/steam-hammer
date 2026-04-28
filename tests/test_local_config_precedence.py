@@ -14,6 +14,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
 
         self.assertEqual(args.runner, BUILTIN_DEFAULTS["runner"])
         self.assertEqual(args.tracker, BUILTIN_DEFAULTS["tracker"])
+        self.assertEqual(args.codehost, BUILTIN_DEFAULTS["codehost"])
         self.assertEqual(args.limit, BUILTIN_DEFAULTS["limit"])
         self.assertEqual(args.branch_prefix, BUILTIN_DEFAULTS["branch_prefix"])
         self.assertEqual(args.fail_on_existing, BUILTIN_DEFAULTS["fail_on_existing"])
@@ -36,6 +37,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
                 json.dump(
                     {
                         "tracker": "jira",
+                        "codehost": "github",
                         "runner": "opencode",
                         "limit": 3,
                         "branch_prefix": "my-fixes",
@@ -57,6 +59,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
             args = parse_args(["--dir", tmpdir])
 
         self.assertEqual(args.tracker, "jira")
+        self.assertEqual(args.codehost, "github")
         self.assertEqual(args.runner, "opencode")
         self.assertEqual(args.limit, 3)
         self.assertEqual(args.branch_prefix, "my-fixes")
@@ -80,6 +83,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
                 json.dump(
                     {
                         "tracker": "jira",
+                        "codehost": "github",
                         "runner": "opencode",
                         "limit": 2,
                         "branch_prefix": "my-fixes",
@@ -104,6 +108,7 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
             )
 
         self.assertEqual(args.tracker, "jira")
+        self.assertEqual(args.codehost, "github")
         self.assertEqual(args.runner, "claude")
         self.assertEqual(args.limit, 7)
         self.assertEqual(args.branch_prefix, "my-fixes")
@@ -120,6 +125,18 @@ class LocalConfigPrecedenceTests(unittest.TestCase):
             args = parse_args(["--dir", tmpdir, "--project-config", project_config_path])
 
         self.assertTrue(args.track_tokens)
+
+    def test_project_config_provider_defaults_are_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.mkdir(os.path.join(tmpdir, ".git"))
+            project_config_path = os.path.join(tmpdir, "project-config.json")
+            with open(project_config_path, "w", encoding="utf-8") as config_file:
+                json.dump({"defaults": {"tracker": "jira", "codehost": "github"}}, config_file)
+
+            args = parse_args(["--dir", tmpdir, "--project-config", project_config_path])
+
+        self.assertEqual(args.tracker, "jira")
+        self.assertEqual(args.codehost, "github")
 
     def test_project_config_token_budget_default_is_applied(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -592,6 +592,8 @@ func (a *App) runPython(ctx context.Context, args []string) int {
 
 type commonOptions struct {
 	repo     *string
+	tracker  *string
+	codehost *string
 	dir      *string
 	runner   *string
 	agent    *string
@@ -609,6 +611,8 @@ type commonOptions struct {
 
 func addCommonFlags(fs *flag.FlagSet, opts *commonOptions) {
 	opts.repo = fs.String("repo", "", "GitHub repo in owner/name format")
+	opts.tracker = fs.String("tracker", "", "tracker provider: github or jira")
+	opts.codehost = fs.String("codehost", "", "code host provider: github, bitbucket, or custom-proxy")
 	opts.dir = fs.String("dir", "", "local git repository path")
 	opts.runner = fs.String("runner", "", "AI runner: claude or opencode")
 	opts.agent = fs.String("agent", "", "OpenCode agent name")
@@ -627,6 +631,12 @@ func addCommonFlags(fs *flag.FlagSet, opts *commonOptions) {
 func appendCommonPythonArgs(args []string, opts commonOptions) []string {
 	if *opts.repo != "" {
 		args = append(args, "--repo", *opts.repo)
+	}
+	if *opts.tracker != "" {
+		args = append(args, "--tracker", *opts.tracker)
+	}
+	if *opts.codehost != "" {
+		args = append(args, "--codehost", *opts.codehost)
 	}
 	if *opts.dir != "" {
 		args = append(args, "--dir", *opts.dir)

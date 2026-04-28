@@ -934,6 +934,208 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertIn("[dry-run] Recovered orchestration state context", output)
         self.assertIn("status=ready-for-review", output)
 
+    def test_main_pr_mode_waiting_for_ci_success_marks_ready_to_merge_when_auto_merge_disabled(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=None,
+            pr=12,
+            from_review_comments=True,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            isolate_worktree=True,
+        )
+
+        pr_comments = [
+            {
+                "id": 99,
+                "created_at": "2026-04-26T14:00:00Z",
+                "html_url": "https://example/pull/12#issuecomment-99",
+                "body": (
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"waiting-for-ci","attempt":1}\n'
+                    "```"
+                ),
+            }
+        ]
+        pull_request = {
+            "number": 12,
+            "title": "PR title",
+            "body": "PR body",
+            "url": "https://example/pull/12",
+            "state": "OPEN",
+            "headRefName": "issue-fix/12-pr",
+            "baseRefName": "main",
+            "mergeStateStatus": "CLEAN",
+            "mergeable": "MERGEABLE",
+            "reviewDecision": "APPROVED",
+            "headRefOid": "abc123",
+            "reviews": [],
+            "files": [{"path": "scripts/run_github_issues_to_opencode.py"}],
+            "author": {"login": "pr-owner"},
+            "closingIssuesReferences": [],
+        }
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.load_project_config", return_value={"workflow": {"merge": {"auto": False, "method": "squash"}}}))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=pr_comments))
+            fetch_pr_mock = stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.fetch_pull_request", side_effect=[pull_request, pull_request])
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[]))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.wait_for_pr_ci_status",
+                    return_value={
+                        "head_sha": "abc123",
+                        "overall": "success",
+                        "checks": [{"name": "ci/test", "state": "success", "url": "https://example/checks/1"}],
+                        "pending_checks": [],
+                        "failing_checks": [],
+                    },
+                )
+            )
+            run_merge_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_merge_for_pull_request"))
+            state_post_mock = stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment")
+            )
+            stdout_mock = stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(fetch_pr_mock.call_count, 2)
+        run_merge_mock.assert_not_called()
+        posted_state = state_post_mock.call_args.kwargs["state"]
+        self.assertEqual(posted_state["status"], "ready-to-merge")
+        self.assertEqual(posted_state["stage"], "merge_gate")
+        self.assertEqual(posted_state["next_action"], "ready_for_merge")
+        self.assertEqual(posted_state["merge_policy"]["auto"], False)
+        self.assertIn("auto-merge is disabled", stdout_mock.getvalue())
+
+    def test_main_pr_mode_ready_to_merge_success_requests_auto_merge_when_enabled(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=None,
+            pr=12,
+            from_review_comments=True,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            isolate_worktree=True,
+        )
+
+        pr_comments = [
+            {
+                "id": 99,
+                "created_at": "2026-04-26T14:00:00Z",
+                "html_url": "https://example/pull/12#issuecomment-99",
+                "body": (
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"ready-to-merge","attempt":1}\n'
+                    "```"
+                ),
+            }
+        ]
+        pull_request = {
+            "number": 12,
+            "title": "PR title",
+            "body": "PR body",
+            "url": "https://example/pull/12",
+            "state": "OPEN",
+            "headRefName": "issue-fix/12-pr",
+            "baseRefName": "main",
+            "mergeStateStatus": "CLEAN",
+            "mergeable": "MERGEABLE",
+            "reviewDecision": "APPROVED",
+            "headRefOid": "abc123",
+            "reviews": [],
+            "files": [{"path": "scripts/run_github_issues_to_opencode.py"}],
+            "author": {"login": "pr-owner"},
+            "closingIssuesReferences": [],
+        }
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.load_project_config", return_value={"workflow": {"merge": {"auto": True, "method": "squash"}}}))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=pr_comments))
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.fetch_pull_request", side_effect=[pull_request, pull_request])
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[]))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.wait_for_pr_ci_status",
+                    return_value={
+                        "head_sha": "abc123",
+                        "overall": "success",
+                        "checks": [{"name": "ci/test", "state": "success", "url": "https://example/checks/1"}],
+                        "pending_checks": [],
+                        "failing_checks": [],
+                    },
+                )
+            )
+            run_merge_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_merge_for_pull_request"))
+            state_post_mock = stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment")
+            )
+            stdout_mock = stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        run_merge_mock.assert_called_once_with(
+            repo="owner/repo",
+            pr_number=12,
+            merge_policy={"auto": True, "method": "squash"},
+            dry_run=True,
+        )
+        posted_state = state_post_mock.call_args.kwargs["state"]
+        self.assertEqual(posted_state["status"], "ready-to-merge")
+        self.assertEqual(posted_state["stage"], "merge_execution")
+        self.assertEqual(posted_state["next_action"], "await_github_auto_merge")
+        self.assertEqual(posted_state["merge_policy"]["auto"], True)
+        self.assertIn("auto-merge was requested", stdout_mock.getvalue())
+
     def test_single_issue_with_linked_pr_actionable_feedback_runs_pr_review_mode(self) -> None:
         args = argparse.Namespace(
             repo="owner/repo",
@@ -1447,6 +1649,267 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertEqual(posted_state["attempt"], 1)
         self.assertIn("retry limit reached", posted_state["error"])
         self.assertIn("retry limit reached", stdout_mock.getvalue())
+
+    def test_single_issue_waiting_for_ci_success_marks_ready_to_merge_when_auto_merge_disabled(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=52,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            token_budget=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            max_attempts=2,
+            decompose="never",
+            create_child_issues=False,
+            track_tokens=False,
+        )
+
+        issue = {
+            "number": 52,
+            "title": "Prevent duplicate processing",
+            "body": "Implement duplicate guards",
+            "url": "https://example/issues/52",
+        }
+        linked_pr = {
+            "number": 120,
+            "url": "https://example/pull/120",
+            "headRefName": "issue-fix/52-prevent-duplicate-processing",
+            "baseRefName": "main",
+        }
+        pull_request = {
+            "number": 120,
+            "title": "Fix duplicate processing",
+            "body": "PR body",
+            "url": "https://example/pull/120",
+            "state": "OPEN",
+            "mergeStateStatus": "CLEAN",
+            "mergeable": "MERGEABLE",
+            "reviewDecision": "APPROVED",
+            "headRefOid": "abc123",
+            "headRefName": linked_pr["headRefName"],
+            "baseRefName": "main",
+            "reviews": [],
+            "files": [{"path": "scripts/run_github_issues_to_opencode.py"}],
+            "author": {"login": "pr-owner"},
+        }
+        pr_state_comments = [
+            {
+                "id": 21,
+                "created_at": "2026-04-26T14:00:00Z",
+                "html_url": "https://example/pull/120#issuecomment-21",
+                "body": (
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"waiting-for-ci","attempt":1}\n'
+                    "```"
+                ),
+            }
+        ]
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.load_project_config", return_value={"workflow": {"merge": {"auto": False, "method": "squash"}}}))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=linked_pr))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_issue_comments",
+                    side_effect=[[], pr_state_comments],
+                )
+            )
+            fetch_pr_mock = stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.fetch_pull_request", side_effect=[pull_request, pull_request])
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[]))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.wait_for_pr_ci_status",
+                    return_value={
+                        "head_sha": "abc123",
+                        "overall": "success",
+                        "checks": [{"name": "ci/test", "state": "success", "url": "https://example/checks/1"}],
+                        "pending_checks": [],
+                        "failing_checks": [],
+                    },
+                )
+            )
+            run_merge_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_merge_for_pull_request"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"))
+            state_post_mock = stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment")
+            )
+            stdout_mock = stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(fetch_pr_mock.call_count, 2)
+        run_merge_mock.assert_not_called()
+        posted_state = state_post_mock.call_args.kwargs["state"]
+        self.assertEqual(posted_state["status"], "ready-to-merge")
+        self.assertEqual(posted_state["stage"], "merge_gate")
+        self.assertEqual(posted_state["next_action"], "ready_for_merge")
+        self.assertEqual(posted_state["merge_readiness"]["review_decision"], "APPROVED")
+        self.assertEqual(posted_state["merge_policy"]["auto"], False)
+        self.assertIn("auto-merge is disabled", stdout_mock.getvalue())
+
+    def test_single_issue_ready_to_merge_success_requests_auto_merge_when_enabled(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=52,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            token_budget=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            max_attempts=2,
+            decompose="never",
+            create_child_issues=False,
+            track_tokens=False,
+        )
+
+        issue = {
+            "number": 52,
+            "title": "Prevent duplicate processing",
+            "body": "Implement duplicate guards",
+            "url": "https://example/issues/52",
+        }
+        linked_pr = {
+            "number": 120,
+            "url": "https://example/pull/120",
+            "headRefName": "issue-fix/52-prevent-duplicate-processing",
+            "baseRefName": "main",
+        }
+        pull_request = {
+            "number": 120,
+            "title": "Fix duplicate processing",
+            "body": "PR body",
+            "url": "https://example/pull/120",
+            "state": "OPEN",
+            "mergeStateStatus": "CLEAN",
+            "mergeable": "MERGEABLE",
+            "reviewDecision": "APPROVED",
+            "headRefOid": "abc123",
+            "headRefName": linked_pr["headRefName"],
+            "baseRefName": "main",
+            "reviews": [],
+            "files": [{"path": "scripts/run_github_issues_to_opencode.py"}],
+            "author": {"login": "pr-owner"},
+        }
+        pr_state_comments = [
+            {
+                "id": 21,
+                "created_at": "2026-04-26T14:00:00Z",
+                "html_url": "https://example/pull/120#issuecomment-21",
+                "body": (
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"ready-to-merge","attempt":1}\n'
+                    "```"
+                ),
+            }
+        ]
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.load_project_config", return_value={"workflow": {"merge": {"auto": True, "method": "squash"}}}))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=linked_pr))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_issue_comments",
+                    side_effect=[[], pr_state_comments],
+                )
+            )
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.fetch_pull_request", side_effect=[pull_request, pull_request])
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[]))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.wait_for_pr_ci_status",
+                    return_value={
+                        "head_sha": "abc123",
+                        "overall": "success",
+                        "checks": [{"name": "ci/test", "state": "success", "url": "https://example/checks/1"}],
+                        "pending_checks": [],
+                        "failing_checks": [],
+                    },
+                )
+            )
+            run_merge_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_merge_for_pull_request"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"))
+            state_post_mock = stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment")
+            )
+            stdout_mock = stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        run_merge_mock.assert_called_once_with(
+            repo="owner/repo",
+            pr_number=120,
+            merge_policy={"auto": True, "method": "squash"},
+            dry_run=True,
+        )
+        posted_state = state_post_mock.call_args.kwargs["state"]
+        self.assertEqual(posted_state["status"], "ready-to-merge")
+        self.assertEqual(posted_state["stage"], "merge_execution")
+        self.assertEqual(posted_state["next_action"], "await_github_auto_merge")
+        self.assertEqual(posted_state["merge_policy"]["auto"], True)
+        self.assertIn("auto-merge was requested", stdout_mock.getvalue())
 
     def test_main_issue_flow_posts_blocked_state_when_token_budget_exceeded(self) -> None:
         args = argparse.Namespace(

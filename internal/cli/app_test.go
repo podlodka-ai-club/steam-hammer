@@ -42,6 +42,7 @@ func (contextRunner) Run(ctx context.Context, _ string, _ ...string) error {
 
 type recordingDetachedStarter struct {
 	req   DetachedRequest
+	reqs  []DetachedRequest
 	pid   int
 	calls int
 	err   error
@@ -49,6 +50,7 @@ type recordingDetachedStarter struct {
 
 func (r *recordingDetachedStarter) Start(req DetachedRequest) (DetachedProcess, error) {
 	r.req = req
+	r.reqs = append(r.reqs, req)
 	r.calls++
 	if r.err != nil {
 		return DetachedProcess{}, r.err
@@ -58,6 +60,24 @@ func (r *recordingDetachedStarter) Start(req DetachedRequest) (DetachedProcess, 
 		pid = 4242
 	}
 	return DetachedProcess{PID: pid}, nil
+}
+
+type recordingBatchClonePreparer struct {
+	sourceDirs []string
+	targetDirs []string
+	err        error
+}
+
+func (r *recordingBatchClonePreparer) Prepare(sourceDir, targetDir string) (string, error) {
+	r.sourceDirs = append(r.sourceDirs, sourceDir)
+	r.targetDirs = append(r.targetDirs, targetDir)
+	if r.err != nil {
+		return "", r.err
+	}
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return "", err
+	}
+	return targetDir, nil
 }
 
 type exitCodeError int
@@ -445,10 +465,12 @@ func TestRunBatchDryRunWiresPythonRunnerPerIssue(t *testing.T) {
 
 func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
+	cloner := &recordingBatchClonePreparer{}
 	targetDir := t.TempDir()
 	var out strings.Builder
 	app := NewApp(&out, &strings.Builder{})
 	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
 
 	code := app.Run([]string{"run", "batch", "--ids", "71,72", "--repo", "owner/repo", "--dir", targetDir, "--detach"})
 	if code != 0 {
@@ -456,6 +478,15 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 	}
 	if starter.calls != 2 {
 		t.Fatalf("starter calls = %d, want 2", starter.calls)
+	}
+	if len(cloner.targetDirs) != 2 {
+		t.Fatalf("clone preparations = %d, want 2", len(cloner.targetDirs))
+	}
+	if len(starter.reqs) != 2 {
+		t.Fatalf("starter requests = %d, want 2", len(starter.reqs))
+	}
+	if starter.reqs[0].Dir == starter.reqs[1].Dir {
+		t.Fatalf("worker dirs should differ, got %q", starter.reqs[0].Dir)
 	}
 	for _, issueID := range []string{"71", "72"} {
 		workerDir := filepath.Join(targetDir, ".orchestrator", "workers", "issue-"+issueID)
@@ -473,6 +504,13 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 		if state.TargetKind != "issue" || state.TargetID != issueID {
 			t.Fatalf("worker target = %#v", state)
 		}
+		wantClonePath := filepath.Join(workerDir, "repo")
+		if state.ClonePath != wantClonePath {
+			t.Fatalf("clone path = %q, want %q", state.ClonePath, wantClonePath)
+		}
+		if state.WorkDir != wantClonePath {
+			t.Fatalf("work dir = %q, want %q", state.WorkDir, wantClonePath)
+		}
 	}
 	printed := out.String()
 	for _, want := range []string{"started detached worker issue-71", "started detached worker issue-72"} {
@@ -484,9 +522,11 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 
 func TestRunBatchDetachPersistsBatchMetadataForChildWorkers(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
+	cloner := &recordingBatchClonePreparer{}
 	targetDir := t.TempDir()
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
 
 	code := app.Run([]string{"run", "batch", "--ids", "71,72", "--repo", "owner/repo", "--dir", targetDir, "--detach"})
 	if code != 0 {

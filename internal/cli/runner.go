@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -17,6 +18,10 @@ type Runner interface {
 
 type DetachedStarter interface {
 	Start(req DetachedRequest) (DetachedProcess, error)
+}
+
+type BatchClonePreparer interface {
+	Prepare(sourceDir, targetDir string) (string, error)
 }
 
 type DetachedRequest struct {
@@ -45,6 +50,8 @@ func (r ExecRunner) Run(ctx context.Context, name string, args ...string) error 
 
 type ExecDetachedStarter struct{}
 
+type ExecBatchClonePreparer struct{}
+
 func (ExecDetachedStarter) Start(req DetachedRequest) (DetachedProcess, error) {
 	if err := os.MkdirAll(filepath.Dir(req.LogPath), 0o755); err != nil {
 		return DetachedProcess{}, fmt.Errorf("failed to create log directory: %w", err)
@@ -67,6 +74,46 @@ func (ExecDetachedStarter) Start(req DetachedRequest) (DetachedProcess, error) {
 	}
 	_ = logFile.Close()
 	return DetachedProcess{PID: cmd.Process.Pid}, nil
+}
+
+func (ExecBatchClonePreparer) Prepare(sourceDir, targetDir string) (string, error) {
+	repoRoot, err := gitOutput(sourceDir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve source repository root: %w", err)
+	}
+	originURL, err := gitOutput(repoRoot, "config", "--get", "remote.origin.url")
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve source repository origin: %w", err)
+	}
+	if err := os.RemoveAll(targetDir); err != nil {
+		return "", fmt.Errorf("failed to reset worker clone directory: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(targetDir), 0o755); err != nil {
+		return "", fmt.Errorf("failed to create worker clone parent directory: %w", err)
+	}
+	cmd := exec.Command("git", "clone", "--quiet", originURL, targetDir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git clone %q into %q failed: %w%s", originURL, targetDir, err, formatCommandOutput(output))
+	}
+	return targetDir, nil
+}
+
+func gitOutput(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git %s failed: %w%s", strings.Join(args, " "), err, formatCommandOutput(output))
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func formatCommandOutput(output []byte) string {
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
+		return ""
+	}
+	return ": " + trimmed
 }
 
 func (a *App) runPython(ctx context.Context, args []string) int {

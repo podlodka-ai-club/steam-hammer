@@ -106,7 +106,7 @@ After #204, a small concurrent detached batch is only considered safe when opera
 Recommended scope:
 
 - Use 2-3 issues only.
-- Use a fresh repo clone for the batch, or an explicit `issue -> clone_path` mapping prepared outside the CLI.
+- Use a clean source repo checkout for the batch launch. `run batch --detach` now prepares a fresh per-worker clone automatically under each worker directory.
 - Do not expand to a broader autonomous batch until every check below passes.
 
 Suggested operator flow:
@@ -137,7 +137,7 @@ Pass/fail criteria:
 | --- | --- | --- |
 | Worker registry scope | `status --workers` shows exactly the expected 2-3 workers for this batch and no unrelated live workers that could be mistaken for the same issues. | Missing worker, unexpected extra worker, or registry entries that make issue ownership ambiguous. |
 | Expected branch per issue | Each worker resolves to its own issue and later to its own deterministic issue branch. | Any worker reuses or reports another issue's branch. |
-| Expected repo root / clone | Each worker's `clone_path` matches the fresh clone/root that was assigned before launch. For `run batch --detach`, that usually means the same fresh repo root for all child workers. | A worker reports an unexpected `clone_path`, a reused dirty root, or a clone that belongs to another issue's planned slot. |
+| Expected repo root / clone | Each worker's `clone_path` matches its own fresh managed clone, typically `<worker-dir>/issue-N/repo`, and no two workers share the same path. | A worker reports an unexpected `clone_path`, a reused dirty root, or a clone path shared with another issue. |
 | PR branch ownership | The linked PR shown by `status --worker issue-N` belongs to the same issue branch and does not point at another worker's issue context. | The linked PR head branch belongs to a different issue, or one PR/branch appears to be shared across unrelated issues. |
 | No cross-contamination | Batch summaries, linked PRs, conflicts, and latest states stay one-to-one with their issue IDs. | Any issue summary includes another issue's branch, PR, clone, or readiness state as if it were its own. |
 | Verification before merge | Before merge, the linked PR shows clean readiness and successful verification evidence, such as `merge-result verification=passed` and any required post-batch `verify` result. | Merge happens without clean verification, or verification evidence belongs to the wrong issue/branch. |

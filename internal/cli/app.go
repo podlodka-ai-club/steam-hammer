@@ -13,6 +13,7 @@ type App struct {
 	err    io.Writer
 	runner Runner
 	start  DetachedStarter
+	clone  BatchClonePreparer
 }
 
 func NewApp(out, err io.Writer) *App {
@@ -21,6 +22,7 @@ func NewApp(out, err io.Writer) *App {
 		err:    err,
 		runner: ExecRunner{Stdout: out, Stderr: err},
 		start:  ExecDetachedStarter{},
+		clone:  ExecBatchClonePreparer{},
 	}
 }
 
@@ -30,6 +32,10 @@ func (a *App) SetRunner(r Runner) {
 
 func (a *App) SetDetachedStarter(starter DetachedStarter) {
 	a.start = starter
+}
+
+func (a *App) SetBatchClonePreparer(preparer BatchClonePreparer) {
+	a.clone = preparer
 }
 
 func (a *App) Run(args []string) int {

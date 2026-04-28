@@ -192,6 +192,8 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 		return a.runDoctor(ctx, args[1:])
 	case "autodoctor":
 		return a.runAutoDoctor(ctx, args[1:])
+	case "verify":
+		return a.runVerify(ctx, args[1:])
 	case "status":
 		return a.runStatus(ctx, args[1:])
 	case "run":
@@ -283,6 +285,28 @@ func (a *App) runAutoDoctor(ctx context.Context, args []string) int {
 	return a.runDoctor(ctx, args)
 }
 
+func (a *App) runVerify(ctx context.Context, args []string) int {
+	fs := newFlagSet("verify", a.err)
+	opts := commonOptions{}
+	addCommonFlags(fs, &opts)
+	createFollowupIssue := fs.Bool("create-followup-issue", false, "create a GitHub follow-up issue automatically when verification fails")
+
+	if err := fs.Parse(args); err != nil {
+		return flagExitCode(err)
+	}
+	if fs.NArg() != 0 {
+		_, _ = fmt.Fprintf(a.err, "unexpected verify argument: %s\n", fs.Arg(0))
+		return 2
+	}
+
+	pythonArgs := []string{runnerScript, "--post-batch-verify"}
+	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
+	if *createFollowupIssue {
+		pythonArgs = append(pythonArgs, "--create-followup-issue")
+	}
+	return a.runPython(ctx, pythonArgs)
+}
+
 func (a *App) runStatus(ctx context.Context, args []string) int {
 	fs := newFlagSet("status", a.err)
 	opts := commonOptions{}
@@ -363,6 +387,8 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	base := ""
 	fs.StringVar(&base, "base", "", "base branch mode: default or current")
 	fs.StringVar(&base, "base-branch", "", "base branch mode: default or current")
+	postBatchVerify := fs.Bool("post-batch-verify", false, "run post-batch verification after the daemon cycle completes")
+	createFollowupIssue := fs.Bool("create-followup-issue", false, "create a GitHub follow-up issue automatically when post-batch verification fails")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -450,6 +476,12 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	_ = sessionFile.Close()
 	defer os.Remove(sessionPath)
 	pythonArgs = append(pythonArgs, "--autonomous-session-file", sessionPath)
+	if *postBatchVerify {
+		pythonArgs = append(pythonArgs, "--post-batch-verify")
+	}
+	if *createFollowupIssue {
+		pythonArgs = append(pythonArgs, "--create-followup-issue")
+	}
 
 	cycles := 0
 	for {
@@ -906,6 +938,7 @@ func usage() string {
 	  orchestrator init [flags]
 	  orchestrator doctor [flags]
 	  orchestrator autodoctor [flags]
+	  orchestrator verify [flags]
 	  orchestrator status (--issue N | --pr N) [flags]
 	  orchestrator run issue --id N [flags]
 	  orchestrator run pr --id N [flags]
@@ -915,6 +948,7 @@ func usage() string {
 	  init       Create local/project config scaffolds.
 	  doctor     Run environment diagnostics via the current Python runner.
 	  autodoctor Run doctor diagnostics with the same current checks.
+	  verify     Run post-batch repository verification checks.
 	  status     Print a concise orchestration status summary.
 	  run issue  Run issue orchestration via the current Python runner.
 	  run pr     Run PR review-comment orchestration via the current Python runner.

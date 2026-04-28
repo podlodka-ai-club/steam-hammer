@@ -81,6 +81,18 @@ func TestAutoDoctorCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--doctor", "--repo", "owner/repo", "--dry-run"})
 }
 
+func TestVerifyCommandWiresPythonRunner(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"verify", "--repo", "owner/repo", "--create-followup-issue", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--post-batch-verify", "--repo", "owner/repo", "--dry-run", "--create-followup-issue"})
+}
+
 func TestStatusIssueCommandWiresPythonRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -183,6 +195,34 @@ func TestRunIssueCommandWiresPythonRunner(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run", "--base", "current"})
+}
+
+func TestRunDaemonCommandForwardsPostBatchVerificationFlags(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{
+		"run", "daemon",
+		"--repo", "owner/repo",
+		"--dry-run",
+		"--max-cycles", "1",
+		"--post-batch-verify",
+		"--create-followup-issue",
+	})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	joined := strings.Join(runner.args, " ")
+	if !strings.Contains(joined, "--post-batch-verify") {
+		t.Fatalf("runner args = %q, want --post-batch-verify", joined)
+	}
+	if !strings.Contains(joined, "--create-followup-issue") {
+		t.Fatalf("runner args = %q, want --create-followup-issue", joined)
+	}
+	if !strings.Contains(joined, "--autonomous-session-file") {
+		t.Fatalf("runner args = %q, want daemon session file", joined)
+	}
 }
 
 func TestRunIssueCommandMapsPythonRunnerFlags(t *testing.T) {

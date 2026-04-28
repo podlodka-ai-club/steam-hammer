@@ -201,9 +201,11 @@ Compatibility boundary for Phase 1:
 - `run issue --conflict-recovery-only` reuses an existing issue or linked PR branch, syncs it with base, reports whether it was already current, synced cleanly, auto-resolved, or needs manual intervention, and then stops before agent execution.
 - `status` prints a concise summary from the latest parseable orchestration state comment for a single issue or PR, including current state, next action, blockers, source thread/comment, and PR readiness when available.
 - `run daemon` polls tracker issues through the Python runner in autonomous batch mode, reuses orchestration state, and keeps concurrency at one worktree task at a time.
+- A single `run daemon` invocation now keeps a per-run batch session so later poll cycles skip issues that already reached handoff states such as `ready-for-review`, `waiting-for-ci`, or `ready-to-merge`; this lets bounded runs make progress across distinct selected issues.
 - `run pr` supports PR review-comments execution. `--pr N` is accepted as a compatibility alias for `--id N`, and `--from-review-comments` is accepted as a no-op because the command always selects that mode.
 - `run pr --conflict-recovery-only` syncs the current PR branch with its base and exits before fetching review work for the agent.
 - `run daemon` repeatedly invokes the existing Python batch issue flow with `--limit` / `--state` polling semantics; use `--dry-run` to execute a single poll without looping.
+- The per-run skip list is scoped to the current daemon invocation only, so `--force-reprocess` still works for intentional reruns in later invocations.
 - `run daemon` does not write a dedicated logfile today; operator evidence comes from terminal `stdout` / `stderr` unless you redirect it explicitly.
 - `doctor` accepts `--doctor` as a no-op because the command already selects diagnostics mode.
 - `autodoctor` currently routes to the same diagnostics as `doctor`, so workflow-config validation is available from both entrypoints.

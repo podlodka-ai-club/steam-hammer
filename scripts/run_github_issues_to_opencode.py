@@ -105,6 +105,11 @@ BUILTIN_DEFAULTS = {
     "dir": ".",
 }
 
+POST_BATCH_VERIFICATION_DEFAULT_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("python-tests", "python3 -m unittest discover -s tests -q"),
+    ("go-test", "go test ./..."),
+)
+
 JIRA_ENV_VARS = {
     "base_url": "JIRA_BASE_URL",
     "email": "JIRA_EMAIL",
@@ -1479,7 +1484,9 @@ def update_autonomous_session_checkpoint(
     in_progress: list[str] | None,
     blockers: list[str] | None,
     next_checkpoint: str | None,
+    verification: dict[str, object] | None = None,
 ) -> dict:
+    existing_checkpoint = state.get("checkpoint") if isinstance(state.get("checkpoint"), dict) else {}
     checkpoint = {
         "run_id": run_id,
         "phase": str(phase or "running").strip() or "running",
@@ -1502,6 +1509,15 @@ def update_autonomous_session_checkpoint(
         "next_checkpoint": _as_optional_string(next_checkpoint),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    preserved_verification = (
+        existing_checkpoint.get("verification")
+        if isinstance(existing_checkpoint.get("verification"), dict)
+        else None
+    )
+    if verification is not None:
+        checkpoint["verification"] = verification
+    elif preserved_verification is not None:
+        checkpoint["verification"] = preserved_verification
     state["checkpoint"] = checkpoint
     return state
 
@@ -1526,6 +1542,7 @@ def format_autonomous_session_status_summary(state: dict) -> str:
     actions = checkpoint.get("issue_pr_actions") if isinstance(checkpoint.get("issue_pr_actions"), list) else []
     in_progress = checkpoint.get("in_progress") if isinstance(checkpoint.get("in_progress"), list) else []
     blockers = checkpoint.get("blockers") if isinstance(checkpoint.get("blockers"), list) else []
+    verification = checkpoint.get("verification") if isinstance(checkpoint.get("verification"), dict) else None
     batch_index = int(checkpoint.get("batch_index") or 0)
     total_batches = int(checkpoint.get("total_batches") or 0)
     phase = str(checkpoint.get("phase") or "running").strip() or "running"
@@ -1547,6 +1564,23 @@ def format_autonomous_session_status_summary(state: dict) -> str:
         f"Counts: {counts_summary}",
         f"Updated: {updated_at}",
     ]
+    if isinstance(verification, dict):
+        verification_status = str(verification.get("status") or "unknown")
+        verification_summary = _as_optional_string(verification.get("summary")) or verification_status
+        follow_up_issue = (
+            verification.get("follow_up_issue")
+            if isinstance(verification.get("follow_up_issue"), dict)
+            else None
+        )
+        verification_line = f"Verification: {verification_summary}"
+        if follow_up_issue is not None:
+            follow_up_status = _as_optional_string(follow_up_issue.get("status"))
+            issue_number = follow_up_issue.get("issue_number")
+            if follow_up_status == "created" and type(issue_number) is int:
+                verification_line += f"; follow-up issue #{issue_number} created"
+            elif follow_up_status:
+                verification_line += f"; follow-up={follow_up_status}"
+        lines.append(verification_line)
     return "\n".join(lines)
 
 
@@ -2186,6 +2220,227 @@ def run_configured_workflow_checks(
         raise WorkflowCheckFailure(failed_check=result, checks=results)
 
     return results
+
+
+def detect_post_batch_verification_commands(cwd: str | None = None) -> list[tuple[str, str]]:
+    target_dir = os.path.abspath(cwd or os.getcwd())
+    commands: list[tuple[str, str]] = []
+    if os.path.isdir(os.path.join(target_dir, "tests")):
+        commands.append(POST_BATCH_VERIFICATION_DEFAULT_COMMANDS[0])
+    if os.path.isfile(os.path.join(target_dir, "go.mod")):
+        commands.append(POST_BATCH_VERIFICATION_DEFAULT_COMMANDS[1])
+    return commands
+
+
+def _summarize_post_batch_verification_results(results: list[dict]) -> str:
+    command_count = len(results)
+    passed_count = sum(1 for result in results if str(result.get("status") or "") == "passed")
+    failed = [result for result in results if str(result.get("status") or "") == "failed"]
+    if failed:
+        failed_names = ", ".join(str(result.get("name") or "command") for result in failed)
+        return f"failed ({passed_count}/{command_count} passed; failed: {failed_names})"
+    return f"passed ({passed_count}/{command_count} commands)"
+
+
+def format_post_batch_verification_issue_body(
+    *,
+    repo: str,
+    verification: dict[str, object],
+    touched_prs: list[str] | None = None,
+) -> str:
+    commands = verification.get("commands") if isinstance(verification.get("commands"), list) else []
+    summary = _as_optional_string(verification.get("summary")) or "post-batch verification failed"
+    next_action = _as_optional_string(verification.get("next_action")) or "inspect_verification_failures"
+
+    lines = [
+        "Automated post-batch verification detected a repository regression.",
+        "",
+        f"Repository: {repo}",
+        f"Result: {summary}",
+        f"Next action: {_humanize_status_token(next_action)}",
+    ]
+    if touched_prs:
+        lines.extend(["", "Touched PRs:"])
+        lines.extend(f"- {pr_url}" for pr_url in touched_prs)
+    lines.extend(["", "Verification commands:"])
+    for result in commands:
+        if not isinstance(result, dict):
+            continue
+        name = str(result.get("name") or "command")
+        command_text = str(result.get("command") or "")
+        status = str(result.get("status") or "unknown")
+        exit_code = result.get("exit_code")
+        detail = f"- `{name}`: {status}"
+        if exit_code is not None:
+            detail += f" (exit code {exit_code})"
+        if command_text:
+            detail += f"\n  - command: `{command_text}`"
+        evidence = _as_optional_string(result.get("stderr_excerpt")) or _as_optional_string(result.get("stdout_excerpt"))
+        if evidence:
+            detail += f"\n  - evidence: {evidence}"
+        lines.append(detail)
+    lines.extend(["", "Please fix the failing verification command(s) and rerun the post-batch verification path."])
+    return "\n".join(lines)
+
+
+def create_post_batch_follow_up_issue(
+    *,
+    repo: str,
+    verification: dict[str, object],
+    touched_prs: list[str] | None,
+    dry_run: bool,
+) -> dict[str, object]:
+    commands = verification.get("commands") if isinstance(verification.get("commands"), list) else []
+    failed = [result for result in commands if isinstance(result, dict) and str(result.get("status") or "") == "failed"]
+    first_failed = failed[0] if failed else None
+    failed_name = str(first_failed.get("name") or "verification") if isinstance(first_failed, dict) else "verification"
+    title = f"Post-batch verification failed: {failed_name}"
+    body = format_post_batch_verification_issue_body(
+        repo=repo,
+        verification=verification,
+        touched_prs=touched_prs,
+    )
+    if dry_run:
+        print(f"[dry-run] Would create follow-up issue: {title}")
+        return {
+            "status": "recommended",
+            "title": title,
+            "body": body,
+            "issue_number": None,
+            "issue_url": None,
+        }
+
+    output = run_capture(
+        [
+            "gh",
+            "issue",
+            "create",
+            "--repo",
+            repo,
+            "--title",
+            title,
+            "--body",
+            body,
+            "--json",
+            "number,url",
+        ]
+    )
+    created = json.loads(output)
+    if not isinstance(created, dict):
+        raise RuntimeError("Unexpected response from gh issue create")
+    issue_number = created.get("number")
+    if type(issue_number) is not int:
+        raise RuntimeError("Created follow-up issue response missing integer number")
+    return {
+        "status": "created",
+        "title": title,
+        "body": body,
+        "issue_number": issue_number,
+        "issue_url": str(created.get("url") or ""),
+    }
+
+
+def run_post_batch_verification(
+    *,
+    repo: str,
+    tracker: str,
+    cwd: str | None,
+    dry_run: bool,
+    create_followup_issue: bool,
+    touched_prs: list[str] | None = None,
+) -> dict[str, object]:
+    commands = detect_post_batch_verification_commands(cwd=cwd)
+    if not commands:
+        return {
+            "status": "not-applicable",
+            "summary": "not-applicable (no verification commands detected)",
+            "commands": [],
+            "next_action": "configure_post_batch_verification",
+            "follow_up_issue": {"status": "not-needed"},
+        }
+
+    results: list[dict[str, object]] = []
+    for check_name, command_text in commands:
+        if dry_run:
+            print(f"[dry-run] Would run post-batch verification '{check_name}': {command_text}")
+            results.append(
+                {
+                    "name": check_name,
+                    "command": command_text,
+                    "status": "dry-run",
+                    "exit_code": None,
+                }
+            )
+            continue
+
+        print(f"Running post-batch verification '{check_name}': {command_text}")
+        ok, stdout_text, stderr_text, exit_code = run_check_command(
+            ["bash", "-lc", command_text],
+            cwd=cwd,
+        )
+        result: dict[str, object] = {
+            "name": check_name,
+            "command": command_text,
+            "status": "passed" if ok else "failed",
+            "exit_code": exit_code,
+        }
+        if stdout_text:
+            result["stdout_excerpt"] = _workflow_output_excerpt(stdout_text)
+        if stderr_text:
+            result["stderr_excerpt"] = _workflow_output_excerpt(stderr_text)
+        results.append(result)
+        if ok:
+            print(f"Post-batch verification '{check_name}' passed")
+        else:
+            print(
+                f"Post-batch verification '{check_name}' failed with exit code {exit_code}",
+                file=sys.stderr,
+            )
+
+    failed = [result for result in results if str(result.get("status") or "") == "failed"]
+    if any(str(result.get("status") or "") == "dry-run" for result in results):
+        return {
+            "status": "dry-run",
+            "summary": f"dry-run ({len(results)} commands)",
+            "commands": results,
+            "next_action": "run_post_batch_verification",
+            "follow_up_issue": {"status": "not-requested"},
+        }
+
+    verification: dict[str, object] = {
+        "status": "failed" if failed else "passed",
+        "summary": _summarize_post_batch_verification_results(results),
+        "commands": results,
+        "next_action": "inspect_verification_failures" if failed else "none",
+    }
+
+    if not failed:
+        verification["follow_up_issue"] = {"status": "not-needed"}
+        return verification
+
+    if create_followup_issue and tracker == TRACKER_GITHUB:
+        follow_up_issue = create_post_batch_follow_up_issue(
+            repo=repo,
+            verification=verification,
+            touched_prs=touched_prs,
+            dry_run=dry_run,
+        )
+        verification["follow_up_issue"] = follow_up_issue
+        verification["next_action"] = "fix_regression_from_follow_up_issue"
+        return verification
+
+    follow_up_issue = {
+        "status": "recommended",
+        "title": f"Post-batch verification failed: {str(failed[0].get('name') or 'verification')}",
+        "body": format_post_batch_verification_issue_body(
+            repo=repo,
+            verification=verification,
+            touched_prs=touched_prs,
+        ),
+    }
+    verification["follow_up_issue"] = follow_up_issue
+    verification["next_action"] = "create_follow_up_issue_and_fix_regression"
+    return verification
 
 
 def current_head_sha() -> str:
@@ -8775,6 +9030,19 @@ def build_parser() -> argparse.ArgumentParser:
             "--autonomous-session-file and exit."
         ),
     )
+    parser.add_argument(
+        "--post-batch-verify",
+        action="store_true",
+        help=(
+            "Run the repository post-batch verification path and exit, or run it automatically "
+            "after an autonomous batch loop completes."
+        ),
+    )
+    parser.add_argument(
+        "--create-followup-issue",
+        action="store_true",
+        help="When post-batch verification fails, create a GitHub follow-up issue instead of only recommending one.",
+    )
     return parser
 
 
@@ -8830,6 +9098,8 @@ def main() -> int:
     tracker = _parse_tracker(getattr(args, "tracker", BUILTIN_DEFAULTS["tracker"]))
     pr_number_arg = getattr(args, "pr", None)
     status_mode = bool(getattr(args, "status", False))
+    post_batch_verify_mode = bool(getattr(args, "post_batch_verify", False))
+    create_followup_issue = bool(getattr(args, "create_followup_issue", False))
     from_review_comments = bool(getattr(args, "from_review_comments", False))
     force_issue_flow = bool(getattr(args, "force_issue_flow", False))
     conflict_recovery_only = bool(getattr(args, "conflict_recovery_only", False))
@@ -8938,6 +9208,8 @@ def main() -> int:
             if issue_number_arg is not None and pr_number_arg is not None:
                 raise RuntimeError("Use either --issue or --pr, not both.")
             pr_mode_requested = pr_number_arg is not None or from_review_comments
+            if post_batch_verify_mode and (issue_number_arg is not None or pr_mode_requested) and not autonomous_mode:
+                raise RuntimeError("--post-batch-verify cannot be combined with --issue, --pr, or --from-review-comments.")
             if conflict_recovery_only and issue_number_arg is None and pr_number_arg is None:
                 raise RuntimeError("--conflict-recovery-only requires --issue or --pr.")
             if from_review_comments and pr_number_arg is None:
@@ -8966,6 +9238,29 @@ def main() -> int:
                     run_status_command(args=args, repo=repo, merge_policy=merge_policy),
                     original_process_cwd,
                 )
+            if post_batch_verify_mode and not autonomous_mode:
+                verification = run_post_batch_verification(
+                    repo=repo,
+                    tracker=tracker,
+                    cwd=os.getcwd(),
+                    dry_run=args.dry_run,
+                    create_followup_issue=create_followup_issue,
+                )
+                print(f"Post-batch verification: {verification.get('summary')}")
+                follow_up_issue = (
+                    verification.get("follow_up_issue")
+                    if isinstance(verification.get("follow_up_issue"), dict)
+                    else None
+                )
+                if isinstance(follow_up_issue, dict) and str(follow_up_issue.get("status") or "") == "recommended":
+                    print(f"Recommended follow-up issue: {follow_up_issue.get('title')}")
+                if isinstance(follow_up_issue, dict) and str(follow_up_issue.get("status") or "") == "created":
+                    print(
+                        "Created follow-up issue: "
+                        f"#{follow_up_issue.get('issue_number')} {follow_up_issue.get('issue_url') or ''}".rstrip()
+                    )
+                exit_code = 1 if str(verification.get("status") or "") == "failed" else 0
+                return _finish_main(exit_code, original_process_cwd)
 
             if not pr_mode_requested and base_branch_mode == "current":
                 for warning in current_branch_stack_warnings():
@@ -9844,7 +10139,56 @@ def main() -> int:
         format_autonomous_dependency_blocker(blocked_entry) for blocked_entry in blocked_dependency_entries
     ]
 
+    post_batch_verification: dict[str, object] | None = None
+    if autonomous_mode and issue_number_arg is None and post_batch_verify_mode:
+        post_batch_verification = run_post_batch_verification(
+            repo=repo,
+            tracker=tracker,
+            cwd=os.getcwd(),
+            dry_run=args.dry_run,
+            create_followup_issue=create_followup_issue,
+            touched_prs=touched_prs,
+        )
+        print(f"Post-batch verification: {post_batch_verification.get('summary')}")
+        follow_up_issue = (
+            post_batch_verification.get("follow_up_issue")
+            if isinstance(post_batch_verification.get("follow_up_issue"), dict)
+            else None
+        )
+        if isinstance(follow_up_issue, dict) and str(follow_up_issue.get("status") or "") == "recommended":
+            print(f"Recommended follow-up issue: {follow_up_issue.get('title')}")
+        if isinstance(follow_up_issue, dict) and str(follow_up_issue.get("status") or "") == "created":
+            print(
+                "Created follow-up issue: "
+                f"#{follow_up_issue.get('issue_number')} {follow_up_issue.get('issue_url') or ''}".rstrip()
+            )
+
     if autonomous_mode and issue_number_arg is None:
+        final_issue_pr_actions = (
+            [f"Touched {len(touched_prs)} PR(s)"] if touched_prs else ["No PR updates were needed in the last batch"]
+        )
+        final_blockers = [f"{failures} batch failure(s) need follow-up"] if failures > 0 else []
+        if isinstance(post_batch_verification, dict):
+            verification_status = str(post_batch_verification.get("status") or "")
+            if verification_status == "passed":
+                final_issue_pr_actions.append("Post-batch verification passed")
+            elif verification_status == "failed":
+                final_blockers.append(
+                    _as_optional_string(post_batch_verification.get("summary")) or "post-batch verification failed"
+                )
+                follow_up_issue = (
+                    post_batch_verification.get("follow_up_issue")
+                    if isinstance(post_batch_verification.get("follow_up_issue"), dict)
+                    else None
+                )
+                if isinstance(follow_up_issue, dict):
+                    follow_up_status = str(follow_up_issue.get("status") or "")
+                    if follow_up_status == "created":
+                        final_issue_pr_actions.append(
+                            f"Created verification follow-up issue #{follow_up_issue.get('issue_number')}"
+                        )
+                    elif follow_up_status == "recommended":
+                        final_issue_pr_actions.append("Recommended a verification follow-up issue")
         update_autonomous_session_checkpoint(
             autonomous_session_state,
             run_id=run_id,
@@ -11885,12 +12229,11 @@ def main() -> int:
             done=[f"Autonomous batch loop finished across {len(issues)} runnable issue(s)"],
             current="Idle between autonomous runs",
             next_items=[],
-            issue_pr_actions=(
-                [f"Touched {len(touched_prs)} PR(s)"] if touched_prs else ["No PR updates were needed in the last batch"]
-            ),
+            issue_pr_actions=final_issue_pr_actions,
             in_progress=[],
             blockers=blocked_dependency_summaries + ([f"{failures} batch failure(s) need follow-up"] if failures > 0 else []),
             next_checkpoint="when the next autonomous invocation starts",
+            verification=post_batch_verification,
         )
         save_autonomous_session_state(autonomous_session_file, autonomous_session_state)
         print(format_autonomous_session_status_summary(autonomous_session_state))
@@ -11907,7 +12250,11 @@ def main() -> int:
         print("PRs:")
         for pr_url in touched_prs:
             print(f"- {pr_url}")
-    return _finish_main(1 if failures > 0 else 0, original_process_cwd)
+    verification_failed = bool(
+        isinstance(post_batch_verification, dict)
+        and str(post_batch_verification.get("status") or "") == "failed"
+    )
+    return _finish_main(1 if failures > 0 or verification_failed else 0, original_process_cwd)
 
 
 if __name__ == "__main__":

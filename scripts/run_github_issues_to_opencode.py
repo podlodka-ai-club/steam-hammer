@@ -7581,12 +7581,18 @@ def main() -> int:
                         continue
 
             if skip_if_branch_exists and remote_branch_exists(issue_branch):
-                skipped_existing_branch += 1
-                print(
-                    f"Skipping {issue_label}: branch '{issue_branch}' already exists on origin "
-                    "(--force-reprocess or --no-skip-if-branch-exists to override)."
-                )
-                continue
+                if issue_number_arg is not None:
+                    print(
+                        f"Found existing remote branch for {issue_label}: '{issue_branch}'; "
+                        "continuing so the single-issue run can reuse that branch context."
+                    )
+                else:
+                    skipped_existing_branch += 1
+                    print(
+                        f"Skipping {issue_label}: branch '{issue_branch}' already exists on origin "
+                        "(--force-reprocess or --no-skip-if-branch-exists to override)."
+                    )
+                    continue
 
             if issue_number_arg is not None and has_force_issue_flow_flag and supports_github_issue_ops:
                 if linked_open_pr is None:

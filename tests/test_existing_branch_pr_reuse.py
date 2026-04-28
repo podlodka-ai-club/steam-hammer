@@ -778,7 +778,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         self.assertIn("Processed: 0", stdout_mock.getvalue())
         self.assertIn("skipped_existing_pr: 1", stdout_mock.getvalue())
 
-    def test_main_skips_issue_when_deterministic_remote_branch_exists(self) -> None:
+    def test_main_single_issue_reuses_existing_remote_branch_context(self) -> None:
         args = type("Args", (), {
             "repo": "owner/repo",
             "issue": 33,
@@ -821,21 +821,25 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                     "url": "https://github.com/owner/repo/issues/33",
                 },
             ),
-            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue") as find_open_pr_mock,
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None) as find_open_pr_mock,
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
             patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=True),
-            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch") as prepare_issue_branch_mock,
-            patch("scripts.run_github_issues_to_opencode.run_agent") as run_agent_mock,
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused") as prepare_issue_branch_mock,
+            patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0) as run_agent_mock,
+            patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False),
+            patch("scripts.run_github_issues_to_opencode.ensure_pr", return_value=("reused", "https://example/pull/44")),
+            patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"),
             patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
         ):
             exit_code = main()
 
         self.assertEqual(exit_code, 0)
-        find_open_pr_mock.assert_not_called()
-        prepare_issue_branch_mock.assert_not_called()
-        run_agent_mock.assert_not_called()
-        self.assertIn("branch 'issue-fix/33-do-not-duplicate' already exists on origin", stdout_mock.getvalue())
-        self.assertIn("Processed: 0", stdout_mock.getvalue())
-        self.assertIn("skipped_existing_branch: 1", stdout_mock.getvalue())
+        find_open_pr_mock.assert_called_once_with(repo="owner/repo", issue_number=33)
+        prepare_issue_branch_mock.assert_called_once()
+        run_agent_mock.assert_called_once()
+        self.assertIn("Found existing remote branch for issue #33", stdout_mock.getvalue())
+        self.assertIn("Processed: 1", stdout_mock.getvalue())
+        self.assertIn("skipped_existing_branch: 0", stdout_mock.getvalue())
 
 
 if __name__ == "__main__":

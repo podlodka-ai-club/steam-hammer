@@ -17,6 +17,7 @@
 - `init` создает scaffold для `project-config.json` и `local-config.json`.
 - `doctor` и `autodoctor` проверяют окружение, конфиг и могут делать runner smoke check.
 - `run issue` запускает one-shot issue orchestration.
+- `run batch` запускает явный список issue ID как batch entrypoint: в `--dry-run` режиме показывает per-issue запуск, а в `--detach` стартует отдельный worker на каждый issue.
 - `run pr` запускает review-comments flow для существующего PR.
 - `run daemon` запускает polling loop поверх текущего GitHub/Python runner'а.
 

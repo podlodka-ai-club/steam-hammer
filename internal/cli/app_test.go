@@ -422,6 +422,65 @@ func TestRunIssueCommandAcceptsIssueAlias(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--issue", "71"})
 }
 
+func TestRunBatchDryRunWiresPythonRunnerPerIssue(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "batch", "--ids", "71,72", "--repo", "owner/repo", "--dry-run", "--base", "current"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 2 {
+		t.Fatalf("runner calls = %d, want 2", runner.calls)
+	}
+	if got := stripFlagPair(runner.cmds[0][1:], "--autonomous-session-file"); !reflect.DeepEqual(got, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run", "--base", "current"}) {
+		t.Fatalf("first runner args = %#v", runner.cmds[0][1:])
+	}
+	if got := stripFlagPair(runner.cmds[1][1:], "--autonomous-session-file"); !reflect.DeepEqual(got, []string{runnerScript, "--issue", "72", "--repo", "owner/repo", "--dry-run", "--base", "current"}) {
+		t.Fatalf("second runner args = %#v", runner.cmds[1][1:])
+	}
+}
+
+func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	targetDir := t.TempDir()
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+
+	code := app.Run([]string{"run", "batch", "--ids", "71,72", "--repo", "owner/repo", "--dir", targetDir, "--detach"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if starter.calls != 2 {
+		t.Fatalf("starter calls = %d, want 2", starter.calls)
+	}
+	for _, issueID := range []string{"71", "72"} {
+		workerDir := filepath.Join(targetDir, ".orchestrator", "workers", "issue-"+issueID)
+		statePath := filepath.Join(workerDir, "worker.json")
+		if _, err := os.Stat(statePath); err != nil {
+			t.Fatalf("Stat(%q) error = %v", statePath, err)
+		}
+		state, err := readDetachedWorkerState(statePath)
+		if err != nil {
+			t.Fatalf("readDetachedWorkerState(%q) error = %v", statePath, err)
+		}
+		if state.Mode != "run batch" {
+			t.Fatalf("worker mode = %q, want run batch", state.Mode)
+		}
+		if state.TargetKind != "issue" || state.TargetID != issueID {
+			t.Fatalf("worker target = %#v", state)
+		}
+	}
+	printed := out.String()
+	for _, want := range []string{"started detached worker issue-71", "started detached worker issue-72"} {
+		if !strings.Contains(printed, want) {
+			t.Fatalf("stdout = %q, want %q", printed, want)
+		}
+	}
+}
+
 func TestRunIssueCommandMapsCoreCompatibilityFlags(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -690,6 +749,23 @@ func TestRunIssueRejectsBatchFlags(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "unsupported flag --limit") {
 		t.Fatalf("stderr = %q, want batch flag rejection", errOut.String())
+	}
+}
+
+func TestRunBatchRequiresDetachOrDryRun(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+
+	if code := app.Run([]string{"run", "batch", "--ids", "71,72"}); code != 2 {
+		t.Fatalf("Run() code = %d, want 2", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "requires --detach") {
+		t.Fatalf("stderr = %q, want detach guidance", errOut.String())
 	}
 }
 

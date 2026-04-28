@@ -129,10 +129,22 @@ var unsupportedRunIssueFlags = map[string]string{
 	"doctor-smoke-check":   "use `orchestrator doctor --doctor-smoke-check` instead",
 	"limit":                "batch issue selection is not exposed by `orchestrator run issue`; use `--id N`",
 	"state":                "batch issue selection is not exposed by `orchestrator run issue`; use `--id N`",
+	"ids":                  "use `orchestrator run batch --ids N[,M...]` instead",
+}
+
+var unsupportedRunBatchFlags = map[string]string{
+	"pr":                   "use `orchestrator run pr --id N` instead",
+	"from-review-comments": "use `orchestrator run pr --id N` instead",
+	"doctor":               "use `orchestrator doctor` instead",
+	"doctor-smoke-check":   "use `orchestrator doctor --doctor-smoke-check` instead",
+	"limit":                "use `orchestrator run daemon` for tracker-selected batches",
+	"state":                "use `orchestrator run daemon` for tracker-selected batches",
+	"autonomous":           "use `orchestrator run daemon` for autonomous batch polling",
 }
 
 var unsupportedRunPRFlags = map[string]string{
 	"issue":              "use `orchestrator run issue --id N` instead",
+	"ids":                "use `orchestrator run batch --ids N[,M...]` instead",
 	"doctor":             "use `orchestrator doctor` instead",
 	"doctor-smoke-check": "use `orchestrator doctor --doctor-smoke-check` instead",
 	"limit":              "batch issue selection is not exposed by the Go wrapper yet",

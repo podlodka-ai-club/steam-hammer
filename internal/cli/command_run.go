@@ -3,11 +3,52 @@ package cli
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
+
+type issueIDListFlag struct {
+	ids []int
+}
+
+func (f *issueIDListFlag) String() string {
+	if len(f.ids) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(f.ids))
+	for _, id := range f.ids {
+		parts = append(parts, strconv.Itoa(id))
+	}
+	return strings.Join(parts, ",")
+}
+
+func (f *issueIDListFlag) Set(value string) error {
+	for _, raw := range strings.Split(value, ",") {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		id, err := strconv.Atoi(trimmed)
+		if err != nil || id <= 0 {
+			return fmt.Errorf("invalid issue id %q", trimmed)
+		}
+		duplicate := false
+		for _, existing := range f.ids {
+			if existing == id {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			f.ids = append(f.ids, id)
+		}
+	}
+	return nil
+}
 
 func (a *App) runRun(ctx context.Context, args []string) int {
 	if len(args) == 0 {
@@ -21,6 +62,8 @@ func (a *App) runRun(ctx context.Context, args []string) int {
 		return 0
 	case "issue":
 		return a.runIssue(ctx, args[1:])
+	case "batch":
+		return a.runBatch(ctx, args[1:])
 	case "daemon":
 		return a.runDaemon(ctx, args[1:])
 	case "pr":
@@ -29,6 +72,75 @@ func (a *App) runRun(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintf(a.err, "unknown run target %q\n\n%s", args[0], runUsage())
 		return 2
 	}
+}
+
+func buildIssuePythonArgs(opts commonOptions, id int, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch bool, syncStrategy string, fs flagState) []string {
+	pythonArgs := []string{runnerScript, "--issue", strconv.Itoa(id)}
+	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
+	if base != "" {
+		pythonArgs = append(pythonArgs, "--base", base)
+	}
+	if includeEmpty {
+		pythonArgs = append(pythonArgs, "--include-empty")
+	}
+	if stopOnError {
+		pythonArgs = append(pythonArgs, "--stop-on-error")
+	}
+	if failOnExisting {
+		pythonArgs = append(pythonArgs, "--fail-on-existing")
+	}
+	if forceIssueFlow {
+		pythonArgs = append(pythonArgs, "--force-issue-flow")
+	}
+	if noSkipIfPRExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
+	} else if fs.wasPassed("skip-if-pr-exists") && skipIfPRExists {
+		pythonArgs = append(pythonArgs, "--skip-if-pr-exists")
+	} else if !skipIfPRExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
+	}
+	if noSkipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
+	} else if fs.wasPassed("skip-if-branch-exists") && skipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--skip-if-branch-exists")
+	} else if !skipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
+	}
+	if forceReprocess {
+		pythonArgs = append(pythonArgs, "--force-reprocess")
+	}
+	if conflictRecoveryOnly {
+		pythonArgs = append(pythonArgs, "--conflict-recovery-only")
+	}
+	if noSyncReusedBranch {
+		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
+	} else if fs.wasPassed("sync-reused-branch") && syncReusedBranch {
+		pythonArgs = append(pythonArgs, "--sync-reused-branch")
+	} else if !syncReusedBranch {
+		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
+	}
+	if syncStrategy != "" {
+		pythonArgs = append(pythonArgs, "--sync-strategy", syncStrategy)
+	}
+	return pythonArgs
+}
+
+type flagState interface {
+	wasPassed(name string) bool
+}
+
+type flagStateAdapter struct {
+	fs interface{ Visit(func(*flag.Flag)) }
+}
+
+func (f flagStateAdapter) wasPassed(name string) bool {
+	passed := false
+	f.fs.Visit(func(current *flag.Flag) {
+		if current.Name == name {
+			passed = true
+		}
+	})
+	return passed
 }
 
 func (a *App) runDaemon(ctx context.Context, args []string) int {
@@ -215,6 +327,110 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	}
 }
 
+func (a *App) runBatch(ctx context.Context, args []string) int {
+	if unsupported := firstUnsupportedFlag(args, unsupportedRunBatchFlags); unsupported != "" {
+		_, _ = fmt.Fprintln(a.err, unsupported)
+		return 2
+	}
+
+	fs := newFlagSet("run batch", a.err)
+	opts := commonOptions{}
+	addCommonFlags(fs, &opts)
+	ids := &issueIDListFlag{}
+	fs.Var(ids, "ids", "comma-separated issue IDs")
+	fs.Var(ids, "id", "issue ID; repeatable and accepts comma-separated values")
+	fs.Var(ids, "issue", "compatibility alias for --id")
+	base := ""
+	fs.StringVar(&base, "base", "", "base branch mode: default or current")
+	fs.StringVar(&base, "base-branch", "", "base branch mode: default or current")
+	includeEmpty := fs.Bool("include-empty", false, "process issues even if body is empty")
+	stopOnError := fs.Bool("stop-on-error", false, "stop after first failed issue launch")
+	failOnExisting := fs.Bool("fail-on-existing", false, "fail if issue branch or PR already exists")
+	forceIssueFlow := fs.Bool("force-issue-flow", false, "disable auto-switch to PR-review mode")
+	skipIfPRExists := fs.Bool("skip-if-pr-exists", true, "skip issue processing when a linked open PR exists")
+	noSkipIfPRExists := fs.Bool("no-skip-if-pr-exists", false, "do not skip issue processing when a linked open PR exists")
+	skipIfBranchExists := fs.Bool("skip-if-branch-exists", true, "skip issue processing when deterministic issue branch exists on origin")
+	noSkipIfBranchExists := fs.Bool("no-skip-if-branch-exists", false, "do not skip issue processing when deterministic issue branch exists on origin")
+	forceReprocess := fs.Bool("force-reprocess", false, "override skip guards")
+	conflictRecoveryOnly := fs.Bool("conflict-recovery-only", false, "sync an existing reused branch with base and stop before any agent work")
+	syncReusedBranch := fs.Bool("sync-reused-branch", true, "sync reused issue branches before running the agent")
+	noSyncReusedBranch := fs.Bool("no-sync-reused-branch", false, "disable sync for reused issue branches before the agent step")
+	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
+	detach := fs.Bool("detach", false, "start one detached worker per issue and write logs/state to predictable paths")
+	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
+
+	if err := fs.Parse(args); err != nil {
+		return flagExitCode(err)
+	}
+	if fs.NArg() != 0 {
+		_, _ = fmt.Fprintf(a.err, "unexpected run batch argument: %s\n", fs.Arg(0))
+		return 2
+	}
+	if len(ids.ids) == 0 {
+		_, _ = fmt.Fprintln(a.err, "run batch requires at least one issue id via --ids or repeated --id")
+		return 2
+	}
+	if !*detach && !*opts.dryRun {
+		_, _ = fmt.Fprintln(a.err, "run batch requires --detach for live launches; use --dry-run to preview without starting workers")
+		return 2
+	}
+
+	flags := flagStateAdapter{fs: fs}
+	lastCode := 0
+	for _, id := range ids.ids {
+		pythonArgs := buildIssuePythonArgs(
+			opts,
+			id,
+			base,
+			*includeEmpty,
+			*stopOnError,
+			*failOnExisting,
+			*forceIssueFlow,
+			*skipIfPRExists,
+			*noSkipIfPRExists,
+			*skipIfBranchExists,
+			*noSkipIfBranchExists,
+			*forceReprocess,
+			*conflictRecoveryOnly,
+			*syncReusedBranch,
+			*noSyncReusedBranch,
+			*syncStrategy,
+			flags,
+		)
+		if *detach {
+			workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "issue", strconv.Itoa(id))
+			if err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
+				return 1
+			}
+			code := a.startDetachedWorker(detachedWorkerStateFromOptions(
+				workerName("issue", strconv.Itoa(id)),
+				"run batch",
+				"issue",
+				strconv.Itoa(id),
+				opts,
+				append([]string{"python3"}, pythonArgs...),
+				workerPaths,
+			))
+			if code != 0 {
+				if *stopOnError {
+					return code
+				}
+				lastCode = code
+			}
+			continue
+		}
+		code := a.runPython(ctx, pythonArgs)
+		if code != 0 {
+			if *stopOnError {
+				return code
+			}
+			lastCode = code
+		}
+	}
+	return lastCode
+}
+
 func (a *App) runIssue(ctx context.Context, args []string) int {
 	if unsupported := firstUnsupportedFlag(args, unsupportedRunIssueFlags); unsupported != "" {
 		_, _ = fmt.Fprintln(a.err, unsupported)
@@ -264,53 +480,25 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 		return 2
 	}
 
-	pythonArgs := []string{runnerScript, "--issue", strconv.Itoa(*id)}
-	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
-	if base != "" {
-		pythonArgs = append(pythonArgs, "--base", base)
-	}
-	if *includeEmpty {
-		pythonArgs = append(pythonArgs, "--include-empty")
-	}
-	if *stopOnError {
-		pythonArgs = append(pythonArgs, "--stop-on-error")
-	}
-	if *failOnExisting {
-		pythonArgs = append(pythonArgs, "--fail-on-existing")
-	}
-	if *forceIssueFlow {
-		pythonArgs = append(pythonArgs, "--force-issue-flow")
-	}
-	if *noSkipIfPRExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
-	} else if flagWasPassed(fs, "skip-if-pr-exists") && *skipIfPRExists {
-		pythonArgs = append(pythonArgs, "--skip-if-pr-exists")
-	} else if !*skipIfPRExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
-	}
-	if *noSkipIfBranchExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
-	} else if flagWasPassed(fs, "skip-if-branch-exists") && *skipIfBranchExists {
-		pythonArgs = append(pythonArgs, "--skip-if-branch-exists")
-	} else if !*skipIfBranchExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
-	}
-	if *forceReprocess {
-		pythonArgs = append(pythonArgs, "--force-reprocess")
-	}
-	if *conflictRecoveryOnly {
-		pythonArgs = append(pythonArgs, "--conflict-recovery-only")
-	}
-	if *noSyncReusedBranch {
-		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
-	} else if flagWasPassed(fs, "sync-reused-branch") && *syncReusedBranch {
-		pythonArgs = append(pythonArgs, "--sync-reused-branch")
-	} else if !*syncReusedBranch {
-		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
-	}
-	if *syncStrategy != "" {
-		pythonArgs = append(pythonArgs, "--sync-strategy", *syncStrategy)
-	}
+	pythonArgs := buildIssuePythonArgs(
+		opts,
+		*id,
+		base,
+		*includeEmpty,
+		*stopOnError,
+		*failOnExisting,
+		*forceIssueFlow,
+		*skipIfPRExists,
+		*noSkipIfPRExists,
+		*skipIfBranchExists,
+		*noSkipIfBranchExists,
+		*forceReprocess,
+		*conflictRecoveryOnly,
+		*syncReusedBranch,
+		*noSyncReusedBranch,
+		*syncStrategy,
+		flagStateAdapter{fs: fs},
+	)
 	if *detach {
 		workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "issue", strconv.Itoa(*id))
 		if err != nil {

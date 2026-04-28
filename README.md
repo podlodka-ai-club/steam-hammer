@@ -126,6 +126,7 @@ Available commands:
 go run ./cmd/orchestrator init
 go run ./cmd/orchestrator doctor --repo owner/repo
 go run ./cmd/orchestrator run issue --id 71 --repo owner/repo --dry-run
+go run ./cmd/orchestrator run daemon --repo owner/repo --dry-run --max-cycles 1 --poll-interval-seconds 1
 go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --dry-run
 go run ./cmd/orchestrator run daemon --repo owner/repo --dry-run
 ```
@@ -140,6 +141,7 @@ go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode 
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --model openai/gpt-5.3-codex --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
 go run ./cmd/orchestrator run issue --id 31 --repo owner/repo --force-issue-flow
 go run ./cmd/orchestrator run issue --id 45 --repo owner/repo --base current --runner opencode --agent build
+go run ./cmd/orchestrator run daemon --repo owner/repo --limit 5 --poll-interval-seconds 120
 go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --allow-pr-branch-switch
 go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --runner opencode --agent review --model openai/gpt-4o --opencode-auto-approve --agent-timeout-seconds 900 --dry-run
 go run ./cmd/orchestrator run daemon --repo owner/repo --limit 1 --poll-interval-seconds 120
@@ -150,6 +152,7 @@ The Go handlers translate CLI intent into the current Python runner arguments, e
 Compatibility boundary for Phase 1:
 
 - `run issue` supports single-issue execution through the Python runner. `--issue N` is accepted as a compatibility alias for `--id N`.
+- `run daemon` polls tracker issues through the Python runner in autonomous batch mode, reuses orchestration state, and keeps concurrency at one worktree task at a time.
 - `run pr` supports PR review-comments execution. `--pr N` is accepted as a compatibility alias for `--id N`, and `--from-review-comments` is accepted as a no-op because the command always selects that mode.
 - `run daemon` repeatedly invokes the existing Python batch issue flow with `--limit` / `--state` polling semantics; use `--dry-run` to execute a single poll without looping.
 - `doctor` accepts `--doctor` as a no-op because the command already selects diagnostics mode.
@@ -172,11 +175,16 @@ You can define repository defaults and placeholders for future orchestration pol
 
 Project config currently supports these sections:
 
-- `workflow.commands.test|lint|build` (non-empty string shell command or `null`)
+- `workflow.commands.setup|test|lint|build|e2e` (non-empty string shell command or `null`)
+- `workflow.hooks.pre_agent|post_agent|pre_pr_update|post_pr_update` (non-empty string shell command or `null`)
+- `workflow.readiness.required_checks|required_approvals|require_review|require_mergeable|require_required_file_evidence`
+- `workflow.merge.auto|method` (`method` is `merge`, `squash`, or `rebase`)
 - `defaults.tracker|preset|runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts` (used as parser defaults)
 - `scope.defaults.labels.allow|deny` (arrays of label names)
 - `scope.defaults.authors.allow|deny` (arrays of GitHub logins; optional placeholder)
-- `routing.default_preset|rules[]` where each rule can match `labels`, `task_types`, `scope`, and `needs_decomposition`
+- `scope.defaults.assignees.allow|deny` (arrays of GitHub logins)
+- `scope.defaults.priority.allow|deny|order` (priority labels used for filtering and autonomous ordering)
+- `scope.defaults.freshness.max_age_days|max_idle_days` (positive integers for autonomous freshness guards)
 - `retry.max_attempts|escalate_to_preset` (positive integer plus escalation placeholder)
 - `budgets.max_attempts_per_task|max_runtime_minutes|max_cost_usd|max_model_tier`
 - `communication.verbosity` (`low`, `normal`, `high`)
@@ -205,11 +213,14 @@ Scope rules are evaluated before any issue-mode agent execution:
 
 Workflow checks are evaluated after agent changes are committed and before final PR-ready states are posted:
 
-- commands run in this order when configured: `test`, `lint`, `build`;
+- `setup` runs once before orchestration starts for the selected repository;
+- checks run in this order when configured: `test`, `lint`, `build`, `e2e`;
+- hooks can run before/after agent execution and before/after PR updates;
 - each command is executed via `bash -lc "<command>"` from repository `--dir`;
 - in `--dry-run`, checks are not executed and the script prints which checks would run;
 - on failure, orchestration posts a state update with `stage=workflow_checks` and a `workflow_checks` payload containing command, exit code, and output excerpts;
 - workflow-check failures block readiness transitions (`ready-for-review` / `waiting-for-ci`) and follow existing stop policy (`--stop-on-error`).
+- PR readiness can additionally require named CI checks, approvals, mergeability, and required-file evidence before the orchestrator posts `ready-to-merge`.
 
 Example `project-config.json` workflow block:
 
@@ -217,9 +228,28 @@ Example `project-config.json` workflow block:
 {
   "workflow": {
     "commands": {
+      "setup": "python -m pip install -r requirements.txt",
       "test": "python -m unittest",
       "lint": "ruff check .",
-      "build": null
+      "build": null,
+      "e2e": null
+    },
+    "hooks": {
+      "pre_agent": null,
+      "post_agent": null,
+      "pre_pr_update": null,
+      "post_pr_update": null
+    },
+    "readiness": {
+      "required_checks": ["ci / test"],
+      "required_approvals": 1,
+      "require_review": true,
+      "require_mergeable": true,
+      "require_required_file_evidence": true
+    },
+    "merge": {
+      "auto": false,
+      "method": "squash"
     }
   }
 }

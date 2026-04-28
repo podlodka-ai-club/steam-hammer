@@ -244,6 +244,35 @@ func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments", "--dry-run", "--isolate-worktree"})
 }
 
+func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--poll-interval-seconds", "1", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--autonomous", "--state", "open", "--limit", "3", "--repo", "owner/repo", "--dry-run"})
+}
+
+func TestRunDaemonRejectsParallelismAboveOne(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+
+	if code := app.Run([]string{"run", "daemon", "--max-parallel-tasks", "2", "--poll-interval-seconds", "1", "--max-cycles", "1"}); code != 2 {
+		t.Fatalf("Run() code = %d, want 2", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "--max-parallel-tasks=1") {
+		t.Fatalf("stderr = %q, want concurrency validation", errOut.String())
+	}
+}
+
 func TestRunPRCommandAcceptsPythonPRFlags(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -287,16 +316,16 @@ func TestRunPRCommandMapsCoreCompatibilityFlags(t *testing.T) {
 	})
 }
 
-func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
+func TestRunDaemonCommandSupportsAllState(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
 
-	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--state", "all", "--dry-run", "--poll-interval-seconds", "0"})
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--state", "all", "--dry-run", "--poll-interval-seconds", "1"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--limit", "3", "--state", "all", "--repo", "owner/repo", "--dry-run"})
+	assertCommand(t, runner, []string{runnerScript, "--autonomous", "--state", "all", "--limit", "3", "--repo", "owner/repo", "--dry-run"})
 }
 
 func TestRunDaemonCommandMapsIssueFlowFlags(t *testing.T) {
@@ -324,7 +353,7 @@ func TestRunDaemonCommandMapsIssueFlowFlags(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{
-		runnerScript, "--limit", "1", "--state", "open",
+		runnerScript, "--autonomous", "--state", "open", "--limit", "1",
 		"--dry-run",
 		"--base", "current",
 		"--include-empty",

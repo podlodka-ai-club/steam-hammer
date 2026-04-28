@@ -12,38 +12,52 @@
   },
   "workflow": {
     "commands": {
+      "setup": "python -m pip install -r requirements.txt",
       "test": "python -m unittest",
       "lint": null,
-      "build": null
+      "build": null,
+      "e2e": null
+    },
+    "hooks": {
+      "pre_agent": null,
+      "post_agent": null,
+      "pre_pr_update": null,
+      "post_pr_update": null
+    },
+    "readiness": {
+      "required_checks": [],
+      "required_approvals": 1,
+      "require_review": true,
+      "require_mergeable": true,
+      "require_required_file_evidence": true
+    },
+    "merge": {
+      "auto": false,
+      "method": "squash"
     }
   },
   "retry": {
     "max_attempts": 2,
     "escalate_to_preset": "hard"
   },
-  "routing": {
-    "default_preset": "default",
-    "rules": [
-      {
-        "when": {
-          "labels": ["docs", "chore"],
-          "task_types": ["issue"]
-        },
-        "preset": "cheap"
+  "scope": {
+    "defaults": {
+      "labels": {
+        "allow": ["autonomous", "bug"],
+        "deny": ["manual-only"]
       },
-      {
-        "when": {
-          "needs_decomposition": true
-        },
-        "preset": "hard"
+      "assignees": {
+        "deny": ["human-only"]
+      },
+      "priority": {
+        "allow": ["priority:high", "priority:medium"],
+        "order": ["priority:high", "priority:medium", "priority:low"]
+      },
+      "freshness": {
+        "max_age_days": 30,
+        "max_idle_days": 14
       }
-    ]
-  },
-  "budgets": {
-    "max_attempts_per_task": 3,
-    "max_runtime_minutes": 20,
-    "max_cost_usd": 2.5,
-    "max_model_tier": "hard"
+    }
   },
   "presets": {
     "cheap": {

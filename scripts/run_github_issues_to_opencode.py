@@ -1436,7 +1436,7 @@ CI_TRANSIENT_LOG_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 
 def failure_state_for_stage(failure_stage: str) -> str:
-    return "blocked" if failure_stage in {"workflow_setup", "workflow_hooks", "workflow_checks", "residual_untracked_validation", "token_budget"} else "failed"
+    return "blocked" if failure_stage in {"workflow_setup", "workflow_hooks", "workflow_checks", "residual_untracked_validation", "token_budget", "branch_context_validation"} else "failed"
 
 
 def failure_next_action_for_stage(failure_stage: str) -> str:
@@ -1454,6 +1454,8 @@ def failure_next_action_for_stage(failure_stage: str) -> str:
         return "raise_token_budget_or_split_issue"
     if failure_stage == "cost_budget":
         return "raise_cost_budget_or_split_issue"
+    if failure_stage == "branch_context_validation":
+        return "restore_worker_branch_context_and_retry"
     return "inspect_error_and_retry"
 
 
@@ -1543,6 +1545,27 @@ class RecoveryVerificationFailure(RuntimeError):
         self.verification = verification
         detail = _as_optional_string(verification.get("error")) or _as_optional_string(verification.get("summary"))
         super().__init__(detail or f"{scope.capitalize()} recovery verification failed")
+
+
+class BranchContextMismatchError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        operation: str,
+        expected_branch: str,
+        actual_branch: str,
+        expected_repo_root: str,
+        actual_repo_root: str,
+    ):
+        self.operation = operation
+        self.expected_branch = expected_branch
+        self.actual_branch = actual_branch
+        self.expected_repo_root = expected_repo_root
+        self.actual_repo_root = actual_repo_root
+        super().__init__(
+            f"Refusing to {operation}: expected branch '{expected_branch}' in repo '{expected_repo_root}', "
+            f"but current context is branch '{actual_branch}' in repo '{actual_repo_root}'"
+        )
 
 
 def _run_workflow_shell_command(
@@ -5316,6 +5339,41 @@ def current_branch() -> str:
     return run_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"]).strip()
 
 
+def current_repo_root() -> str:
+    return os.path.abspath(run_capture(["git", "rev-parse", "--show-toplevel"]).strip())
+
+
+def assert_expected_git_context(
+    *,
+    expected_branch: str | None,
+    expected_repo_root: str | None,
+    operation: str,
+) -> None:
+    normalized_branch = str(expected_branch or "").strip()
+    normalized_repo_root = os.path.abspath(str(expected_repo_root or "").strip()) if expected_repo_root else ""
+    if not normalized_branch and not normalized_repo_root:
+        return
+
+    actual_branch = current_branch()
+    actual_repo_root = current_repo_root()
+    if normalized_branch and actual_branch != normalized_branch:
+        raise BranchContextMismatchError(
+            operation=operation,
+            expected_branch=normalized_branch,
+            actual_branch=actual_branch,
+            expected_repo_root=normalized_repo_root or actual_repo_root,
+            actual_repo_root=actual_repo_root,
+        )
+    if normalized_repo_root and actual_repo_root != normalized_repo_root:
+        raise BranchContextMismatchError(
+            operation=operation,
+            expected_branch=normalized_branch or actual_branch,
+            actual_branch=actual_branch,
+            expected_repo_root=normalized_repo_root,
+            actual_repo_root=actual_repo_root,
+        )
+
+
 def ensure_clean_worktree() -> None:
     status = run_capture(["git", "status", "--porcelain"]).strip()
     if status:
@@ -6734,6 +6792,8 @@ def run_agent(
     cost_budget_usd: float | None = None,
     run_stats: dict[str, object] | None = None,
     agent_result: dict[str, object] | None = None,
+    expected_branch: str | None = None,
+    expected_repo_root: str | None = None,
 ) -> int:
     prompt = prompt_override if prompt_override is not None else build_prompt(
         issue=issue,
@@ -6755,6 +6815,9 @@ def run_agent(
         cost_budget_usd=cost_budget_usd,
         run_stats=run_stats,
         agent_result=agent_result,
+        cwd=expected_repo_root,
+        expected_branch=expected_branch,
+        expected_repo_root=expected_repo_root,
     )
 
 
@@ -6816,6 +6879,9 @@ def run_agent_with_prompt(
     cost_budget_usd: float | None = None,
     run_stats: dict[str, object] | None = None,
     agent_result: dict[str, object] | None = None,
+    cwd: str | None = None,
+    expected_branch: str | None = None,
+    expected_repo_root: str | None = None,
 ) -> int:
     command = build_agent_command(
         runner=runner,
@@ -6838,6 +6904,11 @@ def run_agent_with_prompt(
         return 0
 
     validate_opencode_model_backend(runner=runner, model=model)
+    assert_expected_git_context(
+        expected_branch=expected_branch,
+        expected_repo_root=expected_repo_root,
+        operation=f"start agent for {item_label}",
+    )
 
     start = time.monotonic()
     print(f"Running agent for {item_label}")
@@ -6854,6 +6925,7 @@ def run_agent_with_prompt(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        cwd=cwd,
     )
 
     line_queue: _queue.Queue[tuple[str, str]] = _queue.Queue()
@@ -7098,12 +7170,18 @@ def print_branch_sync_result(result: dict[str, object], *, dry_run: bool = False
     _branch_recovery.print_branch_sync_result(result, dry_run=dry_run)
 
 
-def push_recovered_branch(branch_name: str, result: dict[str, object], dry_run: bool) -> None:
+def push_recovered_branch(
+    branch_name: str,
+    result: dict[str, object],
+    dry_run: bool,
+    expected_repo_root: str | None = None,
+) -> None:
     _branch_recovery.push_recovered_branch(
         branch_name,
         result,
         dry_run,
         push_branch=push_branch,
+        expected_repo_root=expected_repo_root,
     )
 
 
@@ -7174,6 +7252,7 @@ def run_conflict_recovery_for_branch(
     strategy: str,
     dry_run: bool,
     verify_recovered_branch: Callable[[dict[str, object]], None] | None = None,
+    expected_repo_root: str | None = None,
 ) -> dict[str, object]:
     return _branch_recovery.run_conflict_recovery_for_branch(
         branch_name=branch_name,
@@ -7184,6 +7263,12 @@ def run_conflict_recovery_for_branch(
         print_branch_sync_result=print_branch_sync_result,
         verify_recovered_branch=verify_recovered_branch,
         push_recovered_branch=push_recovered_branch,
+        verify_git_context=lambda: assert_expected_git_context(
+            expected_branch=branch_name,
+            expected_repo_root=expected_repo_root,
+            operation=f"run conflict recovery for branch '{branch_name}'",
+        ),
+        expected_repo_root=expected_repo_root,
     )
 
 
@@ -7191,11 +7276,18 @@ def commit_changes(
     issue: dict,
     dry_run: bool,
     pre_run_untracked_files: set[str] | None = None,
+    expected_branch: str | None = None,
+    expected_repo_root: str | None = None,
 ) -> str:
     message = issue_commit_title(issue)
     if dry_run:
         print(f"[dry-run] Would commit with message: {message}")
         return message
+    assert_expected_git_context(
+        expected_branch=expected_branch,
+        expected_repo_root=expected_repo_root,
+        operation="commit issue changes",
+    )
     stage_worktree_changes(pre_run_untracked_files)
     run_command(["git", "commit", "-m", message])
 
@@ -7209,7 +7301,12 @@ def commit_changes(
     return message
 
 
-def push_branch(branch_name: str, dry_run: bool, force_with_lease: bool = False) -> None:
+def push_branch(
+    branch_name: str,
+    dry_run: bool,
+    force_with_lease: bool = False,
+    expected_repo_root: str | None = None,
+) -> None:
     command = ["git", "push", "-u", "origin", branch_name]
     if force_with_lease:
         command.insert(3, "--force-with-lease")
@@ -7222,6 +7319,11 @@ def push_branch(branch_name: str, dry_run: bool, force_with_lease: bool = False)
         else:
             print(f"[dry-run] Would push branch '{branch_name}' to origin")
         return
+    assert_expected_git_context(
+        expected_branch=branch_name,
+        expected_repo_root=expected_repo_root,
+        operation="push branch",
+    )
     run_command(command)
 
 
@@ -7236,11 +7338,18 @@ def commit_pr_review_changes(
     pull_request: dict,
     dry_run: bool,
     pre_run_untracked_files: set[str] | None = None,
+    expected_branch: str | None = None,
+    expected_repo_root: str | None = None,
 ) -> str:
     message = f"Address review comments for PR #{pull_request['number']}"
     if dry_run:
         print(f"[dry-run] Would commit with message: {message}")
         return message
+    assert_expected_git_context(
+        expected_branch=expected_branch,
+        expected_repo_root=expected_repo_root,
+        operation="commit PR review changes",
+    )
     stage_worktree_changes(pre_run_untracked_files)
     run_command(["git", "commit", "-m", message])
 
@@ -8984,6 +9093,7 @@ def main() -> int:
                 "branch": None,
                 "base_branch": None,
             }
+            pr_repo_root: str | None = None
             pr_attempt = 1
             if type(pr_number_arg) is not int:
                 raise RuntimeError("--pr must be an integer pull request number")
@@ -9039,6 +9149,8 @@ def main() -> int:
 
                 checkout_pr_target_branch(branch_name=target_pr_branch, dry_run=args.dry_run)
                 switched_branch = (not args.dry_run) and original_branch != target_pr_branch
+            if not args.dry_run:
+                pr_repo_root = current_repo_root()
 
             if conflict_recovery_only:
                 target_base_branch = str(pull_request.get("baseRefName") or "").strip()
@@ -9068,6 +9180,7 @@ def main() -> int:
                             repo_dir=os.getcwd(),
                             dry_run=args.dry_run,
                         ),
+                        expected_repo_root=pr_repo_root,
                     )
                 except RuntimeError as exc:
                     print(
@@ -9465,6 +9578,9 @@ def main() -> int:
                     token_budget=token_budget,
                     run_stats=pr_agent_run_stats,
                     agent_result=pr_agent_result,
+                    cwd=pr_repo_root,
+                    expected_branch=active_branch,
+                    expected_repo_root=pr_repo_root,
                 )
                 if exit_code != 0:
                     exit_summary = describe_exit_code(exit_code)
@@ -9560,6 +9676,8 @@ def main() -> int:
                     pull_request=pull_request,
                     dry_run=args.dry_run,
                     pre_run_untracked_files=pre_run_untracked_files,
+                    expected_branch=active_branch,
+                    expected_repo_root=pr_repo_root,
                 )
 
                 failure_stage = "workflow_checks"
@@ -9579,7 +9697,11 @@ def main() -> int:
                 )
 
                 failure_stage = "commit_push"
-                push_branch(branch_name=active_branch, dry_run=args.dry_run)
+                push_branch(
+                    branch_name=active_branch,
+                    dry_run=args.dry_run,
+                    expected_repo_root=pr_repo_root,
+                )
                 if pr_followup_branch_prefix:
                     print(f"Pushed follow-up branch for PR #{pr_number_arg}: {active_branch}")
 
@@ -9685,6 +9807,8 @@ def main() -> int:
                 if type(failed_pr_number) is int:
                     if isinstance(exc, ResidualUntrackedFilesError):
                         failure_stage = "residual_untracked_validation"
+                    elif isinstance(exc, BranchContextMismatchError):
+                        failure_stage = "branch_context_validation"
                     elif isinstance(exc, TokenBudgetExceededError):
                         failure_stage = "token_budget"
                     elif isinstance(exc, CostBudgetExceededError):
@@ -9907,6 +10031,7 @@ def main() -> int:
             decomposition_child_note: str | None = None
             selected_decomposition_child = False
             issue_agent_run_stats: dict[str, object] | None = None
+            issue_repo_root: str | None = None
             state_attempt = 1
             orchestration_attempt = 1
             active_attempt = state_attempt
@@ -10207,6 +10332,8 @@ def main() -> int:
                         dry_run=args.dry_run,
                         fail_on_existing=args.fail_on_existing,
                     )
+                    if not args.dry_run:
+                        issue_repo_root = current_repo_root()
                     print(f"Branch status for {recovery_label}: {branch_status}")
                     if branch_status != "reused":
                         raise RuntimeError(
@@ -10227,6 +10354,7 @@ def main() -> int:
                                 repo_dir=os.getcwd(),
                                 dry_run=args.dry_run,
                             ),
+                            expected_repo_root=issue_repo_root,
                         )
                     except RuntimeError as exc:
                         print(
@@ -11222,6 +11350,8 @@ def main() -> int:
                     dry_run=args.dry_run,
                     fail_on_existing=args.fail_on_existing,
                 )
+                if not args.dry_run:
+                    issue_repo_root = current_repo_root()
                 print(f"Branch status for {issue_label}: {branch_status}")
 
                 reused_branch_sync_result: dict[str, object] | None = None
@@ -11349,6 +11479,8 @@ def main() -> int:
                             cost_budget_usd=active_cost_budget_usd,
                             run_stats=issue_agent_run_stats,
                             agent_result=agent_result,
+                            expected_branch=issue_branch,
+                            expected_repo_root=issue_repo_root,
                         )
                         if exit_code == 0:
                             agent_error = None
@@ -11554,6 +11686,7 @@ def main() -> int:
                             branch_name=issue_branch,
                             dry_run=False,
                             force_with_lease=used_force_with_lease,
+                            expected_repo_root=issue_repo_root,
                         )
                         print(
                             f"Sync-only push result for {issue_label}: "
@@ -11671,6 +11804,8 @@ def main() -> int:
                     issue=issue,
                     dry_run=args.dry_run,
                     pre_run_untracked_files=pre_run_untracked_files,
+                    expected_branch=issue_branch,
+                    expected_repo_root=issue_repo_root,
                 )
 
                 failure_stage = "workflow_checks"
@@ -11702,6 +11837,7 @@ def main() -> int:
                         and bool(reused_branch_sync_result.get("changed"))
                         and str(reused_branch_sync_result.get("applied_strategy") or "") == "rebase"
                     ),
+                    expected_repo_root=issue_repo_root,
                 )
                 pr_status, pr_url = current_codehost_provider().ensure_pr(
                     repo=repo,
@@ -11844,6 +11980,8 @@ def main() -> int:
             failures += 1
             if isinstance(exc, ResidualUntrackedFilesError):
                 failure_stage = "residual_untracked_validation"
+            elif isinstance(exc, BranchContextMismatchError):
+                failure_stage = "branch_context_validation"
             elif isinstance(exc, TokenBudgetExceededError):
                 failure_stage = "token_budget"
             elif isinstance(exc, CostBudgetExceededError):

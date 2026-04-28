@@ -7155,6 +7155,17 @@ def build_attempt_execution_plan(project_config: dict, initial_settings: dict[st
     return plan
 
 
+def _attempt_settings_summary(attempt_settings: dict[str, object]) -> str:
+    runner = str(attempt_settings.get("runner") or BUILTIN_DEFAULTS["runner"])
+    model = attempt_settings.get("model") or "default"
+    preset = _as_optional_string(attempt_settings.get("preset"))
+    attempt = _as_positive_int(attempt_settings.get("attempt")) or 1
+    max_attempts = _as_positive_int(attempt_settings.get("max_attempts")) or 1
+    if preset is None:
+        return f"attempt {attempt}/{max_attempts} (runner={runner}, model={model})"
+    return f"attempt {attempt}/{max_attempts} using preset {preset} (runner={runner}, model={model})"
+
+
 def without_keys(config: dict, *keys: str) -> dict:
     return {key: value for key, value in config.items() if key not in keys}
 
@@ -9846,7 +9857,7 @@ def main() -> int:
                         target_type=state_target_type,
                         target_number=state_target_number,
                         dry_run=args.dry_run,
-                        state=build_orchestration_state(
+                            state=build_orchestration_state(
                                 status="in-progress",
                                 task_type="pr",
                                 issue_number=issue["number"],
@@ -9937,8 +9948,29 @@ def main() -> int:
                 active_max_attempts = int(execution_settings.get("max_attempts") or max_attempts)
                 active_escalate_to_preset = _as_optional_string(execution_settings.get("escalate_to_preset"))
                 attempt_plan = build_attempt_execution_plan(project_config, execution_settings)
+                if not attempt_plan:
+                    attempt_plan = [dict(execution_settings) | {"attempt": state_attempt or 1}]
+                elif state_attempt > 1:
+                    attempt_plan = [
+                        dict(attempt_settings) | {"attempt": state_attempt + index - 1}
+                        for index, attempt_settings in enumerate(attempt_plan, start=1)
+                    ]
                 if attempt_plan:
-                    active_attempt = int(attempt_plan[0].get("attempt") or state_attempt)
+                    first_attempt_settings = attempt_plan[0]
+                    active_attempt = int(first_attempt_settings.get("attempt") or state_attempt)
+                    active_runner = str(first_attempt_settings.get("runner") or active_runner)
+                    active_agent = str(first_attempt_settings.get("agent") or active_agent)
+                    active_model = first_attempt_settings.get("model")
+                    active_preset = _as_optional_string(first_attempt_settings.get("preset"))
+                    active_track_tokens = bool(first_attempt_settings.get("track_tokens", active_track_tokens))
+                    active_token_budget = first_attempt_settings.get("token_budget")
+                    active_cost_budget_usd = first_attempt_settings.get("cost_budget_usd")
+                    active_timeout_seconds = int(
+                        first_attempt_settings.get("agent_timeout_seconds") or active_timeout_seconds
+                    )
+                    active_idle_timeout_seconds = first_attempt_settings.get("agent_idle_timeout_seconds")
+                    active_max_attempts = int(first_attempt_settings.get("max_attempts") or active_max_attempts)
+                    active_escalate_to_preset = _as_optional_string(first_attempt_settings.get("escalate_to_preset"))
 
                 if active_preset is not None:
                     preset_prefix = "[dry-run] " if args.dry_run else ""
@@ -10036,27 +10068,75 @@ def main() -> int:
                         cwd=os.getcwd(),
                         env=issue_hook_env,
                     )
-                    failure_stage = "agent_run"
                     issue_agent_run_stats = {}
                     agent_result: dict[str, object] = {}
-                    exit_code = run_agent(
-                        issue=issue,
-                        runner=active_runner,
-                        agent=active_agent,
-                        model=active_model,
-                        dry_run=args.dry_run,
-                        timeout_seconds=active_timeout_seconds,
-                        idle_timeout_seconds=active_idle_timeout_seconds,
-                        opencode_auto_approve=args.opencode_auto_approve,
-                        image_paths=issue_image_paths,
-                        prompt_override=prompt_override,
-                        track_tokens=active_track_tokens,
-                        token_budget=active_token_budget,
-                        cost_budget_usd=active_cost_budget_usd,
-                        run_stats=issue_agent_run_stats,
-                        agent_result=agent_result,
-                    )
-                    if exit_code != 0:
+                    agent_error: RuntimeError | None = None
+                    for attempt_settings in attempt_plan:
+                        active_attempt = int(attempt_settings.get("attempt") or state_attempt)
+                        state_attempt = active_attempt
+                        active_runner = str(attempt_settings.get("runner") or active_runner)
+                        active_agent = str(attempt_settings.get("agent") or active_agent)
+                        active_model = attempt_settings.get("model")
+                        active_preset = _as_optional_string(attempt_settings.get("preset"))
+                        active_track_tokens = bool(attempt_settings.get("track_tokens", active_track_tokens))
+                        active_token_budget = attempt_settings.get("token_budget")
+                        active_cost_budget_usd = attempt_settings.get("cost_budget_usd")
+                        active_timeout_seconds = int(
+                            attempt_settings.get("agent_timeout_seconds") or active_timeout_seconds
+                        )
+                        active_idle_timeout_seconds = attempt_settings.get("agent_idle_timeout_seconds")
+                        active_max_attempts = int(attempt_settings.get("max_attempts") or active_max_attempts)
+                        active_escalate_to_preset = _as_optional_string(attempt_settings.get("escalate_to_preset"))
+                        issue_agent_run_stats = {}
+                        agent_result = {}
+
+                        if active_attempt > 1:
+                            print(f"Retrying {issue_label}: {_attempt_settings_summary(attempt_settings)}")
+                            safe_post_orchestration_state_comment(
+                                repo=repo,
+                                target_type=state_target_type,
+                                target_number=state_target_number,
+                                dry_run=args.dry_run,
+                                state=build_orchestration_state(
+                                    status="in-progress",
+                                    task_type="issue" if mode == "issue-flow" else "pr",
+                                    issue_number=issue["number"],
+                                    pr_number=state_pr_number,
+                                    branch=issue_branch,
+                                    base_branch=target_base_branch,
+                                    runner=active_runner,
+                                    agent=active_agent,
+                                    model=active_model,
+                                    attempt=active_attempt,
+                                    stage="agent_run",
+                                    next_action="wait_for_agent_result",
+                                    error=None,
+                                    decomposition=decomposition_rollup,
+                                ),
+                            )
+
+                        failure_stage = "agent_run"
+                        exit_code = run_agent(
+                            issue=issue,
+                            runner=active_runner,
+                            agent=active_agent,
+                            model=active_model,
+                            dry_run=args.dry_run,
+                            timeout_seconds=active_timeout_seconds,
+                            idle_timeout_seconds=active_idle_timeout_seconds,
+                            opencode_auto_approve=args.opencode_auto_approve,
+                            image_paths=issue_image_paths,
+                            prompt_override=prompt_override,
+                            track_tokens=active_track_tokens,
+                            token_budget=active_token_budget,
+                            cost_budget_usd=active_cost_budget_usd,
+                            run_stats=issue_agent_run_stats,
+                            agent_result=agent_result,
+                        )
+                        if exit_code == 0:
+                            agent_error = None
+                            break
+
                         exit_summary = describe_exit_code(exit_code)
                         diagnosis = classify_opencode_failure(
                             return_code=exit_code,
@@ -10066,7 +10146,17 @@ def main() -> int:
                             f"Agent failed for {issue_label} with {exit_summary}"
                             + (f" ({diagnosis})" if diagnosis else "")
                         )
-                        raise RuntimeError(message)
+                        agent_error = RuntimeError(message)
+                        if active_attempt >= active_max_attempts:
+                            break
+                        next_attempt = active_attempt + 1
+                        print(
+                            f"{message}; escalating to attempt {next_attempt}/{active_max_attempts}."
+                        )
+
+                    if agent_error is not None:
+                        raise agent_error
+
                     failure_stage = "workflow_hooks"
                     run_workflow_hook(
                         hooks=configured_hooks,
@@ -10311,10 +10401,10 @@ def main() -> int:
                             pr_number=parse_pr_number_from_url(pr_url),
                             branch=issue_branch,
                             base_branch=target_base_branch,
-                            runner=args.runner,
-                            agent=args.agent,
-                            model=args.model,
-                            attempt=orchestration_attempt,
+                            runner=active_runner,
+                            agent=active_agent,
+                            model=active_model,
+                            attempt=active_attempt,
                             stage="pr_ready",
                             next_action="wait_for_review",
                             error=None,
@@ -10336,10 +10426,10 @@ def main() -> int:
                             pr_number=state_pr_number,
                             branch=issue_branch,
                             base_branch=target_base_branch,
-                            runner=args.runner,
-                            agent=args.agent,
-                            model=args.model,
-                            attempt=state_attempt,
+                            runner=active_runner,
+                            agent=active_agent,
+                            model=active_model,
+                            attempt=active_attempt,
                             stage="changes_pushed",
                             next_action="wait_for_ci",
                             error=None,

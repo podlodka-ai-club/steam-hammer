@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import abc
 import base64
 from datetime import datetime, timezone
 import hashlib
@@ -25,6 +26,7 @@ LOCAL_CONFIG_RELATIVE_PATH = "local-config.json"
 PROJECT_CONFIG_RELATIVE_PATH = "project-config.json"
 BUILTIN_DEFAULTS = {
     "tracker": "github",
+    "codehost": "github",
     "state": "open",
     "limit": 10,
     "runner": "claude",
@@ -57,6 +59,11 @@ BUILTIN_DEFAULTS = {
 TRACKER_GITHUB = "github"
 TRACKER_JIRA = "jira"
 TRACKER_CHOICES = {TRACKER_GITHUB, TRACKER_JIRA}
+
+CODEHOST_GITHUB = "github"
+CODEHOST_BITBUCKET = "bitbucket"
+CODEHOST_CUSTOM_PROXY = "custom-proxy"
+CODEHOST_CHOICES = {CODEHOST_GITHUB, CODEHOST_BITBUCKET, CODEHOST_CUSTOM_PROXY}
 
 JIRA_ENV_VARS = {
     "base_url": "JIRA_BASE_URL",
@@ -170,7 +177,7 @@ def is_trackable_issue_number(value: object) -> bool:
     if isinstance(value, int):
         return value > 0
     if isinstance(value, str):
-        return value.strip().isdigit()
+        return bool(value.strip())
     return False
 
 
@@ -208,6 +215,15 @@ def _parse_tracker(tracker: object) -> str:
     return normalized
 
 
+def _parse_codehost(codehost: object) -> str:
+    normalized = str(codehost or "").strip().lower()
+    if normalized not in CODEHOST_CHOICES:
+        raise RuntimeError(
+            f"Unsupported code host '{codehost}'. Expected one of: {', '.join(sorted(CODEHOST_CHOICES))}"
+        )
+    return normalized
+
+
 def issue_tracker(issue: dict) -> str:
     return _parse_tracker(issue.get("tracker") or TRACKER_GITHUB)
 
@@ -229,6 +245,475 @@ def format_issue_ref_from_issue(issue: dict) -> str:
 
 def format_issue_label_from_issue(issue: dict) -> str:
     return format_issue_label(issue.get("number"), tracker=issue_tracker(issue))
+
+
+class TrackerProvider(abc.ABC):
+    @property
+    @abc.abstractmethod
+    def name(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def supports_issue_labels(self) -> bool:
+        return False
+
+    @abc.abstractmethod
+    def get_issue(self, repo: str, issue_id: int | str) -> dict:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def list_issues(self, repo: str, state: str, limit: int) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def list_issue_comments(self, repo: str, issue_id: int | str) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def post_issue_comment(self, repo: str, issue_id: int | str, body: str) -> None:
+        raise NotImplementedError
+
+    def create_child_issue(
+        self,
+        repo: str,
+        parent_issue: dict,
+        child: dict,
+        created_dependencies: dict[int, dict],
+        dry_run: bool,
+        parent_branch: str | None = None,
+        base_branch: str | None = None,
+    ) -> dict:
+        _ = (parent_branch, base_branch)
+        raise RuntimeError(f"Tracker provider '{self.name}' does not support child issue creation yet")
+
+    def add_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
+        _ = (repo, issue_id, label_name, dry_run)
+
+    def remove_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
+        _ = (repo, issue_id, label_name, dry_run)
+
+    def issue_has_label(self, repo: str, issue_id: int | str, label_name: str) -> bool:
+        _ = (repo, issue_id, label_name)
+        return False
+
+
+class CodeHostProvider(abc.ABC):
+    @property
+    @abc.abstractmethod
+    def name(self) -> str:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def detect_repo(self) -> str:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def detect_default_branch(self, repo: str) -> str:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def find_open_pr_for_issue(self, repo: str, issue: dict) -> dict | None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def fetch_pull_request(self, repo: str, number: int) -> dict:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def list_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def fetch_pr_review_threads(self, repo: str, number: int) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def fetch_pr_conversation_comments(self, repo: str, pr_number: int) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def read_pr_ci_status_for_pull_request(self, repo: str, pull_request: dict) -> dict:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def load_pr_linked_issue_context(self, repo: str, pull_request: dict) -> list[dict]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def ensure_pr(
+        self,
+        repo: str,
+        base_branch: str,
+        branch_name: str,
+        issue: dict,
+        dry_run: bool,
+        fail_on_existing: bool,
+        stacked_base_context: str | None = None,
+    ) -> tuple[str, str]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def post_pr_comment(self, repo: str, pr_number: int, body: str) -> None:
+        raise NotImplementedError
+
+
+class GitHubTrackerProvider(TrackerProvider):
+    @property
+    def name(self) -> str:
+        return TRACKER_GITHUB
+
+    @property
+    def supports_issue_labels(self) -> bool:
+        return True
+
+    def get_issue(self, repo: str, issue_id: int | str) -> dict:
+        if type(issue_id) is not int:
+            raise RuntimeError(f"GitHub tracker requires integer issue numbers, got {issue_id!r}")
+        return fetch_issue(repo=repo, number=issue_id)
+
+    def list_issues(self, repo: str, state: str, limit: int) -> list[dict]:
+        return fetch_issues(repo=repo, state=state, limit=limit)
+
+    def list_issue_comments(self, repo: str, issue_id: int | str) -> list[dict]:
+        return fetch_issue_comments(repo=repo, issue_number=issue_id)
+
+    def post_issue_comment(self, repo: str, issue_id: int | str, body: str) -> None:
+        run_command([
+            "gh",
+            "issue",
+            "comment",
+            str(issue_id),
+            "--repo",
+            repo,
+            "--body",
+            body,
+        ])
+
+    def create_child_issue(
+        self,
+        repo: str,
+        parent_issue: dict,
+        child: dict,
+        created_dependencies: dict[int, dict],
+        dry_run: bool,
+        parent_branch: str | None = None,
+        base_branch: str | None = None,
+    ) -> dict:
+        return create_decomposition_child_issue(
+            repo=repo,
+            parent_issue=parent_issue,
+            child=child,
+            created_dependencies=created_dependencies,
+            dry_run=dry_run,
+            parent_branch=parent_branch,
+            base_branch=base_branch,
+        )
+
+    def add_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
+        ensure_agent_failure_label(repo=repo, dry_run=dry_run)
+        if dry_run:
+            print(f"[dry-run] Would add label '{label_name}' to issue {format_issue_ref(issue_id, tracker=self.name)}")
+            return
+        run_command([
+            "gh",
+            "issue",
+            "edit",
+            str(issue_id),
+            "--repo",
+            repo,
+            "--add-label",
+            label_name,
+        ])
+
+    def remove_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
+        if dry_run:
+            print(f"[dry-run] Would remove label '{label_name}' from issue {format_issue_ref(issue_id, tracker=self.name)} if present")
+            return
+        if not self.issue_has_label(repo=repo, issue_id=issue_id, label_name=label_name):
+            return
+        run_command([
+            "gh",
+            "issue",
+            "edit",
+            str(issue_id),
+            "--repo",
+            repo,
+            "--remove-label",
+            label_name,
+        ])
+
+    def issue_has_label(self, repo: str, issue_id: int | str, label_name: str) -> bool:
+        labels_output = run_capture([
+            "gh",
+            "issue",
+            "view",
+            str(issue_id),
+            "--repo",
+            repo,
+            "--json",
+            "labels",
+            "--jq",
+            ".labels[].name",
+        ])
+        labels = [line.strip() for line in labels_output.splitlines() if line.strip()]
+        return label_name in labels
+
+
+def _jira_comment_to_internal_shape(comment_payload: dict, issue_key: str, base_url: str) -> dict:
+    author = comment_payload.get("author") if isinstance(comment_payload.get("author"), dict) else {}
+    comment_id = comment_payload.get("id")
+    comment_url = ""
+    if comment_id is not None:
+        comment_url = f"{base_url}/browse/{issue_key}?focusedCommentId={comment_id}#comment-{comment_id}"
+    return {
+        "id": comment_id,
+        "body": jira_description_to_text(comment_payload.get("body")),
+        "created_at": str(comment_payload.get("created") or ""),
+        "html_url": comment_url,
+        "author": str(author.get("displayName") or author.get("accountId") or "unknown"),
+    }
+
+
+def jira_text_to_adf(body: str) -> dict:
+    paragraphs: list[dict] = []
+    for line in body.splitlines():
+        if line.strip():
+            paragraphs.append(
+                {
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": line}],
+                }
+            )
+        else:
+            paragraphs.append({"type": "paragraph", "content": []})
+    if not paragraphs:
+        paragraphs.append({"type": "paragraph", "content": []})
+    return {"type": "doc", "version": 1, "content": paragraphs}
+
+
+def fetch_jira_issue_comments(issue_key: str) -> list[dict]:
+    credentials = _jira_credentials_from_env()
+    normalized_key = str(normalize_issue_number(issue_key, TRACKER_JIRA))
+    payload = _jira_request_json(
+        method="GET",
+        url=(
+            f"{credentials['base_url']}/rest/api/3/issue/"
+            f"{urllib.parse.quote(normalized_key)}/comment?maxResults=100"
+        ),
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected response fetching Jira comments for {normalized_key}")
+    comments = payload.get("comments")
+    if not isinstance(comments, list):
+        raise RuntimeError(f"Unexpected Jira comments payload for {normalized_key}")
+    return [
+        _jira_comment_to_internal_shape(item, issue_key=normalized_key, base_url=credentials["base_url"])
+        for item in comments
+        if isinstance(item, dict)
+    ]
+
+
+def post_jira_issue_comment(issue_key: str, body: str) -> None:
+    credentials = _jira_credentials_from_env()
+    normalized_key = str(normalize_issue_number(issue_key, TRACKER_JIRA))
+    _jira_request_json(
+        method="POST",
+        url=f"{credentials['base_url']}/rest/api/3/issue/{urllib.parse.quote(normalized_key)}/comment",
+        payload={"body": jira_text_to_adf(body)},
+    )
+
+
+class JiraTrackerProvider(TrackerProvider):
+    @property
+    def name(self) -> str:
+        return TRACKER_JIRA
+
+    def get_issue(self, repo: str, issue_id: int | str) -> dict:
+        _ = repo
+        return fetch_jira_issue(issue_key=str(issue_id))
+
+    def list_issues(self, repo: str, state: str, limit: int) -> list[dict]:
+        _ = repo
+        jira_jql = {
+            "open": "status != Done ORDER BY created DESC",
+            "closed": "status = Done ORDER BY created DESC",
+            "all": "ORDER BY created DESC",
+        }[state]
+        return fetch_jira_issues(jql=jira_jql, limit=limit)
+
+    def list_issue_comments(self, repo: str, issue_id: int | str) -> list[dict]:
+        _ = repo
+        return fetch_jira_issue_comments(issue_key=str(issue_id))
+
+    def post_issue_comment(self, repo: str, issue_id: int | str, body: str) -> None:
+        _ = repo
+        post_jira_issue_comment(issue_key=str(issue_id), body=body)
+
+
+class GitHubCodeHostProvider(CodeHostProvider):
+    @property
+    def name(self) -> str:
+        return CODEHOST_GITHUB
+
+    def detect_repo(self) -> str:
+        return detect_repo()
+
+    def detect_default_branch(self, repo: str) -> str:
+        return detect_default_branch(repo)
+
+    def find_open_pr_for_issue(self, repo: str, issue: dict) -> dict | None:
+        return find_open_pr_for_issue(repo=repo, issue=issue)
+
+    def fetch_pull_request(self, repo: str, number: int) -> dict:
+        return fetch_pull_request(repo=repo, number=number)
+
+    def list_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
+        return fetch_issue_comments(repo=repo, issue_number=pr_number)
+
+    def fetch_pr_review_threads(self, repo: str, number: int) -> list[dict]:
+        return fetch_pr_review_threads(repo=repo, number=number)
+
+    def fetch_pr_conversation_comments(self, repo: str, pr_number: int) -> list[dict]:
+        return fetch_pr_conversation_comments(repo=repo, pr_number=pr_number)
+
+    def read_pr_ci_status_for_pull_request(self, repo: str, pull_request: dict) -> dict:
+        return read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
+
+    def load_pr_linked_issue_context(self, repo: str, pull_request: dict) -> list[dict]:
+        return load_linked_issue_context(repo=repo, pull_request=pull_request)
+
+    def ensure_pr(
+        self,
+        repo: str,
+        base_branch: str,
+        branch_name: str,
+        issue: dict,
+        dry_run: bool,
+        fail_on_existing: bool,
+        stacked_base_context: str | None = None,
+    ) -> tuple[str, str]:
+        return ensure_pr(
+            repo=repo,
+            base_branch=base_branch,
+            branch_name=branch_name,
+            issue=issue,
+            dry_run=dry_run,
+            fail_on_existing=fail_on_existing,
+            stacked_base_context=stacked_base_context,
+        )
+
+    def post_pr_comment(self, repo: str, pr_number: int, body: str) -> None:
+        run_command([
+            "gh",
+            "pr",
+            "comment",
+            str(pr_number),
+            "--repo",
+            repo,
+            "--body",
+            body,
+        ])
+
+
+class UnsupportedCodeHostProvider(CodeHostProvider):
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def _unsupported(self) -> RuntimeError:
+        return RuntimeError(
+            f"Code host provider '{self._name}' is not implemented yet. "
+            "Core orchestration now routes through the provider interface, so add a provider adapter instead of rewriting the flow."
+        )
+
+    def detect_repo(self) -> str:
+        raise self._unsupported()
+
+    def detect_default_branch(self, repo: str) -> str:
+        _ = repo
+        raise self._unsupported()
+
+    def find_open_pr_for_issue(self, repo: str, issue: dict) -> dict | None:
+        _ = (repo, issue)
+        raise self._unsupported()
+
+    def fetch_pull_request(self, repo: str, number: int) -> dict:
+        _ = (repo, number)
+        raise self._unsupported()
+
+    def list_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
+        _ = (repo, pr_number)
+        raise self._unsupported()
+
+    def fetch_pr_review_threads(self, repo: str, number: int) -> list[dict]:
+        _ = (repo, number)
+        raise self._unsupported()
+
+    def fetch_pr_conversation_comments(self, repo: str, pr_number: int) -> list[dict]:
+        _ = (repo, pr_number)
+        raise self._unsupported()
+
+    def read_pr_ci_status_for_pull_request(self, repo: str, pull_request: dict) -> dict:
+        _ = (repo, pull_request)
+        raise self._unsupported()
+
+    def load_pr_linked_issue_context(self, repo: str, pull_request: dict) -> list[dict]:
+        _ = (repo, pull_request)
+        raise self._unsupported()
+
+    def ensure_pr(
+        self,
+        repo: str,
+        base_branch: str,
+        branch_name: str,
+        issue: dict,
+        dry_run: bool,
+        fail_on_existing: bool,
+        stacked_base_context: str | None = None,
+    ) -> tuple[str, str]:
+        _ = (repo, base_branch, branch_name, issue, dry_run, fail_on_existing, stacked_base_context)
+        raise self._unsupported()
+
+    def post_pr_comment(self, repo: str, pr_number: int, body: str) -> None:
+        _ = (repo, pr_number, body)
+        raise self._unsupported()
+
+
+ACTIVE_TRACKER_PROVIDER: TrackerProvider | None = None
+ACTIVE_CODEHOST_PROVIDER: CodeHostProvider | None = None
+
+
+def resolve_tracker_provider(tracker: str) -> TrackerProvider:
+    normalized = _parse_tracker(tracker)
+    if normalized == TRACKER_GITHUB:
+        return GitHubTrackerProvider()
+    if normalized == TRACKER_JIRA:
+        return JiraTrackerProvider()
+    raise RuntimeError(f"Unsupported tracker provider '{tracker}'")
+
+
+def resolve_codehost_provider(codehost: str) -> CodeHostProvider:
+    normalized = _parse_codehost(codehost)
+    if normalized == CODEHOST_GITHUB:
+        return GitHubCodeHostProvider()
+    return UnsupportedCodeHostProvider(normalized)
+
+
+def configure_active_providers(tracker_provider: TrackerProvider, codehost_provider: CodeHostProvider) -> None:
+    global ACTIVE_TRACKER_PROVIDER, ACTIVE_CODEHOST_PROVIDER
+    ACTIVE_TRACKER_PROVIDER = tracker_provider
+    ACTIVE_CODEHOST_PROVIDER = codehost_provider
+
+
+def current_tracker_provider() -> TrackerProvider:
+    return ACTIVE_TRACKER_PROVIDER or GitHubTrackerProvider()
+
+
+def current_codehost_provider() -> CodeHostProvider:
+    return ACTIVE_CODEHOST_PROVIDER or GitHubCodeHostProvider()
 
 
 def issue_commit_title(issue: dict) -> str:
@@ -257,10 +742,11 @@ def _jira_credentials_from_env() -> dict[str, str]:
     return credentials
 
 
-def validate_tracker_requirements(tracker: str, pr_mode_requested: bool) -> None:
+def validate_provider_requirements(tracker: str, codehost: str, pr_mode_requested: bool) -> None:
     normalized_tracker = _parse_tracker(tracker)
-    if pr_mode_requested and normalized_tracker != TRACKER_GITHUB:
-        raise RuntimeError("--pr / --from-review-comments mode only supports --tracker github")
+    normalized_codehost = _parse_codehost(codehost)
+    if pr_mode_requested and normalized_codehost != CODEHOST_GITHUB:
+        raise RuntimeError("--pr / --from-review-comments mode only supports --codehost github")
     if normalized_tracker == TRACKER_JIRA:
         _jira_credentials_from_env()
 
@@ -2906,6 +3392,7 @@ def refresh_decomposition_plan_payload_from_child_states(
     repo: str,
     plan_payload: dict,
 ) -> dict:
+    tracker_provider = current_tracker_provider()
     refreshed_payload = dict(plan_payload)
     refreshed_created_children = _normalize_created_children(plan_payload.get("created_children") or [])
     blockers: list[str] = []
@@ -2915,8 +3402,8 @@ def refresh_decomposition_plan_payload_from_child_states(
         if issue_number is None:
             continue
 
-        child_issue = fetch_issue(repo=repo, number=issue_number)
-        child_comments = fetch_issue_comments(repo=repo, issue_number=issue_number)
+        child_issue = tracker_provider.get_issue(repo=repo, issue_id=issue_number)
+        child_comments = tracker_provider.list_issue_comments(repo=repo, issue_id=issue_number)
         recovered_state, _warnings = select_latest_parseable_orchestration_state(
             comments=child_comments,
             source_label=f"issue #{issue_number}",
@@ -3683,9 +4170,10 @@ def fetch_actionable_pr_review_feedback(
     pr_number: int,
     pull_request: dict | None = None,
 ) -> tuple[dict, list[dict], dict[str, int]]:
-    current_pull_request = pull_request or fetch_pull_request(repo=repo, number=pr_number)
-    threads = fetch_pr_review_threads(repo=repo, number=pr_number)
-    conversation_comments = fetch_pr_conversation_comments(repo=repo, pr_number=pr_number)
+    codehost_provider = current_codehost_provider()
+    current_pull_request = pull_request or codehost_provider.fetch_pull_request(repo=repo, number=pr_number)
+    threads = codehost_provider.fetch_pr_review_threads(repo=repo, number=pr_number)
+    conversation_comments = codehost_provider.fetch_pr_conversation_comments(repo=repo, pr_number=pr_number)
     reviews = current_pull_request.get("reviews")
     if not isinstance(reviews, list):
         reviews = []
@@ -3773,27 +4261,34 @@ def load_linked_issue_context(repo: str, pull_request: dict) -> list[dict]:
     return linked_issues
 
 
-def pr_links_issue(pr: dict, issue_number: int) -> bool:
+def pr_links_issue(pr: dict, issue: dict) -> bool:
     references = pr.get("closingIssuesReferences")
     if isinstance(references, list):
         for reference in references:
-            if isinstance(reference, dict) and reference.get("number") == issue_number:
+            if not isinstance(reference, dict):
+                continue
+            if issue_tracker(issue) == TRACKER_GITHUB and reference.get("number") == issue.get("number"):
                 return True
 
-    token = f"#{issue_number}"
+    issue_ref = format_issue_ref_from_issue(issue)
+    issue_ref_lower = issue_ref.lower()
     title = str(pr.get("title") or "")
     body = str(pr.get("body") or "")
-    if token in title or token in body:
+    if issue_ref_lower in title.lower() or issue_ref_lower in body.lower():
         return True
 
     head_ref = str(pr.get("headRefName") or "")
-    if re.search(rf"(^|[^0-9]){issue_number}([^0-9]|$)", head_ref):
+    if issue_tracker(issue) == TRACKER_GITHUB:
+        issue_number = issue.get("number")
+        if re.search(rf"(^|[^0-9]){issue_number}([^0-9]|$)", head_ref):
+            return True
+    elif issue_ref_lower in head_ref.lower():
         return True
 
     return False
 
 
-def find_open_pr_for_issue(repo: str, issue_number: int) -> dict | None:
+def find_open_pr_for_issue(repo: str, issue: dict) -> dict | None:
     output = run_capture(
         [
             "gh",
@@ -3814,7 +4309,7 @@ def find_open_pr_for_issue(repo: str, issue_number: int) -> dict | None:
         raise RuntimeError("Unexpected response from gh pr list while searching linked PR")
 
     for pr in prs:
-        if isinstance(pr, dict) and pr_links_issue(pr, issue_number=issue_number):
+        if isinstance(pr, dict) and pr_links_issue(pr, issue=issue):
             return pr
     return None
 
@@ -4034,7 +4529,10 @@ def wait_for_pr_ci_status(
     poll_interval_seconds: int = CI_WAIT_POLL_INTERVAL_SECONDS,
     max_polls: int = CI_WAIT_MAX_POLLS,
 ) -> dict:
-    latest = read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
+    latest = current_codehost_provider().read_pr_ci_status_for_pull_request(
+        repo=repo,
+        pull_request=pull_request,
+    )
     polls = 1
     while str(latest.get("overall") or "") == "pending" and polls < max_polls:
         pending_checks = latest.get("pending_checks")
@@ -4045,7 +4543,10 @@ def wait_for_pr_ci_status(
             f"({pending_count} pending); waiting {poll_interval_seconds}s before retry {polls + 1}/{max_polls}."
         )
         time.sleep(poll_interval_seconds)
-        latest = read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
+        latest = current_codehost_provider().read_pr_ci_status_for_pull_request(
+            repo=repo,
+            pull_request=pull_request,
+        )
         polls += 1
     latest = dict(latest)
     latest["poll_count"] = polls
@@ -4534,67 +5035,42 @@ def ensure_agent_failure_label(repo: str, dry_run: bool) -> None:
 
 
 def add_agent_failure_label_to_issue(repo: str, issue_number: int, dry_run: bool) -> None:
-    ensure_agent_failure_label(repo=repo, dry_run=dry_run)
-    if dry_run:
-        print(
-            f"[dry-run] Would add label '{AGENT_FAILURE_LABEL_NAME}' to issue #{issue_number}"
-        )
+    tracker_provider = current_tracker_provider()
+    if not tracker_provider.supports_issue_labels:
         return
-    run_command(
-        [
-            "gh",
-            "issue",
-            "edit",
-            str(issue_number),
-            "--repo",
-            repo,
-            "--add-label",
-            AGENT_FAILURE_LABEL_NAME,
-        ]
+    tracker_provider.add_issue_label(
+        repo=repo,
+        issue_id=issue_number,
+        label_name=AGENT_FAILURE_LABEL_NAME,
+        dry_run=dry_run,
     )
 
 
 def issue_has_label(repo: str, issue_number: int, label_name: str) -> bool:
-    labels_output = run_capture(
-        [
-            "gh",
-            "issue",
-            "view",
-            str(issue_number),
-            "--repo",
-            repo,
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ]
+    return current_tracker_provider().issue_has_label(
+        repo=repo,
+        issue_id=issue_number,
+        label_name=label_name,
     )
-    labels = [line.strip() for line in labels_output.splitlines() if line.strip()]
-    return label_name in labels
 
 
 def remove_agent_failure_label_from_issue(repo: str, issue_number: int, dry_run: bool) -> None:
-    if dry_run:
-        print(
-            f"[dry-run] Would remove label '{AGENT_FAILURE_LABEL_NAME}' from issue #{issue_number} if present"
-        )
-        return
-
     try:
-        if not issue_has_label(repo=repo, issue_number=issue_number, label_name=AGENT_FAILURE_LABEL_NAME):
+        tracker_provider = current_tracker_provider()
+        if not tracker_provider.supports_issue_labels:
+            return
+        if not tracker_provider.issue_has_label(
+            repo=repo,
+            issue_id=issue_number,
+            label_name=AGENT_FAILURE_LABEL_NAME,
+        ):
             return
 
-        run_command(
-            [
-                "gh",
-                "issue",
-                "edit",
-                str(issue_number),
-                "--repo",
-                repo,
-                "--remove-label",
-                AGENT_FAILURE_LABEL_NAME,
-            ]
+        tracker_provider.remove_issue_label(
+            repo=repo,
+            issue_id=issue_number,
+            label_name=AGENT_FAILURE_LABEL_NAME,
+            dry_run=dry_run,
         )
     except Exception as exc:  # noqa: BLE001
         print(
@@ -4605,7 +5081,7 @@ def remove_agent_failure_label_from_issue(repo: str, issue_number: int, dry_run:
 
 def safe_report_issue_automation_failure(
     repo: str,
-    issue_number: int,
+    issue_number: int | str,
     run_id: str,
     stage: str,
     error: str,
@@ -4638,21 +5114,14 @@ def safe_report_issue_automation_failure(
         )
         if dry_run:
             print(
-                f"[dry-run] Would post agent failure report comment to issue #{issue_number}: "
+                f"[dry-run] Would post agent failure report comment to issue {format_issue_ref(issue_number, tracker=current_tracker_provider().name)}: "
                 f"stage={stage} run_id={run_id}"
             )
         else:
-            run_command(
-                [
-                    "gh",
-                    "issue",
-                    "comment",
-                    str(issue_number),
-                    "--repo",
-                    repo,
-                    "--body",
-                    body,
-                ]
+            current_tracker_provider().post_issue_comment(
+                repo=repo,
+                issue_id=issue_number,
+                body=body,
             )
         add_agent_failure_label_to_issue(
             repo=repo,
@@ -4667,7 +5136,7 @@ def safe_report_issue_automation_failure(
         )
 
 
-def build_issue_scope_skip_comment(issue_number: int, reason: str, forced: bool) -> str:
+def build_issue_scope_skip_comment(issue_number: int | str, reason: str, forced: bool) -> str:
     payload = {
         "status": "forced-in-scope" if forced else "out-of-scope",
         "issue": issue_number,
@@ -5039,7 +5508,7 @@ def format_decomposition_plan_comment(payload: dict) -> str:
 
 def post_decomposition_plan_comment(
     repo: str,
-    issue_number: int,
+    issue_number: int | str,
     payload: dict,
     dry_run: bool,
 ) -> None:
@@ -5050,23 +5519,16 @@ def post_decomposition_plan_comment(
         )
         return
 
-    run_command(
-        [
-            "gh",
-            "issue",
-            "comment",
-            str(issue_number),
-            "--repo",
-            repo,
-            "--body",
-            format_decomposition_plan_comment(payload),
-        ]
+    current_tracker_provider().post_issue_comment(
+        repo=repo,
+        issue_id=issue_number,
+        body=format_decomposition_plan_comment(payload),
     )
 
 
 def safe_post_issue_scope_skip_comment(
     repo: str,
-    issue_number: int,
+    issue_number: int | str,
     reason: str,
     forced: bool,
     dry_run: bool,
@@ -5079,22 +5541,15 @@ def safe_post_issue_scope_skip_comment(
         )
         if dry_run:
             print(
-                f"[dry-run] Would post scope decision comment to issue #{issue_number}: "
+                f"[dry-run] Would post scope decision comment to issue {format_issue_ref(issue_number, tracker=current_tracker_provider().name)}: "
                 f"decision={'forced-in-scope' if forced else 'out-of-scope'}"
             )
             return
 
-        run_command(
-            [
-                "gh",
-                "issue",
-                "comment",
-                str(issue_number),
-                "--repo",
-                repo,
-                "--body",
-                body,
-            ]
+        current_tracker_provider().post_issue_comment(
+            repo=repo,
+            issue_id=issue_number,
+            body=body,
         )
     except Exception as exc:  # noqa: BLE001
         print(
@@ -5268,7 +5723,7 @@ def safe_post_clarification_request_comment(
 def post_orchestration_state_comment(
     repo: str,
     target_type: str,
-    target_number: int,
+    target_number: int | str,
     state: dict,
     dry_run: bool,
 ) -> None:
@@ -5283,24 +5738,25 @@ def post_orchestration_state_comment(
         )
         return
 
-    run_command(
-        [
-            "gh",
-            target_type,
-            "comment",
-            str(target_number),
-            "--repo",
-            repo,
-            "--body",
-            body,
-        ]
+    if target_type == "issue":
+        current_tracker_provider().post_issue_comment(
+            repo=repo,
+            issue_id=target_number,
+            body=body,
+        )
+        return
+
+    current_codehost_provider().post_pr_comment(
+        repo=repo,
+        pr_number=int(target_number),
+        body=body,
     )
 
 
 def safe_post_orchestration_state_comment(
     repo: str,
     target_type: str,
-    target_number: int,
+    target_number: int | str,
     state: dict,
     dry_run: bool,
 ) -> None:
@@ -5322,39 +5778,34 @@ def safe_post_orchestration_state_comment(
 def format_orchestration_claim_comment(claim: dict) -> str:
     status = str(claim.get("status") or "unknown")
     issue_number = claim.get("issue")
+    tracker_name = current_tracker_provider().name
     return (
-        f"Orchestration claim update: {status} for issue #{issue_number}.\n\n"
+        f"Orchestration claim update: {status} for issue {format_issue_ref(issue_number, tracker=tracker_name)}.\n\n"
         f"{ORCHESTRATION_CLAIM_MARKER}\n"
         f"```json\n{json.dumps(claim, ensure_ascii=True, indent=2)}\n```"
     )
 
 
-def post_orchestration_claim_comment(repo: str, issue_number: int, claim: dict, dry_run: bool) -> None:
+def post_orchestration_claim_comment(repo: str, issue_number: int | str, claim: dict, dry_run: bool) -> None:
     body = format_orchestration_claim_comment(claim)
+    issue_ref = format_issue_ref(issue_number, tracker=current_tracker_provider().name)
     if dry_run:
         print(
-            f"[dry-run] Would post orchestration claim to issue #{issue_number}: "
+            f"[dry-run] Would post orchestration claim to issue {issue_ref}: "
             f"status={claim.get('status')}"
         )
         return
 
-    run_command(
-        [
-            "gh",
-            "issue",
-            "comment",
-            str(issue_number),
-            "--repo",
-            repo,
-            "--body",
-            body,
-        ]
+    current_tracker_provider().post_issue_comment(
+        repo=repo,
+        issue_id=issue_number,
+        body=body,
     )
 
 
 def safe_post_orchestration_claim_comment(
     repo: str,
-    issue_number: int,
+    issue_number: int | str,
     claim: dict,
     dry_run: bool,
 ) -> None:
@@ -5367,7 +5818,7 @@ def safe_post_orchestration_claim_comment(
         )
     except Exception as exc:  # noqa: BLE001
         print(
-            f"Warning: failed to post orchestration claim to issue #{issue_number}: {exc}",
+            f"Warning: failed to post orchestration claim to issue {format_issue_ref(issue_number, tracker=current_tracker_provider().name)}: {exc}",
             file=sys.stderr,
         )
 
@@ -6584,6 +7035,8 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
 
 def _validate_project_defaults(config: dict, config_path: str) -> None:
     supported_defaults_keys = {
+        "tracker",
+        "codehost",
         "runner",
         "agent",
         "model",
@@ -6600,6 +7053,12 @@ def _validate_project_defaults(config: dict, config_path: str) -> None:
             f"Unsupported key(s) in project config {config_path} under 'defaults': "
             + ", ".join(unsupported_defaults)
         )
+
+    if "tracker" in config:
+        _parse_tracker(config["tracker"])
+
+    if "codehost" in config:
+        _parse_codehost(config["codehost"])
 
     if "runner" in config and config["runner"] not in {"claude", "opencode"}:
         raise RuntimeError("Project config key 'defaults.runner' must be one of: claude, opencode")
@@ -6938,6 +7397,8 @@ def project_cli_defaults(project_config: dict) -> dict:
     cli_defaults: dict = {}
     if isinstance(defaults, dict):
         for key in [
+            "tracker",
+            "codehost",
             "runner",
             "agent",
             "model",
@@ -6962,6 +7423,7 @@ def project_cli_defaults(project_config: dict) -> dict:
 def validate_local_config(config: dict, config_path: str) -> dict:
     supported_keys = {
         "tracker",
+        "codehost",
         "state",
         "limit",
         "runner",
@@ -7000,6 +7462,9 @@ def validate_local_config(config: dict, config_path: str) -> dict:
 
     if "tracker" in config:
         validated["tracker"] = _parse_tracker(config["tracker"])
+
+    if "codehost" in config:
+        validated["codehost"] = _parse_codehost(config["codehost"])
 
     if "state" in config:
         if config["state"] not in {"open", "closed", "all"}:
@@ -7516,16 +7981,22 @@ def run_doctor(args: argparse.Namespace, raw_argv: list[str] | None = None) -> i
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fetch GitHub issues with gh and run an AI agent for each issue body."
+        description="Fetch tracker items, coordinate code-host operations, and run an AI agent for each task body."
     )
     parser.add_argument(
-        "--repo", help="GitHub repo in owner/name format. Defaults to current gh repo."
+        "--repo", help="Repository slug for the active code host. Defaults to the current authenticated repo context."
     )
     parser.add_argument(
         "--tracker",
         default=BUILTIN_DEFAULTS["tracker"],
         choices=sorted(TRACKER_CHOICES),
         help="Issue tracker to fetch from (default: github).",
+    )
+    parser.add_argument(
+        "--codehost",
+        default=BUILTIN_DEFAULTS["codehost"],
+        choices=sorted(CODEHOST_CHOICES),
+        help="Code host provider for PR/MR operations (default: github).",
     )
     parser.add_argument(
         "--issue",
@@ -7867,7 +8338,6 @@ def main() -> int:
     pr_number_arg = getattr(args, "pr", None)
     from_review_comments = bool(getattr(args, "from_review_comments", False))
     force_issue_flow = bool(getattr(args, "force_issue_flow", False))
-    has_force_issue_flow_flag = hasattr(args, "force_issue_flow")
     skip_if_pr_exists = bool(getattr(args, "skip_if_pr_exists", False))
     skip_if_branch_exists = bool(getattr(args, "skip_if_branch_exists", False))
     force_reprocess = bool(getattr(args, "force_reprocess", False))
@@ -7976,7 +8446,15 @@ def main() -> int:
                 raise RuntimeError("--from-review-comments requires --pr <number>.")
             if pr_number_arg is not None and not from_review_comments:
                 raise RuntimeError("--pr requires --from-review-comments.")
-            validate_tracker_requirements(tracker=tracker, pr_mode_requested=pr_mode_requested)
+            codehost = _parse_codehost(getattr(args, "codehost", BUILTIN_DEFAULTS["codehost"]))
+            validate_provider_requirements(
+                tracker=tracker,
+                codehost=codehost,
+                pr_mode_requested=pr_mode_requested,
+            )
+            tracker_provider = resolve_tracker_provider(tracker)
+            codehost_provider = resolve_codehost_provider(codehost)
+            configure_active_providers(tracker_provider, codehost_provider)
             if issue_number_arg is not None:
                 issue_number_arg = normalize_issue_number(issue_number_arg, tracker=tracker)
 
@@ -7985,7 +8463,7 @@ def main() -> int:
                     print(f"Warning: {warning}", file=sys.stderr)
 
             ensure_clean_worktree()
-            repo = args.repo or detect_repo()
+            repo = args.repo or codehost_provider.detect_repo()
             if setup_command is not None:
                 failure_stage = "workflow_setup"
                 _run_workflow_shell_command(
@@ -8003,7 +8481,7 @@ def main() -> int:
                 if base_branch_mode == "current":
                     base_branch = current_branch()
                 else:
-                    base_branch = detect_default_branch(repo)
+                    base_branch = codehost_provider.detect_default_branch(repo)
                 mode_label = "[dry-run]" if args.dry_run else ""
                 if base_branch_mode == "current":
                     if mode_label:
@@ -8021,20 +8499,9 @@ def main() -> int:
                         print("Base mode: default (stack on current branch: no)")
 
                 if issue_number_arg is not None:
-                    if tracker == TRACKER_JIRA:
-                        issues = [fetch_jira_issue(issue_key=str(issue_number_arg))]
-                    else:
-                        issues = [fetch_issue(repo=repo, number=issue_number_arg)]
+                    issues = [tracker_provider.get_issue(repo=repo, issue_id=issue_number_arg)]
                 else:
-                    if tracker == TRACKER_JIRA:
-                        jira_jql = {
-                            "open": "status != Done ORDER BY created DESC",
-                            "closed": "status = Done ORDER BY created DESC",
-                            "all": "ORDER BY created DESC",
-                        }[args.state]
-                        issues = fetch_jira_issues(jql=jira_jql, limit=args.limit)
-                    else:
-                        issues = fetch_issues(repo=repo, state=args.state, limit=args.limit)
+                    issues = tracker_provider.list_issues(repo=repo, state=args.state, limit=args.limit)
         except Exception:
             raise
     except Exception as exc:  # noqa: BLE001
@@ -8062,7 +8529,7 @@ def main() -> int:
                 raise RuntimeError("--pr must be an integer pull request number")
 
             failure_stage = "fetch_pr"
-            pull_request = fetch_pull_request(repo=repo, number=pr_number_arg)
+            pull_request = current_codehost_provider().fetch_pull_request(repo=repo, number=pr_number_arg)
             pr_state_context["pr"] = pr_number_arg
             pr_state = str(pull_request.get("state") or "").strip().upper()
             if pr_state != "OPEN":
@@ -8116,7 +8583,10 @@ def main() -> int:
             recovered_pr_state: dict | None = None
             pr_clarification_answer: dict | None = None
             try:
-                pr_comments = fetch_issue_comments(repo=repo, issue_number=pr_number_arg)
+                pr_comments = current_codehost_provider().list_pr_comments(
+                    repo=repo,
+                    pr_number=pr_number_arg,
+                )
                 recovered_pr_state, pr_state_warnings = select_latest_parseable_orchestration_state(
                     comments=pr_comments,
                     source_label=f"pr #{pr_number_arg}",
@@ -8190,7 +8660,10 @@ def main() -> int:
             while True:
                 pr_attempt = attempt
                 ci_prompt_override: str | None = None
-                linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                linked_issues = current_codehost_provider().load_pr_linked_issue_context(
+                    repo=repo,
+                    pull_request=pull_request,
+                )
                 recovered_pr_status = ""
                 if isinstance(recovered_pr_state, dict):
                     recovered_pr_status = str(recovered_pr_state.get("status") or "")
@@ -8803,7 +9276,7 @@ def main() -> int:
             mode_reason = "batch issue processing"
             force_override_applied = False
             skip_agent_run = False
-            supports_github_issue_ops = False
+            supports_issue_tracker_ops = True
             issue_label = format_issue_label_from_issue(issue)
             issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
             state_target_type = "issue"
@@ -8835,7 +9308,7 @@ def main() -> int:
                         f"Continuing {issue_label} despite out-of-scope decision "
                         "because --force-reprocess is set."
                     )
-                    if supports_github_issue_ops:
+                    if supports_issue_tracker_ops:
                         safe_post_issue_scope_skip_comment(
                             repo=repo,
                             issue_number=issue["number"],
@@ -8845,7 +9318,7 @@ def main() -> int:
                         )
                 else:
                     skipped_out_of_scope += 1
-                    if supports_github_issue_ops:
+                    if supports_issue_tracker_ops:
                         safe_post_orchestration_state_comment(
                             repo=repo,
                             target_type="issue",
@@ -8880,8 +9353,8 @@ def main() -> int:
                     )
                     continue
 
-            if skip_if_pr_exists and supports_github_issue_ops and not autonomous_mode:
-                linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
+            if skip_if_pr_exists and not autonomous_mode:
+                linked_open_pr = current_codehost_provider().find_open_pr_for_issue(repo=repo, issue=issue)
                 if linked_open_pr is not None:
                     if issue_number_arg is not None:
                         linked_pr_number = linked_open_pr.get("number")
@@ -8928,14 +9401,14 @@ def main() -> int:
                     )
                     continue
 
-            if (issue_number_arg is not None or autonomous_mode) and has_force_issue_flow_flag and supports_github_issue_ops:
+            if issue_number_arg is not None or autonomous_mode:
                 if linked_open_pr is None:
-                    linked_open_pr = find_open_pr_for_issue(repo=repo, issue_number=issue["number"])
+                    linked_open_pr = current_codehost_provider().find_open_pr_for_issue(repo=repo, issue=issue)
 
                 recovered_issue_state: dict | None = None
                 issue_comments: list[dict] = []
                 try:
-                    issue_comments = fetch_issue_comments(repo=repo, issue_number=issue["number"])
+                    issue_comments = current_tracker_provider().list_issue_comments(repo=repo, issue_id=issue["number"])
                     (
                         recovered_issue_state,
                         issue_state_warnings,
@@ -8957,9 +9430,9 @@ def main() -> int:
                     linked_pr_number = linked_open_pr.get("number")
                     if type(linked_pr_number) is int:
                         try:
-                            linked_pr_comments = fetch_issue_comments(
+                            linked_pr_comments = current_codehost_provider().list_pr_comments(
                                 repo=repo,
-                                issue_number=linked_pr_number,
+                                pr_number=linked_pr_number,
                             )
                             (
                                 recovered_pr_state,
@@ -9090,7 +9563,7 @@ def main() -> int:
                 latest_payload_dict = {}
                 latest_plan_is_execution_ready = False
                 if should_plan or should_check_existing_decomposition_plan(issue, assessment):
-                    issue_comments = fetch_issue_comments(repo=repo, issue_number=issue["number"])
+                    issue_comments = current_tracker_provider().list_issue_comments(repo=repo, issue_id=issue["number"])
                     latest_plan, plan_warnings = select_latest_parseable_decomposition_plan(
                         comments=issue_comments,
                         source_label=f"issue #{issue['number']}",
@@ -9112,7 +9585,7 @@ def main() -> int:
                                 created_children = _extract_ordered_linked_children(latest_payload_dict)
                                 created_children_updates: list[dict] = []
                                 for child in missing_children:
-                                    created_child = create_decomposition_child_issue(
+                                    created_child = current_tracker_provider().create_child_issue(
                                         repo=repo,
                                         parent_issue=issue,
                                         child=child,
@@ -9348,7 +9821,10 @@ def main() -> int:
                                     decomposition=decomposition_rollup,
                                 ),
                             )
-                            issue = fetch_issue(repo=repo, number=selected_child_issue_number)
+                            issue = current_tracker_provider().get_issue(
+                                repo=repo,
+                                issue_id=selected_child_issue_number,
+                            )
                             issue_image_urls = collect_issue_image_urls(issue)
                             issue_branch = branch_name_for_issue(
                                 issue=issue,
@@ -9486,7 +9962,7 @@ def main() -> int:
                     print(
                         f"Auto-switch to PR-review mode for {issue_label}: {mode_reason}."
                     )
-                    pull_request = fetch_pull_request(repo=repo, number=pr_number)
+                    pull_request = current_codehost_provider().fetch_pull_request(repo=repo, number=pr_number)
                     merge_state = str(pull_request.get("mergeStateStatus") or "").strip().upper()
                     should_force_sync_rerun = merge_state in {"DIRTY", "CONFLICTING"}
                     if should_force_sync_rerun:
@@ -9791,7 +10267,10 @@ def main() -> int:
                         )
 
                     if review_items:
-                        linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                        linked_issues = current_codehost_provider().load_pr_linked_issue_context(
+                            repo=repo,
+                            pull_request=pull_request,
+                        )
                         prompt_override = build_pr_review_prompt(
                             pull_request=pull_request,
                             review_items=review_items,
@@ -9845,7 +10324,7 @@ def main() -> int:
                 )
 
                 if mode == "issue-flow":
-                    if supports_github_issue_ops:
+                    if supports_issue_tracker_ops:
                         safe_post_orchestration_state_comment(
                             repo=repo,
                             target_type=state_target_type,
@@ -10086,7 +10565,7 @@ def main() -> int:
                                     decomposition=decomposition_rollup,
                                 ),
                             )
-                        elif mode == "issue-flow" and supports_github_issue_ops:
+                        elif mode == "issue-flow" and supports_issue_tracker_ops:
                             safe_post_orchestration_state_comment(
                                 repo=repo,
                                 target_type="issue",
@@ -10134,7 +10613,7 @@ def main() -> int:
                                 plan_payload=decomposition_parent_payload,
                                 dry_run=args.dry_run,
                             )
-                        if supports_github_issue_ops:
+                        if supports_issue_tracker_ops:
                             remove_agent_failure_label_from_issue(
                                 repo=repo,
                                 issue_number=issue["number"],
@@ -10178,7 +10657,7 @@ def main() -> int:
                         and reused_branch_sync_changed
                     ),
                 )
-                pr_status, pr_url = ensure_pr(
+                pr_status, pr_url = current_codehost_provider().ensure_pr(
                     repo=repo,
                     base_branch=target_base_branch,
                     branch_name=issue_branch,
@@ -10292,7 +10771,7 @@ def main() -> int:
 
                 if not args.dry_run:
                     run_command(["git", "checkout", base_branch])
-                if supports_github_issue_ops:
+                if supports_issue_tracker_ops:
                     remove_agent_failure_label_from_issue(
                         repo=repo,
                         issue_number=issue["number"],
@@ -10311,7 +10790,7 @@ def main() -> int:
             residual_untracked_files = (
                 exc.files if isinstance(exc, ResidualUntrackedFilesError) else None
             )
-            if supports_github_issue_ops or mode == "pr-review":
+            if supports_issue_tracker_ops or mode == "pr-review":
                 safe_post_orchestration_state_comment(
                     repo=repo,
                     target_type=state_target_type,
@@ -10360,7 +10839,7 @@ def main() -> int:
                         f"#{decomposition_parent_issue['number']}: {parent_exc}",
                         file=sys.stderr,
                     )
-            if supports_github_issue_ops:
+            if supports_issue_tracker_ops:
                 safe_report_issue_automation_failure(
                     repo=repo,
                     issue_number=issue["number"],

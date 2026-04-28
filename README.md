@@ -1,9 +1,9 @@
-# GitHub Issue/PR -> AI Agent Runner
+# Multi-Provider Issue/PR -> AI Agent Runner
 
 Script can run in two modes:
 
-- Issue mode: fetches GitHub issues via `gh`, runs an AI agent on each issue body, and automates git workflow for a fix branch.
-- PR review mode: fetches unresolved PR review feedback, builds a focused prompt for the agent, and prepares a follow-up commit.
+- Issue mode: fetches tracker issues, runs an AI agent on each issue body, and automates git workflow for a fix branch.
+- PR review mode: fetches unresolved code-host review feedback, builds a focused prompt for the agent, and prepares a follow-up commit.
 
 Memo link: https://www.notion.so/Hacker-Sprint-1-33f2db4c860e8064a657e199b4578f66
 
@@ -69,6 +69,7 @@ export JIRA_API_TOKEN=your_token
 
 python scripts/run_github_issues_to_opencode.py \
   --tracker jira \
+  --codehost github \
   --issue PROJ-42 \
   --repo owner/repo
 ```

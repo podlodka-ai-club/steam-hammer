@@ -100,18 +100,35 @@ Exit codes:
 
 ## Go orchestrator CLI
 
-Phase 1 includes a Go CLI wrapper around the existing Python runner. Build or run it with Go:
+Phase 1 includes a Go CLI wrapper around the existing Python runner. Install the binary once, or run it directly with Go:
+
+```bash
+go install ./cmd/orchestrator
+orchestrator --help
+```
 
 ```bash
 go run ./cmd/orchestrator --help
 ```
 
+Bootstrap config files for a repository before the first run:
+
+```bash
+orchestrator init
+orchestrator init --dir path/to/repo
+```
+
+`init` writes `project-config.json` and `local-config.json` scaffolds and refuses to overwrite existing files unless `--force` is passed.
+
 Available commands:
 
 ```bash
+go run ./cmd/orchestrator init
 go run ./cmd/orchestrator doctor --repo owner/repo
 go run ./cmd/orchestrator run issue --id 71 --repo owner/repo --dry-run
+go run ./cmd/orchestrator run daemon --repo owner/repo --dry-run --max-cycles 1 --poll-interval-seconds 1
 go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --dry-run
+go run ./cmd/orchestrator run daemon --repo owner/repo --dry-run
 ```
 
 Common Python-runner examples map to the Go wrapper as follows:
@@ -124,17 +141,22 @@ go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode 
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --model openai/gpt-5.3-codex --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
 go run ./cmd/orchestrator run issue --id 31 --repo owner/repo --force-issue-flow
 go run ./cmd/orchestrator run issue --id 45 --repo owner/repo --base current --runner opencode --agent build
+go run ./cmd/orchestrator run daemon --repo owner/repo --limit 5 --poll-interval-seconds 120
 go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --allow-pr-branch-switch
 go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --runner opencode --agent review --model openai/gpt-4o --opencode-auto-approve --agent-timeout-seconds 900 --dry-run
+go run ./cmd/orchestrator run daemon --repo owner/repo --limit 1 --poll-interval-seconds 120
 ```
 
-The Go handlers only translate CLI intent into the current Python runner arguments. Use `--help` on any command to inspect flags without invoking the runner, and use `--dry-run` for issue/PR runs to avoid starting agents.
+The Go handlers translate CLI intent into the current Python runner arguments, except `init`, which creates config scaffolds directly in Go. Use `--help` on any command to inspect flags without invoking the runner, and use `--dry-run` for issue/PR/daemon runs to avoid starting agents.
 
 Compatibility boundary for Phase 1:
 
 - `run issue` supports single-issue execution through the Python runner. `--issue N` is accepted as a compatibility alias for `--id N`.
+- `run daemon` polls tracker issues through the Python runner in autonomous batch mode, reuses orchestration state, and keeps concurrency at one worktree task at a time.
 - `run pr` supports PR review-comments execution. `--pr N` is accepted as a compatibility alias for `--id N`, and `--from-review-comments` is accepted as a no-op because the command always selects that mode.
+- `run daemon` repeatedly invokes the existing Python batch issue flow with `--limit` / `--state` polling semantics; use `--dry-run` to execute a single poll without looping.
 - `doctor` accepts `--doctor` as a no-op because the command already selects diagnostics mode.
+- `init` creates local scaffolds for `project-config.json` and `local-config.json` so users can start with the Go CLI instead of copying files manually.
 - Precedence remains delegated to the Python runner: CLI flags forwarded by Go override local config, local config overrides project config, and project config overrides built-in defaults.
 
 ## Project config scaffold (repository-level)
@@ -143,7 +165,7 @@ You can define repository defaults and placeholders for future orchestration pol
 
 1. Copy the scaffold and adapt it for your project:
    ```bash
-   cp project-config.example.json project-config.json
+   orchestrator init --skip-local-config
    ```
 2. Keep using CLI flags and local config as usual. Precedence is:
    - CLI flags
@@ -153,10 +175,16 @@ You can define repository defaults and placeholders for future orchestration pol
 
 Project config currently supports these sections:
 
-- `workflow.commands.test|lint|build` (non-empty string shell command or `null`)
+- `workflow.commands.setup|test|lint|build|e2e` (non-empty string shell command or `null`)
+- `workflow.hooks.pre_agent|post_agent|pre_pr_update|post_pr_update` (non-empty string shell command or `null`)
+- `workflow.readiness.required_checks|required_approvals|require_review|require_mergeable|require_required_file_evidence`
+- `workflow.merge.auto|method` (`method` is `merge`, `squash`, or `rebase`)
 - `defaults.tracker|preset|runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts` (used as parser defaults)
 - `scope.defaults.labels.allow|deny` (arrays of label names)
 - `scope.defaults.authors.allow|deny` (arrays of GitHub logins; optional placeholder)
+- `scope.defaults.assignees.allow|deny` (arrays of GitHub logins)
+- `scope.defaults.priority.allow|deny|order` (priority labels used for filtering and autonomous ordering)
+- `scope.defaults.freshness.max_age_days|max_idle_days` (positive integers for autonomous freshness guards)
 - `retry.max_attempts|escalate_to_preset` (positive integer plus escalation placeholder)
 - `communication.verbosity` (`low`, `normal`, `high`)
 - `presets.<name>.runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts|escalate_to_preset`
@@ -182,11 +210,14 @@ Scope rules are evaluated before any issue-mode agent execution:
 
 Workflow checks are evaluated after agent changes are committed and before final PR-ready states are posted:
 
-- commands run in this order when configured: `test`, `lint`, `build`;
+- `setup` runs once before orchestration starts for the selected repository;
+- checks run in this order when configured: `test`, `lint`, `build`, `e2e`;
+- hooks can run before/after agent execution and before/after PR updates;
 - each command is executed via `bash -lc "<command>"` from repository `--dir`;
 - in `--dry-run`, checks are not executed and the script prints which checks would run;
 - on failure, orchestration posts a state update with `stage=workflow_checks` and a `workflow_checks` payload containing command, exit code, and output excerpts;
 - workflow-check failures block readiness transitions (`ready-for-review` / `waiting-for-ci`) and follow existing stop policy (`--stop-on-error`).
+- PR readiness can additionally require named CI checks, approvals, mergeability, and required-file evidence before the orchestrator posts `ready-to-merge`.
 
 Example `project-config.json` workflow block:
 
@@ -194,9 +225,28 @@ Example `project-config.json` workflow block:
 {
   "workflow": {
     "commands": {
+      "setup": "python -m pip install -r requirements.txt",
       "test": "python -m unittest",
       "lint": "ruff check .",
-      "build": null
+      "build": null,
+      "e2e": null
+    },
+    "hooks": {
+      "pre_agent": null,
+      "post_agent": null,
+      "pre_pr_update": null,
+      "post_pr_update": null
+    },
+    "readiness": {
+      "required_checks": ["ci / test"],
+      "required_approvals": 1,
+      "require_review": true,
+      "require_mergeable": true,
+      "require_required_file_evidence": true
+    },
+    "merge": {
+      "auto": false,
+      "method": "squash"
     }
   }
 }

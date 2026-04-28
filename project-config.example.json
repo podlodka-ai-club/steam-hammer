@@ -19,31 +19,45 @@
       "e2e": null
     },
     "hooks": {
-      "before_agent": [
-        "python -m unittest tests.test_local_config_precedence"
-      ],
-      "after_agent": [],
-      "before_pr_update": [],
-      "after_pr_update": []
+      "pre_agent": null,
+      "post_agent": null,
+      "pre_pr_update": null,
+      "post_pr_update": null
     },
     "readiness": {
-      "required_checks": [
-        "ci/test"
-      ],
+      "required_checks": [],
       "required_approvals": 1,
-      "require_review_approval": true,
-      "require_required_file_evidence": true,
-      "require_green_checks": true,
-      "require_local_workflow_checks": true
+      "require_review": true,
+      "require_mergeable": true,
+      "require_required_file_evidence": true
     },
     "merge": {
-      "auto_merge": false,
+      "auto": false,
       "method": "squash"
     }
   },
   "retry": {
     "max_attempts": 2,
     "escalate_to_preset": "hard"
+  },
+  "scope": {
+    "defaults": {
+      "labels": {
+        "allow": ["autonomous", "bug"],
+        "deny": ["manual-only"]
+      },
+      "assignees": {
+        "deny": ["human-only"]
+      },
+      "priority": {
+        "allow": ["priority:high", "priority:medium"],
+        "order": ["priority:high", "priority:medium", "priority:low"]
+      },
+      "freshness": {
+        "max_age_days": 30,
+        "max_idle_days": 14
+      }
+    }
   },
   "presets": {
     "cheap": {

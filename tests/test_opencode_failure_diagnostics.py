@@ -1,5 +1,7 @@
 import signal
+import subprocess
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.run_github_issues_to_opencode import (
@@ -8,6 +10,7 @@ from scripts.run_github_issues_to_opencode import (
     classify_opencode_failure,
     describe_exit_code,
     ensure_agent_failure_label,
+    validate_opencode_model_backend,
 )
 
 
@@ -72,6 +75,42 @@ class EnsureAgentFailureLabelTests(unittest.TestCase):
 
         self.assertIn("Failed to create missing failure label", str(ctx.exception))
         self.assertIn(AGENT_FAILURE_LABEL_NAME, str(ctx.exception))
+
+
+class ValidateOpenCodeModelBackendTests(unittest.TestCase):
+    def test_non_ollama_models_skip_validation(self) -> None:
+        validate_opencode_model_backend(runner="opencode", model="openai/gpt-4o")
+        validate_opencode_model_backend(runner="claude", model="ollama/qwen3.5:2b")
+
+    @patch("scripts.run_github_issues_to_opencode.shutil.which", return_value=None)
+    def test_missing_ollama_cli_raises_clear_error(self, _which) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            validate_opencode_model_backend(runner="opencode", model="ollama/qwen3.5:2b")
+
+        self.assertIn("`ollama` CLI", str(ctx.exception))
+        self.assertIn("ollama/qwen3.5:2b", str(ctx.exception))
+
+    @patch("scripts.run_github_issues_to_opencode.shutil.which", return_value="/usr/local/bin/ollama")
+    @patch("scripts.run_github_issues_to_opencode.subprocess.run")
+    def test_ollama_show_failure_raises_actionable_error(self, run_mock, _which) -> None:
+        run_mock.return_value = SimpleNamespace(returncode=1, stdout="", stderr="model not found")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            validate_opencode_model_backend(runner="opencode", model="ollama/qwen3.5:2b")
+
+        self.assertIn("Unable to validate local Ollama model 'qwen3.5:2b'", str(ctx.exception))
+        self.assertIn("ollama show qwen3.5:2b", str(ctx.exception))
+
+    @patch("scripts.run_github_issues_to_opencode.shutil.which", return_value="/usr/local/bin/ollama")
+    @patch("scripts.run_github_issues_to_opencode.subprocess.run")
+    def test_ollama_show_timeout_raises_clear_error(self, run_mock, _which) -> None:
+        run_mock.side_effect = subprocess.TimeoutExpired(cmd=["ollama", "show", "qwen3.5:2b"], timeout=30)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            validate_opencode_model_backend(runner="opencode", model="ollama/qwen3.5:2b")
+
+        self.assertIn("Timed out after 30s", str(ctx.exception))
+        self.assertIn("qwen3.5:2b", str(ctx.exception))
 
 
 if __name__ == "__main__":

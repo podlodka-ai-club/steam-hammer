@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -63,6 +65,56 @@ func TestDoctorCommandWiresPythonRunner(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--doctor", "--repo", "owner/repo", "--dry-run"})
+}
+
+func TestInitCreatesConfigScaffolds(t *testing.T) {
+	targetDir := t.TempDir()
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+
+	code := app.Run([]string{"init", "--dir", targetDir})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+
+	for _, name := range []string{defaultProjectConfigName, defaultLocalConfigName} {
+		path := filepath.Join(targetDir, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%q) error = %v", path, err)
+		}
+		if len(data) == 0 {
+			t.Fatalf("ReadFile(%q) returned empty scaffold", path)
+		}
+	}
+	if !strings.Contains(out.String(), filepath.Join(targetDir, defaultProjectConfigName)) {
+		t.Fatalf("stdout = %q, want created project-config path", out.String())
+	}
+}
+
+func TestInitRefusesToOverwriteWithoutForce(t *testing.T) {
+	targetDir := t.TempDir()
+	projectPath := filepath.Join(targetDir, defaultProjectConfigName)
+	if err := os.WriteFile(projectPath, []byte("existing\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+
+	if code := app.Run([]string{"init", "--dir", targetDir, "--skip-local-config"}); code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if !strings.Contains(errOut.String(), "already exists") {
+		t.Fatalf("stderr = %q, want overwrite guidance", errOut.String())
+	}
+	data, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(data) != "existing\n" {
+		t.Fatalf("project config = %q, want original contents preserved", string(data))
+	}
 }
 
 func TestRunIssueCommandWiresPythonRunner(t *testing.T) {
@@ -192,6 +244,35 @@ func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments", "--dry-run", "--isolate-worktree"})
 }
 
+func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--poll-interval-seconds", "1", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--autonomous", "--state", "open", "--limit", "3", "--repo", "owner/repo", "--dry-run"})
+}
+
+func TestRunDaemonRejectsParallelismAboveOne(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+
+	if code := app.Run([]string{"run", "daemon", "--max-parallel-tasks", "2", "--poll-interval-seconds", "1", "--max-cycles", "1"}); code != 2 {
+		t.Fatalf("Run() code = %d, want 2", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "--max-parallel-tasks=1") {
+		t.Fatalf("stderr = %q, want concurrency validation", errOut.String())
+	}
+}
+
 func TestRunPRCommandAcceptsPythonPRFlags(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -232,6 +313,58 @@ func TestRunPRCommandMapsCoreCompatibilityFlags(t *testing.T) {
 		"--opencode-auto-approve",
 		"--dry-run",
 		"--agent-timeout-seconds", "900",
+	})
+}
+
+func TestRunDaemonCommandSupportsAllState(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--state", "all", "--dry-run", "--poll-interval-seconds", "1"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--autonomous", "--state", "all", "--limit", "3", "--repo", "owner/repo", "--dry-run"})
+}
+
+func TestRunDaemonCommandMapsIssueFlowFlags(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{
+		"run", "daemon",
+		"--limit", "1",
+		"--poll-interval-seconds", "0",
+		"--include-empty",
+		"--stop-on-error",
+		"--fail-on-existing",
+		"--force-issue-flow",
+		"--no-skip-if-pr-exists",
+		"--no-skip-if-branch-exists",
+		"--force-reprocess",
+		"--no-sync-reused-branch",
+		"--sync-strategy", "merge",
+		"--base", "current",
+		"--dry-run",
+	})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{
+		runnerScript, "--autonomous", "--state", "open", "--limit", "1",
+		"--dry-run",
+		"--base", "current",
+		"--include-empty",
+		"--stop-on-error",
+		"--fail-on-existing",
+		"--force-issue-flow",
+		"--no-skip-if-pr-exists",
+		"--no-skip-if-branch-exists",
+		"--force-reprocess",
+		"--no-sync-reused-branch",
+		"--sync-strategy", "merge",
 	})
 }
 

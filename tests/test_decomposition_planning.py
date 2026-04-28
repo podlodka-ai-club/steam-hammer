@@ -6,10 +6,12 @@ import unittest
 from scripts.run_github_issues_to_opencode import (
     BUILTIN_DEFAULTS,
     DECOMPOSITION_PLAN_MARKER,
+    _build_child_issue_body,
     _classify_decomposition_child_execution_status,
     _decomposition_plan_has_missing_children,
     _normalize_created_children,
     assess_issue_decomposition_need,
+    attach_decomposition_resume_context,
     build_decomposition_plan_payload,
     build_decomposition_child_execution_note,
     build_decomposition_rollup_from_plan_payload,
@@ -192,6 +194,28 @@ class DecompositionPlanningTests(unittest.TestCase):
         self.assertEqual(parsed["status"], "proposed")
         self.assertEqual(parsed["parent_issue"], 99)
         self.assertIn(DECOMPOSITION_PLAN_MARKER, body)
+
+    def test_plan_comment_includes_resume_execution_context(self) -> None:
+        issue = {
+            "number": 99,
+            "title": "Epic: Decompose work",
+            "body": "- First slice\n- Second slice",
+        }
+        payload = attach_decomposition_resume_context(
+            plan_payload=build_decomposition_plan_payload(issue=issue, assessment={}),
+            parent_issue=issue,
+            parent_branch="issue-fix/99-decompose-work",
+            base_branch="main",
+            next_action="execute_next_child",
+            selected_child={"order": 2, "title": "Second slice", "issue_number": 120},
+        )
+
+        body = format_decomposition_plan_comment(payload)
+
+        self.assertIn("Execution context:", body)
+        self.assertIn("branch: `issue-fix/99-decompose-work`", body)
+        self.assertIn("base branch: `main`", body)
+        self.assertIn("selected child: `2: Second slice (#120)`", body)
 
     def test_plan_payload_uses_scope_bullets_and_skips_success_criteria(self) -> None:
         issue = {
@@ -460,6 +484,25 @@ class DecompositionPlanningTests(unittest.TestCase):
 
         self.assertIn("Parent issue: #170 - Parent tracker", note)
         self.assertIn("Selected child step: 1: Child", note)
+
+    def test_child_issue_body_includes_dependency_branch_and_resume_instructions(self) -> None:
+        body = _build_child_issue_body(
+            parent_issue={"number": 170, "title": "Parent tracker"},
+            child={
+                "order": 2,
+                "title": "Child",
+                "depends_on": [1],
+                "acceptance": ["Complete the child safely."],
+            },
+            created_dependencies={1: {"issue_number": 601, "issue_url": "https://example/issues/601"}},
+            parent_branch="issue-fix/170-parent-tracker",
+            base_branch="main",
+        )
+
+        self.assertIn("Depends on: [Step 1: #601](https://example/issues/601)", body)
+        self.assertIn("Parent orchestration branch: `issue-fix/170-parent-tracker`", body)
+        self.assertIn("Preferred resume path: rerun the orchestrator for parent issue #170", body)
+        self.assertIn("Do not start this task until the listed dependencies are completed.", body)
 
 
 

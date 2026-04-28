@@ -4,14 +4,18 @@ import unittest
 from unittest.mock import patch
 
 from scripts.run_github_issues_to_opencode import (
+    CLARIFICATION_REQUEST_MARKER,
     ORCHESTRATION_STATE_MARKER,
     TokenBudgetExceededError,
     build_decomposition_rollup_from_plan_payload,
     build_decomposition_rollup_from_recovered_state,
+    build_clarification_context_note,
     build_orchestration_state,
+    find_waiting_for_author_answer,
     format_recovered_state_context,
     format_decomposition_rollup_context,
     format_orchestration_state_comment,
+    parse_clarification_request_text,
     main,
     parse_orchestration_state_comment_body,
     select_latest_parseable_orchestration_state,
@@ -19,6 +23,21 @@ from scripts.run_github_issues_to_opencode import (
 
 
 class OrchestrationStateRecoveryTests(unittest.TestCase):
+    def test_parse_clarification_request_text_parses_fenced_json(self) -> None:
+        body = (
+            "Need answer before continuing\n"
+            f"{CLARIFICATION_REQUEST_MARKER}\n"
+            "```json\n"
+            '{"question":"Should this pause on unsafe writes?","reason":"Needs product decision"}\n'
+            "```\n"
+        )
+
+        payload, error = parse_clarification_request_text(body)
+
+        self.assertIsNone(error)
+        self.assertEqual(payload["question"], "Should this pause on unsafe writes?")
+        self.assertEqual(payload["reason"], "Needs product decision")
+
     def test_parse_orchestration_state_comment_body_parses_fenced_json(self) -> None:
         body = (
             "Runner state update\n"
@@ -249,6 +268,58 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("ignoring malformed orchestration state comment", warnings[0])
 
+    def test_find_waiting_for_author_answer_uses_latest_author_reply_after_state(self) -> None:
+        recovered_state = {
+            "status": "waiting-for-author",
+            "created_at": "2026-04-27T12:00:00Z",
+            "comment_id": 20,
+            "payload": {"task_type": "issue", "question": "What should happen?"},
+        }
+        comments = [
+            {
+                "id": 20,
+                "created_at": "2026-04-27T12:00:00Z",
+                "html_url": "https://example/issues/45#issuecomment-20",
+                "body": "<!-- orchestration-state:v1 -->\n```json\n{\"status\":\"waiting-for-author\"}\n```",
+                "user": {"login": "bot"},
+            },
+            {
+                "id": 21,
+                "created_at": "2026-04-27T12:05:00Z",
+                "html_url": "https://example/issues/45#issuecomment-21",
+                "body": "Use the safer default and keep the manual override.",
+                "user": {"login": "issue-author"},
+            },
+        ]
+
+        answer = find_waiting_for_author_answer(
+            comments=comments,
+            recovered_state=recovered_state,
+            author_login="issue-author",
+        )
+
+        self.assertIsNotNone(answer)
+        assert answer is not None
+        self.assertIn("safer default", answer["body"])
+
+    def test_build_clarification_context_note_includes_question_and_answer(self) -> None:
+        note = build_clarification_context_note(
+            state={
+                "status": "waiting-for-author",
+                "source": "issue #45",
+                "created_at": "2026-04-27T12:00:00Z",
+                "payload": {"question": "Should this pause by default?", "reason": "Needs product call"},
+            },
+            answer={
+                "author": "issue-author",
+                "body": "Yes, pause unless the run is explicitly forced.",
+                "url": "https://example/issues/45#issuecomment-21",
+            },
+        )
+
+        self.assertIn("question asked to the task author", note)
+        self.assertIn("pause unless the run is explicitly forced", note)
+
     def test_main_issue_flow_without_recovered_state_does_not_require_force_override(self) -> None:
         args = argparse.Namespace(
             repo="owner/repo",
@@ -443,6 +514,165 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         assert prompt_override is not None
         self.assertIn("Recovered previous orchestration failure context", prompt_override)
         self.assertIn("merge conflict while rebasing", prompt_override)
+
+    def test_main_issue_flow_pauses_and_posts_question_when_agent_requests_clarification(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=45,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            decompose="never",
+            create_child_issues=False,
+            track_tokens=False,
+            dir=".",
+            local_config="local-config.json",
+            project_config="project-config.json",
+            dry_run=False,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            isolate_worktree=True,
+        )
+        issue = {
+            "number": 45,
+            "title": "Clarify human-in-the-loop",
+            "body": "Implement the clarification workflow",
+            "url": "https://example/issues/45",
+            "author": {"login": "issue-author"},
+        }
+
+        def fake_run_agent(**kwargs):
+            kwargs["agent_result"]["clarification_request"] = {
+                "question": "Should forced continuation bypass waiting-for-author?",
+                "reason": "Needs product decision",
+            }
+            return 0
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.load_project_config", return_value={}),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
+            patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="created"),
+            patch("scripts.run_github_issues_to_opencode.run_agent", side_effect=fake_run_agent),
+            patch("scripts.run_github_issues_to_opencode.safe_post_clarification_request_comment") as clarification_comment_mock,
+            patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment") as state_comment_mock,
+            patch("scripts.run_github_issues_to_opencode.run_command"),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        clarification_comment_mock.assert_called_once()
+        state_payload = state_comment_mock.call_args_list[-1].kwargs["state"]
+        self.assertEqual(state_payload["status"], "waiting-for-author")
+        self.assertEqual(state_payload["next_action"], "await_author_reply")
+        self.assertEqual(state_payload["question"], "Should forced continuation bypass waiting-for-author?")
+        self.assertIn("Paused issue #45 for author clarification", stdout_mock.getvalue())
+
+    def test_main_issue_flow_resumes_when_author_reply_exists(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=45,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            isolate_worktree=True,
+        )
+        issue = {
+            "number": 45,
+            "title": "Recover orchestration context",
+            "body": "Implement state recovery",
+            "url": "https://example/issues/45",
+            "author": {"login": "issue-author"},
+        }
+        issue_comments = [
+            {
+                "id": 1,
+                "created_at": "2026-04-26T12:00:00Z",
+                "html_url": "https://example/issues/45#issuecomment-1",
+                "body": (
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"waiting-for-author","task_type":"issue","question":"Use strict mode or keep fallback?"}\n'
+                    "```"
+                ),
+            },
+            {
+                "id": 2,
+                "created_at": "2026-04-26T13:00:00Z",
+                "html_url": "https://example/issues/45#issuecomment-2",
+                "body": "Use strict mode by default.",
+                "user": {"login": "issue-author"},
+            },
+        ]
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=issue_comments),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
+            patch("scripts.run_github_issues_to_opencode.sync_reused_branch_with_base", return_value=False),
+            patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0) as run_agent_mock,
+            patch("scripts.run_github_issues_to_opencode.commit_changes"),
+            patch("scripts.run_github_issues_to_opencode.push_branch"),
+            patch("scripts.run_github_issues_to_opencode.ensure_pr", return_value=("reused", "")),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(run_agent_mock.called)
+        prompt_override = run_agent_mock.call_args.kwargs.get("prompt_override")
+        self.assertIsNotNone(prompt_override)
+        assert prompt_override is not None
+        self.assertIn("Recovered clarification context", prompt_override)
+        self.assertIn("Use strict mode by default.", prompt_override)
+        self.assertIn("Selected mode: issue-flow", stdout_mock.getvalue())
 
     def test_main_parent_decomposition_executes_selected_child_issue(self) -> None:
         args = argparse.Namespace(

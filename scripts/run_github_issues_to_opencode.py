@@ -9032,7 +9032,7 @@ def main() -> int:
             scope_defaults = project_scope_defaults(project_config)
             setup_command = configured_setup_command(project_config)
             workflow_checks = configured_workflow_commands(project_config)
-            configured_hooks = workflow_hooks(project_config)
+            configured_hooks = configured_workflow_hooks(project_config)
             readiness_policy = workflow_readiness_policy(project_config)
             merge_policy = workflow_merge_policy(project_config)
 
@@ -11220,12 +11220,13 @@ def main() -> int:
                         raise agent_error
 
                     failure_stage = "workflow_hooks"
-                    run_workflow_hook(
-                        hooks=configured_hooks,
+                    run_configured_workflow_hooks(
                         hook_name="post_agent",
+                        configured_hooks=configured_hooks,
                         dry_run=args.dry_run,
                         cwd=os.getcwd(),
                         env=issue_hook_env,
+                        context=issue_hook_context,
                     )
                     clarification_request = agent_result.get("clarification_request")
                     if isinstance(clarification_request, dict):

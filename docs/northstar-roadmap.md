@@ -19,6 +19,7 @@
 Цель: сделать уже реализованный surface надежным для повседневного использования.
 
 - Прогнать и задокументировать daemon smoke test на чистом `main`.
+- Держать отдельный post-#204 branch-isolation smoke checklist для 2-3 detached workers: expected issue branch, expected clone/root, PR ownership, отсутствие cross-contamination, verification before merge.
 - Упростить и стабилизировать full verification path.
 - Снизить шум Python suite и expected mocked `gh` warnings.
 - Убедиться, что docs о текущем поведении, gap'ах и roadmap остаются синхронизированы с кодом.

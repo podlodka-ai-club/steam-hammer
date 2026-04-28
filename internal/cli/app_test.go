@@ -1156,6 +1156,12 @@ func TestStatusWorkersJSONListsRegistryEntries(t *testing.T) {
 	if worker.Worker.Name != "daemon" {
 		t.Fatalf("worker name = %q, want daemon", worker.Worker.Name)
 	}
+	if worker.Worker.Repo != "owner/repo" {
+		t.Fatalf("worker repo = %q, want owner/repo", worker.Worker.Repo)
+	}
+	if worker.Worker.ClonePath != targetDir {
+		t.Fatalf("worker clone path = %q, want %q", worker.Worker.ClonePath, targetDir)
+	}
 	if worker.ProcessStatus != "exited" {
 		t.Fatalf("process status = %q, want exited", worker.ProcessStatus)
 	}

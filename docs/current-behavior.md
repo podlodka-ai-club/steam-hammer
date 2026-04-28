@@ -64,8 +64,16 @@
 - Для `run issue`, `run pr` и `run daemon` появился first-class `--detach` path: worker стартует в фоне и пишет `worker.json`/`worker.log` в `.orchestrator/workers/<issue-N|pr-N|daemon>/`.
 - Во время autonomous batch loop сохраняется session-level checkpoint в `--autonomous-session-file`: done/current/next, issue/PR actions, blockers, счетчики и next checkpoint.
 - `status` теперь умеет читать не только issue/PR state comments, но и session-level checkpoint из `--autonomous-session-file`, а также detached worker metadata через `--worker` и `--workers`, чтобы оператор мог проверить pid/process state, log progress, clone path, linked issue/PR state и session checkpoint без ручных `ps`/`wc -l`/path lookup. Для worker surfaces доступен `--json`, а `status --worker issue-N` для detached batch child дополнительно сводит batch-level done/current/next, child workers, linked PRs, conflicts, verification и failures.
-- Safe bounded smoke path для текущего entrypoint задокументирован в `docs/daemon-smoke-test.md`.
+- Safe bounded smoke path для текущего entrypoint задокументирован в `docs/daemon-smoke-test.md`, включая post-#204 checklist для маленького detached batch.
 - Это рабочий автономный entrypoint ранней стадии, а не финальный service-grade orchestrator.
+
+### Post-#204 safety invariants
+
+- Detached concurrency сейчас считается безопасной только при явной проверке branch/repo ownership на уровне каждого issue worker.
+- Перед live merge оператор должен иметь ожидаемое соответствие `issue -> branch -> clone_path/repo root -> linked PR` и сверить его через `status --workers` плюс `status --worker issue-N`.
+- Для `run batch --detach` допустим либо один fresh repo root на весь batch, либо внешне подготовленное соответствие `issue -> fresh clone`; в обоих случаях `clone_path` у worker'а обязан совпадать с заранее ожидаемым root и не может "переехать" на clone другого issue.
+- PR ownership считается корректным только если linked PR у worker'а указывает на branch этого же issue; появление branch/PR другого issue в summary, worker registry или linked state считается cross-contamination и блокирует merge.
+- Verification остается merge gate: перед merge нужен чистый linked readiness state и успешный verification verdict (`merge-result verification` для PR progression и/или `verify` / post-batch verification для batch-level follow-up).
 
 ## Что еще не доведено до North Star
 
@@ -79,7 +87,7 @@
 ## Ближайшие практические зоны улучшения
 
 1. Прогнать daemon smoke test на чистом `main` и зафиксировать expected operator path.
-2. Развить session checkpoint дальше: richer `resume`, history по batch checkpoint и более явные operator actions.
+2. Закрепить post-#204 branch-isolation smoke discipline как стандартный preflight для любых batch'ей шире 1 worker.
 3. Уменьшить шум и длительность full Python verification.
 4. Добавить dedicated conflict-recovery path для reused branches и stacked batches.
 5. Автоматизировать post-batch verification и follow-up issue creation.

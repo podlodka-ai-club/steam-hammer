@@ -182,7 +182,7 @@ go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --detach
 go run ./cmd/orchestrator run daemon --repo owner/repo --detach
 ```
 
-Bounded daemon smoke-test guidance, including the exact safe operator command and observed output, is documented in [`docs/daemon-smoke-test.md`](docs/daemon-smoke-test.md).
+Bounded daemon smoke-test guidance, including the exact safe operator command, observed output, and the post-#204 detached batch branch-isolation checklist, is documented in [`docs/daemon-smoke-test.md`](docs/daemon-smoke-test.md).
 
 Common Python-runner examples map to the Go wrapper as follows:
 

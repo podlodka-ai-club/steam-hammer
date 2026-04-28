@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -159,17 +158,15 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		if *createFollowupIssue {
 			pythonArgs = append(pythonArgs, "--create-followup-issue")
 		}
-		return a.startDetachedWorker(detachedWorkerState{
-			Name:        "daemon",
-			Mode:        "run daemon",
-			TargetKind:  "daemon",
-			Repo:        strings.TrimSpace(*opts.repo),
-			Command:     append([]string{"python3"}, pythonArgs...),
-			LogPath:     workerPaths.logPath,
-			SessionPath: workerPaths.sessionPath,
-			StatePath:   workerPaths.statePath,
-			WorkDir:     workerPaths.workDir,
-		})
+		return a.startDetachedWorker(detachedWorkerStateFromOptions(
+			"daemon",
+			"run daemon",
+			"daemon",
+			"",
+			opts,
+			append([]string{"python3"}, pythonArgs...),
+			workerPaths,
+		))
 	}
 
 	sessionFile, err := os.CreateTemp("", "orchestrator-daemon-session-*.json")
@@ -320,17 +317,15 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
 			return 1
 		}
-		return a.startDetachedWorker(detachedWorkerState{
-			Name:       workerName("issue", strconv.Itoa(*id)),
-			Mode:       "run issue",
-			TargetKind: "issue",
-			TargetID:   strconv.Itoa(*id),
-			Repo:       strings.TrimSpace(*opts.repo),
-			Command:    append([]string{"python3"}, pythonArgs...),
-			LogPath:    workerPaths.logPath,
-			StatePath:  workerPaths.statePath,
-			WorkDir:    workerPaths.workDir,
-		})
+		return a.startDetachedWorker(detachedWorkerStateFromOptions(
+			workerName("issue", strconv.Itoa(*id)),
+			"run issue",
+			"issue",
+			strconv.Itoa(*id),
+			opts,
+			append([]string{"python3"}, pythonArgs...),
+			workerPaths,
+		))
 	}
 	return a.runPython(ctx, pythonArgs)
 }
@@ -401,17 +396,15 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
 			return 1
 		}
-		return a.startDetachedWorker(detachedWorkerState{
-			Name:       workerName("pr", strconv.Itoa(*id)),
-			Mode:       "run pr",
-			TargetKind: "pr",
-			TargetID:   strconv.Itoa(*id),
-			Repo:       strings.TrimSpace(*opts.repo),
-			Command:    append([]string{"python3"}, pythonArgs...),
-			LogPath:    workerPaths.logPath,
-			StatePath:  workerPaths.statePath,
-			WorkDir:    workerPaths.workDir,
-		})
+		return a.startDetachedWorker(detachedWorkerStateFromOptions(
+			workerName("pr", strconv.Itoa(*id)),
+			"run pr",
+			"pr",
+			strconv.Itoa(*id),
+			opts,
+			append([]string{"python3"}, pythonArgs...),
+			workerPaths,
+		))
 	}
 	return a.runPython(ctx, pythonArgs)
 }

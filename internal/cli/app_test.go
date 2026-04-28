@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -241,7 +242,18 @@ func TestRunIssueDetachStartsBackgroundWorkerWithPredictablePaths(t *testing.T) 
 	app := NewApp(&out, &strings.Builder{})
 	app.SetDetachedStarter(starter)
 
-	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", targetDir, "--detach"})
+	code := app.Run([]string{
+		"run", "issue",
+		"--id", "71",
+		"--repo", "owner/repo",
+		"--tracker", "github",
+		"--codehost", "github",
+		"--runner", "opencode",
+		"--agent", "build",
+		"--model", "openai/gpt-4o",
+		"--dir", targetDir,
+		"--detach",
+	})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
@@ -253,7 +265,7 @@ func TestRunIssueDetachStartsBackgroundWorkerWithPredictablePaths(t *testing.T) 
 	if starter.req.Name != "python3" {
 		t.Fatalf("starter name = %q, want python3", starter.req.Name)
 	}
-	if !reflect.DeepEqual(starter.req.Args, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dir", targetDir}) {
+	if !reflect.DeepEqual(starter.req.Args, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--tracker", "github", "--codehost", "github", "--dir", targetDir, "--runner", "opencode", "--agent", "build", "--model", "openai/gpt-4o"}) {
 		t.Fatalf("starter args = %#v", starter.req.Args)
 	}
 	if starter.req.LogPath != wantLogPath {
@@ -264,6 +276,16 @@ func TestRunIssueDetachStartsBackgroundWorkerWithPredictablePaths(t *testing.T) 
 	}
 	if _, err := os.Stat(wantStatePath); err != nil {
 		t.Fatalf("Stat(%q) error = %v", wantStatePath, err)
+	}
+	state, err := readDetachedWorkerState(wantStatePath)
+	if err != nil {
+		t.Fatalf("readDetachedWorkerState() error = %v", err)
+	}
+	if state.ClonePath != targetDir {
+		t.Fatalf("clone path = %q, want %q", state.ClonePath, targetDir)
+	}
+	if state.Tracker != "github" || state.CodeHost != "github" || state.Runner != "opencode" || state.Agent != "build" || state.Model != "openai/gpt-4o" {
+		t.Fatalf("worker state metadata = %#v", state)
 	}
 	if !strings.Contains(out.String(), "orchestrator status --worker issue-71") {
 		t.Fatalf("stdout = %q, want detached status hint", out.String())
@@ -701,6 +723,13 @@ func TestPythonRunnerContextCancellation(t *testing.T) {
 }
 
 func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
+	pythonDir := t.TempDir()
+	pythonPath := filepath.Join(pythonDir, "python3")
+	if err := os.WriteFile(pythonPath, []byte("#!/bin/sh\nprintf 'Target: issue #71\\nLatest state: waiting-for-ci\\nCurrent: waiting on 1 pending CI check(s)\\nNext: wait for ci\\nBlockers: pending ci\\nPR: #101\\nUpdated: 2026-04-28T12:05:00Z\\n'\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(fake python) error = %v", err)
+	}
+	t.Setenv("PATH", pythonDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
 	targetDir := t.TempDir()
 	workerRoot := filepath.Join(targetDir, ".orchestrator", "workers")
 	workerDir := filepath.Join(workerRoot, "issue-71")
@@ -715,11 +744,18 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 		TargetKind: "issue",
 		TargetID:   "71",
 		Repo:       "owner/repo",
+		Runner:     "opencode",
+		Agent:      "build",
+		Model:      "openai/gpt-4o",
 		PID:        os.Getpid(),
 		StartedAt:  "2026-04-28T12:00:00Z",
 		LogPath:    logPath,
 		StatePath:  statePath,
+		ClonePath:  targetDir,
 		WorkDir:    targetDir,
+	}
+	if err := os.WriteFile(logPath, []byte("line 1\nline 2\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(log) error = %v", err)
 	}
 	if err := writeDetachedWorkerState(state); err != nil {
 		t.Fatalf("writeDetachedWorkerState() error = %v", err)
@@ -736,12 +772,78 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 		"worker: issue-71",
 		"target: issue #71",
 		"process: running",
+		"clone: " + targetDir,
+		"agent: runner=opencode agent=build model=openai/gpt-4o",
+		"log-progress: lines=2",
 		"log: " + logPath,
+		"linked-latest-state: waiting-for-ci",
+		"linked-pr: #101",
 		"orchestrator status --issue 71 --repo owner/repo",
 	} {
 		if !strings.Contains(printed, want) {
 			t.Fatalf("stdout = %q, want %q", printed, want)
 		}
+	}
+}
+
+func TestStatusWorkersJSONListsRegistryEntries(t *testing.T) {
+	targetDir := t.TempDir()
+	workerRoot := filepath.Join(targetDir, ".orchestrator", "workers")
+	if err := os.MkdirAll(filepath.Join(workerRoot, "daemon"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	logPath := filepath.Join(workerRoot, "daemon", "worker.log")
+	statePath := filepath.Join(workerRoot, "daemon", "worker.json")
+	sessionPath := filepath.Join(workerRoot, "daemon", "session.json")
+	if err := os.WriteFile(logPath, []byte("batch start\nbatch done\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(log) error = %v", err)
+	}
+	if err := os.WriteFile(sessionPath, []byte("{\n  \"processed_issues\": {\"71\": {\"status\": \"ready-for-review\"}},\n  \"checkpoint\": {\n    \"phase\": \"running\",\n    \"current\": \"issue #71\",\n    \"next\": [\"issue #72\"],\n    \"counts\": {\"processed\": 1, \"failures\": 0},\n    \"updated_at\": \"2026-04-28T12:10:00Z\"\n  }\n}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(session) error = %v", err)
+	}
+	if err := writeDetachedWorkerState(detachedWorkerState{
+		Name:        "daemon",
+		Mode:        "run daemon",
+		TargetKind:  "daemon",
+		Repo:        "owner/repo",
+		PID:         0,
+		StartedAt:   "2026-04-28T12:00:00Z",
+		LogPath:     logPath,
+		SessionPath: sessionPath,
+		StatePath:   statePath,
+		ClonePath:   targetDir,
+		WorkDir:     targetDir,
+	}); err != nil {
+		t.Fatalf("writeDetachedWorkerState() error = %v", err)
+	}
+
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	code := app.Run([]string{"status", "--workers", "--worker-dir", workerRoot, "--json"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	var payload struct {
+		Workers []detachedWorkerReport `json:"workers"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &payload); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v\n%s", err, out.String())
+	}
+	if len(payload.Workers) != 1 {
+		t.Fatalf("workers len = %d, want 1", len(payload.Workers))
+	}
+	worker := payload.Workers[0]
+	if worker.Worker.Name != "daemon" {
+		t.Fatalf("worker name = %q, want daemon", worker.Worker.Name)
+	}
+	if worker.ProcessStatus != "exited" {
+		t.Fatalf("process status = %q, want exited", worker.ProcessStatus)
+	}
+	if worker.Log.Lines != 2 {
+		t.Fatalf("log lines = %d, want 2", worker.Log.Lines)
+	}
+	if worker.Session == nil || worker.Session.Current != "issue #71" || worker.Session.Processed != 1 {
+		t.Fatalf("session = %#v", worker.Session)
 	}
 }
 

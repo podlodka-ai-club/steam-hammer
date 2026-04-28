@@ -899,6 +899,180 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 	}
 }
 
+func TestStatusWorkerShowsBatchSummary(t *testing.T) {
+	pythonDir := t.TempDir()
+	pythonPath := filepath.Join(pythonDir, "python3")
+	raw := "#!/bin/sh\n" +
+		"case \"$*\" in\n" +
+		"  *\"--issue 71\"*)\n" +
+		"    printf 'Target: issue #71\\nLatest state: waiting-for-ci\\nCurrent: waiting on 1 pending CI check(s)\\nNext: wait for ci\\nBlockers: none\\nPR: #101\\nPR readiness: merge=clean, ci=pending, pending=1, failing=0; merge-result verification=passed (2/2 commands)\\nUpdated: 2026-04-28T12:05:00Z\\n'\n" +
+		"    ;;\n" +
+		"  *\"--issue 72\"*)\n" +
+		"    printf 'Target: issue #72\\nLatest state: failed\\nCurrent: merge conflict while rebasing\\nNext: resolve merge conflicts\\nBlockers: merge conflict while rebasing\\nPR: #102\\nPR readiness: merge=conflicting, ci=failure, pending=0, failing=1; merge-result verification=failed (1/2 commands)\\nUpdated: 2026-04-28T12:06:00Z\\n'\n" +
+		"    ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(pythonPath, []byte(raw), 0o755); err != nil {
+		t.Fatalf("WriteFile(fake python) error = %v", err)
+	}
+	t.Setenv("PATH", pythonDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	targetDir := t.TempDir()
+	workerRoot := filepath.Join(targetDir, ".orchestrator", "workers")
+	states := []detachedWorkerState{
+		{
+			Name:       "issue-71",
+			Mode:       "run batch",
+			TargetKind: "issue",
+			TargetID:   "71",
+			Repo:       "owner/repo",
+			PID:        os.Getpid(),
+			StartedAt:  "2026-04-28T12:00:00Z",
+			LogPath:    filepath.Join(workerRoot, "issue-71", "worker.log"),
+			StatePath:  filepath.Join(workerRoot, "issue-71", "worker.json"),
+			ClonePath:  targetDir,
+			WorkDir:    targetDir,
+		},
+		{
+			Name:       "issue-72",
+			Mode:       "run batch",
+			TargetKind: "issue",
+			TargetID:   "72",
+			Repo:       "owner/repo",
+			PID:        0,
+			StartedAt:  "2026-04-28T12:01:00Z",
+			LogPath:    filepath.Join(workerRoot, "issue-72", "worker.log"),
+			StatePath:  filepath.Join(workerRoot, "issue-72", "worker.json"),
+			ClonePath:  targetDir,
+			WorkDir:    targetDir,
+		},
+	}
+	states = withDetachedBatchMetadata(states, []int{71, 72})
+	for _, state := range states {
+		if err := os.MkdirAll(filepath.Dir(state.StatePath), 0o755); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+		if err := os.WriteFile(state.LogPath, []byte("line 1\nline 2\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile(log) error = %v", err)
+		}
+	}
+	if err := writeDetachedBatchStates(states); err != nil {
+		t.Fatalf("writeDetachedBatchStates() error = %v", err)
+	}
+
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	code := app.Run([]string{"status", "--worker", "issue-71", "--worker-dir", workerRoot})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	printed := out.String()
+	for _, want := range []string{
+		"batch-child-workers: 2",
+		"batch-done: issue #71: waiting-for-ci (#101)",
+		"batch-current: issue #72: merge conflict while rebasing (#102)",
+		"batch-next: issue #71: wait for ci; issue #72: resolve merge conflicts",
+		"batch-linked-prs: issue #71 -> #101; issue #72 -> #102",
+		"batch-conflicts: issue #72: merge conflict while rebasing",
+		"merge-result verification=passed (2/2 commands)",
+		"merge-result verification=failed (1/2 commands)",
+		"batch-failures: issue #72: merge=conflicting, ci=failure, pending=0, failing=1; merge-result verification=failed (1/2 commands); issue #72: failed (#102)",
+	} {
+		if !strings.Contains(printed, want) {
+			t.Fatalf("stdout = %q, want %q", printed, want)
+		}
+	}
+}
+
+func TestStatusWorkerJSONIncludesBatchSummary(t *testing.T) {
+	pythonDir := t.TempDir()
+	pythonPath := filepath.Join(pythonDir, "python3")
+	raw := "#!/bin/sh\n" +
+		"case \"$*\" in\n" +
+		"  *\"--issue 71\"*)\n" +
+		"    printf 'Target: issue #71\\nLatest state: waiting-for-ci\\nCurrent: waiting on 1 pending CI check(s)\\nNext: wait for ci\\nBlockers: none\\nPR: #101\\nPR readiness: merge=clean, ci=pending, pending=1, failing=0; merge-result verification=passed (2/2 commands)\\nUpdated: 2026-04-28T12:05:00Z\\n'\n" +
+		"    ;;\n" +
+		"  *\"--issue 72\"*)\n" +
+		"    printf 'Target: issue #72\\nLatest state: failed\\nCurrent: merge conflict while rebasing\\nNext: resolve merge conflicts\\nBlockers: merge conflict while rebasing\\nPR: #102\\nPR readiness: merge=conflicting, ci=failure, pending=0, failing=1; merge-result verification=failed (1/2 commands)\\nUpdated: 2026-04-28T12:06:00Z\\n'\n" +
+		"    ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(pythonPath, []byte(raw), 0o755); err != nil {
+		t.Fatalf("WriteFile(fake python) error = %v", err)
+	}
+	t.Setenv("PATH", pythonDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	targetDir := t.TempDir()
+	workerRoot := filepath.Join(targetDir, ".orchestrator", "workers")
+	states := []detachedWorkerState{
+		{
+			Name:       "issue-71",
+			Mode:       "run batch",
+			TargetKind: "issue",
+			TargetID:   "71",
+			Repo:       "owner/repo",
+			PID:        os.Getpid(),
+			StartedAt:  "2026-04-28T12:00:00Z",
+			LogPath:    filepath.Join(workerRoot, "issue-71", "worker.log"),
+			StatePath:  filepath.Join(workerRoot, "issue-71", "worker.json"),
+			ClonePath:  targetDir,
+			WorkDir:    targetDir,
+		},
+		{
+			Name:       "issue-72",
+			Mode:       "run batch",
+			TargetKind: "issue",
+			TargetID:   "72",
+			Repo:       "owner/repo",
+			PID:        0,
+			StartedAt:  "2026-04-28T12:01:00Z",
+			LogPath:    filepath.Join(workerRoot, "issue-72", "worker.log"),
+			StatePath:  filepath.Join(workerRoot, "issue-72", "worker.json"),
+			ClonePath:  targetDir,
+			WorkDir:    targetDir,
+		},
+	}
+	states = withDetachedBatchMetadata(states, []int{71, 72})
+	for _, state := range states {
+		if err := os.MkdirAll(filepath.Dir(state.StatePath), 0o755); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+		if err := os.WriteFile(state.LogPath, []byte("line 1\nline 2\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile(log) error = %v", err)
+		}
+	}
+	if err := writeDetachedBatchStates(states); err != nil {
+		t.Fatalf("writeDetachedBatchStates() error = %v", err)
+	}
+
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	code := app.Run([]string{"status", "--worker", "issue-71", "--worker-dir", workerRoot, "--json"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	var payload detachedWorkerReport
+	if err := json.Unmarshal([]byte(out.String()), &payload); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v\n%s", err, out.String())
+	}
+	if payload.Worker.Name != "issue-71" {
+		t.Fatalf("worker name = %q, want issue-71", payload.Worker.Name)
+	}
+	if payload.Batch == nil {
+		t.Fatalf("batch = nil")
+	}
+	if len(payload.Batch.ChildWorkers) != 2 {
+		t.Fatalf("child workers len = %d, want 2", len(payload.Batch.ChildWorkers))
+	}
+	if !reflect.DeepEqual(payload.Batch.LinkedPRs, []string{"issue #71 -> #101", "issue #72 -> #102"}) {
+		t.Fatalf("linked PRs = %#v", payload.Batch.LinkedPRs)
+	}
+	if len(payload.Batch.Verification) != 2 {
+		t.Fatalf("verification len = %d, want 2", len(payload.Batch.Verification))
+	}
+	if len(payload.Batch.Failures) == 0 {
+		t.Fatalf("failures = %#v, want non-empty", payload.Batch.Failures)
+	}
+}
+
 func TestReadDetachedWorkerStateSupportsLegacyMetadataWithoutBatch(t *testing.T) {
 	targetDir := t.TempDir()
 	statePath := filepath.Join(targetDir, "worker.json")

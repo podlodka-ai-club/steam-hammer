@@ -1,140 +1,104 @@
 # Верхнеуровневый план движения к North Star
 
-Документ описывает последовательность крупных этапов, которые переводят текущий GitHub/Python-прототип в автономный Go-оркестратор из `northstar.md`.
+Документ описывает обновленную траекторию после North Star batch. Базовый MVP больше не нужно планировать с нуля: его нужно закрепить, сделать наблюдаемым и постепенно перенести из Python-centered runner'а в product-grade Go orchestrator.
 
-## Принцип движения
+## Текущая точка
 
-Идём итеративно: сначала усиливаем уже работающий GitHub-based прототип, затем оформляем продуктовый слой вокруг него, потом переносим ядро в Go и расширяем автономность.
+Сейчас репозиторий уже имеет:
 
-Главный критерий прогресса — не количество интеграций, а способность оркестратора всё чаще доводить задачу от issue до готового PR/MR, а затем до merge без ручного управления.
+- Go CLI surface: `init`, `doctor`, `autodoctor`, `run issue`, `run pr`, `run daemon`;
+- рабочий GitHub issue/PR orchestration flow;
+- state comments, recovery, failure reporting и decomposition;
+- project config для scope/workflow/readiness/presets/budgets;
+- ранний daemon mode поверх текущего Python runner'а.
 
-## Этап 1. Зафиксировать текущее ядро
+Это означает, что MVP mostly implemented. Дальнейшая дорожная карта должна концентрироваться не на повторном добавлении уже существующих функций, а на hardening и beta/target-state gaps.
 
-Цель: сделать текущий прототип надёжной основой для дальнейших задач.
+## Этап 1. Hardening текущего MVP
 
-- Зафиксировать `northstar.md` и `docs/northstar-gap.md` как продуктовые ориентиры.
-- Поддерживать актуальность `docs/current-behavior.md`.
-- Укрепить тесты вокруг текущих GitHub issue/PR сценариев.
-- Явно описать поддерживаемые режимы: issue-flow, pr-review, dry-run.
-- Сделать поведение повторных запусков предсказуемым и документированным.
+Цель: сделать уже реализованный surface надежным для повседневного использования.
 
-Результат: текущий runner понятен, тестируем и безопасен для дальнейшего развития.
+- Прогнать и задокументировать daemon smoke test на чистом `main`.
+- Упростить и стабилизировать full verification path.
+- Снизить шум Python suite и expected mocked `gh` warnings.
+- Убедиться, что docs о текущем поведении, gap'ах и roadmap остаются синхронизированы с кодом.
 
-## Этап 2. Добавить state и прозрачность через issue/PR comments
+Результат: MVP не только существует, но и дает предсказуемый operational baseline.
 
-Цель: сделать tracker источником истины и подготовить восстановление после сбоев.
+## Этап 2. Status visibility и operator UX
 
-- Ввести стандартизированные комментарии состояния в issue/PR.
-- Фиксировать branch, PR, runner, model, статус, попытку, next action.
-- Добавить статусы: `in-progress`, `blocked`, `waiting-for-author`, `waiting-for-ci`, `ready-for-review`, `ready-to-merge`.
-- Писать краткие happy-path статусы и подробные failure reports при проблемах.
-- Научиться восстанавливать контекст из issue/PR comments.
+Цель: сделать orchestration state легко читаемым без ручного разбора issue/PR comments и длинных логов.
 
-Результат: оркестратор может продолжать работу без отдельной базы состояния.
+- Добавить `status`-style summary для issue/PR/daemon state.
+- Показать краткий прогресс batch/daemon runs и явный `next_action`.
+- Сделать blocked/waiting states проще для чтения оператором.
 
-## Этап 3. Project config, scope и doctor
+Результат: оператор быстрее понимает, где застряла задача и что делать дальше.
 
-Цель: сделать подключение к проекту управляемым и безопасным.
+## Этап 3. Conflict recovery и post-batch verification
 
-- Добавить проектный конфиг для scope rules.
-- Разрешить allow/deny правила по labels, author, типу задачи, area, workflow.
-- Добавить базовые workflow команды: setup/test/lint/build.
-- Сделать `doctor`: проверка git, auth, `gh`, runner binaries, clean worktree, config.
-- Сделать `autodoctor`: диагностика и предложения, что настроить дальше.
-- Подготовить `init`, который создаёт минимальный config scaffold.
+Цель: уменьшить ручную боль после merge waves и при reused branches.
 
-Результат: новый проект можно подключить предсказуемо, а оркестратор понимает, какие задачи можно брать.
+- Добавить dedicated conflict-recovery mode.
+- Разделить branch sync recovery и повторный full issue run.
+- Автоматизировать post-batch verification.
+- При необходимости автоматически создавать follow-up issue/checklist на найденные регрессии.
 
-## Этап 4. Presets, routing и эскалация
+Результат: крупные batch merges перестают требовать столько ручного контроля и повторных полных rerun'ов.
 
-Цель: управлять стоимостью, качеством и сложностью выполнения.
+## Этап 4. Modularization перед переносом core в Go
 
-- Ввести presets: например `cheap`, `default`, `hard`.
-- Привязать presets к runner/model/agent.
-- Добавить routing rules по labels, типам задач и project config.
-- Добавить retry policy и max attempts.
-- Добавить эскалацию модели/runner'а после неудач.
-- Добавить базовые budget limits: время, количество попыток, допустимый уровень модели.
+Цель: сократить conflict surface и подготовить безопасный перенос логики.
 
-Результат: оркестратор выбирает исполнителя не вручную, а по правилам проекта и сложности задачи.
+- Разбить крупный Python runner на меньшие модули по зонам ответственности.
+- Выделить boundaries для state, policy, workflow, recovery и provider access.
+- Сохранить текущее поведение тестами перед переносом.
 
-## Этап 5. CI и review loop
+Результат: дальнейший перенос в Go становится инженерно управляемым, а не big-bang rewrite.
 
-Цель: приблизиться к самостоятельному доведению PR до готовности.
+## Этап 5. Beta autonomy polish
 
-- Научиться ждать GitHub checks.
-- Читать статусы и логи failing CI.
-- Отличать transient failure от реальной ошибки.
-- Запускать агента на исправление CI failure с контекстом логов.
-- Продолжить развитие PR review mode.
-- Комментировать неожиданные failures с evidence и next hypothesis.
+Цель: довести автономный режим до устойчивого beta-level поведения.
 
-Результат: оркестратор не просто создаёт PR, а пытается довести его до зелёного состояния.
+- Усилить daemon resume/retry semantics.
+- Сделать более зрелый task selection, claiming и concurrency control.
+- Довести presets, escalation и budget-aware routing до понятного default behavior.
+- Улучшить CI/review progression до более надежного self-serve loop.
 
-## Этап 6. Go CLI как продуктовая оболочка
+Результат: оркестратор стабильно ведет задачи без постоянного ручного подталкивания.
 
-Цель: перейти от скрипта к устанавливаемому CLI-приложению.
+## Этап 6. Product-grade Go core
 
-- Спроектировать Go CLI: `init`, `doctor`, `run issue`, `run pr`, `run daemon`.
-- На первом шаге Go CLI может вызывать существующий Python runner как compatibility layer.
-- Постепенно переносить core logic в Go.
-- Вынести интерфейсы: tracker, code host, runner, workflow, notifier.
-- Оставить Python-прототип как reference implementation до завершения миграции.
+Цель: перейти от Go wrapper + Python core к полноценному Go orchestrator.
 
-Результат: появляется стабильная продуктовая точка входа и путь к одному компилируемому бинарнику.
+- Перенести execution core, policy engine и state handling в Go.
+- Сохранить совместимость на уровне существующего CLI surface.
+- Постепенно убрать зависимость от монолитного Python runner'а.
 
-## Этап 7. Daemon/autonomous mode
+Результат: основной orchestration runtime становится компилируемым, модульным и легче расширяемым.
 
-Цель: перейти от one-shot выполнения к автономной работе.
+## Этап 7. Multi-provider и end-to-end target state
 
-- Добавить polling loop.
-- Выбирать задачи по project rules.
-- Claim/lock задачи через tracker state comments или labels.
-- Соблюдать лимиты параллельности.
-- Восстанавливаться после рестарта.
-- Закрывать или помечать устаревшие PR по правилам проекта.
+Цель: выйти за пределы текущего GitHub-only execution path.
 
-Результат: оркестратор может периодически брать задачи и вести их без ручного запуска каждой issue.
+- Ввести production-grade provider split: tracker, code host, runner, notifier, workflow.
+- Добавить Bitbucket и custom API proxy adapters.
+- Довести CI/review/merge/deploy loop до policy-driven automation.
+- Добавить messenger/notifier integrations там, где это реально помогает операторам.
 
-## Этап 8. Multi-provider architecture
+Результат: оркестратор приближается к полному North Star из `northstar.md`.
 
-Цель: выйти за пределы GitHub.
+## Ближайший приоритетный список
 
-- Разделить tracker provider и code hosting provider.
-- Стабилизировать GitHub adapter.
-- Добавить Bitbucket adapter.
-- Добавить custom API proxy adapter.
-- Не завязывать core workflow на `gh` как единственный способ интеграции.
+1. Daemon smoke test.
+2. Status visibility.
+3. Test noise reduction и fast/full verification split.
+4. Conflict-recovery mode.
+5. Post-batch verification automation.
+6. Runner modularization.
+7. Beta autonomy polish.
+8. Go core migration.
 
-Результат: оркестратор можно подключать к разным системам управления задачами и кодом.
+## Итог
 
-## Этап 9. Merge, deploy и messenger integrations
-
-Цель: довести цикл доставки до конца.
-
-- Добавить `ready-to-merge` policy.
-- Добавить автоматический merge, если project rules это разрешают.
-- Добавить deploy hooks после merge.
-- Добавить Slack/Telegram/Discord или другой notifier abstraction.
-- Использовать мессенджеры для уточнений, статусов, review requests и blockers.
-
-Результат: оркестратор закрывает полный путь от задачи до merge/deploy, вовлекая человека только при необходимости.
-
-## Предлагаемый порядок ближайших задач
-
-1. State comments в issue/PR.
-2. Failure comments с evidence и next hypothesis.
-3. `doctor` для текущего Python-прототипа.
-4. Project config scaffold.
-5. Scope rules.
-6. Presets и retry/escalation policy.
-7. GitHub CI status reader.
-8. Go CLI wrapper.
-9. `init` и `run issue` в Go CLI.
-10. Daemon polling mode.
-
-## Итоговая траектория
-
-Текущий прототип уже решает важную часть MVP: GitHub issue/PR + Claude/OpenCode + branch/PR automation.
-
-Дальше нужно добавлять не просто новые команды, а продуктовый слой автономности: состояние, scope, диагностику, routing, CI/review loop, Go CLI, daemon и provider abstractions.
+Следующий этап развития репозитория уже не про “добавить базовый orchestration flow”. Он про то, чтобы сделать существующий MVP надежным, наблюдаемым и удобным для автономной эксплуатации, а затем спокойно перенести его в provider-agnostic Go core.

@@ -98,7 +98,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         run_command_mock,
     ) -> None:
         current_head_sha_mock.side_effect = ["sha-before", "sha-after"]
-        changed = sync_reused_branch_with_base(
+        result = sync_reused_branch_with_base(
             base_branch="main",
             branch_name="issue-fix/26-rerun",
             strategy="rebase",
@@ -112,7 +112,9 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 unittest.mock.call(["git", "rebase", "origin/main"]),
             ],
         )
-        self.assertTrue(changed)
+        self.assertEqual(result["status"], "synced-cleanly")
+        self.assertEqual(result["applied_strategy"], "rebase")
+        self.assertTrue(result["changed"])
 
     @patch("scripts.run_github_issues_to_opencode.command_succeeds", return_value=True)
     @patch("scripts.run_github_issues_to_opencode.run_command")
@@ -130,14 +132,17 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             None,
         ]
 
-        changed = sync_reused_branch_with_base(
+        result = sync_reused_branch_with_base(
             base_branch="main",
             branch_name="issue-fix/26-rerun",
             strategy="rebase",
             dry_run=False,
         )
 
-        self.assertTrue(changed)
+        self.assertEqual(result["status"], "auto-resolved")
+        self.assertEqual(result["requested_strategy"], "rebase")
+        self.assertEqual(result["applied_strategy"], "merge")
+        self.assertTrue(result["changed"])
         self.assertEqual(
             run_command_mock.call_args_list,
             [
@@ -168,14 +173,16 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             None,
         ]
 
-        changed = sync_reused_branch_with_base(
+        result = sync_reused_branch_with_base(
             base_branch="main",
             branch_name="issue-fix/26-rerun",
             strategy="merge",
             dry_run=False,
         )
 
-        self.assertTrue(changed)
+        self.assertEqual(result["status"], "auto-resolved")
+        self.assertEqual(result["applied_strategy"], "merge")
+        self.assertTrue(result["changed"])
         self.assertEqual(
             run_command_mock.call_args_list,
             [
@@ -327,7 +334,11 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
             patch(
                 "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
-                return_value=True,
+                return_value={
+                    "status": "synced-cleanly",
+                    "changed": True,
+                    "applied_strategy": "rebase",
+                },
             ),
             patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0),
             patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False),
@@ -495,7 +506,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             unittest.mock.call(
                 branch_name="issue-fix/35-auto-resolve-pr-conflicts",
                 dry_run=False,
-                force_with_lease=True,
+                force_with_lease=False,
             ),
             push_branch_mock.call_args_list,
         )
@@ -525,6 +536,145 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             "GitHub mergeability should be recalculated without manual conflict steps",
             output,
         )
+
+    def test_main_issue_conflict_recovery_only_syncs_and_skips_agent(self) -> None:
+        args = type("Args", (), {
+            "repo": "owner/repo",
+            "issue": 33,
+            "state": "open",
+            "limit": 10,
+            "runner": "opencode",
+            "agent": "build",
+            "model": None,
+            "agent_timeout_seconds": 900,
+            "agent_idle_timeout_seconds": None,
+            "opencode_auto_approve": False,
+            "branch_prefix": "issue-fix",
+            "include_empty": False,
+            "stop_on_error": False,
+            "fail_on_existing": False,
+            "force_issue_flow": False,
+            "conflict_recovery_only": True,
+            "sync_reused_branch": True,
+            "sync_strategy": "rebase",
+            "base_branch": "default",
+            "dir": ".",
+            "local_config": "local-config.json",
+            "dry_run": False,
+        })()
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_issue",
+                return_value={
+                    "number": 33,
+                    "title": "Recover branch",
+                    "body": "rerun",
+                    "url": "https://github.com/owner/repo/issues/33",
+                },
+            ),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
+            patch(
+                "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
+                return_value={
+                    "branch_name": "issue-fix/33-recover-branch",
+                    "remote_base_ref": "origin/main",
+                    "requested_strategy": "rebase",
+                    "applied_strategy": "rebase",
+                    "status": "synced-cleanly",
+                    "changed": True,
+                    "auto_resolved": False,
+                },
+            ),
+            patch("scripts.run_github_issues_to_opencode.push_branch") as push_branch_mock,
+            patch("scripts.run_github_issues_to_opencode.run_agent") as run_agent_mock,
+            patch("scripts.run_github_issues_to_opencode.ensure_pr") as ensure_pr_mock,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        run_agent_mock.assert_not_called()
+        ensure_pr_mock.assert_not_called()
+        push_branch_mock.assert_called_once_with(
+            branch_name="issue-fix/33-recover-branch",
+            dry_run=False,
+            force_with_lease=True,
+        )
+        output = stdout_mock.getvalue()
+        self.assertIn("Selected mode: conflict-recovery-only", output)
+        self.assertIn("Conflict recovery result for branch 'issue-fix/33-recover-branch': synced cleanly", output)
+
+    def test_main_pr_conflict_recovery_only_syncs_and_skips_review_agent(self) -> None:
+        args = type("Args", (), {
+            "repo": "owner/repo",
+            "issue": None,
+            "pr": 72,
+            "from_review_comments": True,
+            "state": "open",
+            "limit": 10,
+            "runner": "opencode",
+            "agent": "review",
+            "model": None,
+            "agent_timeout_seconds": 900,
+            "agent_idle_timeout_seconds": None,
+            "opencode_auto_approve": False,
+            "conflict_recovery_only": True,
+            "sync_strategy": "rebase",
+            "allow_pr_branch_switch": False,
+            "isolate_worktree": False,
+            "post_pr_summary": False,
+            "pr_followup_branch_prefix": None,
+            "dir": ".",
+            "local_config": "local-config.json",
+            "dry_run": False,
+        })()
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.current_branch", return_value="feature/pr-72"),
+            patch("scripts.run_github_issues_to_opencode.checkout_pr_target_branch"),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_pull_request",
+                return_value={
+                    "number": 72,
+                    "state": "OPEN",
+                    "headRefName": "feature/pr-72",
+                    "baseRefName": "main",
+                },
+            ),
+            patch(
+                "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
+                return_value={
+                    "branch_name": "feature/pr-72",
+                    "remote_base_ref": "origin/main",
+                    "requested_strategy": "rebase",
+                    "applied_strategy": "rebase",
+                    "status": "already-current",
+                    "changed": False,
+                    "auto_resolved": False,
+                },
+            ),
+            patch("scripts.run_github_issues_to_opencode.push_branch") as push_branch_mock,
+            patch("scripts.run_github_issues_to_opencode.fetch_actionable_pr_review_feedback") as review_feedback_mock,
+            patch("scripts.run_github_issues_to_opencode.run_agent_with_prompt") as run_agent_mock,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        push_branch_mock.assert_not_called()
+        review_feedback_mock.assert_not_called()
+        run_agent_mock.assert_not_called()
+        output = stdout_mock.getvalue()
+        self.assertIn("Selected mode: conflict-recovery-only (PR #72", output)
+        self.assertIn("Conflict recovery result for branch 'feature/pr-72': already current", output)
 
     def test_main_pr_review_mode_conflicted_pr_without_actionable_comments_still_syncs(self) -> None:
         args = type("Args", (), {
@@ -601,7 +751,14 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             )
             stack.enter_context(patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"))
             stack.enter_context(
-                patch("scripts.run_github_issues_to_opencode.sync_reused_branch_with_base", return_value=True)
+                patch(
+                    "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
+                    return_value={
+                        "status": "auto-resolved",
+                        "changed": True,
+                        "applied_strategy": "merge",
+                    },
+                )
             )
             run_agent_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_agent"))
             stack.enter_context(patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False))
@@ -623,7 +780,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             unittest.mock.call(
                 branch_name="issue-fix/35-auto-resolve-pr-conflicts",
                 dry_run=False,
-                force_with_lease=True,
+                force_with_lease=False,
             ),
             push_branch_mock.call_args_list,
         )

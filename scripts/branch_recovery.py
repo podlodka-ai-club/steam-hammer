@@ -309,6 +309,7 @@ def run_conflict_recovery_for_branch(
     dry_run: bool,
     sync_reused_branch_with_base: Callable[..., dict[str, object]],
     print_branch_sync_result: Callable[..., None],
+    verify_recovered_branch: Callable[[dict[str, object]], None] | None = None,
     push_recovered_branch: Callable[..., None],
 ) -> dict[str, object]:
     result = sync_reused_branch_with_base(
@@ -318,5 +319,7 @@ def run_conflict_recovery_for_branch(
         dry_run=dry_run,
     )
     print_branch_sync_result(result, dry_run=dry_run)
+    if verify_recovered_branch is not None:
+        verify_recovered_branch(result)
     push_recovered_branch(branch_name=branch_name, result=result, dry_run=dry_run)
     return result

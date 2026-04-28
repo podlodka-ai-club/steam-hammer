@@ -645,13 +645,14 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - On rerun with a reused branch, the script syncs that branch with the selected base before running the agent (`--sync-strategy rebase` by default).
 - If rebase sync for a reused branch conflicts, the script now automatically falls back to merge-based sync and resolves conflicted files in favor of the selected base branch.
 - In auto-switched `pr-review` runs (`--issue <n>` with linked open PR), the same conflict flow is applied so routine sync conflicts do not block unattended reruns.
-- Explicit rerun case is supported: when the issue already has an open PR that is conflicted with base (`mergeStateStatus=DIRTY`), pr-review mode auto-resolves routine sync conflicts, pushes the updated branch, and lets GitHub recalculate mergeability without manual conflict steps.
+- Explicit rerun case is supported: when the issue already has an open PR that is conflicted with base (`mergeStateStatus=DIRTY`), pr-review mode auto-resolves routine sync conflicts, runs forced recovery verification, pushes the updated branch, and lets GitHub recalculate mergeability without manual conflict steps.
 - Conflict strategy is deterministic for trusted repositories: prefer selected base branch content (`git checkout --theirs`) for conflicted paths, then finish merge with `--no-edit`.
 - If merge-based auto-resolution still cannot finish, the run stops before agent execution with a clear error and hints to resolve conflicts.
-- If sync updates branch history and agent produces no new file changes, the script still pushes sync-only branch updates so existing PR conflict status can be refreshed.
+- If sync updates branch history and agent produces no new file changes, the script first runs forced recovery verification and only then pushes sync-only branch updates so existing PR conflict status can be refreshed safely.
 - For rebase-based sync that rewrites branch history, push uses `--force-with-lease` automatically.
 - Use `--sync-strategy merge` if you prefer merge-based sync instead of rebase.
 - Use `--no-sync-reused-branch` only when you intentionally want to skip auto-sync.
+- Recovery verification always runs full-repo checks (`workflow.commands` when configured, otherwise detected repo defaults). You can add `workflow.verification.focused_commands` to also run extra uncached checks in a fresh clone before the branch is considered safely recovered.
 - Use `--dry-run` to preview selected base branch mode (`default` vs `current`), selected base branch name, and whether each issue will create or reuse branch/PR resources.
 - `--dry-run` also shows whether reused-branch sync will run and which strategy will be used.
 - In `--base current` mode, the runner warns when the current branch is dirty, has no upstream tracking branch, or is ahead of upstream.

@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.run_github_issues_to_opencode import (
+    configured_recovery_focused_commands,
     configured_setup_command,
     configured_workflow_commands,
     evaluate_pr_readiness,
@@ -36,6 +37,11 @@ class ProjectWorkflowConfigTests(unittest.TestCase):
                     "post_agent": "scripts/post-agent.sh",
                     "pre_pr_update": "scripts/pre-pr.sh",
                     "post_pr_update": "scripts/post-pr.sh",
+                },
+                "verification": {
+                    "focused_commands": [
+                        "python3 -m unittest tests/test_existing_branch_pr_reuse.py"
+                    ]
                 },
                 "readiness": {
                     "required_checks": ["ci / test", "ci / lint"],
@@ -72,6 +78,17 @@ class ProjectWorkflowConfigTests(unittest.TestCase):
                 "post_pr_update": "scripts/post-pr.sh",
             },
         )
+        self.assertEqual(
+            configured_recovery_focused_commands(validated),
+            [("focused-1", "python3 -m unittest tests/test_existing_branch_pr_reuse.py")],
+        )
+
+    def test_validate_project_config_rejects_invalid_focused_verification_commands(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "workflow.verification.focused_commands"):
+            validate_project_config(
+                {"workflow": {"verification": {"focused_commands": [""]}}},
+                "project-config.json",
+            )
 
     def test_validate_project_config_rejects_unknown_merge_method(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "workflow.merge.method"):

@@ -160,6 +160,19 @@ def configured_workflow_hooks(project_config: dict) -> dict[str, list[str]]:
     return configured
 
 
+def configured_recovery_focused_commands(project_config: dict) -> list[tuple[str, str]]:
+    workflow = project_config.get("workflow") if isinstance(project_config, dict) else None
+    if not isinstance(workflow, dict):
+        return []
+
+    verification = workflow.get("verification")
+    if not isinstance(verification, dict):
+        return []
+
+    commands = _normalize_hook_command_list(verification.get("focused_commands"))
+    return [(f"focused-{index}", command) for index, command in enumerate(commands, start=1)]
+
+
 def workflow_hooks(project_config: dict) -> dict[str, str]:
     configured: dict[str, str] = {}
     for hook_name, commands in configured_workflow_hooks(project_config).items():
@@ -231,7 +244,7 @@ def workflow_merge_policy(project_config: dict) -> dict[str, object]:
 
 
 def _validate_project_workflow(config: dict, config_path: str) -> None:
-    supported_workflow_keys = {"commands", "hooks", "readiness", "merge"}
+    supported_workflow_keys = {"commands", "hooks", "readiness", "merge", "verification"}
     unsupported_workflow = sorted(set(config) - supported_workflow_keys)
     if unsupported_workflow:
         raise RuntimeError(
@@ -366,6 +379,25 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
                 raise RuntimeError(
                     "Project config key 'workflow.merge.method' must be one of: merge, squash, rebase"
                 )
+
+    verification = config.get("verification")
+    if verification is not None:
+        if not isinstance(verification, dict):
+            raise RuntimeError("Project config key 'workflow.verification' must be an object")
+
+        supported_verification_keys = {"focused_commands"}
+        unsupported_verification = sorted(set(verification) - supported_verification_keys)
+        if unsupported_verification:
+            raise RuntimeError(
+                f"Unsupported key(s) in project config {config_path} under 'workflow.verification': "
+                + ", ".join(unsupported_verification)
+            )
+
+        if "focused_commands" in verification:
+            _normalize_hook_command_list(
+                verification.get("focused_commands"),
+                "workflow.verification.focused_commands",
+            )
 
 
 def _validate_project_defaults(config: dict, config_path: str) -> None:

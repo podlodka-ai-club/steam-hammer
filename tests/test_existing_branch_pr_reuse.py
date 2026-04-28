@@ -342,6 +342,10 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             ),
             patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0),
             patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False),
+            patch(
+                "scripts.run_github_issues_to_opencode.run_forced_recovery_verification",
+                return_value={"status": "passed", "summary": "passed (1/1 commands)", "commands": []},
+            ) as forced_verification_mock,
             patch("scripts.run_github_issues_to_opencode.push_branch") as push_branch_mock,
             patch(
                 "scripts.run_github_issues_to_opencode.ensure_pr",
@@ -353,6 +357,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             exit_code = main()
 
         self.assertEqual(exit_code, 0)
+        forced_verification_mock.assert_called_once()
         self.assertIn(
             unittest.mock.call(
                 branch_name="issue-fix/33-sync-reused-branch",
@@ -490,6 +495,12 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             )
             stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0))
             stack.enter_context(patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False))
+            forced_verification_mock = stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.run_forced_recovery_verification",
+                    return_value={"status": "passed", "summary": "passed (1/1 commands)", "commands": []},
+                )
+            )
             push_branch_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.push_branch"))
             ensure_pr_mock = stack.enter_context(
                 patch(
@@ -502,6 +513,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             exit_code = main()
 
         self.assertEqual(exit_code, 0)
+        forced_verification_mock.assert_called_once()
         self.assertIn(
             unittest.mock.call(
                 branch_name="issue-fix/35-auto-resolve-pr-conflicts",
@@ -591,6 +603,10 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                     "auto_resolved": False,
                 },
             ),
+            patch(
+                "scripts.run_github_issues_to_opencode.run_forced_recovery_verification",
+                return_value={"status": "passed", "summary": "passed (1/1 commands)", "commands": []},
+            ) as forced_verification_mock,
             patch("scripts.run_github_issues_to_opencode.push_branch") as push_branch_mock,
             patch("scripts.run_github_issues_to_opencode.run_agent") as run_agent_mock,
             patch("scripts.run_github_issues_to_opencode.ensure_pr") as ensure_pr_mock,
@@ -601,6 +617,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         run_agent_mock.assert_not_called()
         ensure_pr_mock.assert_not_called()
+        forced_verification_mock.assert_called_once()
         push_branch_mock.assert_called_once_with(
             branch_name="issue-fix/33-recover-branch",
             dry_run=False,
@@ -661,6 +678,10 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                     "auto_resolved": False,
                 },
             ),
+            patch(
+                "scripts.run_github_issues_to_opencode.run_forced_recovery_verification",
+                return_value={"status": "passed", "summary": "passed (1/1 commands)", "commands": []},
+            ) as forced_verification_mock,
             patch("scripts.run_github_issues_to_opencode.push_branch") as push_branch_mock,
             patch("scripts.run_github_issues_to_opencode.fetch_actionable_pr_review_feedback") as review_feedback_mock,
             patch("scripts.run_github_issues_to_opencode.run_agent_with_prompt") as run_agent_mock,
@@ -669,12 +690,82 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             exit_code = main()
 
         self.assertEqual(exit_code, 0)
+        forced_verification_mock.assert_called_once()
         push_branch_mock.assert_not_called()
         review_feedback_mock.assert_not_called()
         run_agent_mock.assert_not_called()
         output = stdout_mock.getvalue()
         self.assertIn("Selected mode: conflict-recovery-only (PR #72", output)
         self.assertIn("Conflict recovery result for branch 'feature/pr-72': already current", output)
+
+    def test_main_conflict_recovery_only_stops_when_forced_verification_fails(self) -> None:
+        args = type("Args", (), {
+            "repo": "owner/repo",
+            "issue": 33,
+            "state": "open",
+            "limit": 10,
+            "runner": "opencode",
+            "agent": "build",
+            "model": None,
+            "agent_timeout_seconds": 900,
+            "agent_idle_timeout_seconds": None,
+            "opencode_auto_approve": False,
+            "branch_prefix": "issue-fix",
+            "include_empty": False,
+            "stop_on_error": False,
+            "fail_on_existing": False,
+            "force_issue_flow": False,
+            "conflict_recovery_only": True,
+            "sync_reused_branch": True,
+            "sync_strategy": "rebase",
+            "base_branch": "default",
+            "dir": ".",
+            "local_config": "local-config.json",
+            "dry_run": False,
+        })()
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_issue",
+                return_value={
+                    "number": 33,
+                    "title": "Recover branch",
+                    "body": "rerun",
+                    "url": "https://github.com/owner/repo/issues/33",
+                },
+            ),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
+            patch(
+                "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
+                return_value={
+                    "branch_name": "issue-fix/33-recover-branch",
+                    "remote_base_ref": "origin/main",
+                    "requested_strategy": "rebase",
+                    "applied_strategy": "rebase",
+                    "status": "synced-cleanly",
+                    "changed": True,
+                    "auto_resolved": False,
+                },
+            ),
+            patch(
+                "scripts.run_github_issues_to_opencode.run_forced_recovery_verification",
+                side_effect=RuntimeError("Full-repo recovery verification failed: Workflow check 'python-tests' failed (exit code 1)"),
+            ),
+            patch("scripts.run_github_issues_to_opencode.push_branch") as push_branch_mock,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+            patch("sys.stderr", new_callable=io.StringIO) as stderr_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 1)
+        push_branch_mock.assert_not_called()
+        self.assertIn("needs manual intervention", stdout_mock.getvalue())
+        self.assertIn("Full-repo recovery verification failed", stderr_mock.getvalue())
 
     def test_main_pr_review_mode_conflicted_pr_without_actionable_comments_still_syncs(self) -> None:
         args = type("Args", (), {
@@ -762,6 +853,12 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             )
             run_agent_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_agent"))
             stack.enter_context(patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False))
+            forced_verification_mock = stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.run_forced_recovery_verification",
+                    return_value={"status": "passed", "summary": "passed (1/1 commands)", "commands": []},
+                )
+            )
             push_branch_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.push_branch"))
             ensure_pr_mock = stack.enter_context(
                 patch(
@@ -776,6 +873,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         run_agent_mock.assert_not_called()
+        forced_verification_mock.assert_called_once()
         self.assertIn(
             unittest.mock.call(
                 branch_name="issue-fix/35-auto-resolve-pr-conflicts",
@@ -898,6 +996,12 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             )
             run_agent_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_agent"))
             stack.enter_context(patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False))
+            forced_verification_mock = stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.run_forced_recovery_verification",
+                    return_value={"status": "passed", "summary": "passed (1/1 commands)", "commands": []},
+                )
+            )
             push_branch_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.push_branch"))
             ensure_pr_mock = stack.enter_context(
                 patch(
@@ -912,6 +1016,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         run_agent_mock.assert_not_called()
+        forced_verification_mock.assert_called_once()
         self.assertIn(
             unittest.mock.call(
                 branch_name="issue-fix/35-auto-sync-stale-pr",

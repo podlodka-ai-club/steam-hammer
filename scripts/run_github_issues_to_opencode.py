@@ -68,6 +68,7 @@ from scripts.project_config import (
     TRACKER_GITHUB,
     TRACKER_JIRA,
     WORKFLOW_HOOK_ALIASES,
+    configured_recovery_focused_commands,
     configured_setup_command,
     configured_setup_commands,
     configured_workflow_commands,
@@ -2220,6 +2221,102 @@ def _summarize_post_batch_verification_results(results: list[dict]) -> str:
         failed_names = ", ".join(str(result.get("name") or "command") for result in failed)
         return f"failed ({passed_count}/{command_count} passed; failed: {failed_names})"
     return f"passed ({passed_count}/{command_count} commands)"
+
+
+def _summarize_recovery_verification_results(results: list[dict[str, object]]) -> str:
+    if not results:
+        return "passed (0 commands)"
+    failed = [result for result in results if str(result.get("status") or "") == "failed"]
+    if failed:
+        failed_names = ", ".join(str(result.get("name") or "command") for result in failed)
+        return f"failed ({len(results) - len(failed)}/{len(results)} passed; failed: {failed_names})"
+    return f"passed ({len(results)}/{len(results)} commands)"
+
+
+def full_repo_verification_commands(
+    *,
+    project_config: dict,
+    cwd: str | None,
+) -> list[tuple[str, str]]:
+    commands = configured_workflow_commands(project_config)
+    if commands:
+        return commands
+    return detect_post_batch_verification_commands(cwd=cwd)
+
+
+def run_recovery_focused_verification(
+    *,
+    checks: list[tuple[str, str]],
+    branch_name: str,
+    repo_dir: str,
+    dry_run: bool,
+) -> list[dict[str, object]]:
+    if not checks:
+        return []
+
+    if dry_run:
+        print(
+            f"[dry-run] Would run focused recovery verification in a fresh clone for branch '{branch_name}'"
+        )
+        return run_configured_workflow_checks(checks=checks, dry_run=True)
+
+    clone_dir = tempfile.mkdtemp(prefix=f"recovery-verify-{sanitize_branch_for_path(branch_name)}-")
+    try:
+        run_command(["git", "clone", "--quiet", repo_dir, clone_dir])
+        run_command(["git", "-C", clone_dir, "checkout", branch_name])
+        return run_configured_workflow_checks(checks=checks, dry_run=False, cwd=clone_dir)
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def run_forced_recovery_verification(
+    *,
+    branch_name: str,
+    project_config: dict,
+    repo_dir: str,
+    dry_run: bool,
+) -> dict[str, object]:
+    focused_checks = configured_recovery_focused_commands(project_config)
+    full_repo_checks = full_repo_verification_commands(project_config=project_config, cwd=repo_dir)
+    if not full_repo_checks:
+        raise RuntimeError(
+            "Conflict recovery verification requires configured workflow commands or detectable full-repo checks."
+        )
+
+    results: list[dict[str, object]] = []
+    if focused_checks:
+        print(
+            f"Running focused recovery verification for branch '{branch_name}' in a fresh clone"
+        )
+        try:
+            focused_results = run_recovery_focused_verification(
+                checks=focused_checks,
+                branch_name=branch_name,
+                repo_dir=repo_dir,
+                dry_run=dry_run,
+            )
+        except WorkflowCheckFailure as exc:
+            raise RuntimeError(f"Focused recovery verification failed: {exc}") from exc
+        results.extend(focused_results)
+
+    print(f"Running full-repo recovery verification for branch '{branch_name}'")
+    try:
+        full_repo_results = run_configured_workflow_checks(
+            checks=full_repo_checks,
+            dry_run=dry_run,
+            cwd=repo_dir,
+        )
+    except WorkflowCheckFailure as exc:
+        raise RuntimeError(f"Full-repo recovery verification failed: {exc}") from exc
+    results.extend(full_repo_results)
+
+    summary = _summarize_recovery_verification_results(results)
+    print(f"Forced recovery verification result for branch '{branch_name}': {summary}")
+    return {
+        "status": "dry-run" if dry_run else "passed",
+        "summary": summary,
+        "commands": results,
+    }
 
 
 def format_post_batch_verification_issue_body(
@@ -7259,6 +7356,7 @@ def run_conflict_recovery_for_branch(
     base_branch: str,
     strategy: str,
     dry_run: bool,
+    verify_recovered_branch: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
     return _branch_recovery.run_conflict_recovery_for_branch(
         branch_name=branch_name,
@@ -7267,6 +7365,7 @@ def run_conflict_recovery_for_branch(
         dry_run=dry_run,
         sync_reused_branch_with_base=sync_reused_branch_with_base,
         print_branch_sync_result=print_branch_sync_result,
+        verify_recovered_branch=verify_recovered_branch,
         push_recovered_branch=push_recovered_branch,
     )
 
@@ -9007,6 +9106,12 @@ def main() -> int:
                         base_branch=target_base_branch,
                         strategy=args.sync_strategy,
                         dry_run=args.dry_run,
+                        verify_recovered_branch=lambda _result: run_forced_recovery_verification(
+                            branch_name=target_pr_branch,
+                            project_config=project_config,
+                            repo_dir=os.getcwd(),
+                            dry_run=args.dry_run,
+                        ),
                     )
                 except RuntimeError as exc:
                     print(
@@ -10160,6 +10265,12 @@ def main() -> int:
                             base_branch=recovery_base_branch,
                             strategy=args.sync_strategy,
                             dry_run=args.dry_run,
+                            verify_recovered_branch=lambda _result: run_forced_recovery_verification(
+                                branch_name=recovery_branch,
+                                project_config=project_config,
+                                repo_dir=os.getcwd(),
+                                dry_run=args.dry_run,
+                            ),
                         )
                     except RuntimeError as exc:
                         print(
@@ -11389,6 +11500,13 @@ def main() -> int:
                             f"No file changes from agent for {issue_label}; "
                             "pushing sync-only branch updates"
                         )
+                        failure_stage = "workflow_checks"
+                        run_forced_recovery_verification(
+                            branch_name=issue_branch,
+                            project_config=project_config,
+                            repo_dir=os.getcwd(),
+                            dry_run=False,
+                        )
                         used_force_with_lease = (
                             str(reused_branch_sync_result.get("applied_strategy") or "") == "rebase"
                         )
@@ -11416,7 +11534,7 @@ def main() -> int:
                             linked_pr_number = linked_open_pr.get("number")
                             if type(linked_pr_number) is int:
                                 print(
-                                    f"PR #{linked_pr_number} rerun sync pushed; "
+                                    f"PR #{linked_pr_number} rerun sync pushed; forced verification passed and "
                                     "GitHub mergeability should be recalculated without manual conflict steps"
                                 )
                     else:

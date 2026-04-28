@@ -284,6 +284,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
                 "latest_state": {
                     "status": "blocked",
                     "created_at": "2026-04-28T12:00:00Z",
+                    "source": "pr #201",
                     "url": "https://example/pr/201#issuecomment-9",
                     "payload": {
                         "status": "blocked",
@@ -309,6 +310,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertIn("Current: blocked at ci_checks", summary)
         self.assertIn("Next: inspect failing ci checks", summary)
         self.assertIn("Blockers: CI failing checks: unit (https://ci.example/unit)", summary)
+        self.assertIn("State source: pr #201", summary)
         self.assertIn("Source comment: https://example/pr/201#issuecomment-9", summary)
 
     def test_find_waiting_for_author_answer_uses_latest_author_reply_after_state(self) -> None:
@@ -474,6 +476,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertIn("Current: waiting-for-ci at ci_checks; waiting on 1 pending CI check(s)", rendered)
         self.assertIn("Next: wait for ci", rendered)
         self.assertIn("PR readiness: ci=pending, pending=1, failing=0", rendered)
+        self.assertIn("State source: pr #201", rendered)
         self.assertIn("Source comment: https://example/pr/201#issuecomment-9", rendered)
 
     def test_build_clarification_context_note_includes_question_and_answer(self) -> None:

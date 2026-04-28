@@ -3855,6 +3855,7 @@ def format_orchestration_status_summary(snapshot: dict) -> str:
     target_number = snapshot.get("target_number")
     latest_state = snapshot.get("latest_state") if isinstance(snapshot.get("latest_state"), dict) else None
     payload = _status_payload(latest_state)
+    state_source = _as_optional_string(latest_state.get("source") if isinstance(latest_state, dict) else None)
     issue_number = snapshot.get("issue_number")
     pr_number = snapshot.get("pr_number")
     branch = _as_optional_string(snapshot.get("branch"))
@@ -3928,6 +3929,8 @@ def format_orchestration_status_summary(snapshot: dict) -> str:
         )
     elif isinstance(merge_readiness, dict):
         lines.append(f"PR readiness: {str(merge_readiness.get('status') or 'unknown')}")
+    if state_source:
+        lines.append(f"State source: {state_source}")
     if source_comment:
         lines.append(f"Source comment: {source_comment}")
     created_at = _as_optional_string(latest_state.get("created_at") if isinstance(latest_state, dict) else None)

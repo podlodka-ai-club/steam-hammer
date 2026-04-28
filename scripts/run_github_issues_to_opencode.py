@@ -256,6 +256,50 @@ def _first_json_object(raw: str) -> dict:
     return payload
 
 
+def _parse_created_issue_reference(raw: str) -> dict[str, object]:
+    issue_url_match = re.search(r"https?://\S+/issues/(\d+)\b", raw)
+    if issue_url_match is None:
+        raise RuntimeError("Unexpected response from gh issue create")
+    issue_number = _as_positive_int(issue_url_match.group(1))
+    if issue_number is None:
+        raise RuntimeError("Created issue response missing integer number")
+    return {
+        "number": issue_number,
+        "url": issue_url_match.group(0),
+    }
+
+
+def gh_issue_create(repo: str, title: str, body: str) -> dict[str, object]:
+    create_command = [
+        "gh",
+        "issue",
+        "create",
+        "--repo",
+        repo,
+        "--title",
+        title,
+        "--body",
+        body,
+    ]
+    try:
+        output = run_capture(create_command + ["--json", "number,url"])
+    except RuntimeError as exc:
+        if "unknown flag: --json" not in str(exc):
+            raise
+        return _parse_created_issue_reference(run_capture(create_command))
+
+    created = json.loads(output)
+    if not isinstance(created, dict):
+        raise RuntimeError("Unexpected response from gh issue create")
+    issue_number = created.get("number")
+    if type(issue_number) is not int:
+        raise RuntimeError("Created issue response missing integer number")
+    return {
+        "number": issue_number,
+        "url": str(created.get("url") or ""),
+    }
+
+
 def _extract_issue_references_from_text(raw: str, tracker: str) -> list[int | str]:
     if tracker == TRACKER_JIRA:
         seen: set[str] = set()
@@ -2246,24 +2290,7 @@ def create_post_batch_follow_up_issue(
             "issue_url": None,
         }
 
-    output = run_capture(
-        [
-            "gh",
-            "issue",
-            "create",
-            "--repo",
-            repo,
-            "--title",
-            title,
-            "--body",
-            body,
-            "--json",
-            "number,url",
-        ]
-    )
-    created = json.loads(output)
-    if not isinstance(created, dict):
-        raise RuntimeError("Unexpected response from gh issue create")
+    created = gh_issue_create(repo, title, body)
     issue_number = created.get("number")
     if type(issue_number) is not int:
         raise RuntimeError("Created follow-up issue response missing integer number")
@@ -3956,25 +3983,7 @@ def create_decomposition_child_issue(
             "created": False,
         }
 
-    output = run_capture(
-        [
-            "gh",
-            "issue",
-            "create",
-            "--repo",
-            repo,
-            "--title",
-            child_title,
-            "--body",
-            body,
-            "--json",
-            "number,url",
-        ]
-    )
-    created = json.loads(output)
-    if not isinstance(created, dict):
-        raise RuntimeError("Unexpected response from gh issue create")
-
+    created = gh_issue_create(repo, child_title, body)
     issue_number = created.get("number")
     if type(issue_number) is not int:
         raise RuntimeError("Created child issue response missing integer number")
@@ -9796,6 +9805,10 @@ def main() -> int:
             issue_agent_run_stats: dict[str, object] | None = None
             state_attempt = 1
             orchestration_attempt = 1
+            active_attempt = state_attempt
+            active_runner = str(args.runner)
+            active_agent = str(args.agent)
+            active_model = args.model
             supports_github_issue_ops = issue_tracker(issue) == TRACKER_GITHUB and type(issue["number"]) is int
             decomposition_assessment = assess_issue_decomposition_need(issue)
             batch_done_summary = f"Started batch {batch_index}/{len(issues)} for {issue_label}"

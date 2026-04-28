@@ -100,18 +100,34 @@ Exit codes:
 
 ## Go orchestrator CLI
 
-Phase 1 includes a Go CLI wrapper around the existing Python runner. Build or run it with Go:
+Phase 1 includes a Go CLI wrapper around the existing Python runner. Install the binary once, or run it directly with Go:
+
+```bash
+go install ./cmd/orchestrator
+orchestrator --help
+```
 
 ```bash
 go run ./cmd/orchestrator --help
 ```
 
+Bootstrap config files for a repository before the first run:
+
+```bash
+orchestrator init
+orchestrator init --dir path/to/repo
+```
+
+`init` writes `project-config.json` and `local-config.json` scaffolds and refuses to overwrite existing files unless `--force` is passed.
+
 Available commands:
 
 ```bash
+go run ./cmd/orchestrator init
 go run ./cmd/orchestrator doctor --repo owner/repo
 go run ./cmd/orchestrator run issue --id 71 --repo owner/repo --dry-run
 go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --dry-run
+go run ./cmd/orchestrator run daemon --repo owner/repo --dry-run
 ```
 
 Common Python-runner examples map to the Go wrapper as follows:
@@ -126,15 +142,18 @@ go run ./cmd/orchestrator run issue --id 31 --repo owner/repo --force-issue-flow
 go run ./cmd/orchestrator run issue --id 45 --repo owner/repo --base current --runner opencode --agent build
 go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --allow-pr-branch-switch
 go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --runner opencode --agent review --model openai/gpt-4o --opencode-auto-approve --agent-timeout-seconds 900 --dry-run
+go run ./cmd/orchestrator run daemon --repo owner/repo --limit 1 --poll-interval-seconds 120
 ```
 
-The Go handlers only translate CLI intent into the current Python runner arguments. Use `--help` on any command to inspect flags without invoking the runner, and use `--dry-run` for issue/PR runs to avoid starting agents.
+The Go handlers translate CLI intent into the current Python runner arguments, except `init`, which creates config scaffolds directly in Go. Use `--help` on any command to inspect flags without invoking the runner, and use `--dry-run` for issue/PR/daemon runs to avoid starting agents.
 
 Compatibility boundary for Phase 1:
 
 - `run issue` supports single-issue execution through the Python runner. `--issue N` is accepted as a compatibility alias for `--id N`.
 - `run pr` supports PR review-comments execution. `--pr N` is accepted as a compatibility alias for `--id N`, and `--from-review-comments` is accepted as a no-op because the command always selects that mode.
+- `run daemon` repeatedly invokes the existing Python batch issue flow with `--limit` / `--state` polling semantics; use `--dry-run` to execute a single poll without looping.
 - `doctor` accepts `--doctor` as a no-op because the command already selects diagnostics mode.
+- `init` creates local scaffolds for `project-config.json` and `local-config.json` so users can start with the Go CLI instead of copying files manually.
 - Precedence remains delegated to the Python runner: CLI flags forwarded by Go override local config, local config overrides project config, and project config overrides built-in defaults.
 
 ## Project config scaffold (repository-level)
@@ -143,7 +162,7 @@ You can define repository defaults and placeholders for future orchestration pol
 
 1. Copy the scaffold and adapt it for your project:
    ```bash
-   cp project-config.example.json project-config.json
+   orchestrator init --skip-local-config
    ```
 2. Keep using CLI flags and local config as usual. Precedence is:
    - CLI flags

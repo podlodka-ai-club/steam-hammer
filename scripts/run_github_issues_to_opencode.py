@@ -68,11 +68,14 @@ ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"
 AGENT_FAILURE_REPORT_MARKER = "<!-- orchestration-agent-failure:v1 -->"
 SCOPE_DECISION_MARKER = "<!-- orchestration-scope:v1 -->"
 DECOMPOSITION_PLAN_MARKER = "<!-- orchestration-decomposition:v1 -->"
+CLARIFICATION_REQUEST_MARKER = "<!-- orchestration-clarification-request:v1 -->"
 DECOMPOSITION_CHILD_ORDER_PREFIX = "Step"
 AGENT_FAILURE_LABEL_NAME = "auto:agent-failed"
 AGENT_FAILURE_LABEL_COLOR = "B60205"
 AGENT_FAILURE_LABEL_DESCRIPTION = "Automation run failed for this issue"
 RECOMMENDED_OPENCODE_MODEL = "openai/gpt-4o"
+OLLAMA_MODEL_PREFIX = "ollama/"
+OLLAMA_PREFLIGHT_TIMEOUT_SECONDS = 30
 SIGKILL_EXIT_DESCRIPTION = (
     "This usually indicates a hard kill (SIGKILL), commonly from resource limits or environment-level"
     " termination rather than an argument/model syntax error."
@@ -536,6 +539,60 @@ def classify_opencode_failure(return_code: int, model: str | None) -> str | None
     return " ".join(details)
 
 
+def _ollama_model_name(model: str | None) -> str | None:
+    normalized_model = str(model or "").strip()
+    if not normalized_model.startswith(OLLAMA_MODEL_PREFIX):
+        return None
+
+    local_model = normalized_model[len(OLLAMA_MODEL_PREFIX):].strip()
+    if not local_model:
+        raise RuntimeError(
+            "OpenCode model 'ollama/' is missing the local Ollama model name. "
+            "Use a value like 'ollama/qwen3.5:2b'."
+        )
+    return local_model
+
+
+def validate_opencode_model_backend(runner: str, model: str | None) -> None:
+    if runner != "opencode":
+        return
+
+    local_model = _ollama_model_name(model)
+    if local_model is None:
+        return
+
+    ollama_path = shutil.which("ollama")
+    if not ollama_path:
+        raise RuntimeError(
+            f"OpenCode model '{model}' requires the local `ollama` CLI, but it was not found in PATH. "
+            "Install/start Ollama or use a known-working non-Ollama model/backend."
+        )
+
+    try:
+        result = subprocess.run(
+            [ollama_path, "show", local_model],
+            capture_output=True,
+            text=True,
+            timeout=OLLAMA_PREFLIGHT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Timed out after {OLLAMA_PREFLIGHT_TIMEOUT_SECONDS}s while validating local Ollama model "
+            f"'{local_model}' for OpenCode. Confirm the Ollama backend is healthy, then retry, "
+            "or use a known-working model/backend."
+        ) from exc
+
+    if result.returncode == 0:
+        return
+
+    detail = (result.stderr or "").strip() or (result.stdout or "").strip() or "ollama show failed"
+    raise RuntimeError(
+        f"Unable to validate local Ollama model '{local_model}' for OpenCode: {detail}. "
+        f"Confirm `ollama show {local_model}` succeeds, pull the model if needed, then retry, "
+        "or use a known-working model/backend."
+    )
+
+
 def _label_already_exists_error(message: str) -> bool:
     return "already exists" in str(message).lower()
 
@@ -553,6 +610,17 @@ CI_FAILURE_CHECK_RUN_CONCLUSIONS = {
     "stale",
 }
 CI_FAILURE_COMMIT_STATES = {"error", "failure"}
+CI_WAIT_POLL_INTERVAL_SECONDS = 10
+CI_WAIT_MAX_POLLS = 30
+CI_LOG_MAX_CHECKS = 3
+CI_LOG_EXCERPT_MAX_CHARS = 4000
+CI_TRANSIENT_LOG_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)rate limit|too many requests|secondary rate limit"), "rate limited"),
+    (re.compile(r"(?i)connection reset|connection refused|connection timed out|network is unreachable"), "network failure"),
+    (re.compile(r"(?i)timed out while|context deadline exceeded|timeout awaiting|TLS handshake timeout"), "network timeout"),
+    (re.compile(r"(?i)502 bad gateway|503 service unavailable|504 gateway timeout"), "upstream service outage"),
+    (re.compile(r"(?i)runner lost communication|runner has received a shutdown signal|hosted runner|resource temporarily unavailable"), "runner infrastructure issue"),
+)
 
 
 def failure_state_for_stage(failure_stage: str) -> str:
@@ -1282,6 +1350,45 @@ def _first_json_object(raw: str) -> dict:
     return payload
 
 
+def parse_clarification_request_text(raw: str) -> tuple[dict | None, str | None]:
+    if CLARIFICATION_REQUEST_MARKER not in raw:
+        return None, None
+
+    after_marker = raw.split(CLARIFICATION_REQUEST_MARKER, maxsplit=1)[1].strip()
+    if not after_marker:
+        return None, "marker found but payload is empty"
+
+    fenced_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", after_marker, flags=re.DOTALL)
+    candidates = fenced_matches if fenced_matches else [after_marker]
+
+    parse_errors: list[str] = []
+    for candidate in candidates:
+        try:
+            payload = _first_json_object(candidate)
+        except (ValueError, json.JSONDecodeError) as exc:
+            parse_errors.append(str(exc))
+            continue
+
+        question = _as_optional_string(payload.get("question"))
+        if not question:
+            parse_errors.append("clarification payload must include a non-empty 'question'")
+            continue
+
+        normalized_payload = dict(payload)
+        normalized_payload["question"] = question
+        normalized_payload["reason"] = _as_optional_string(payload.get("reason")) or question
+        return normalized_payload, None
+
+    if parse_errors:
+        return None, parse_errors[-1]
+    return None, "unable to parse clarification payload"
+
+
+def latest_clarification_request_from_agent_output(output: str) -> dict | None:
+    payload, _error = parse_clarification_request_text(output)
+    return payload
+
+
 def parse_orchestration_state_comment_body(body: str) -> tuple[dict | None, str | None]:
     if ORCHESTRATION_STATE_MARKER not in body:
         return None, None
@@ -1516,8 +1623,11 @@ def build_decomposition_rollup_from_plan_payload(payload: dict) -> dict:
     next_action_hint = str(payload.get("next_action") or "").strip() or (
         "execute_next_child" if next_child is not None else "all_children_complete"
     )
+    resume_context = payload.get("resume_context")
+    if not isinstance(resume_context, dict):
+        resume_context = None
 
-    return {
+    rollup = {
         "parent_issue": plan_parent_issue,
         "counts": counts,
         "children": rollup_children,
@@ -1532,6 +1642,9 @@ def build_decomposition_rollup_from_plan_payload(payload: dict) -> dict:
         "next_action_hint": next_action_hint,
         "source": "plan_payload",
     }
+    if resume_context is not None:
+        rollup["resume_context"] = dict(resume_context)
+    return rollup
 
 
 def build_decomposition_rollup_from_recovered_state(
@@ -1854,6 +1967,50 @@ def refresh_decomposition_plan_payload_from_child_states(
     return refreshed_payload
 
 
+def build_decomposition_resume_context(
+    parent_issue: dict,
+    parent_branch: str | None,
+    base_branch: str | None,
+    next_action: str,
+    selected_child: dict | None = None,
+) -> dict:
+    context = {
+        "task_type": "issue",
+        "parent_issue": parent_issue.get("number"),
+        "branch": str(parent_branch or "").strip(),
+        "base_branch": str(base_branch or "").strip(),
+        "next_action": str(next_action or "").strip(),
+        "resume_issue": parent_issue.get("number"),
+    }
+    if isinstance(selected_child, dict):
+        child_context = {
+            "order": selected_child.get("order"),
+            "title": str(selected_child.get("title") or "").strip(),
+            "issue_number": _as_positive_int(selected_child.get("issue_number")),
+        }
+        context["selected_child"] = child_context
+    return context
+
+
+def attach_decomposition_resume_context(
+    plan_payload: dict,
+    parent_issue: dict,
+    parent_branch: str | None,
+    base_branch: str | None,
+    next_action: str,
+    selected_child: dict | None = None,
+) -> dict:
+    annotated_payload = dict(plan_payload)
+    annotated_payload["resume_context"] = build_decomposition_resume_context(
+        parent_issue=parent_issue,
+        parent_branch=parent_branch,
+        base_branch=base_branch,
+        next_action=next_action,
+        selected_child=selected_child,
+    )
+    return annotated_payload
+
+
 def build_decomposition_child_execution_note(
     parent_issue: dict,
     decomposition_rollup: dict,
@@ -1908,6 +2065,16 @@ def post_parent_decomposition_rollup_update(
         next_action = str(refreshed_payload.get("next_action") or "execute_next_child")
         error = None
 
+    refreshed_payload = attach_decomposition_resume_context(
+        plan_payload=refreshed_payload,
+        parent_issue=parent_issue,
+        parent_branch=parent_branch,
+        base_branch=base_branch,
+        next_action=next_action,
+        selected_child=next_child,
+    )
+    rollup = build_decomposition_rollup_from_plan_payload(refreshed_payload)
+
     post_decomposition_plan_comment(
         repo=repo,
         issue_number=parent_issue["number"],
@@ -1948,6 +2115,8 @@ def _build_child_issue_body(
     parent_issue: dict,
     child: dict,
     created_dependencies: dict[int, dict],
+    parent_branch: str | None = None,
+    base_branch: str | None = None,
 ) -> str:
     parent_number = parent_issue.get("number")
     parent_title = str(parent_issue.get("title") or "(untitled)").strip()
@@ -1979,6 +2148,21 @@ def _build_child_issue_body(
         if dependency_lines
         else "\nDepends on: none"
     )
+    branch_context_lines: list[str] = []
+    parent_branch_text = str(parent_branch or "").strip()
+    base_branch_text = str(base_branch or "").strip()
+    if parent_branch_text:
+        branch_context_lines.append(f"- Parent orchestration branch: `{parent_branch_text}`")
+    if base_branch_text:
+        branch_context_lines.append(f"- Base branch: `{base_branch_text}`")
+    branch_context_text = "\n".join(branch_context_lines) or "- Branch context will be selected by the parent orchestration run."
+    parent_ref = format_issue_ref_from_issue(parent_issue)
+    resume_lines = [
+        f"- Preferred resume path: rerun the orchestrator for parent issue {parent_ref}; it will select the next unblocked child in dependency order.",
+        f"- Parent issue branch context: `{parent_branch_text or 'resolved at runtime'}`.",
+    ]
+    if dependency_lines:
+        resume_lines.append("- Do not start this task until the listed dependencies are completed.")
 
     acceptance = child.get("acceptance")
     acceptance_lines: list[str] = []
@@ -1991,11 +2175,17 @@ def _build_child_issue_body(
     if not acceptance_lines:
         acceptance_lines = ["- Implementation is complete and validated."]
 
+    resume_text = "\n".join(resume_lines)
+
     return (
         "Child task generated from decomposition plan\n\n"
-        f"Parent issue: #{parent_number} ({parent_title})\n"
+        f"Parent issue: {parent_ref} ({parent_title})\n"
         f"Execution order: {execution_order_text}\n"
         f"{dependency_text}\n\n"
+        "Branch context:\n"
+        f"{branch_context_text}\n\n"
+        "Resume instructions:\n"
+        f"{resume_text}\n\n"
         f"Suggested acceptance criteria:\n" + "\n".join(acceptance_lines)
     )
 
@@ -2006,12 +2196,20 @@ def create_decomposition_child_issue(
     child: dict,
     created_dependencies: dict[int, dict],
     dry_run: bool,
+    parent_branch: str | None = None,
+    base_branch: str | None = None,
 ) -> dict:
     child_title = str(child.get("title") or "")[:120]
     if not child_title:
         raise RuntimeError("Cannot create child issue with empty title")
 
-    body = _build_child_issue_body(parent_issue, child, created_dependencies)
+    body = _build_child_issue_body(
+        parent_issue,
+        child,
+        created_dependencies,
+        parent_branch=parent_branch,
+        base_branch=base_branch,
+    )
     if dry_run:
         print(f"[dry-run] Would create child issue for order {child.get('order')} of parent #{parent_issue.get('number')}")
         return {
@@ -2128,6 +2326,111 @@ def format_recovered_state_context(state: dict) -> str:
     if url:
         details += f"; comment={url}"
     return details
+
+
+def _comment_author_login(comment: dict) -> str:
+    user = comment.get("user") if isinstance(comment, dict) else None
+    if isinstance(user, dict):
+        login = str(user.get("login") or "").strip().lower()
+        if login:
+            return login
+
+    author = comment.get("author") if isinstance(comment, dict) else None
+    if isinstance(author, dict):
+        login = str(author.get("login") or "").strip().lower()
+        if login:
+            return login
+    if isinstance(author, str):
+        return author.strip().lower()
+    return ""
+
+
+def _is_orchestration_machine_comment(body: str) -> bool:
+    return any(
+        marker in body
+        for marker in (
+            ORCHESTRATION_STATE_MARKER,
+            DECOMPOSITION_PLAN_MARKER,
+            AGENT_FAILURE_REPORT_MARKER,
+            SCOPE_DECISION_MARKER,
+        )
+    )
+
+
+def find_waiting_for_author_answer(
+    comments: list[dict],
+    recovered_state: dict | None,
+    author_login: str | None = None,
+) -> dict | None:
+    if not isinstance(recovered_state, dict):
+        return None
+    if str(recovered_state.get("status") or "") != "waiting-for-author":
+        return None
+
+    waiting_created_at = str(recovered_state.get("created_at") or "")
+    waiting_comment_id = recovered_state.get("comment_id")
+    normalized_author = str(author_login or "").strip().lower()
+
+    latest_answer: dict | None = None
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        body = str(comment.get("body") or "").strip()
+        if not body or _is_orchestration_machine_comment(body):
+            continue
+
+        created_at = str(comment.get("created_at") or "")
+        comment_id = comment.get("id")
+        if waiting_created_at and created_at and created_at < waiting_created_at:
+            continue
+        if waiting_comment_id is not None and comment_id is not None:
+            try:
+                if int(comment_id) <= int(waiting_comment_id):
+                    continue
+            except (TypeError, ValueError):
+                pass
+
+        comment_author = _comment_author_login(comment)
+        if normalized_author and comment_author and comment_author != normalized_author:
+            continue
+
+        latest_answer = {
+            "body": body,
+            "created_at": created_at,
+            "url": str(comment.get("html_url") or "").strip(),
+            "author": comment_author or normalized_author or "unknown",
+            "comment_id": comment_id,
+        }
+
+    return latest_answer
+
+
+def build_clarification_context_note(state: dict, answer: dict | None = None) -> str:
+    payload = state.get("payload") if isinstance(state, dict) else None
+    if not isinstance(payload, dict):
+        payload = {}
+
+    question = _as_optional_string(payload.get("question")) or _as_optional_string(payload.get("reason")) or "Clarification requested"
+    reason = _as_optional_string(payload.get("reason"))
+    lines = [
+        "Recovered clarification context:",
+        f"- {format_recovered_state_context(state)}",
+    ]
+    if reason and reason != question:
+        lines.append(f"- why clarification was needed: {reason}")
+    lines.append(f"- question asked to the task author: {question}")
+    if isinstance(answer, dict):
+        answer_text = _as_optional_string(answer.get("body")) or ""
+        answer_author = _as_optional_string(answer.get("author")) or "unknown"
+        answer_url = _as_optional_string(answer.get("url"))
+        answer_context = f" by {answer_author}"
+        if answer_url:
+            answer_context += f" ({answer_url})"
+        lines.append(f"- answer received{answer_context}: {answer_text}")
+        lines.append("- use this answer as authoritative context for the resumed run")
+    else:
+        lines.append("- no answer has been posted yet; do not guess beyond the current requirements")
+    return "\n".join(lines)
 
 
 def build_recovered_failure_context_note(state: dict) -> str:
@@ -2661,8 +2964,10 @@ def read_pr_ci_status_for_head_sha(repo: str, head_sha: str) -> dict:
         normalized_checks.append(
             {
                 "source": "check-run",
+                "id": check_run.get("id"),
                 "name": name,
                 "url": url,
+                "html_url": str(check_run.get("html_url") or "").strip(),
                 "status": status,
                 "conclusion": conclusion or None,
                 "state": normalized_state,
@@ -2744,6 +3049,223 @@ def format_failing_ci_checks_summary(failing_checks: list[dict], max_items: int 
         rendered_items.append(f"and {remaining} more")
 
     return "CI failing checks: " + "; ".join(rendered_items)
+
+
+def wait_for_pr_ci_status(
+    repo: str,
+    pull_request: dict,
+    poll_interval_seconds: int = CI_WAIT_POLL_INTERVAL_SECONDS,
+    max_polls: int = CI_WAIT_MAX_POLLS,
+) -> dict:
+    latest = read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
+    polls = 1
+    while str(latest.get("overall") or "") == "pending" and polls < max_polls:
+        pending_checks = latest.get("pending_checks")
+        pending_count = len(pending_checks) if isinstance(pending_checks, list) else 0
+        pr_number = pull_request.get("number")
+        print(
+            f"CI checks still pending for PR #{pr_number} "
+            f"({pending_count} pending); waiting {poll_interval_seconds}s before retry {polls + 1}/{max_polls}."
+        )
+        time.sleep(poll_interval_seconds)
+        latest = read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
+        polls += 1
+    latest = dict(latest)
+    latest["poll_count"] = polls
+    latest["timed_out_waiting"] = str(latest.get("overall") or "") == "pending" and polls >= max_polls
+    return latest
+
+
+def _extract_github_actions_run_id(url: str) -> int | None:
+    match = re.search(r"/runs/(\d+)", str(url or ""))
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def fetch_failed_ci_log(repo: str, check: dict) -> str | None:
+    run_id = _extract_github_actions_run_id(
+        str(check.get("url") or "") or str(check.get("html_url") or "")
+    )
+    if run_id is None:
+        return None
+    try:
+        output = run_capture(
+            [
+                "gh",
+                "run",
+                "view",
+                str(run_id),
+                "--repo",
+                repo,
+                "--log-failed",
+            ]
+        )
+    except Exception:
+        return None
+    normalized = str(output or "").strip()
+    return normalized or None
+
+
+def classify_ci_failure(check: dict, log_text: str | None) -> dict:
+    name = str(check.get("name") or "unknown-check")
+    conclusion = str(check.get("conclusion") or check.get("status") or "").strip().lower()
+    log_excerpt = str(log_text or "")
+
+    if conclusion in {"cancelled", "startup_failure", "stale"}:
+        return {
+            "check": name,
+            "kind": "transient",
+            "reason": f"check concluded with {conclusion}",
+        }
+
+    for pattern, reason in CI_TRANSIENT_LOG_PATTERNS:
+        if pattern.search(log_excerpt):
+            return {
+                "check": name,
+                "kind": "transient",
+                "reason": reason,
+            }
+
+    if conclusion == "timed_out" and not log_excerpt:
+        return {
+            "check": name,
+            "kind": "transient",
+            "reason": "check timed out without captured failing log evidence",
+        }
+
+    return {
+        "check": name,
+        "kind": "real",
+        "reason": "failure log points to a repository or test issue",
+    }
+
+
+def collect_failing_ci_diagnostics(repo: str, failing_checks: list[dict]) -> dict:
+    diagnostics: list[dict] = []
+    classifications: list[str] = []
+    for check in failing_checks[:CI_LOG_MAX_CHECKS]:
+        log_text = fetch_failed_ci_log(repo=repo, check=check)
+        if log_text and len(log_text) > CI_LOG_EXCERPT_MAX_CHARS:
+            log_excerpt = log_text[-CI_LOG_EXCERPT_MAX_CHARS :]
+        else:
+            log_excerpt = log_text
+        classification = classify_ci_failure(check=check, log_text=log_excerpt)
+        classifications.append(str(classification.get("kind") or "real"))
+        diagnostics.append(
+            {
+                "name": str(check.get("name") or "unknown-check"),
+                "url": str(check.get("url") or "").strip(),
+                "classification": classification,
+                "log_excerpt": log_excerpt,
+            }
+        )
+
+    if not diagnostics:
+        overall = "real"
+    elif all(kind == "transient" for kind in classifications):
+        overall = "transient"
+    else:
+        overall = "real"
+
+    return {
+        "overall_classification": overall,
+        "failing_checks": diagnostics,
+    }
+
+
+def format_ci_diagnostics_summary(ci_diagnostics: dict) -> str:
+    failing_checks = ci_diagnostics.get("failing_checks")
+    if not isinstance(failing_checks, list) or not failing_checks:
+        return "No CI diagnostics available"
+
+    summary_parts: list[str] = []
+    for item in failing_checks:
+        if not isinstance(item, dict):
+            continue
+        classification = item.get("classification") if isinstance(item.get("classification"), dict) else {}
+        name = str(item.get("name") or "unknown-check")
+        kind = str(classification.get("kind") or "real")
+        reason = str(classification.get("reason") or "unspecified reason")
+        summary_parts.append(f"{name}: {kind} ({reason})")
+    return "; ".join(summary_parts) if summary_parts else "No CI diagnostics available"
+
+
+def build_ci_failure_prompt(
+    pull_request: dict,
+    failing_checks: list[dict],
+    ci_diagnostics: dict,
+    linked_issues: list[dict] | None = None,
+) -> str:
+    pr_number = pull_request.get("number")
+    pr_title = str(pull_request.get("title") or "")
+    pr_url = str(pull_request.get("url") or "")
+    pr_body = str(pull_request.get("body") or "").strip()
+    issue_context_lines: list[str] = []
+    for issue in linked_issues or []:
+        if not isinstance(issue, dict):
+            continue
+        issue_context_lines.append(
+            (
+                f"- Issue {format_issue_ref_from_issue(issue)}: {str(issue.get('title') or '')}\n"
+                f"  URL: {str(issue.get('url') or '')}\n"
+                f"  Body: {str(issue.get('body') or '').strip()}"
+            ).strip()
+        )
+    if not issue_context_lines:
+        issue_context_lines.append("- No linked issue context found.")
+
+    failing_lines: list[str] = []
+    for check in failing_checks:
+        if not isinstance(check, dict):
+            continue
+        check_name = str(check.get("name") or "unknown-check")
+        check_url = str(check.get("url") or "").strip()
+        conclusion = str(check.get("conclusion") or check.get("status") or "unknown")
+        failing_lines.append(
+            f"- {check_name} [{conclusion}]" + (f"\n  URL: {check_url}" if check_url else "")
+        )
+
+    diagnostics_lines: list[str] = []
+    for item in ci_diagnostics.get("failing_checks", []):
+        if not isinstance(item, dict):
+            continue
+        classification = item.get("classification") if isinstance(item.get("classification"), dict) else {}
+        diagnostics_lines.append(
+            (
+                f"Check: {str(item.get('name') or 'unknown-check')}\n"
+                f"Classification: {str(classification.get('kind') or 'real')}\n"
+                f"Reason: {str(classification.get('reason') or 'unspecified reason')}\n"
+                "Failed log excerpt:\n"
+                f"{str(item.get('log_excerpt') or 'No failed log excerpt available.') }"
+            ).strip()
+        )
+
+    return (
+        "You are working on an existing GitHub pull request CI failure cycle in the current git branch.\n"
+        "Diagnose the failing CI checks using the provided logs and implement the safest repository fix in files.\n"
+        "Do not run git commands; git actions are handled by orchestration script.\n\n"
+        f"Pull Request: #{pr_number} - {pr_title}\n"
+        f"PR URL: {pr_url}\n\n"
+        "PR description:\n"
+        f"{pr_body}\n\n"
+        "Linked issue context:\n"
+        f"{'\n'.join(issue_context_lines)}\n\n"
+        "Failing CI checks:\n"
+        f"{'\n'.join(failing_lines) if failing_lines else '- No failing checks supplied.'}\n\n"
+        "CI diagnostics and failing logs:\n\n"
+        f"{'\n\n'.join(diagnostics_lines) if diagnostics_lines else 'No CI diagnostics available.'}\n"
+    )
+
+
+def orchestration_attempt_from_state(state: dict | None) -> int:
+    if not isinstance(state, dict):
+        return 1
+    attempt = state.get("attempt")
+    return attempt if type(attempt) is int and attempt > 0 else 1
 
 
 def fetch_pr_conversation_comments(repo: str, pr_number: int) -> list[dict]:
@@ -3446,6 +3968,9 @@ def format_decomposition_plan_comment(payload: dict) -> str:
     created_children = payload.get("created_children")
     if not isinstance(created_children, list):
         created_children = []
+    resume_context = payload.get("resume_context")
+    if not isinstance(resume_context, dict):
+        resume_context = {}
 
     reason_lines = "\n".join(f"- `{reason}`" for reason in reasons) or "- `manual`"
     child_lines: list[str] = []
@@ -3476,6 +4001,29 @@ def format_decomposition_plan_comment(payload: dict) -> str:
             created_entry = f"- {order}. {title}"
         created_lines.append(created_entry)
     created_text = "\n".join(created_lines) or "No child issues created yet."
+    resume_lines: list[str] = []
+    resume_branch = str(resume_context.get("branch") or "").strip()
+    resume_base = str(resume_context.get("base_branch") or "").strip()
+    resume_action = str(resume_context.get("next_action") or payload.get("next_action") or "").strip()
+    resume_issue = resume_context.get("resume_issue")
+    if resume_branch:
+        resume_lines.append(f"- branch: `{resume_branch}`")
+    if resume_base:
+        resume_lines.append(f"- base branch: `{resume_base}`")
+    if is_trackable_issue_number(resume_issue):
+        resume_lines.append(f"- resume parent issue: `{resume_issue}`")
+    if resume_action:
+        resume_lines.append(f"- next action: `{resume_action}`")
+    selected_child = resume_context.get("selected_child") if isinstance(resume_context.get("selected_child"), dict) else None
+    if isinstance(selected_child, dict):
+        child_order = selected_child.get("order")
+        child_title = str(selected_child.get("title") or "").strip()
+        child_issue_number = _as_positive_int(selected_child.get("issue_number"))
+        child_text = f"{child_order}: {child_title}" if child_title else str(child_order)
+        if child_issue_number is not None:
+            child_text = f"{child_text} (#{child_issue_number})"
+        resume_lines.append(f"- selected child: `{child_text}`")
+    resume_text = "\n".join(resume_lines) or "- Resume context will be filled in when execution starts."
 
     if status == "children_created":
         status_note = (
@@ -3503,6 +4051,8 @@ def format_decomposition_plan_comment(payload: dict) -> str:
         f"{reason_lines}\n\n"
         "Proposed child tasks:\n"
         f"{children_text}\n\n"
+        "Execution context:\n"
+        f"{resume_text}\n\n"
         f"Created child issues:\n{created_text}\n\n"
         f"Recommended next action: {next_action}\n\n"
         f"{DECOMPOSITION_PLAN_MARKER}\n"
@@ -3602,6 +4152,7 @@ def build_orchestration_state(
     error: str | None,
     workflow_checks: list[dict] | None = None,
     ci_checks: list[dict] | None = None,
+    ci_diagnostics: dict[str, object] | None = None,
     residual_untracked_files: list[str] | None = None,
     decomposition: dict | None = None,
     stats: dict[str, object] | None = None,
@@ -3632,6 +4183,8 @@ def build_orchestration_state(
         state["workflow_checks"] = workflow_checks
     if ci_checks is not None:
         state["ci_checks"] = ci_checks
+    if ci_diagnostics is not None:
+        state["ci_diagnostics"] = ci_diagnostics
     if residual_untracked_files is not None:
         sorted_residual = sorted(residual_untracked_files)
         state["residual_untracked_files"] = sorted_residual
@@ -3658,6 +4211,75 @@ def format_orchestration_state_comment(state: dict) -> str:
         f"{ORCHESTRATION_STATE_MARKER}\n"
         f"```json\n{json.dumps(state, ensure_ascii=True, indent=2)}\n```"
     )
+
+
+def format_clarification_request_comment(question: str, reason: str | None = None) -> str:
+    lines = [
+        "Automation needs clarification before it can continue safely.",
+        "",
+        f"Question: {question}",
+    ]
+    if reason and reason.strip() and reason.strip() != question.strip():
+        lines.extend(["", f"Why this is blocked: {reason.strip()}"])
+    lines.extend(["", "Next action: reply here and rerun the orchestrator."])
+    return "\n".join(lines)
+
+
+def post_clarification_request_comment(
+    repo: str,
+    target_type: str,
+    target_number: int,
+    question: str,
+    reason: str | None,
+    dry_run: bool,
+) -> None:
+    if target_type not in {"issue", "pr"}:
+        raise RuntimeError(f"Unsupported clarification comment target type: {target_type}")
+
+    body = format_clarification_request_comment(question=question, reason=reason)
+    if dry_run:
+        print(
+            f"[dry-run] Would post clarification request to {target_type} #{target_number}: "
+            f"question={question}"
+        )
+        return
+
+    run_command(
+        [
+            "gh",
+            target_type,
+            "comment",
+            str(target_number),
+            "--repo",
+            repo,
+            "--body",
+            body,
+        ]
+    )
+
+
+def safe_post_clarification_request_comment(
+    repo: str,
+    target_type: str,
+    target_number: int,
+    question: str,
+    reason: str | None,
+    dry_run: bool,
+) -> None:
+    try:
+        post_clarification_request_comment(
+            repo=repo,
+            target_type=target_type,
+            target_number=target_number,
+            question=question,
+            reason=reason,
+            dry_run=dry_run,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Warning: failed to post clarification request to {target_type} #{target_number}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def post_orchestration_state_comment(
@@ -3728,6 +4350,9 @@ def build_prompt(issue: dict, image_paths: list[str] | None = None) -> str:
         "You are working on an issue in the current git branch.\n"
         "Implement the fix for the issue in the repository files.\n"
         "Do not run git commands; git actions are handled by orchestration script.\n\n"
+        "If the task is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. "
+        f"Instead, stop and print {CLARIFICATION_REQUEST_MARKER} followed by a JSON object like "
+        '{"question":"<focused question>","reason":"<why clarification is required>"}.\n\n'
         f"Issue: {format_issue_ref_from_issue(issue)} - {issue['title']}\n"
         f"URL: {issue['url']}\n\n"
         "Issue body:\n"
@@ -3813,6 +4438,9 @@ def build_pr_review_prompt(
         "You are working on an existing GitHub pull request review cycle in the current git branch.\n"
         "Implement the fix requested in PR review comments in repository files.\n"
         "Do not run git commands; git actions are handled by orchestration script.\n\n"
+        "If the requested change is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. "
+        f"Instead, stop and print {CLARIFICATION_REQUEST_MARKER} followed by a JSON object like "
+        '{"question":"<focused question>","reason":"<why clarification is required>"}.\n\n'
         f"Pull Request: #{pr_number} - {pr_title}\n"
         f"PR URL: {pr_url}\n\n"
         "PR description:\n"
@@ -3829,6 +4457,7 @@ def choose_execution_mode(
     linked_open_pr: dict | None,
     force_issue_flow: bool,
     recovered_state: dict | None = None,
+    clarification_answer: dict | None = None,
 ) -> tuple[str, str]:
     if force_issue_flow:
         return "issue-flow", "--force-issue-flow is set"
@@ -3836,6 +4465,16 @@ def choose_execution_mode(
     recovered_status = ""
     if isinstance(recovered_state, dict):
         recovered_status = str(recovered_state.get("status") or "")
+
+    if recovered_status == "waiting-for-author" and clarification_answer is not None:
+        recovered_payload = recovered_state.get("payload") if isinstance(recovered_state, dict) else None
+        recovered_task_type = ""
+        if isinstance(recovered_payload, dict):
+            recovered_task_type = str(recovered_payload.get("task_type") or "")
+        if linked_open_pr is not None and recovered_task_type == "pr":
+            pr_number = linked_open_pr.get("number")
+            return "pr-review", f"recovered waiting-for-author state has a newer author answer for linked PR #{pr_number}"
+        return "issue-flow", "recovered waiting-for-author state has a newer author answer"
 
     if recovered_status in {"waiting-for-author", "blocked"}:
         return (
@@ -4050,6 +4689,7 @@ def run_agent(
     track_tokens: bool = False,
     token_budget: int | None = None,
     run_stats: dict[str, object] | None = None,
+    agent_result: dict[str, object] | None = None,
 ) -> int:
     prompt = prompt_override if prompt_override is not None else build_prompt(
         issue=issue,
@@ -4069,6 +4709,7 @@ def run_agent(
         track_tokens=track_tokens,
         token_budget=token_budget,
         run_stats=run_stats,
+        agent_result=agent_result,
     )
 
 
@@ -4128,6 +4769,7 @@ def run_agent_with_prompt(
     track_tokens: bool = False,
     token_budget: int | None = None,
     run_stats: dict[str, object] | None = None,
+    agent_result: dict[str, object] | None = None,
 ) -> int:
     command = build_agent_command(
         runner=runner,
@@ -4149,6 +4791,8 @@ def run_agent_with_prompt(
             print(f"[dry-run] Would run: {' '.join(command[:4])} ... for {item_label}")
         return 0
 
+    validate_opencode_model_backend(runner=runner, model=model)
+
     start = time.monotonic()
     print(f"Running agent for {item_label}")
     last_output = start
@@ -4156,6 +4800,7 @@ def run_agent_with_prompt(
     tokens_in: int | None = None
     tokens_out: int | None = None
     cost_usd: float | None = None
+    captured_output: list[str] = []
 
     process = subprocess.Popen(  # noqa: S603
         command,
@@ -4261,8 +4906,10 @@ def run_agent_with_prompt(
                         process.wait(timeout=10)
                         _raise_if_token_budget_exceeded()
                 if tag == "stderr":
+                    captured_output.append(line)
                     print(line, end="", file=sys.stderr)
                 else:
+                    captured_output.append(line)
                     print(line, end="")
         except _queue.Empty:
             pass
@@ -4285,8 +4932,10 @@ def run_agent_with_prompt(
                         if token_budget is not None and total_tokens is not None and total_tokens > token_budget:
                             _raise_if_token_budget_exceeded()
                     if tag == "stderr":
+                        captured_output.append(line)
                         print(line, end="", file=sys.stderr)
                     else:
+                        captured_output.append(line)
                         print(line, end="")
 
             recorded_stats = _record_agent_run_stats(
@@ -4296,6 +4945,14 @@ def run_agent_with_prompt(
                 tokens_out=tokens_out,
                 cost_usd=cost_usd,
             )
+            if agent_result is not None:
+                agent_result.clear()
+                agent_result["output"] = "".join(captured_output)
+                clarification_request = latest_clarification_request_from_agent_output(
+                    agent_result["output"]
+                )
+                if clarification_request is not None:
+                    agent_result["clarification_request"] = clarification_request
             if recorded_stats is not None:
                 print_agent_run_summary(item_label=item_label, stats=recorded_stats)
             return process.returncode
@@ -5536,6 +6193,24 @@ def run_doctor(args: argparse.Namespace, raw_argv: list[str] | None = None) -> i
     else:
         _doctor_record(checks, "WARN", "Runner availability (opencode)", "not installed")
 
+    if runner == "opencode":
+        try:
+            local_ollama_model = _ollama_model_name(model)
+        except RuntimeError as exc:
+            _doctor_record(checks, "FAIL", "Ollama model availability", str(exc))
+        else:
+            if local_ollama_model is not None:
+                try:
+                    validate_opencode_model_backend(runner=runner, model=model)
+                    _doctor_record(
+                        checks,
+                        "PASS",
+                        "Ollama model availability",
+                        f"validated local model '{local_ollama_model}'",
+                    )
+                except RuntimeError as exc:
+                    _doctor_record(checks, "FAIL", "Ollama model availability", str(exc))
+
     if smoke_enabled:
         smoke_command: list[str]
         if runner == "claude":
@@ -6124,6 +6799,7 @@ def main() -> int:
                 "branch": None,
                 "base_branch": None,
             }
+            pr_attempt = 1
             if type(pr_number_arg) is not int:
                 raise RuntimeError("--pr must be an integer pull request number")
 
@@ -6180,11 +6856,17 @@ def main() -> int:
                 switched_branch = (not args.dry_run) and original_branch != target_pr_branch
 
             recovered_pr_state: dict | None = None
+            pr_clarification_answer: dict | None = None
             try:
                 pr_comments = fetch_issue_comments(repo=repo, issue_number=pr_number_arg)
                 recovered_pr_state, pr_state_warnings = select_latest_parseable_orchestration_state(
                     comments=pr_comments,
                     source_label=f"pr #{pr_number_arg}",
+                )
+                pr_clarification_answer = find_waiting_for_author_answer(
+                    comments=pr_comments,
+                    recovered_state=recovered_pr_state,
+                    author_login=pr_author_login if "pr_author_login" in locals() else None,
                 )
                 for warning in pr_state_warnings:
                     print(f"Warning: {warning}", file=sys.stderr)
@@ -6209,7 +6891,27 @@ def main() -> int:
             pull_request, review_items, review_stats = fetch_actionable_pr_review_feedback(
                 repo=repo,
                 pr_number=pr_number_arg,
-                pull_request=pull_request,
+            )
+            reviews = pull_request.get("reviews")
+            if not isinstance(reviews, list):
+                reviews = []
+
+            pr_author_payload = pull_request.get("author")
+            pr_author_login = ""
+            if isinstance(pr_author_payload, dict):
+                pr_author_login = str(pr_author_payload.get("login") or "")
+            if pr_clarification_answer is None:
+                pr_clarification_answer = find_waiting_for_author_answer(
+                    comments=pr_comments if "pr_comments" in locals() else [],
+                    recovered_state=recovered_pr_state,
+                    author_login=pr_author_login,
+                )
+
+            review_items, review_stats = normalize_review_items(
+                threads=threads,
+                reviews=reviews,
+                conversation_comments=conversation_comments,
+                pr_author_login=pr_author_login,
             )
             print(
                 "Review prompt sources: "
@@ -6246,7 +6948,7 @@ def main() -> int:
                     runner=args.runner,
                     agent=args.agent,
                     model=args.model,
-                    attempt=1,
+                    attempt=pr_attempt,
                     stage="agent_run",
                     next_action="wait_for_agent_result",
                     error=None,
@@ -6255,12 +6957,14 @@ def main() -> int:
             )
 
             if not review_items:
+                ci_prompt_override: str | None = None
                 recovered_pr_status = ""
                 if isinstance(recovered_pr_state, dict):
                     recovered_pr_status = str(recovered_pr_state.get("status") or "")
 
                 if recovered_pr_status == "waiting-for-ci":
-                    ci_status = read_pr_ci_status_for_pull_request(
+                    current_attempt = orchestration_attempt_from_state(recovered_pr_state)
+                    ci_status = wait_for_pr_ci_status(
                         repo=repo,
                         pull_request=pull_request,
                     )
@@ -6272,6 +6976,9 @@ def main() -> int:
                     pending_checks = ci_status.get("pending_checks")
                     pending_checks_count = (
                         len(pending_checks) if isinstance(pending_checks, list) else 0
+                    )
+                    ci_checks_payload = (
+                        ci_status.get("checks") if isinstance(ci_status.get("checks"), list) else []
                     )
 
                     if ci_overall == "pending":
@@ -6290,15 +6997,11 @@ def main() -> int:
                                 runner=args.runner,
                                 agent=args.agent,
                                 model=args.model,
-                                attempt=1,
+                                attempt=current_attempt,
                                 stage="ci_checks",
                                 next_action="wait_for_ci",
                                 error=None,
-                                ci_checks=(
-                                    ci_status.get("checks")
-                                    if isinstance(ci_status.get("checks"), list)
-                                    else []
-                                ),
+                                ci_checks=ci_checks_payload,
                                 decomposition=pr_recovered_decomposition_rollup,
                             ),
                         )
@@ -6310,13 +7013,91 @@ def main() -> int:
 
                     if ci_overall == "failure":
                         failing_summary = format_failing_ci_checks_summary(failing_checks_list)
+                        ci_diagnostics = collect_failing_ci_diagnostics(
+                            repo=repo,
+                            failing_checks=failing_checks_list,
+                        )
+                        diagnostics_summary = format_ci_diagnostics_summary(ci_diagnostics)
+                        if str(ci_diagnostics.get("overall_classification") or "") == "transient":
+                            safe_post_orchestration_state_comment(
+                                repo=repo,
+                                target_type="pr",
+                                target_number=pr_number_arg,
+                                dry_run=args.dry_run,
+                                state=build_orchestration_state(
+                                    status="blocked",
+                                    task_type="pr",
+                                    issue_number=None,
+                                    pr_number=pr_number_arg,
+                                    branch=active_branch,
+                                    base_branch=str(pr_state_context["base_branch"] or "") or None,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    attempt=current_attempt,
+                                    stage="ci_checks",
+                                    next_action="retry_ci_after_transient_failure",
+                                    error=short_error_text(f"{failing_summary}; {diagnostics_summary}"),
+                                    ci_checks=ci_checks_payload,
+                                    ci_diagnostics=ci_diagnostics,
+                                    decomposition=pr_recovered_decomposition_rollup,
+                                ),
+                            )
+                            print(
+                                f"PR #{pr_number_arg} CI failure looks transient: {diagnostics_summary}. "
+                                "Stopping without a code change retry."
+                            )
+                            return _finish_main(0, original_process_cwd)
+
+                        if current_attempt >= max_attempts:
+                            safe_post_orchestration_state_comment(
+                                repo=repo,
+                                target_type="pr",
+                                target_number=pr_number_arg,
+                                dry_run=args.dry_run,
+                                state=build_orchestration_state(
+                                    status="blocked",
+                                    task_type="pr",
+                                    issue_number=None,
+                                    pr_number=pr_number_arg,
+                                    branch=active_branch,
+                                    base_branch=str(pr_state_context["base_branch"] or "") or None,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    attempt=current_attempt,
+                                    stage="ci_checks",
+                                    next_action="manual_ci_fix_required",
+                                    error=short_error_text(
+                                        f"{failing_summary}; retry limit reached at attempt {current_attempt}/{max_attempts}"
+                                    ),
+                                    ci_checks=ci_checks_payload,
+                                    ci_diagnostics=ci_diagnostics,
+                                    decomposition=pr_recovered_decomposition_rollup,
+                                ),
+                            )
+                            print(
+                                f"PR #{pr_number_arg} has failing CI checks after {current_attempt}/{max_attempts} "
+                                f"attempts: {diagnostics_summary}"
+                            )
+                            return _finish_main(0, original_process_cwd)
+
+                        retry_attempt = current_attempt + 1
+                        pr_attempt = retry_attempt
+                        linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                        ci_prompt_override = build_ci_failure_prompt(
+                            pull_request=pull_request,
+                            failing_checks=failing_checks_list,
+                            ci_diagnostics=ci_diagnostics,
+                            linked_issues=linked_issues,
+                        )
                         safe_post_orchestration_state_comment(
                             repo=repo,
                             target_type="pr",
                             target_number=pr_number_arg,
                             dry_run=args.dry_run,
                             state=build_orchestration_state(
-                                status="blocked",
+                                status="in-progress",
                                 task_type="pr",
                                 issue_number=None,
                                 pr_number=pr_number_arg,
@@ -6325,34 +7106,66 @@ def main() -> int:
                                 runner=args.runner,
                                 agent=args.agent,
                                 model=args.model,
-                                attempt=1,
+                                attempt=retry_attempt,
                                 stage="ci_checks",
-                                 next_action="inspect_failing_ci_checks",
-                                 error=short_error_text(failing_summary),
-                                 ci_checks=ci_status.get("checks")
-                                 if isinstance(ci_status.get("checks"), list)
-                                 else [],
-                                 decomposition=pr_recovered_decomposition_rollup,
-                             ),
-                         )
-                        print(f"PR #{pr_number_arg} has failing CI checks: {failing_summary}")
-                        return 0
+                                next_action="run_ci_fix_agent",
+                                error=short_error_text(f"{failing_summary}; {diagnostics_summary}"),
+                                ci_checks=ci_checks_payload,
+                                ci_diagnostics=ci_diagnostics,
+                                decomposition=pr_recovered_decomposition_rollup,
+                            ),
+                        )
+                        print(
+                            f"PR #{pr_number_arg} has failing CI checks: {diagnostics_summary}. "
+                            f"Running CI fix attempt {retry_attempt}/{max_attempts}."
+                        )
 
-                    required_file_validation = validate_required_files_in_pr(
-                        pull_request=pull_request,
-                        linked_issues=load_linked_issue_context(repo=repo, pull_request=pull_request),
-                    )
+                    if ci_overall == "success":
+                        required_file_validation = validate_required_files_in_pr(
+                            pull_request=pull_request,
+                            linked_issues=load_linked_issue_context(repo=repo, pull_request=pull_request),
+                        )
 
-                    if required_file_validation.get("status") == "blocked":
-                        missing_files = required_file_validation.get("missing_files")
-                        missing_summary = ", ".join(sorted(str(file) for file in missing_files))
+                        if required_file_validation.get("status") == "blocked":
+                            missing_files = required_file_validation.get("missing_files")
+                            missing_summary = ", ".join(sorted(str(file) for file in missing_files))
+                            safe_post_orchestration_state_comment(
+                                repo=repo,
+                                target_type="pr",
+                                target_number=pr_number_arg,
+                                dry_run=args.dry_run,
+                                state=build_orchestration_state(
+                                    status="blocked",
+                                    task_type="pr",
+                                    issue_number=None,
+                                    pr_number=pr_number_arg,
+                                    branch=active_branch,
+                                    base_branch=str(pr_state_context["base_branch"] or "") or None,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    attempt=current_attempt,
+                                    stage="ci_checks",
+                                    next_action="update_pr_with_required_files",
+                                    error=f"Missing required file evidence: {missing_summary}",
+                                    ci_checks=ci_checks_payload,
+                                    decomposition=pr_recovered_decomposition_rollup,
+                                    required_file_validation=required_file_validation,
+                                ),
+                            )
+                            print(
+                                f"PR #{pr_number_arg} CI passed but required file evidence check failed. "
+                                f"Missing files: {missing_summary}"
+                            )
+                            return _finish_main(0, original_process_cwd)
+
                         safe_post_orchestration_state_comment(
                             repo=repo,
                             target_type="pr",
                             target_number=pr_number_arg,
                             dry_run=args.dry_run,
                             state=build_orchestration_state(
-                                status="blocked",
+                                status="ready-to-merge",
                                 task_type="pr",
                                 issue_number=None,
                                 pr_number=pr_number_arg,
@@ -6361,53 +7174,19 @@ def main() -> int:
                                 runner=args.runner,
                                 agent=args.agent,
                                 model=args.model,
-                                attempt=1,
+                                attempt=current_attempt,
                                 stage="ci_checks",
-                                next_action="update_pr_with_required_files",
-                                error=f"Missing required file evidence: {missing_summary}",
-                                ci_checks=ci_status.get("checks")
-                                if isinstance(ci_status.get("checks"), list)
-                                else [],
+                                next_action="ready_for_merge",
+                                error=None,
+                                ci_checks=ci_checks_payload,
                                 decomposition=pr_recovered_decomposition_rollup,
                                 required_file_validation=required_file_validation,
                             ),
                         )
                         print(
-                            f"PR #{pr_number_arg} CI passed but required file evidence check failed. "
-                            f"Missing files: {missing_summary}"
+                            f"CI checks passed for PR #{pr_number_arg}; marking orchestration state as ready-to-merge."
                         )
                         return _finish_main(0, original_process_cwd)
-
-                    safe_post_orchestration_state_comment(
-                        repo=repo,
-                        target_type="pr",
-                        target_number=pr_number_arg,
-                        dry_run=args.dry_run,
-                        state=build_orchestration_state(
-                            status="ready-to-merge",
-                            task_type="pr",
-                            issue_number=None,
-                            pr_number=pr_number_arg,
-                            branch=active_branch,
-                            base_branch=str(pr_state_context["base_branch"] or "") or None,
-                            runner=args.runner,
-                            agent=args.agent,
-                            model=args.model,
-                            attempt=1,
-                            stage="ci_checks",
-                            next_action="ready_for_merge",
-                            error=None,
-                            ci_checks=ci_status.get("checks")
-                            if isinstance(ci_status.get("checks"), list)
-                            else [],
-                            decomposition=pr_recovered_decomposition_rollup,
-                            required_file_validation=required_file_validation,
-                        ),
-                    )
-                    print(
-                        f"CI checks passed for PR #{pr_number_arg}; marking orchestration state as ready-to-merge."
-                    )
-                    return _finish_main(0, original_process_cwd)
 
                 safe_post_orchestration_state_comment(
                     repo=repo,
@@ -6424,7 +7203,7 @@ def main() -> int:
                         runner=args.runner,
                         agent=args.agent,
                         model=args.model,
-                        attempt=1,
+                        attempt=pr_attempt,
                                  stage="review_feedback",
                                  next_action="await_new_review_comments",
                                  error="No actionable review comments found",
@@ -6437,42 +7216,178 @@ def main() -> int:
                 )
                 return _finish_main(0, original_process_cwd)
 
-            attempt = 1
-            while True:
-                linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
-                prompt = build_pr_review_prompt(
-                    pull_request=pull_request,
-                    review_items=review_items,
-                    linked_issues=linked_issues,
+            linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+            prompt = ci_prompt_override if 'ci_prompt_override' in locals() and ci_prompt_override is not None else build_pr_review_prompt(
+                pull_request=pull_request,
+                review_items=review_items,
+                linked_issues=linked_issues,
+            )
+            if (
+                recovered_pr_state is not None
+                and str(recovered_pr_state.get("status") or "") == "failed"
+            ):
+                prompt = append_recovered_context_to_prompt(
+                    prompt,
+                    build_recovered_failure_context_note(recovered_pr_state),
                 )
-                if (
-                    recovered_pr_state is not None
-                    and str(recovered_pr_state.get("status") or "") == "failed"
-                    and attempt == 1
-                ):
-                    prompt = append_recovered_context_to_prompt(
-                        prompt,
-                        build_recovered_failure_context_note(recovered_pr_state),
-                    )
+            elif (
+                recovered_pr_state is not None
+                and str(recovered_pr_state.get("status") or "") == "waiting-for-author"
+                and pr_clarification_answer is not None
+            ):
+                prompt = append_recovered_context_to_prompt(
+                    prompt,
+                    build_clarification_context_note(recovered_pr_state, pr_clarification_answer),
+                )
 
-                failure_stage = "agent_run"
-                pre_run_untracked_files: set[str] | None = None
-                if not args.dry_run:
-                    pre_run_untracked_files = list_untracked_files()
-                pr_agent_run_stats = {}
-                exit_code = run_agent_with_prompt(
-                    prompt=prompt,
-                    item_label=f"PR #{pr_number_arg}",
-                    runner=args.runner,
-                    agent=args.agent,
-                    model=args.model,
+            failure_stage = "agent_run"
+            pre_run_untracked_files: set[str] | None = None
+            if not args.dry_run:
+                pre_run_untracked_files = list_untracked_files()
+            pr_agent_run_stats: dict[str, object] = {}
+            pr_agent_result: dict[str, object] = {}
+            exit_code = run_agent_with_prompt(
+                prompt=prompt,
+                item_label=f"PR #{pr_number_arg}",
+                runner=args.runner,
+                agent=args.agent,
+                model=args.model,
+                dry_run=args.dry_run,
+                timeout_seconds=args.agent_timeout_seconds,
+                idle_timeout_seconds=args.agent_idle_timeout_seconds,
+                opencode_auto_approve=args.opencode_auto_approve,
+                track_tokens=track_tokens,
+                token_budget=token_budget,
+                run_stats=pr_agent_run_stats,
+                agent_result=pr_agent_result,
+            )
+            if exit_code != 0:
+                exit_summary = describe_exit_code(exit_code)
+                diagnosis = (
+                    classify_opencode_failure(return_code=exit_code, model=args.model)
+                    if args.runner == "opencode"
+                    else None
+                )
+                message = (
+                    f"Agent failed for PR #{pr_number_arg} with {exit_summary}"
+                    + (f" ({diagnosis})" if diagnosis else "")
+                )
+                raise RuntimeError(message)
+
+            clarification_request = pr_agent_result.get("clarification_request")
+            if isinstance(clarification_request, dict):
+                question = str(clarification_request.get("question") or "").strip()
+                reason = _as_optional_string(clarification_request.get("reason"))
+                if question:
+                    safe_post_clarification_request_comment(
+                        repo=repo,
+                        target_type="pr",
+                        target_number=pr_number_arg,
+                        question=question,
+                        reason=reason,
+                        dry_run=args.dry_run,
+                    )
+                    safe_post_orchestration_state_comment(
+                        repo=repo,
+                        target_type="pr",
+                        target_number=pr_number_arg,
+                        dry_run=args.dry_run,
+                        state=build_orchestration_state(
+                            status="waiting-for-author",
+                            task_type="pr",
+                            issue_number=None,
+                            pr_number=pr_number_arg,
+                            branch=active_branch,
+                            base_branch=str(pr_state_context["base_branch"] or "") or None,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            attempt=1,
+                            stage="agent_run",
+                            next_action="await_author_reply",
+                            error=reason or question,
+                            stats=pr_agent_run_stats,
+                            decomposition=pr_recovered_decomposition_rollup,
+                        ) | {"question": question, "reason": reason},
+                    )
+                    print(f"Paused PR #{pr_number_arg} for author clarification: {question}")
+                    if pr_followup_branch_prefix and not args.dry_run:
+                        run_command(["git", "checkout", base_branch_for_run])
+                    return _finish_main(0, original_process_cwd)
+
+            if not args.dry_run and not has_changes():
+                safe_post_orchestration_state_comment(
+                    repo=repo,
+                    target_type="pr",
+                    target_number=pr_number_arg,
+                    dry_run=False,
+                    state=build_orchestration_state(
+                        status="waiting-for-author",
+                        task_type="pr",
+                        issue_number=None,
+                        pr_number=pr_number_arg,
+                        branch=active_branch,
+                        base_branch=str(pr_state_context["base_branch"] or "") or None,
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        attempt=pr_attempt,
+                        stage="post_agent_check",
+                        next_action="await_more_feedback_or_manual_changes",
+                        error="Agent produced no repository changes",
+                        stats=pr_agent_run_stats,
+                        decomposition=pr_recovered_decomposition_rollup,
+                    ),
+                )
+                print(f"No changes detected for PR #{pr_number_arg}; skipping commit and push")
+                if pr_followup_branch_prefix:
+                    run_command(["git", "checkout", base_branch_for_run])
+                return _finish_main(0, original_process_cwd)
+
+            failure_stage = "commit_push"
+            commit_pr_review_changes(
+                pull_request=pull_request,
+                dry_run=args.dry_run,
+                pre_run_untracked_files=pre_run_untracked_files,
+            )
+
+            failure_stage = "workflow_checks"
+            workflow_check_results = run_configured_workflow_checks(
+                checks=workflow_checks,
+                dry_run=args.dry_run,
+                cwd=os.getcwd(),
+            )
+
+            failure_stage = "commit_push"
+            if pr_followup_branch_prefix:
+                push_branch(branch_name=active_branch, dry_run=args.dry_run)
+                print(f"Pushed follow-up branch for PR #{pr_number_arg}: {active_branch}")
+            else:
+                push_branch(branch_name=active_branch, dry_run=args.dry_run)
+
+                safe_post_orchestration_state_comment(
+                    repo=repo,
+                    target_type="pr",
+                    target_number=pr_number_arg,
                     dry_run=args.dry_run,
-                    timeout_seconds=args.agent_timeout_seconds,
-                    idle_timeout_seconds=args.agent_idle_timeout_seconds,
-                    opencode_auto_approve=args.opencode_auto_approve,
-                    track_tokens=track_tokens,
-                    token_budget=token_budget,
-                    run_stats=pr_agent_run_stats,
+                    state=build_orchestration_state(
+                        status="waiting-for-ci",
+                        task_type="pr",
+                        issue_number=None,
+                        pr_number=pr_number_arg,
+                        branch=active_branch,
+                        base_branch=str(pr_state_context["base_branch"] or "") or None,
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        attempt=pr_attempt,
+                        stage="changes_pushed",
+                        next_action="wait_for_ci",
+                        error=None,
+                        workflow_checks=workflow_check_results,
+                        stats=pr_agent_run_stats,
+                        decomposition=pr_recovered_decomposition_rollup,
+                    ),
                 )
                 if exit_code != 0:
                     exit_summary = describe_exit_code(exit_code)
@@ -6656,7 +7571,7 @@ def main() -> int:
                             runner=args.runner,
                             agent=args.agent,
                             model=args.model,
-                            attempt=1,
+                            attempt=pr_attempt,
                             stage=failure_stage,
                             next_action=next_action,
                             error=short_error_text(str(exc)),
@@ -6727,6 +7642,7 @@ def main() -> int:
             decomposition_child_note: str | None = None
             selected_decomposition_child = False
             issue_agent_run_stats: dict[str, object] | None = None
+            state_attempt = 1
             supports_github_issue_ops = issue_tracker(issue) == TRACKER_GITHUB and type(issue["number"]) is int
 
             scope_decision = evaluate_issue_scope(issue=issue, scope_defaults=scope_defaults)
@@ -6824,12 +7740,18 @@ def main() -> int:
                         continue
 
             if skip_if_branch_exists and remote_branch_exists(issue_branch):
-                skipped_existing_branch += 1
-                print(
-                    f"Skipping {issue_label}: branch '{issue_branch}' already exists on origin "
-                    "(--force-reprocess or --no-skip-if-branch-exists to override)."
-                )
-                continue
+                if issue_number_arg is not None:
+                    print(
+                        f"Found existing remote branch for {issue_label}: '{issue_branch}'; "
+                        "continuing so the single-issue run can reuse that branch context."
+                    )
+                else:
+                    skipped_existing_branch += 1
+                    print(
+                        f"Skipping {issue_label}: branch '{issue_branch}' already exists on origin "
+                        "(--force-reprocess or --no-skip-if-branch-exists to override)."
+                    )
+                    continue
 
             if issue_number_arg is not None and has_force_issue_flow_flag and supports_github_issue_ops:
                 if linked_open_pr is None:
@@ -6882,6 +7804,13 @@ def main() -> int:
                 recovered_state = merge_latest_recovered_state(
                     [recovered_issue_state, recovered_pr_state]
                 )
+                clarification_answer: dict | None = None
+                if recovered_issue_state is not None:
+                    clarification_answer = find_waiting_for_author_answer(
+                        comments=issue_comments,
+                        recovered_state=recovered_issue_state,
+                        author_login=_issue_author_login(issue),
+                    )
                 decomposition_rollup = build_decomposition_rollup_from_recovered_state(
                     recovered_state=recovered_state,
                     parent_issue=issue["number"],
@@ -6891,6 +7820,11 @@ def main() -> int:
                     print(
                         f"{prefix}Recovered orchestration state context: "
                         f"{format_recovered_state_context(recovered_state)}"
+                    )
+                if clarification_answer is not None:
+                    print(
+                        f"Found author clarification reply for {issue_label}: "
+                        f"{clarification_answer.get('body')}"
                     )
 
                 if recovered_state is not None:
@@ -6907,6 +7841,7 @@ def main() -> int:
                     linked_open_pr=linked_open_pr,
                     force_issue_flow=force_issue_flow,
                     recovered_state=recovered_state,
+                    clarification_answer=clarification_answer,
                 )
                 if mode == "skip":
                     print(
@@ -6971,6 +7906,8 @@ def main() -> int:
                                         child=child,
                                         created_dependencies=created_children,
                                         dry_run=args.dry_run,
+                                        parent_branch=issue_branch,
+                                        base_branch=base_branch if base_branch else None,
                                     )
                                     created_order = child.get("order")
                                     if type(created_order) is int and created_order > 0:
@@ -7005,6 +7942,21 @@ def main() -> int:
                                     latest_payload_dict["status"] = "children_created"
                                     latest_payload_dict["next_action"] = "execute_children_in_order"
 
+                                latest_payload_dict = attach_decomposition_resume_context(
+                                    plan_payload=latest_payload_dict,
+                                    parent_issue=issue,
+                                    parent_branch=issue_branch,
+                                    base_branch=base_branch if base_branch else None,
+                                    next_action=str(
+                                        latest_payload_dict.get("next_action")
+                                        or "execute_children_in_order"
+                                    ),
+                                )
+
+                                decomposition_rollup = build_decomposition_rollup_from_plan_payload(
+                                    payload=latest_payload_dict,
+                                )
+
                                 post_decomposition_plan_comment(
                                     repo=repo,
                                     issue_number=issue["number"],
@@ -7034,12 +7986,20 @@ def main() -> int:
                                             if all_children_created
                                             else "Waiting for all child issue creation in approved plan"
                                         ),
+                                        decomposition=decomposition_rollup,
                                     ),
                                 )
                                 processed += 1
                                 continue
 
                             if missing_children:
+                                latest_payload_dict = attach_decomposition_resume_context(
+                                    plan_payload=latest_payload_dict,
+                                    parent_issue=issue,
+                                    parent_branch=issue_branch,
+                                    base_branch=base_branch if base_branch else None,
+                                    next_action="create_missing_child_issues",
+                                )
                                 decomposition_rollup = build_decomposition_rollup_from_plan_payload(
                                     payload=latest_payload_dict,
                                 )
@@ -7076,6 +8036,21 @@ def main() -> int:
                             latest_payload_dict = refresh_decomposition_plan_payload_from_child_states(
                                 repo=repo,
                                 plan_payload=latest_payload_dict,
+                            )
+                            decomposition_rollup = build_decomposition_rollup_from_plan_payload(
+                                payload=latest_payload_dict,
+                            )
+                            selected_child = decomposition_rollup.get("next_child")
+                            latest_payload_dict = attach_decomposition_resume_context(
+                                plan_payload=latest_payload_dict,
+                                parent_issue=issue,
+                                parent_branch=issue_branch,
+                                base_branch=base_branch if base_branch else None,
+                                next_action=str(
+                                    latest_payload_dict.get("next_action")
+                                    or ("execute_next_child" if isinstance(selected_child, dict) else "review_completed_children")
+                                ),
+                                selected_child=selected_child if isinstance(selected_child, dict) else None,
                             )
                             decomposition_rollup = build_decomposition_rollup_from_plan_payload(
                                 payload=latest_payload_dict,
@@ -7194,6 +8169,13 @@ def main() -> int:
 
                     if not selected_decomposition_child:
                         payload = build_decomposition_plan_payload(issue=issue, assessment=assessment)
+                        payload = attach_decomposition_resume_context(
+                            plan_payload=payload,
+                            parent_issue=issue,
+                            parent_branch=issue_branch,
+                            base_branch=base_branch if base_branch else None,
+                            next_action="approve_plan_or_rerun_with_decompose_never",
+                        )
                         post_decomposition_plan_comment(
                             repo=repo,
                             issue_number=issue["number"],
@@ -7259,6 +8241,15 @@ def main() -> int:
                         build_prompt(issue, image_paths=issue_image_paths),
                         build_recovered_failure_context_note(recovered_state),
                     )
+                elif (
+                    recovered_state is not None
+                    and str(recovered_state.get("status") or "") == "waiting-for-author"
+                    and clarification_answer is not None
+                ):
+                    prompt_override = append_recovered_context_to_prompt(
+                        build_prompt(issue, image_paths=issue_image_paths),
+                        build_clarification_context_note(recovered_state, clarification_answer),
+                    )
                 elif decomposition_child_note:
                     prompt_override = append_recovered_context_to_prompt(
                         build_prompt(issue, image_paths=issue_image_paths),
@@ -7317,7 +8308,8 @@ def main() -> int:
                                 f"continuing with sync-only rerun because mergeStateStatus={merge_state}"
                             )
                         elif recovered_status == "waiting-for-ci":
-                            ci_status = read_pr_ci_status_for_pull_request(
+                            current_attempt = orchestration_attempt_from_state(recovered_state)
+                            ci_status = wait_for_pr_ci_status(
                                 repo=repo,
                                 pull_request=pull_request,
                             )
@@ -7350,7 +8342,7 @@ def main() -> int:
                                         runner=args.runner,
                                         agent=args.agent,
                                         model=args.model,
-                                        attempt=1,
+                                        attempt=current_attempt,
                                          stage="ci_checks",
                                          next_action="wait_for_ci",
                                          error=None,
@@ -7372,13 +8364,101 @@ def main() -> int:
 
                             if ci_overall == "failure":
                                 failing_summary = format_failing_ci_checks_summary(failing_checks_list)
+                                ci_diagnostics = collect_failing_ci_diagnostics(
+                                    repo=repo,
+                                    failing_checks=failing_checks_list,
+                                )
+                                diagnostics_summary = format_ci_diagnostics_summary(ci_diagnostics)
+                                if str(ci_diagnostics.get("overall_classification") or "") == "transient":
+                                    safe_post_orchestration_state_comment(
+                                        repo=repo,
+                                        target_type="pr",
+                                        target_number=state_target_number,
+                                        dry_run=args.dry_run,
+                                        state=build_orchestration_state(
+                                            status="blocked",
+                                            task_type="pr",
+                                            issue_number=issue["number"],
+                                            pr_number=state_pr_number,
+                                            branch=issue_branch,
+                                            base_branch=target_base_branch,
+                                            runner=args.runner,
+                                            agent=args.agent,
+                                            model=args.model,
+                                            attempt=current_attempt,
+                                            stage="ci_checks",
+                                            next_action="retry_ci_after_transient_failure",
+                                            error=short_error_text(f"{failing_summary}; {diagnostics_summary}"),
+                                            ci_checks=ci_checks_payload,
+                                            ci_diagnostics=ci_diagnostics,
+                                            decomposition=decomposition_rollup,
+                                        ),
+                                    )
+                                    print(
+                                        f"No actionable review comments for linked PR #{pr_number}; "
+                                        f"CI failure looks transient: {diagnostics_summary}."
+                                    )
+                                    remove_agent_failure_label_from_issue(
+                                        repo=repo,
+                                        issue_number=issue["number"],
+                                        dry_run=args.dry_run,
+                                    )
+                                    continue
+
+                                if current_attempt >= max_attempts:
+                                    safe_post_orchestration_state_comment(
+                                        repo=repo,
+                                        target_type="pr",
+                                        target_number=state_target_number,
+                                        dry_run=args.dry_run,
+                                        state=build_orchestration_state(
+                                            status="blocked",
+                                            task_type="pr",
+                                            issue_number=issue["number"],
+                                            pr_number=state_pr_number,
+                                            branch=issue_branch,
+                                            base_branch=target_base_branch,
+                                            runner=args.runner,
+                                            agent=args.agent,
+                                            model=args.model,
+                                            attempt=current_attempt,
+                                            stage="ci_checks",
+                                            next_action="manual_ci_fix_required",
+                                            error=short_error_text(
+                                                f"{failing_summary}; retry limit reached at attempt {current_attempt}/{max_attempts}"
+                                            ),
+                                            ci_checks=ci_checks_payload,
+                                            ci_diagnostics=ci_diagnostics,
+                                            decomposition=decomposition_rollup,
+                                        ),
+                                    )
+                                    print(
+                                        f"No actionable review comments for linked PR #{pr_number}; "
+                                        f"retry limit reached after {current_attempt}/{max_attempts} attempts: "
+                                        f"{diagnostics_summary}"
+                                    )
+                                    remove_agent_failure_label_from_issue(
+                                        repo=repo,
+                                        issue_number=issue["number"],
+                                        dry_run=args.dry_run,
+                                    )
+                                    continue
+
+                                retry_attempt = current_attempt + 1
+                                state_attempt = retry_attempt
+                                prompt_override = build_ci_failure_prompt(
+                                    pull_request=pull_request,
+                                    failing_checks=failing_checks_list,
+                                    ci_diagnostics=ci_diagnostics,
+                                    linked_issues=[issue],
+                                )
                                 safe_post_orchestration_state_comment(
                                     repo=repo,
                                     target_type="pr",
                                     target_number=state_target_number,
                                     dry_run=args.dry_run,
                                     state=build_orchestration_state(
-                                        status="blocked",
+                                        status="in-progress",
                                         task_type="pr",
                                         issue_number=issue["number"],
                                         pr_number=state_pr_number,
@@ -7387,40 +8467,73 @@ def main() -> int:
                                         runner=args.runner,
                                         agent=args.agent,
                                         model=args.model,
-                                        attempt=1,
+                                        attempt=retry_attempt,
                                         stage="ci_checks",
-                                        next_action="inspect_failing_ci_checks",
-                                        error=short_error_text(failing_summary),
+                                        next_action="run_ci_fix_agent",
+                                        error=short_error_text(f"{failing_summary}; {diagnostics_summary}"),
                                         ci_checks=ci_checks_payload,
+                                        ci_diagnostics=ci_diagnostics,
                                         decomposition=decomposition_rollup,
                                     ),
                                 )
                                 print(
                                     f"No actionable review comments for linked PR #{pr_number}; "
-                                    f"CI is failing: {failing_summary}"
+                                    f"CI is failing: {diagnostics_summary}. "
+                                    f"Running CI fix attempt {retry_attempt}/{max_attempts}."
                                 )
-                                remove_agent_failure_label_from_issue(
-                                    repo=repo,
-                                    issue_number=issue["number"],
-                                    dry_run=args.dry_run,
+
+                            if ci_overall == "success":
+                                required_file_validation = validate_required_files_in_pr(
+                                    pull_request=pull_request,
+                                    linked_issues=[issue],
                                 )
-                                continue
 
-                            required_file_validation = validate_required_files_in_pr(
-                                pull_request=pull_request,
-                                linked_issues=[issue],
-                            )
+                                if required_file_validation.get("status") == "blocked":
+                                    missing_files = required_file_validation.get("missing_files")
+                                    missing_summary = ", ".join(sorted(str(file) for file in missing_files))
+                                    safe_post_orchestration_state_comment(
+                                        repo=repo,
+                                        target_type="pr",
+                                        target_number=state_target_number,
+                                        dry_run=args.dry_run,
+                                        state=build_orchestration_state(
+                                            status="blocked",
+                                            task_type="pr",
+                                            issue_number=issue["number"],
+                                            pr_number=state_pr_number,
+                                            branch=issue_branch,
+                                            base_branch=target_base_branch,
+                                            runner=args.runner,
+                                            agent=args.agent,
+                                            model=args.model,
+                                            attempt=current_attempt,
+                                            stage="ci_checks",
+                                            next_action="update_pr_with_required_files",
+                                            error=f"Missing required file evidence: {missing_summary}",
+                                            ci_checks=ci_checks_payload,
+                                            decomposition=decomposition_rollup,
+                                            required_file_validation=required_file_validation,
+                                        ),
+                                    )
+                                    print(
+                                        f"No actionable review comments for linked PR #{pr_number}; "
+                                        "CI checks passed but required file evidence check failed. "
+                                        f"Missing files: {missing_summary}"
+                                    )
+                                    remove_agent_failure_label_from_issue(
+                                        repo=repo,
+                                        issue_number=issue["number"],
+                                        dry_run=args.dry_run,
+                                    )
+                                    continue
 
-                            if required_file_validation.get("status") == "blocked":
-                                missing_files = required_file_validation.get("missing_files")
-                                missing_summary = ", ".join(sorted(str(file) for file in missing_files))
                                 safe_post_orchestration_state_comment(
                                     repo=repo,
                                     target_type="pr",
                                     target_number=state_target_number,
                                     dry_run=args.dry_run,
                                     state=build_orchestration_state(
-                                        status="blocked",
+                                        status="ready-to-merge",
                                         task_type="pr",
                                         issue_number=issue["number"],
                                         pr_number=state_pr_number,
@@ -7429,10 +8542,10 @@ def main() -> int:
                                         runner=args.runner,
                                         agent=args.agent,
                                         model=args.model,
-                                        attempt=1,
+                                        attempt=current_attempt,
                                         stage="ci_checks",
-                                        next_action="update_pr_with_required_files",
-                                        error=f"Missing required file evidence: {missing_summary}",
+                                        next_action="ready_for_merge",
+                                        error=None,
                                         ci_checks=ci_checks_payload,
                                         decomposition=decomposition_rollup,
                                         required_file_validation=required_file_validation,
@@ -7440,8 +8553,7 @@ def main() -> int:
                                 )
                                 print(
                                     f"No actionable review comments for linked PR #{pr_number}; "
-                                    "CI checks passed but required file evidence check failed. "
-                                    f"Missing files: {missing_summary}"
+                                    "CI checks passed, marking ready-to-merge."
                                 )
                                 remove_agent_failure_label_from_issue(
                                     repo=repo,
@@ -7449,41 +8561,6 @@ def main() -> int:
                                     dry_run=args.dry_run,
                                 )
                                 continue
-
-                            safe_post_orchestration_state_comment(
-                                repo=repo,
-                                target_type="pr",
-                                target_number=state_target_number,
-                                dry_run=args.dry_run,
-                                state=build_orchestration_state(
-                                    status="ready-to-merge",
-                                    task_type="pr",
-                                    issue_number=issue["number"],
-                                    pr_number=state_pr_number,
-                                    branch=issue_branch,
-                                    base_branch=target_base_branch,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
-                                    attempt=1,
-                                    stage="ci_checks",
-                                    next_action="ready_for_merge",
-                                    error=None,
-                                    ci_checks=ci_checks_payload,
-                                    decomposition=decomposition_rollup,
-                                    required_file_validation=required_file_validation,
-                                ),
-                            )
-                            print(
-                                f"No actionable review comments for linked PR #{pr_number}; "
-                                "CI checks passed, marking ready-to-merge."
-                            )
-                            remove_agent_failure_label_from_issue(
-                                repo=repo,
-                                issue_number=issue["number"],
-                                dry_run=args.dry_run,
-                            )
-                            continue
                         elif recovered_status == "ready-for-review":
                             print(
                                 f"No actionable review comments for linked PR #{pr_number}; "
@@ -7511,7 +8588,7 @@ def main() -> int:
                                     runner=args.runner,
                                     agent=args.agent,
                                     model=args.model,
-                                    attempt=1,
+                                    attempt=state_attempt,
                                      stage="review_feedback",
                                      next_action="await_new_review_comments",
                                      error="No actionable review comments found",
@@ -7544,7 +8621,7 @@ def main() -> int:
                             runner=args.runner,
                             agent=args.agent,
                             model=args.model,
-                            attempt=1,
+                            attempt=state_attempt,
                                 stage="agent_run",
                                 next_action="wait_for_agent_result",
                                 error=None,
@@ -7566,6 +8643,15 @@ def main() -> int:
                             prompt_override = append_recovered_context_to_prompt(
                                 prompt_override,
                                 build_recovered_failure_context_note(recovered_state),
+                            )
+                        elif (
+                            recovered_state is not None
+                            and str(recovered_state.get("status") or "") == "waiting-for-author"
+                            and clarification_answer is not None
+                        ):
+                            prompt_override = append_recovered_context_to_prompt(
+                                prompt_override,
+                                build_clarification_context_note(recovered_state, clarification_answer),
                             )
 
                     review_comment_count = len(review_items)
@@ -7655,10 +8741,129 @@ def main() -> int:
                         f"strategy: '{args.sync_strategy}')"
                     )
 
-                review_attempt = 1
-                while True:
-                    if mode == "pr-review" and not skip_agent_run:
-                        safe_post_orchestration_state_comment(
+                pre_run_untracked_files: set[str] | None = None
+                if not skip_agent_run and not args.dry_run:
+                    pre_run_untracked_files = list_untracked_files()
+
+                if skip_agent_run:
+                    print(
+                        f"Skipping agent run for {issue_label} in pr-review mode: "
+                        "no actionable review comments; running sync-only path"
+                    )
+                else:
+                    failure_stage = "agent_run"
+                    issue_agent_run_stats = {}
+                    agent_result: dict[str, object] = {}
+                    exit_code = run_agent(
+                        issue=issue,
+                        runner=args.runner,
+                        agent=args.agent,
+                        model=args.model,
+                        dry_run=args.dry_run,
+                        timeout_seconds=args.agent_timeout_seconds,
+                        idle_timeout_seconds=args.agent_idle_timeout_seconds,
+                        opencode_auto_approve=args.opencode_auto_approve,
+                        image_paths=issue_image_paths,
+                        prompt_override=prompt_override,
+                        track_tokens=track_tokens,
+                        token_budget=token_budget,
+                        run_stats=issue_agent_run_stats,
+                        agent_result=agent_result,
+                    )
+                    if exit_code != 0:
+                        exit_summary = describe_exit_code(exit_code)
+                        diagnosis = classify_opencode_failure(
+                            return_code=exit_code,
+                            model=args.model,
+                        ) if args.runner == "opencode" else None
+                        message = (
+                            f"Agent failed for {issue_label} with {exit_summary}"
+                            + (f" ({diagnosis})" if diagnosis else "")
+                        )
+                        raise RuntimeError(message)
+                    clarification_request = agent_result.get("clarification_request")
+                    if isinstance(clarification_request, dict):
+                        question = str(clarification_request.get("question") or "").strip()
+                        reason = _as_optional_string(clarification_request.get("reason"))
+                        if question:
+                            safe_post_clarification_request_comment(
+                                repo=repo,
+                                target_type=state_target_type,
+                                target_number=state_target_number,
+                                question=question,
+                                reason=reason,
+                                dry_run=args.dry_run,
+                            )
+                            safe_post_orchestration_state_comment(
+                                repo=repo,
+                                target_type=state_target_type,
+                                target_number=state_target_number,
+                                dry_run=args.dry_run,
+                                state=build_orchestration_state(
+                                    status="waiting-for-author",
+                                    task_type="issue" if mode == "issue-flow" else "pr",
+                                    issue_number=issue["number"],
+                                    pr_number=state_pr_number,
+                                    branch=issue_branch,
+                                    base_branch=target_base_branch,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    attempt=1,
+                                    stage="agent_run",
+                                    next_action="await_author_reply",
+                                    error=reason or question,
+                                    stats=issue_agent_run_stats,
+                                    decomposition=decomposition_rollup,
+                                ) | {"question": question, "reason": reason},
+                            )
+                            print(
+                                f"Paused {issue_label} for author clarification: {question}"
+                            )
+                            if (
+                                decomposition_parent_issue is not None
+                                and decomposition_parent_branch is not None
+                                and decomposition_parent_payload is not None
+                            ):
+                                decomposition_parent_payload, decomposition_rollup = post_parent_decomposition_rollup_update(
+                                    repo=repo,
+                                    parent_issue=decomposition_parent_issue,
+                                    parent_branch=decomposition_parent_branch,
+                                    base_branch=base_branch if base_branch else None,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    plan_payload=decomposition_parent_payload,
+                                    dry_run=args.dry_run,
+                                )
+                            if not args.dry_run:
+                                run_command(["git", "checkout", base_branch])
+                            continue
+                if not args.dry_run and not has_changes():
+                    if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:
+                        print(
+                            f"No file changes from agent for {issue_label}; "
+                            "pushing sync-only branch updates"
+                        )
+                        used_force_with_lease = args.sync_strategy == "rebase"
+                        push_branch(
+                            branch_name=issue_branch,
+                            dry_run=False,
+                            force_with_lease=used_force_with_lease,
+                        )
+                        print(
+                            f"Sync-only push result for {issue_label}: "
+                            f"branch '{issue_branch}' pushed "
+                            f"(force-with-lease: {'yes' if used_force_with_lease else 'no'})"
+                        )
+                        if mode == "pr-review" and linked_open_pr is not None:
+                            linked_pr_number = linked_open_pr.get("number")
+                            if type(linked_pr_number) is int:
+                                print(
+                                    f"PR #{linked_pr_number} rerun sync pushed; "
+                                    "GitHub mergeability should be recalculated without manual conflict steps"
+                                )
+                        pr_status, pr_url = ensure_pr(
                             repo=repo,
                             target_type=state_target_type,
                             target_number=state_target_number,
@@ -7862,10 +9067,34 @@ def main() -> int:
                                     runner=args.runner,
                                     agent=args.agent,
                                     model=args.model,
-                                    attempt=review_attempt,
-                                    stage="post_agent_check",
-                                    next_action="await_more_context",
-                                    error="No changes produced",
+                                    attempt=state_attempt,
+                                    stage="changes_pushed",
+                                    next_action="wait_for_ci",
+                                    error=None,
+                                    stats=issue_agent_run_stats,
+                                    decomposition=decomposition_rollup,
+                                ),
+                            )
+                        elif mode == "issue-flow" and supports_github_issue_ops:
+                            safe_post_orchestration_state_comment(
+                                repo=repo,
+                                target_type="issue",
+                                target_number=issue["number"],
+                                dry_run=False,
+                                state=build_orchestration_state(
+                                    status="ready-for-review",
+                                    task_type="issue",
+                                    issue_number=issue["number"],
+                                    pr_number=parse_pr_number_from_url(pr_url),
+                                    branch=issue_branch,
+                                    base_branch=target_base_branch,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    attempt=1,
+                                    stage="pr_ready",
+                                    next_action="wait_for_review",
+                                    error=None,
                                     stats=issue_agent_run_stats,
                                     decomposition=decomposition_rollup,
                                 ),
@@ -7901,6 +9130,54 @@ def main() -> int:
                         dry_run=args.dry_run,
                         pre_run_untracked_files=pre_run_untracked_files,
                     )
+                    if supports_github_issue_ops or mode == "pr-review":
+                        safe_post_orchestration_state_comment(
+                            repo=repo,
+                            target_type=state_target_type,
+                            target_number=state_target_number,
+                            dry_run=False,
+                            state=build_orchestration_state(
+                                status="waiting-for-author",
+                                task_type="issue" if mode == "issue-flow" else "pr",
+                                issue_number=issue["number"],
+                                pr_number=state_pr_number,
+                                branch=issue_branch,
+                                base_branch=target_base_branch,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=state_attempt,
+                                stage="post_agent_check",
+                                next_action="await_more_context",
+                                error="No changes produced",
+                                stats=issue_agent_run_stats,
+                                decomposition=decomposition_rollup,
+                            ),
+                        )
+                    if (
+                        decomposition_parent_issue is not None
+                        and decomposition_parent_branch is not None
+                        and decomposition_parent_payload is not None
+                    ):
+                        decomposition_parent_payload, decomposition_rollup = post_parent_decomposition_rollup_update(
+                            repo=repo,
+                            parent_issue=decomposition_parent_issue,
+                            parent_branch=decomposition_parent_branch,
+                            base_branch=base_branch if base_branch else None,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            plan_payload=decomposition_parent_payload,
+                            dry_run=args.dry_run,
+                        )
+                    if supports_github_issue_ops:
+                        remove_agent_failure_label_from_issue(
+                            repo=repo,
+                            issue_number=issue["number"],
+                            dry_run=args.dry_run,
+                        )
+                    run_command(["git", "checkout", base_branch])
+                    continue
 
                     failure_stage = "workflow_checks"
                     workflow_check_results = run_configured_workflow_checks(
@@ -8024,7 +9301,7 @@ def main() -> int:
                                 runner=args.runner,
                                 agent=args.agent,
                                 model=args.model,
-                                attempt=review_attempt,
+                                attempt=state_attempt,
                                 stage="changes_pushed",
                                 next_action="wait_for_ci",
                                 error=None,
@@ -8089,7 +9366,7 @@ def main() -> int:
                         runner=args.runner,
                         agent=args.agent,
                         model=args.model,
-                        attempt=1,
+                        attempt=state_attempt,
                         stage=failure_stage,
                         next_action=next_action,
                         error=short_error_text(str(exc)),

@@ -11,30 +11,47 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
 type detachedWorkerState struct {
-	Name        string   `json:"name"`
-	Mode        string   `json:"mode"`
-	TargetKind  string   `json:"target_kind"`
-	TargetID    string   `json:"target_id,omitempty"`
-	Repo        string   `json:"repo,omitempty"`
-	Tracker     string   `json:"tracker,omitempty"`
-	CodeHost    string   `json:"codehost,omitempty"`
-	Runner      string   `json:"runner,omitempty"`
-	Agent       string   `json:"agent,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	Command     []string `json:"command"`
-	StartedAt   string   `json:"started_at"`
-	PID         int      `json:"pid"`
-	LogPath     string   `json:"log_path"`
-	SessionPath string   `json:"session_path,omitempty"`
-	StatePath   string   `json:"state_path"`
-	ClonePath   string   `json:"clone_path,omitempty"`
-	WorkDir     string   `json:"work_dir"`
+	Name        string                 `json:"name"`
+	Mode        string                 `json:"mode"`
+	TargetKind  string                 `json:"target_kind"`
+	TargetID    string                 `json:"target_id,omitempty"`
+	Repo        string                 `json:"repo,omitempty"`
+	Tracker     string                 `json:"tracker,omitempty"`
+	CodeHost    string                 `json:"codehost,omitempty"`
+	Runner      string                 `json:"runner,omitempty"`
+	Agent       string                 `json:"agent,omitempty"`
+	Model       string                 `json:"model,omitempty"`
+	Command     []string               `json:"command"`
+	StartedAt   string                 `json:"started_at"`
+	PID         int                    `json:"pid"`
+	LogPath     string                 `json:"log_path"`
+	SessionPath string                 `json:"session_path,omitempty"`
+	StatePath   string                 `json:"state_path"`
+	ClonePath   string                 `json:"clone_path,omitempty"`
+	WorkDir     string                 `json:"work_dir"`
+	Batch       *detachedBatchMetadata `json:"batch,omitempty"`
+}
+
+type detachedBatchMetadata struct {
+	ChildIssueIDs []string                  `json:"child_issue_ids,omitempty"`
+	ChildWorkers  []detachedBatchWorkerLink `json:"child_workers,omitempty"`
+}
+
+type detachedBatchWorkerLink struct {
+	IssueID       string `json:"issue_id,omitempty"`
+	WorkerName    string `json:"worker_name,omitempty"`
+	LogPath       string `json:"log_path,omitempty"`
+	ClonePath     string `json:"clone_path,omitempty"`
+	StartedAt     string `json:"started_at,omitempty"`
+	StatePath     string `json:"state_path,omitempty"`
+	StatusCommand string `json:"status_command,omitempty"`
 }
 
 type detachedWorkerLogReport struct {
@@ -114,22 +131,27 @@ func workerName(targetKind, targetID string) string {
 }
 
 func (a *App) startDetachedWorker(state detachedWorkerState) int {
+	_, code := a.startDetachedWorkerState(state)
+	return code
+}
+
+func (a *App) startDetachedWorkerState(state detachedWorkerState) (detachedWorkerState, int) {
 	if a.start == nil {
 		_, _ = fmt.Fprintln(a.err, "orchestrator: detached worker starter is not configured")
-		return 1
+		return detachedWorkerState{}, 1
 	}
 	if err := ensureDetachedWorkerWritable(state.StatePath); err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
-		return 1
+		return detachedWorkerState{}, 1
 	}
 	if err := os.MkdirAll(filepath.Dir(state.StatePath), 0o755); err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to create worker directory: %v\n", err)
-		return 1
+		return detachedWorkerState{}, 1
 	}
 	if state.SessionPath != "" {
 		if err := os.MkdirAll(filepath.Dir(state.SessionPath), 0o755); err != nil {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to create session directory: %v\n", err)
-			return 1
+			return detachedWorkerState{}, 1
 		}
 	}
 	process, err := a.start.Start(DetachedRequest{
@@ -140,13 +162,13 @@ func (a *App) startDetachedWorker(state detachedWorkerState) int {
 	})
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to start detached worker: %v\n", err)
-		return 1
+		return detachedWorkerState{}, 1
 	}
 	state.PID = process.PID
 	state.StartedAt = time.Now().UTC().Format(time.RFC3339)
 	if err := writeDetachedWorkerState(state); err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to write detached worker state: %v\n", err)
-		return 1
+		return detachedWorkerState{}, 1
 	}
 	_, _ = fmt.Fprintf(a.out, "started detached worker %s\n", state.Name)
 	_, _ = fmt.Fprintf(a.out, "pid: %d\n", state.PID)
@@ -156,7 +178,48 @@ func (a *App) startDetachedWorker(state detachedWorkerState) int {
 		_, _ = fmt.Fprintf(a.out, "session: %s\n", state.SessionPath)
 	}
 	_, _ = fmt.Fprintf(a.out, "next: orchestrator status --worker %s\n", state.Name)
-	return 0
+	return state, 0
+}
+
+func withDetachedBatchMetadata(states []detachedWorkerState, requestedIssueIDs []int) []detachedWorkerState {
+	if len(states) == 0 {
+		return nil
+	}
+	childIssueIDs := make([]string, 0, len(requestedIssueIDs))
+	for _, id := range requestedIssueIDs {
+		childIssueIDs = append(childIssueIDs, strconv.Itoa(id))
+	}
+	childWorkers := make([]detachedBatchWorkerLink, 0, len(states))
+	for _, state := range states {
+		childWorkers = append(childWorkers, detachedBatchWorkerLink{
+			IssueID:       state.TargetID,
+			WorkerName:    state.Name,
+			LogPath:       state.LogPath,
+			ClonePath:     state.ClonePath,
+			StartedAt:     state.StartedAt,
+			StatePath:     state.StatePath,
+			StatusCommand: detachedTargetStatusCommand(state),
+		})
+	}
+	updated := make([]detachedWorkerState, len(states))
+	copy(updated, states)
+	batch := &detachedBatchMetadata{
+		ChildIssueIDs: childIssueIDs,
+		ChildWorkers:  childWorkers,
+	}
+	for i := range updated {
+		updated[i].Batch = batch
+	}
+	return updated
+}
+
+func writeDetachedBatchStates(states []detachedWorkerState) error {
+	for _, state := range states {
+		if err := writeDetachedWorkerState(state); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func ensureDetachedWorkerWritable(statePath string) error {

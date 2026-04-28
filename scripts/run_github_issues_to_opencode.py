@@ -21,6 +21,11 @@ import threading
 import time
 import signal
 
+if __package__ in {None, ""}:
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
 from scripts.orchestration_state import (
     CLARIFICATION_REQUEST_MARKER,
     DECOMPOSITION_PLAN_MARKER,

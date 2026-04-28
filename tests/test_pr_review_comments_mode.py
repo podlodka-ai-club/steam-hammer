@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import tempfile
 import types
@@ -83,6 +84,19 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(stats["threads_outdated"], 0)
         self.assertEqual(stats["comments_outdated"], 1)
         self.assertEqual(stats["reviews_non_actionable"], 1)
+
+    def test_script_supports_direct_execution_from_repo_root(self) -> None:
+        script_path = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "run_github_issues_to_opencode.py"
+        completed = subprocess.run(
+            [sys.executable, str(script_path), "--help"],
+            cwd=script_path.parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("usage:", completed.stdout.lower())
 
     def test_normalize_review_items_skips_outdated_threads(self) -> None:
         threads = [

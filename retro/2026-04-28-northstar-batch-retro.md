@@ -23,6 +23,7 @@ Date: 2026-04-28
 - Sequential merge + rerun loop worked despite heavy overlap.
 - Final verification caught a real regression in merge policy normalization before stopping.
 - Provider-qualified model string `openai/gpt-5.4` was used successfully.
+- The session showed that a mostly autonomous orchestration loop is viable: the orchestrator can manage batches of runner/CLI executions, inspect PR/issue state between batches, decide what to merge or rerun, and continue with limited user involvement.
 
 ## What was painful
 
@@ -34,6 +35,7 @@ Date: 2026-04-28
 - Worker reruns sometimes re-implemented or extended issue work instead of doing only branch conflict recovery.
 - Full Python suite takes about 5 minutes and emits noisy mocked `gh` warnings.
 - Runner output around rebase failures and merge fallback is verbose and hard to scan.
+- During the long-running orchestration loop, the user did not get enough periodic status checkpoints. It was hard to see what was done, what was currently running, what would happen next, and where the next checkpoint was.
 
 ## Process improvements
 
@@ -45,6 +47,7 @@ Date: 2026-04-28
 - Add a dedicated conflict-recovery mode that only syncs/rebases and resolves conflicts, without asking the worker to revisit the entire issue scope.
 - Add a post-batch verification issue/checklist automatically when a large batch finishes.
 - Suppress or isolate expected mocked `gh` warnings in tests so real failures are easier to spot.
+- Treat periodic batch status as part of the orchestrator contract for long sessions: between batches of CLI/runner executions, summarize done/current/next, touched issues/PRs, blockers, and the next checkpoint. This should not happen after every command, but it should happen often enough that a user can ask for status and understand the session state.
 
 ## Action items
 
@@ -52,3 +55,4 @@ Date: 2026-04-28
 2. Create a task to reduce full Python suite noise and/or split slow verification modes.
 3. Create a task for smarter reused-branch conflict recovery.
 4. Consider splitting the large Python runner into smaller modules to reduce conflict pressure.
+5. Track periodic batch status as a product/agent improvement: GitHub issue #141.

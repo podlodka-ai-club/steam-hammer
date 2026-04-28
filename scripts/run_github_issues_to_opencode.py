@@ -1483,6 +1483,157 @@ def run_merge_for_pull_request(repo: str, pr_number: int, merge_policy: dict, dr
     run_command(command)
 
 
+def finalize_pr_after_ci_success(
+    repo: str,
+    pr_number: int,
+    linked_issues: list[dict] | None,
+    merge_policy: dict,
+    target_type: str,
+    target_number: int,
+    issue_number: int | None,
+    branch: str | None,
+    base_branch: str | None,
+    runner: str,
+    agent: str,
+    model: str | None,
+    attempt: int,
+    ci_checks: list[dict] | None,
+    decomposition: dict | None,
+    dry_run: bool,
+) -> dict:
+    pull_request = fetch_pull_request(repo=repo, number=pr_number)
+    required_file_validation = validate_required_files_in_pr(
+        pull_request=pull_request,
+        linked_issues=linked_issues,
+    )
+    if required_file_validation.get("status") == "blocked":
+        missing_files = required_file_validation.get("missing_files")
+        missing_summary = ", ".join(sorted(str(file) for file in missing_files))
+        state = build_orchestration_state(
+            status="blocked",
+            task_type="pr",
+            issue_number=issue_number,
+            pr_number=pr_number,
+            branch=branch,
+            base_branch=base_branch,
+            runner=runner,
+            agent=agent,
+            model=model,
+            attempt=attempt,
+            stage="ci_checks",
+            next_action="update_pr_with_required_files",
+            error=f"Missing required file evidence: {missing_summary}",
+            ci_checks=ci_checks,
+            decomposition=decomposition,
+            required_file_validation=required_file_validation,
+            merge_policy=merge_policy,
+        )
+        safe_post_orchestration_state_comment(
+            repo=repo,
+            target_type=target_type,
+            target_number=target_number,
+            dry_run=dry_run,
+            state=state,
+        )
+        print(
+            f"PR #{pr_number} CI passed but required file evidence check failed. "
+            f"Missing files: {missing_summary}"
+        )
+        return state
+
+    merge_readiness = evaluate_pr_merge_readiness(
+        pull_request=pull_request,
+        merge_policy=merge_policy,
+    )
+    readiness_status = str(merge_readiness.get("status") or "blocked")
+    next_action = str(merge_readiness.get("next_action") or "inspect_merge_requirements")
+    error = _as_optional_string(merge_readiness.get("error"))
+
+    if readiness_status != "ready-to-merge":
+        state = build_orchestration_state(
+            status=readiness_status,
+            task_type="pr",
+            issue_number=issue_number,
+            pr_number=pr_number,
+            branch=branch,
+            base_branch=base_branch,
+            runner=runner,
+            agent=agent,
+            model=model,
+            attempt=attempt,
+            stage="merge_gate",
+            next_action=next_action,
+            error=error,
+            ci_checks=ci_checks,
+            decomposition=decomposition,
+            required_file_validation=required_file_validation,
+            merge_readiness=merge_readiness,
+            merge_policy=merge_policy,
+        )
+        safe_post_orchestration_state_comment(
+            repo=repo,
+            target_type=target_type,
+            target_number=target_number,
+            dry_run=dry_run,
+            state=state,
+        )
+        if readiness_status == "waiting-for-author":
+            print(
+                f"CI checks passed for PR #{pr_number}, but merge is waiting on human action: {error}"
+            )
+        else:
+            print(f"CI checks passed for PR #{pr_number}, but merge is blocked: {error}")
+        return state
+
+    state_stage = "merge_gate"
+    state_next_action = "ready_for_merge"
+    if merge_policy.get("auto"):
+        run_merge_for_pull_request(
+            repo=repo,
+            pr_number=pr_number,
+            merge_policy=merge_policy,
+            dry_run=dry_run,
+        )
+        state_stage = "merge_execution"
+        state_next_action = "await_github_auto_merge"
+        print(
+            f"CI checks passed for PR #{pr_number}; merge gate passed and GitHub auto-merge was requested."
+        )
+    else:
+        print(
+            f"CI checks passed for PR #{pr_number}; merge gate passed and auto-merge is disabled, marking ready-to-merge."
+        )
+
+    state = build_orchestration_state(
+        status="ready-to-merge",
+        task_type="pr",
+        issue_number=issue_number,
+        pr_number=pr_number,
+        branch=branch,
+        base_branch=base_branch,
+        runner=runner,
+        agent=agent,
+        model=model,
+        attempt=attempt,
+        stage=state_stage,
+        next_action=state_next_action,
+        error=None,
+        ci_checks=ci_checks,
+        decomposition=decomposition,
+        required_file_validation=required_file_validation,
+        merge_readiness=merge_readiness,
+        merge_policy=merge_policy,
+    )
+    safe_post_orchestration_state_comment(
+        repo=repo,
+        target_type=target_type,
+        target_number=target_number,
+        dry_run=dry_run,
+        state=state,
+    )
+    return state
+
+
 def _first_json_object(raw: str) -> dict:
     start = raw.find("{")
     if start < 0:
@@ -4591,11 +4742,11 @@ def choose_execution_mode(
             f"recovered orchestration state is {recovered_status}; skipping until explicitly forced",
         )
 
-    if recovered_status == "waiting-for-ci" and linked_open_pr is not None:
+    if recovered_status in {"waiting-for-ci", "ready-to-merge"} and linked_open_pr is not None:
         pr_number = linked_open_pr.get("number")
         return (
             "pr-review",
-            f"recovered orchestration state is waiting-for-ci and linked open PR #{pr_number} exists",
+            f"recovered orchestration state is {recovered_status} and linked open PR #{pr_number} exists",
         )
 
     if recovered_status == "ready-for-review" and linked_open_pr is not None:
@@ -8332,7 +8483,7 @@ def main() -> int:
                                 f"No actionable review comments for linked PR #{pr_number}; "
                                 f"continuing with sync-only rerun because mergeStateStatus={merge_state}"
                             )
-                        elif recovered_status == "waiting-for-ci":
+                        elif recovered_status in {"waiting-for-ci", "ready-to-merge"}:
                             current_attempt = orchestration_attempt_from_state(recovered_state)
                             ci_status = wait_for_pr_ci_status(
                                 repo=repo,
@@ -8509,78 +8660,24 @@ def main() -> int:
                                 )
 
                             if ci_overall == "success":
-                                required_file_validation = validate_required_files_in_pr(
-                                    pull_request=pull_request,
-                                    linked_issues=[issue],
-                                )
-
-                                if required_file_validation.get("status") == "blocked":
-                                    missing_files = required_file_validation.get("missing_files")
-                                    missing_summary = ", ".join(sorted(str(file) for file in missing_files))
-                                    safe_post_orchestration_state_comment(
-                                        repo=repo,
-                                        target_type="pr",
-                                        target_number=state_target_number,
-                                        dry_run=args.dry_run,
-                                        state=build_orchestration_state(
-                                            status="blocked",
-                                            task_type="pr",
-                                            issue_number=issue["number"],
-                                            pr_number=state_pr_number,
-                                            branch=issue_branch,
-                                            base_branch=target_base_branch,
-                                            runner=args.runner,
-                                            agent=args.agent,
-                                            model=args.model,
-                                            attempt=current_attempt,
-                                            stage="ci_checks",
-                                            next_action="update_pr_with_required_files",
-                                            error=f"Missing required file evidence: {missing_summary}",
-                                            ci_checks=ci_checks_payload,
-                                            decomposition=decomposition_rollup,
-                                            required_file_validation=required_file_validation,
-                                        ),
-                                    )
-                                    print(
-                                        f"No actionable review comments for linked PR #{pr_number}; "
-                                        "CI checks passed but required file evidence check failed. "
-                                        f"Missing files: {missing_summary}"
-                                    )
-                                    remove_agent_failure_label_from_issue(
-                                        repo=repo,
-                                        issue_number=issue["number"],
-                                        dry_run=args.dry_run,
-                                    )
-                                    continue
-
-                                safe_post_orchestration_state_comment(
+                                failure_stage = "merge_execution"
+                                finalize_pr_after_ci_success(
                                     repo=repo,
+                                    pr_number=pr_number,
+                                    linked_issues=[issue],
+                                    merge_policy=merge_policy,
                                     target_type="pr",
                                     target_number=state_target_number,
+                                    issue_number=issue["number"],
+                                    branch=issue_branch,
+                                    base_branch=target_base_branch,
+                                    runner=args.runner,
+                                    agent=args.agent,
+                                    model=args.model,
+                                    attempt=current_attempt,
+                                    ci_checks=ci_checks_payload,
+                                    decomposition=decomposition_rollup,
                                     dry_run=args.dry_run,
-                                    state=build_orchestration_state(
-                                        status="ready-to-merge",
-                                        task_type="pr",
-                                        issue_number=issue["number"],
-                                        pr_number=state_pr_number,
-                                        branch=issue_branch,
-                                        base_branch=target_base_branch,
-                                        runner=args.runner,
-                                        agent=args.agent,
-                                        model=args.model,
-                                        attempt=current_attempt,
-                                        stage="ci_checks",
-                                        next_action="ready_for_merge",
-                                        error=None,
-                                        ci_checks=ci_checks_payload,
-                                        decomposition=decomposition_rollup,
-                                        required_file_validation=required_file_validation,
-                                        merge_policy=merge_policy,
-                                    ),
-                                )
-                                print(
-                                    f"No actionable review comments for linked PR #{pr_number}; "
-                                    "CI checks passed, marking ready-to-merge."
                                 )
                                 remove_agent_failure_label_from_issue(
                                     repo=repo,

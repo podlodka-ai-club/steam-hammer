@@ -123,6 +123,9 @@ ORCHESTRATION_STATE_STATUSES = {
     "ready-to-merge",
 }
 AUTONOMOUS_CLAIM_TTL_SECONDS = 3600
+AUTONOMOUS_BATCH_SINGLE_PASS_STATUSES = frozenset(
+    {"ready-for-review", "waiting-for-ci", "ready-to-merge"}
+)
 DECOMPOSITION_CHILD_STATUSES = ("planned", "created", "in-progress", "done", "blocked")
 KNOWN_NO_EXTENSION_REQUIRED_FILES = frozenset(
     {
@@ -1139,6 +1142,87 @@ def sort_autonomous_issues(issues: list[dict], scope_defaults: dict) -> list[dic
         )
 
     return sorted(issues, key=sort_key)
+
+
+def load_autonomous_session_state(path: str | None) -> dict:
+    if not path:
+        return {"processed_issues": {}}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return {"processed_issues": {}}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Warning: unable to load autonomous session state from {path}: {exc}", file=sys.stderr)
+        return {"processed_issues": {}}
+    if not isinstance(payload, dict):
+        return {"processed_issues": {}}
+    processed_issues = payload.get("processed_issues")
+    if not isinstance(processed_issues, dict):
+        processed_issues = {}
+    return {"processed_issues": processed_issues}
+
+
+def save_autonomous_session_state(path: str | None, state: dict) -> None:
+    if not path:
+        return
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix="autonomous-session-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temp_path, path)
+    except OSError as exc:
+        print(f"Warning: unable to save autonomous session state to {path}: {exc}", file=sys.stderr)
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def autonomous_session_processed_issue_numbers(state: dict) -> set[int]:
+    processed = state.get("processed_issues") if isinstance(state, dict) else None
+    if not isinstance(processed, dict):
+        return set()
+    issue_numbers: set[int] = set()
+    for raw_issue_number in processed.keys():
+        issue_number = _as_positive_int(raw_issue_number)
+        if issue_number is not None:
+            issue_numbers.add(issue_number)
+    return issue_numbers
+
+
+def mark_autonomous_session_issue_processed(state: dict, issue_number: int, status: str) -> dict:
+    if status not in AUTONOMOUS_BATCH_SINGLE_PASS_STATUSES:
+        return state
+    processed = state.get("processed_issues") if isinstance(state, dict) else None
+    if not isinstance(processed, dict):
+        processed = {}
+        state["processed_issues"] = processed
+    processed[str(issue_number)] = {
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return state
+
+
+def filter_autonomous_issues_for_single_pass(
+    issues: list[dict], session_state: dict
+) -> tuple[list[dict], list[int]]:
+    processed_issue_numbers = autonomous_session_processed_issue_numbers(session_state)
+    if not processed_issue_numbers:
+        return list(issues), []
+    filtered: list[dict] = []
+    skipped: list[int] = []
+    for issue in issues:
+        issue_number = _as_positive_int(issue.get("number"))
+        if issue_number is not None and issue_number in processed_issue_numbers:
+            skipped.append(issue_number)
+            continue
+        filtered.append(issue)
+    return filtered, skipped
 
 
 def run_capture(command: list[str]) -> str:
@@ -9139,6 +9223,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--autonomous-session-file",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--doctor",
         action="store_true",
         help="Run environment diagnostics and exit without running any agent.",
@@ -9223,6 +9312,7 @@ def main() -> int:
     post_pr_summary = bool(getattr(args, "post_pr_summary", False))
     track_tokens = bool(getattr(args, "track_tokens", False))
     autonomous_mode = bool(getattr(args, "autonomous", False))
+    autonomous_session_file = _as_optional_string(getattr(args, "autonomous_session_file", None))
     token_budget = getattr(args, "token_budget", BUILTIN_DEFAULTS["token_budget"])
     if token_budget is not None and (type(token_budget) is not int or token_budget <= 0):
         print("Error: --token-budget must be a positive integer", file=sys.stderr)
@@ -10189,6 +10279,19 @@ def main() -> int:
     if autonomous_mode and not pr_mode_requested and issue_number_arg is None:
         issues = sort_autonomous_issues(issues=issues, scope_defaults=scope_defaults)
 
+    autonomous_session_state = load_autonomous_session_state(autonomous_session_file)
+    if autonomous_mode and issue_number_arg is None:
+        issues, skipped_session_issues = filter_autonomous_issues_for_single_pass(
+            issues=issues,
+            session_state=autonomous_session_state,
+        )
+        if skipped_session_issues:
+            skipped_labels = ", ".join(f"#{issue_number}" for issue_number in skipped_session_issues)
+            print(
+                "Skipping previously processed issues for this daemon invocation: "
+                f"{skipped_labels}"
+            )
+
     run_id = generate_run_id()
     failures = 0
     processed = 0
@@ -10201,6 +10304,7 @@ def main() -> int:
     for issue in issues:
         try:
             failure_stage = "issue_setup"
+            batch_issue_number = issue["number"]
             claim_acquired = False
             workflow_check_results: list[dict] | None = None
             linked_open_pr: dict | None = None
@@ -11048,6 +11152,15 @@ def main() -> int:
                                     issue_number=issue["number"],
                                     dry_run=args.dry_run,
                                 )
+                                mark_autonomous_session_issue_processed(
+                                    autonomous_session_state,
+                                    issue_number=batch_issue_number,
+                                    status="waiting-for-ci",
+                                )
+                                save_autonomous_session_state(
+                                    autonomous_session_file,
+                                    autonomous_session_state,
+                                )
                                 continue
 
                             if ci_overall == "failure":
@@ -11197,6 +11310,15 @@ def main() -> int:
                                     issue_number=issue["number"],
                                     dry_run=args.dry_run,
                                 )
+                                mark_autonomous_session_issue_processed(
+                                    autonomous_session_state,
+                                    issue_number=batch_issue_number,
+                                    status="ready-to-merge",
+                                )
+                                save_autonomous_session_state(
+                                    autonomous_session_file,
+                                    autonomous_session_state,
+                                )
                                 continue
                         elif recovered_status == "ready-for-review":
                             print(
@@ -11207,6 +11329,15 @@ def main() -> int:
                                 repo=repo,
                                 issue_number=issue["number"],
                                 dry_run=args.dry_run,
+                            )
+                            mark_autonomous_session_issue_processed(
+                                autonomous_session_state,
+                                issue_number=batch_issue_number,
+                                status="ready-for-review",
+                            )
+                            save_autonomous_session_state(
+                                autonomous_session_file,
+                                autonomous_session_state,
                             )
                             continue
                         else:
@@ -11754,6 +11885,15 @@ def main() -> int:
                             )
                         if not args.dry_run:
                             run_command(["git", "checkout", base_branch])
+                        mark_autonomous_session_issue_processed(
+                            autonomous_session_state,
+                            issue_number=batch_issue_number,
+                            status="ready-for-review",
+                        )
+                        save_autonomous_session_state(
+                            autonomous_session_file,
+                            autonomous_session_state,
+                        )
                         continue
 
                 failure_stage = "commit_push"
@@ -11886,6 +12026,15 @@ def main() -> int:
                     cwd=os.getcwd(),
                     env=issue_hook_env,
                     context=issue_hook_context,
+                )
+                mark_autonomous_session_issue_processed(
+                    autonomous_session_state,
+                    issue_number=batch_issue_number,
+                    status=("ready-for-review" if mode == "issue-flow" else "waiting-for-ci"),
+                )
+                save_autonomous_session_state(
+                    autonomous_session_file,
+                    autonomous_session_state,
                 )
                 break
 

@@ -1,15 +1,22 @@
 import argparse
 import io
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from scripts.run_github_issues_to_opencode import (
+    autonomous_session_processed_issue_numbers,
     build_orchestration_claim,
     evaluate_issue_scope,
+    filter_autonomous_issues_for_single_pass,
     format_orchestration_claim_comment,
     is_active_orchestration_claim,
+    load_autonomous_session_state,
     main,
+    mark_autonomous_session_issue_processed,
     parse_orchestration_claim_comment_body,
+    save_autonomous_session_state,
     sort_autonomous_issues,
 )
 
@@ -74,6 +81,45 @@ class AutonomousDaemonSelectionTests(unittest.TestCase):
         self.assertEqual(payload["issue"], 93)
         self.assertTrue(is_active_orchestration_claim(payload, run_id="other-run"))
         self.assertFalse(is_active_orchestration_claim(payload, run_id="run-1"))
+
+    def test_autonomous_session_filters_previously_processed_issue_numbers(self) -> None:
+        issues = [
+            {"number": 153, "title": "First"},
+            {"number": 152, "title": "Second"},
+        ]
+        session_state = {"processed_issues": {}}
+
+        mark_autonomous_session_issue_processed(session_state, issue_number=153, status="ready-for-review")
+
+        filtered, skipped = filter_autonomous_issues_for_single_pass(issues, session_state)
+
+        self.assertEqual([issue["number"] for issue in filtered], [152])
+        self.assertEqual(skipped, [153])
+        self.assertEqual(autonomous_session_processed_issue_numbers(session_state), {153})
+
+    def test_autonomous_session_persists_processed_issue_between_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_path = os.path.join(temp_dir, "daemon-session.json")
+
+            first_cycle_state = load_autonomous_session_state(session_path)
+            mark_autonomous_session_issue_processed(
+                first_cycle_state,
+                issue_number=153,
+                status="ready-for-review",
+            )
+            save_autonomous_session_state(session_path, first_cycle_state)
+
+            second_cycle_state = load_autonomous_session_state(session_path)
+            filtered, skipped = filter_autonomous_issues_for_single_pass(
+                issues=[
+                    {"number": 153, "title": "First"},
+                    {"number": 152, "title": "Second"},
+                ],
+                session_state=second_cycle_state,
+            )
+
+        self.assertEqual([issue["number"] for issue in filtered], [152])
+        self.assertEqual(skipped, [153])
 
     def test_main_autonomous_batch_resumes_linked_pr_instead_of_skipping(self) -> None:
         args = argparse.Namespace(

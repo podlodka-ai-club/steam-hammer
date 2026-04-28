@@ -441,6 +441,16 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		effectiveMaxCycles = 1
 	}
 
+	sessionFile, err := os.CreateTemp("", "orchestrator-daemon-session-*.json")
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to create daemon session file: %v\n", err)
+		return 1
+	}
+	sessionPath := sessionFile.Name()
+	_ = sessionFile.Close()
+	defer os.Remove(sessionPath)
+	pythonArgs = append(pythonArgs, "--autonomous-session-file", sessionPath)
+
 	cycles := 0
 	for {
 		cycles++

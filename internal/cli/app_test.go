@@ -13,12 +13,14 @@ type recordingRunner struct {
 	name  string
 	args  []string
 	calls int
+	cmds  [][]string
 }
 
 func (r *recordingRunner) Run(_ context.Context, name string, args ...string) error {
 	r.name = name
 	r.args = append([]string(nil), args...)
 	r.calls++
+	r.cmds = append(r.cmds, append([]string{name}, args...))
 	return nil
 }
 
@@ -314,6 +316,32 @@ func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--autonomous", "--state", "open", "--limit", "3", "--repo", "owner/repo", "--dry-run"})
+	assertCommandContainsFlag(t, runner.args, "--autonomous-session-file")
+}
+
+func TestRunDaemonReusesAutonomousSessionFileAcrossCycles(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--poll-interval-seconds", "0", "--max-cycles", "2", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 2 {
+		t.Fatalf("runner calls = %d, want 2", runner.calls)
+	}
+	firstSessionPath := flagValue(runner.cmds[0][1:], "--autonomous-session-file")
+	secondSessionPath := flagValue(runner.cmds[1][1:], "--autonomous-session-file")
+	if firstSessionPath == "" || secondSessionPath == "" {
+		t.Fatalf("missing autonomous session file flag in daemon calls: %#v", runner.cmds)
+	}
+	if firstSessionPath != secondSessionPath {
+		t.Fatalf("session file path mismatch: first=%q second=%q", firstSessionPath, secondSessionPath)
+	}
+	if _, err := os.Stat(firstSessionPath); !os.IsNotExist(err) {
+		t.Fatalf("session file %q still exists after daemon run, err=%v", firstSessionPath, err)
+	}
 }
 
 func TestRunDaemonRejectsParallelismAboveOne(t *testing.T) {
@@ -541,7 +569,35 @@ func assertCommand(t *testing.T, runner *recordingRunner, wantArgs []string) {
 	if runner.name != "python3" {
 		t.Fatalf("runner name = %q, want python3", runner.name)
 	}
-	if !reflect.DeepEqual(runner.args, wantArgs) {
+	if !reflect.DeepEqual(stripFlagPair(runner.args, "--autonomous-session-file"), wantArgs) {
 		t.Fatalf("runner args = %#v, want %#v", runner.args, wantArgs)
 	}
+}
+
+func assertCommandContainsFlag(t *testing.T, args []string, flagName string) {
+	t.Helper()
+	if flagValue(args, flagName) == "" {
+		t.Fatalf("runner args %v missing %s", args, flagName)
+	}
+}
+
+func flagValue(args []string, flagName string) string {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flagName {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func stripFlagPair(args []string, flagName string) []string {
+	cleaned := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] == flagName {
+			i++
+			continue
+		}
+		cleaned = append(cleaned, args[i])
+	}
+	return cleaned
 }

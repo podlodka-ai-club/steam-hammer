@@ -174,7 +174,7 @@ def is_trackable_issue_number(value: object) -> bool:
     if isinstance(value, int):
         return value > 0
     if isinstance(value, str):
-        return value.strip().isdigit()
+        return bool(value.strip())
     return False
 
 
@@ -277,7 +277,10 @@ class TrackerProvider(abc.ABC):
         child: dict,
         created_dependencies: dict[int, dict],
         dry_run: bool,
+        parent_branch: str | None = None,
+        base_branch: str | None = None,
     ) -> dict:
+        _ = (parent_branch, base_branch)
         raise RuntimeError(f"Tracker provider '{self.name}' does not support child issue creation yet")
 
     def add_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
@@ -311,6 +314,10 @@ class CodeHostProvider(abc.ABC):
 
     @abc.abstractmethod
     def fetch_pull_request(self, repo: str, number: int) -> dict:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def list_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -382,6 +389,8 @@ class GitHubTrackerProvider(TrackerProvider):
         child: dict,
         created_dependencies: dict[int, dict],
         dry_run: bool,
+        parent_branch: str | None = None,
+        base_branch: str | None = None,
     ) -> dict:
         return create_decomposition_child_issue(
             repo=repo,
@@ -389,6 +398,8 @@ class GitHubTrackerProvider(TrackerProvider):
             child=child,
             created_dependencies=created_dependencies,
             dry_run=dry_run,
+            parent_branch=parent_branch,
+            base_branch=base_branch,
         )
 
     def add_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
@@ -549,6 +560,9 @@ class GitHubCodeHostProvider(CodeHostProvider):
     def fetch_pull_request(self, repo: str, number: int) -> dict:
         return fetch_pull_request(repo=repo, number=number)
 
+    def list_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
+        return fetch_issue_comments(repo=repo, issue_number=pr_number)
+
     def fetch_pr_review_threads(self, repo: str, number: int) -> list[dict]:
         return fetch_pr_review_threads(repo=repo, number=number)
 
@@ -618,6 +632,10 @@ class UnsupportedCodeHostProvider(CodeHostProvider):
 
     def fetch_pull_request(self, repo: str, number: int) -> dict:
         _ = (repo, number)
+        raise self._unsupported()
+
+    def list_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
+        _ = (repo, pr_number)
         raise self._unsupported()
 
     def fetch_pr_review_threads(self, repo: str, number: int) -> list[dict]:
@@ -2372,6 +2390,7 @@ def refresh_decomposition_plan_payload_from_child_states(
     repo: str,
     plan_payload: dict,
 ) -> dict:
+    tracker_provider = current_tracker_provider()
     refreshed_payload = dict(plan_payload)
     refreshed_created_children = _normalize_created_children(plan_payload.get("created_children") or [])
     blockers: list[str] = []
@@ -2381,8 +2400,8 @@ def refresh_decomposition_plan_payload_from_child_states(
         if issue_number is None:
             continue
 
-        child_issue = fetch_issue(repo=repo, number=issue_number)
-        child_comments = fetch_issue_comments(repo=repo, issue_number=issue_number)
+        child_issue = tracker_provider.get_issue(repo=repo, issue_id=issue_number)
+        child_comments = tracker_provider.list_issue_comments(repo=repo, issue_id=issue_number)
         recovered_state, _warnings = select_latest_parseable_orchestration_state(
             comments=child_comments,
             source_label=f"issue #{issue_number}",
@@ -4468,7 +4487,7 @@ def format_decomposition_plan_comment(payload: dict) -> str:
 
 def post_decomposition_plan_comment(
     repo: str,
-    issue_number: int,
+    issue_number: int | str,
     payload: dict,
     dry_run: bool,
 ) -> None:
@@ -4479,17 +4498,10 @@ def post_decomposition_plan_comment(
         )
         return
 
-    run_command(
-        [
-            "gh",
-            "issue",
-            "comment",
-            str(issue_number),
-            "--repo",
-            repo,
-            "--body",
-            format_decomposition_plan_comment(payload),
-        ]
+    current_tracker_provider().post_issue_comment(
+        repo=repo,
+        issue_id=issue_number,
+        body=format_decomposition_plan_comment(payload),
     )
 
 
@@ -7275,7 +7287,10 @@ def main() -> int:
             recovered_pr_state: dict | None = None
             pr_clarification_answer: dict | None = None
             try:
-                pr_comments = fetch_issue_comments(repo=repo, issue_number=pr_number_arg)
+                pr_comments = current_codehost_provider().list_pr_comments(
+                    repo=repo,
+                    pr_number=pr_number_arg,
+                )
                 recovered_pr_state, pr_state_warnings = select_latest_parseable_orchestration_state(
                     comments=pr_comments,
                     source_label=f"pr #{pr_number_arg}",
@@ -7913,7 +7928,7 @@ def main() -> int:
             mode_reason = "batch issue processing"
             force_override_applied = False
             skip_agent_run = False
-            supports_github_issue_ops = False
+            supports_issue_tracker_ops = False
             issue_label = format_issue_label_from_issue(issue)
             issue_branch = branch_name_for_issue(issue=issue, prefix=args.branch_prefix)
             state_target_type = "issue"
@@ -7927,7 +7942,7 @@ def main() -> int:
             selected_decomposition_child = False
             issue_agent_run_stats: dict[str, object] | None = None
             state_attempt = 1
-            supports_github_issue_ops = issue_tracker(issue) == TRACKER_GITHUB and type(issue["number"]) is int
+            supports_issue_tracker_ops = is_trackable_issue_number(issue.get("number"))
 
             scope_decision = evaluate_issue_scope(issue=issue, scope_defaults=scope_defaults)
             scope_eligible = bool(scope_decision.get("eligible", True))
@@ -7944,7 +7959,7 @@ def main() -> int:
                         f"Continuing {issue_label} despite out-of-scope decision "
                         "because --force-reprocess is set."
                     )
-                    if supports_github_issue_ops:
+                    if supports_issue_tracker_ops:
                         safe_post_issue_scope_skip_comment(
                             repo=repo,
                             issue_number=issue["number"],
@@ -7954,7 +7969,7 @@ def main() -> int:
                         )
                 else:
                     skipped_out_of_scope += 1
-                    if supports_github_issue_ops:
+                    if supports_issue_tracker_ops:
                         safe_post_orchestration_state_comment(
                             repo=repo,
                             target_type="issue",
@@ -7989,7 +8004,7 @@ def main() -> int:
                     )
                     continue
 
-            if skip_if_pr_exists and supports_github_issue_ops:
+            if skip_if_pr_exists and supports_issue_tracker_ops:
                 linked_open_pr = current_codehost_provider().find_open_pr_for_issue(repo=repo, issue=issue)
                 if linked_open_pr is not None:
                     if issue_number_arg is not None:
@@ -8037,7 +8052,7 @@ def main() -> int:
                     )
                     continue
 
-            if issue_number_arg is not None and has_force_issue_flow_flag and supports_github_issue_ops:
+            if issue_number_arg is not None and has_force_issue_flow_flag and supports_issue_tracker_ops:
                 if linked_open_pr is None:
                     linked_open_pr = current_codehost_provider().find_open_pr_for_issue(repo=repo, issue=issue)
 
@@ -8065,9 +8080,9 @@ def main() -> int:
                     linked_pr_number = linked_open_pr.get("number")
                     if type(linked_pr_number) is int:
                         try:
-                            linked_pr_comments = fetch_issue_comments(
+                            linked_pr_comments = current_codehost_provider().list_pr_comments(
                                 repo=repo,
-                                issue_number=linked_pr_number,
+                                pr_number=linked_pr_number,
                             )
                             (
                                 recovered_pr_state,
@@ -8985,7 +9000,7 @@ def main() -> int:
                 )
 
                 if mode == "issue-flow":
-                    if supports_github_issue_ops:
+                    if supports_issue_tracker_ops:
                         safe_post_orchestration_state_comment(
                             repo=repo,
                             target_type=state_target_type,
@@ -9164,7 +9179,7 @@ def main() -> int:
                                     f"PR #{linked_pr_number} rerun sync pushed; "
                                     "GitHub mergeability should be recalculated without manual conflict steps"
                                 )
-                        pr_status, pr_url = ensure_pr(
+                        pr_status, pr_url = current_codehost_provider().ensure_pr(
                             repo=repo,
                             base_branch=target_base_branch,
                             branch_name=issue_branch,
@@ -9200,7 +9215,7 @@ def main() -> int:
                                     decomposition=decomposition_rollup,
                                 ),
                             )
-                        elif mode == "issue-flow" and supports_github_issue_ops:
+                        elif mode == "issue-flow" and supports_issue_tracker_ops:
                             safe_post_orchestration_state_comment(
                                 repo=repo,
                                 target_type="issue",
@@ -9240,7 +9255,7 @@ def main() -> int:
                                 plan_payload=decomposition_parent_payload,
                                 dry_run=args.dry_run,
                             )
-                        if supports_github_issue_ops:
+                        if supports_issue_tracker_ops:
                             remove_agent_failure_label_from_issue(
                                 repo=repo,
                                 issue_number=issue["number"],
@@ -9252,7 +9267,7 @@ def main() -> int:
                     print(
                         f"No changes detected for {issue_label}; skipping commit and PR"
                     )
-                    if supports_github_issue_ops or mode == "pr-review":
+                    if supports_issue_tracker_ops or mode == "pr-review":
                         safe_post_orchestration_state_comment(
                             repo=repo,
                             target_type=state_target_type,
@@ -9292,7 +9307,7 @@ def main() -> int:
                             plan_payload=decomposition_parent_payload,
                             dry_run=args.dry_run,
                         )
-                    if supports_github_issue_ops:
+                    if supports_issue_tracker_ops:
                         remove_agent_failure_label_from_issue(
                             repo=repo,
                             issue_number=issue["number"],
@@ -9326,7 +9341,7 @@ def main() -> int:
                         and reused_branch_sync_changed
                     ),
                 )
-                pr_status, pr_url = ensure_pr(
+                pr_status, pr_url = current_codehost_provider().ensure_pr(
                     repo=repo,
                     base_branch=target_base_branch,
                     branch_name=issue_branch,
@@ -9338,7 +9353,7 @@ def main() -> int:
                 if pr_url:
                     touched_prs.append(pr_url)
                     print(f"PR status for {issue_label}: {pr_status} ({pr_url})")
-                    if mode == "issue-flow" and supports_github_issue_ops:
+                    if mode == "issue-flow" and supports_issue_tracker_ops:
                         safe_post_orchestration_state_comment(
                             repo=repo,
                             target_type="issue",
@@ -9408,7 +9423,7 @@ def main() -> int:
 
                 if not args.dry_run:
                     run_command(["git", "checkout", base_branch])
-                if supports_github_issue_ops:
+                if supports_issue_tracker_ops:
                     remove_agent_failure_label_from_issue(
                         repo=repo,
                         issue_number=issue["number"],
@@ -9427,7 +9442,7 @@ def main() -> int:
             residual_untracked_files = (
                 exc.files if isinstance(exc, ResidualUntrackedFilesError) else None
             )
-            if supports_github_issue_ops or mode == "pr-review":
+            if supports_issue_tracker_ops or mode == "pr-review":
                 safe_post_orchestration_state_comment(
                     repo=repo,
                     target_type=state_target_type,
@@ -9476,7 +9491,7 @@ def main() -> int:
                         f"#{decomposition_parent_issue['number']}: {parent_exc}",
                         file=sys.stderr,
                     )
-            if supports_github_issue_ops:
+            if supports_issue_tracker_ops:
                 safe_report_issue_automation_failure(
                     repo=repo,
                     issue_number=issue["number"],

@@ -834,7 +834,15 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             exit_code = main()
 
         self.assertEqual(exit_code, 0)
-        find_open_pr_mock.assert_called_once_with(repo="owner/repo", issue_number=33)
+        find_open_pr_mock.assert_called_once_with(
+            repo="owner/repo",
+            issue={
+                "number": 33,
+                "title": "Do not duplicate",
+                "body": "non-empty",
+                "url": "https://github.com/owner/repo/issues/33",
+            },
+        )
         prepare_issue_branch_mock.assert_called_once()
         run_agent_mock.assert_called_once()
         self.assertIn("Found existing remote branch for issue #33", stdout_mock.getvalue())

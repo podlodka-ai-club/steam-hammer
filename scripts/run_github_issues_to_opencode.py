@@ -121,6 +121,17 @@ POST_BATCH_VERIFICATION_DEFAULT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("python-tests", "python3 -m unittest discover -s tests -q"),
     ("go-test", "go test ./..."),
 )
+CENTRAL_RUNNER_PATH_PREFIXES: tuple[str, ...] = (
+    "scripts/",
+    "cmd/orchestrator/",
+    "internal/cli/",
+    "internal/core/",
+)
+DOC_ONLY_PATH_PREFIXES: tuple[str, ...] = (
+    "docs/",
+    "retro/",
+)
+DOC_ONLY_FILE_EXTENSIONS = {".md", ".rst", ".txt"}
 
 JIRA_ENV_VARS = {
     "base_url": "JIRA_BASE_URL",
@@ -1606,6 +1617,287 @@ def _check_name_key(value: object) -> str:
     return str(value or "").strip().lower()
 
 
+def _pull_request_changed_paths(pull_request: dict | None) -> list[str]:
+    files = pull_request.get("files") if isinstance(pull_request, dict) else None
+    if not isinstance(files, list):
+        return []
+
+    changed_paths: list[str] = []
+    seen: set[str] = set()
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        changed_paths.append(path)
+    return changed_paths
+
+
+def _is_docs_only_path(path: str) -> bool:
+    normalized = str(path or "").strip().lower()
+    if not normalized:
+        return False
+    if any(normalized.startswith(prefix) for prefix in DOC_ONLY_PATH_PREFIXES):
+        return True
+    _, extension = os.path.splitext(normalized)
+    return extension in DOC_ONLY_FILE_EXTENSIONS
+
+
+def _touches_central_runner_files(changed_paths: list[str]) -> bool:
+    return any(
+        path.startswith(prefix)
+        for path in changed_paths
+        for prefix in CENTRAL_RUNNER_PATH_PREFIXES
+    )
+
+
+def list_open_pull_requests(repo: str, limit: int = 100) -> list[dict]:
+    output = run_capture(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--limit",
+            str(limit),
+            "--json",
+            "number,title,url,headRefName,baseRefName",
+        ]
+    )
+    prs = json.loads(output)
+    if not isinstance(prs, list):
+        raise RuntimeError("Unexpected response from gh pr list while loading open PRs")
+    return [pr for pr in prs if isinstance(pr, dict)]
+
+
+def determine_merge_result_verification_need(repo: str, pull_request: dict) -> dict[str, object]:
+    pr_number = pull_request.get("number")
+    base_branch = str(pull_request.get("baseRefName") or "").strip()
+    changed_paths = _pull_request_changed_paths(pull_request)
+    if not changed_paths:
+        return {
+            "required": False,
+            "reason": "no-changed-files",
+            "summary": "skipped (no changed files reported)",
+            "changed_files": [],
+            "overlapping_prs": [],
+        }
+
+    if all(_is_docs_only_path(path) for path in changed_paths):
+        return {
+            "required": False,
+            "reason": "docs-only",
+            "summary": "skipped (docs-only PR)",
+            "changed_files": changed_paths,
+            "overlapping_prs": [],
+        }
+
+    if _touches_central_runner_files(changed_paths):
+        return {
+            "required": True,
+            "reason": "central-runner-files",
+            "summary": "required (touches central runner files)",
+            "changed_files": changed_paths,
+            "overlapping_prs": [],
+        }
+
+    current_paths = set(changed_paths)
+    overlapping_prs: list[dict[str, object]] = []
+    for candidate in list_open_pull_requests(repo=repo):
+        if candidate.get("number") == pr_number:
+            continue
+        if base_branch and str(candidate.get("baseRefName") or "").strip() != base_branch:
+            continue
+
+        candidate_number = candidate.get("number")
+        if type(candidate_number) is not int:
+            continue
+        candidate_details = fetch_pull_request(repo=repo, number=candidate_number)
+        candidate_paths = set(_pull_request_changed_paths(candidate_details))
+        overlap = sorted(current_paths & candidate_paths)
+        if not overlap:
+            continue
+        overlapping_prs.append(
+            {
+                "number": candidate_number,
+                "head_ref": str(candidate.get("headRefName") or "").strip(),
+                "files": overlap,
+            }
+        )
+
+    if overlapping_prs:
+        overlapping_numbers = ", ".join(f"#{entry['number']}" for entry in overlapping_prs)
+        return {
+            "required": True,
+            "reason": "overlapping-open-prs",
+            "summary": f"required (overlaps with open PRs: {overlapping_numbers})",
+            "changed_files": changed_paths,
+            "overlapping_prs": overlapping_prs,
+        }
+
+    return {
+        "required": False,
+        "reason": "non-overlapping",
+        "summary": "skipped (no overlap and no central runner files)",
+        "changed_files": changed_paths,
+        "overlapping_prs": [],
+    }
+
+
+def _summarize_merge_result_verification_results(results: list[dict[str, object]]) -> str:
+    command_count = len(results)
+    passed_count = sum(1 for result in results if str(result.get("status") or "") == "passed")
+    failed = [result for result in results if str(result.get("status") or "") == "failed"]
+    if failed:
+        failed_names = ", ".join(str(result.get("name") or "command") for result in failed)
+        return f"failed ({passed_count}/{command_count} passed; failed: {failed_names})"
+    return f"passed ({passed_count}/{command_count} commands)"
+
+
+def merge_result_verification_commands(
+    *,
+    project_config: dict,
+    cwd: str | None,
+) -> list[tuple[str, str]]:
+    commands = configured_workflow_commands(project_config)
+    if commands:
+        return commands
+    return detect_post_batch_verification_commands(cwd=cwd)
+
+
+def verify_pull_request_merge_result(
+    *,
+    repo: str,
+    pull_request: dict,
+    project_config: dict,
+    repo_dir: str,
+    dry_run: bool,
+) -> dict[str, object]:
+    decision = determine_merge_result_verification_need(repo=repo, pull_request=pull_request)
+    verification: dict[str, object] = {
+        "status": "skipped",
+        "summary": str(decision.get("summary") or "skipped"),
+        "required": bool(decision.get("required")),
+        "reason": str(decision.get("reason") or "unknown"),
+        "changed_files": list(decision.get("changed_files") or []),
+        "overlapping_prs": list(decision.get("overlapping_prs") or []),
+        "checkout": "temp-clone",
+        "commands": [],
+    }
+    if not bool(decision.get("required")):
+        return verification
+
+    commands = merge_result_verification_commands(project_config=project_config, cwd=repo_dir)
+    if not commands:
+        verification.update(
+            {
+                "status": "failed",
+                "summary": "failed (no merge-result verification commands detected)",
+                "error": "Merge-result verification is required, but no verification commands are configured or detectable.",
+            }
+        )
+        return verification
+
+    verification["commands"] = [
+        {"name": check_name, "command": command_text, "status": "pending"}
+        for check_name, command_text in commands
+    ]
+    if dry_run:
+        verification.update(
+            {
+                "status": "dry-run",
+                "summary": f"dry-run ({len(commands)} commands in temp clone)",
+            }
+        )
+        return verification
+
+    pr_number = pull_request.get("number")
+    base_branch = str(pull_request.get("baseRefName") or "").strip()
+    head_branch = str(pull_request.get("headRefName") or "").strip()
+    if not base_branch or not head_branch:
+        verification.update(
+            {
+                "status": "failed",
+                "summary": "failed (missing branch metadata)",
+                "error": "Pull request is missing base/head branch metadata required for merge-result verification.",
+            }
+        )
+        return verification
+
+    clone_dir = tempfile.mkdtemp(prefix=f"merge-verify-pr-{pr_number or 'unknown'}-")
+    try:
+        run_command(["git", "clone", "--quiet", repo_dir, clone_dir])
+        run_command(["git", "-C", clone_dir, "fetch", "origin", base_branch, head_branch])
+        run_command(["git", "-C", clone_dir, "checkout", "--detach", f"origin/{base_branch}"])
+        ok_merge, _stdout_merge, stderr_merge, merge_exit_code = run_check_command(
+            ["git", "merge", "--no-ff", "--no-commit", f"origin/{head_branch}"],
+            cwd=clone_dir,
+        )
+        if not ok_merge:
+            verification.update(
+                {
+                    "status": "failed",
+                    "summary": "failed (could not construct merge result)",
+                    "error": short_error_text(stderr_merge or "git merge failed"),
+                    "merge_exit_code": merge_exit_code,
+                }
+            )
+            return verification
+
+        results: list[dict[str, object]] = []
+        for check_name, command_text in commands:
+            ok, stdout_text, stderr_text, exit_code = run_check_command(
+                ["bash", "-lc", command_text],
+                cwd=clone_dir,
+            )
+            result: dict[str, object] = {
+                "name": check_name,
+                "command": command_text,
+                "status": "passed" if ok else "failed",
+                "exit_code": exit_code,
+            }
+            if stdout_text:
+                result["stdout_excerpt"] = _workflow_output_excerpt(stdout_text)
+            if stderr_text:
+                result["stderr_excerpt"] = _workflow_output_excerpt(stderr_text)
+            results.append(result)
+            if not ok:
+                break
+
+        verification["commands"] = results
+        failed = [result for result in results if str(result.get("status") or "") == "failed"]
+        if failed:
+            first_failed = failed[0]
+            verification.update(
+                {
+                    "status": "failed",
+                    "summary": _summarize_merge_result_verification_results(results),
+                    "error": short_error_text(
+                        _as_optional_string(first_failed.get("stderr_excerpt"))
+                        or _as_optional_string(first_failed.get("stdout_excerpt"))
+                        or f"Merge-result verification failed: {str(first_failed.get('name') or 'command')}"
+                    ),
+                }
+            )
+            return verification
+
+        verification.update(
+            {
+                "status": "passed",
+                "summary": _summarize_merge_result_verification_results(results),
+                "error": None,
+            }
+        )
+        return verification
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
 def count_approving_reviews(pull_request: dict) -> dict[str, object]:
     reviews = pull_request.get("reviews")
     if not isinstance(reviews, list):
@@ -2704,7 +2996,11 @@ def derive_pr_review_decision(pull_request: dict) -> str:
     return "UNKNOWN"
 
 
-def evaluate_pr_merge_readiness(pull_request: dict, merge_policy: dict) -> dict:
+def evaluate_pr_merge_readiness(
+    pull_request: dict,
+    merge_policy: dict,
+    merge_result_verification: dict[str, object] | None = None,
+) -> dict:
     merge_state = str(pull_request.get("mergeStateStatus") or "").strip().upper() or "UNKNOWN"
     mergeable = str(pull_request.get("mergeable") or "").strip().upper() or "UNKNOWN"
     is_draft = bool(pull_request.get("isDraft")) or merge_state == "DRAFT"
@@ -2724,6 +3020,8 @@ def evaluate_pr_merge_readiness(pull_request: dict, merge_policy: dict) -> dict:
         "next_action": "ready_for_merge",
         "error": None,
     }
+    if merge_result_verification is not None:
+        readiness["merge_result_verification"] = merge_result_verification
 
     if is_draft:
         readiness.update(
@@ -2771,6 +3069,18 @@ def evaluate_pr_merge_readiness(pull_request: dict, merge_policy: dict) -> dict:
                 "status": "blocked",
                 "next_action": "inspect_merge_requirements",
                 "error": f"GitHub has not marked this PR mergeable yet (mergeStateStatus={merge_state})",
+            }
+        )
+        return readiness
+
+    verification_status = str((merge_result_verification or {}).get("status") or "").strip().lower()
+    verification_summary = _as_optional_string((merge_result_verification or {}).get("summary"))
+    if verification_status == "failed":
+        readiness.update(
+            {
+                "status": "blocked",
+                "next_action": "inspect_merge_result_verification",
+                "error": verification_summary or "Merge-result verification failed",
             }
         )
         return readiness
@@ -2843,6 +3153,7 @@ def finalize_pr_after_ci_success(
     ci_checks: list[dict] | None,
     decomposition: dict | None,
     project_config: dict,
+    repo_dir: str,
     dry_run: bool,
 ) -> dict:
     pull_request = fetch_pull_request(repo=repo, number=pr_number)
@@ -2936,9 +3247,17 @@ def finalize_pr_after_ci_success(
             )
         return state
 
+    merge_result_verification = verify_pull_request_merge_result(
+        repo=repo,
+        pull_request=pull_request,
+        project_config=project_config,
+        repo_dir=repo_dir,
+        dry_run=dry_run,
+    )
     merge_readiness = evaluate_pr_merge_readiness(
         pull_request=pull_request,
         merge_policy=merge_policy,
+        merge_result_verification=merge_result_verification,
     )
     readiness_status = str(merge_readiness.get("status") or "blocked")
     next_action = str(merge_readiness.get("next_action") or "inspect_merge_requirements")
@@ -3945,8 +4264,19 @@ def _summarize_current_status(
 
     if isinstance(merge_readiness, dict) and status == "ready-to-merge":
         merge_state = str(merge_readiness.get("merge_state_status") or "").strip()
+        verification = (
+            merge_readiness.get("merge_result_verification")
+            if isinstance(merge_readiness.get("merge_result_verification"), dict)
+            else None
+        )
+        verification_status = str(verification.get("status") or "").strip() if verification else ""
+        verification_text = (
+            f"; merge-result verification {verification_status}"
+            if verification_status in {"passed", "skipped", "dry-run"}
+            else ""
+        )
         if merge_state:
-            return f"{status} at {stage or 'unknown stage'}; merge state {merge_state}"
+            return f"{status} at {stage or 'unknown stage'}; merge state {merge_state}{verification_text}"
 
     if stage:
         return f"{status} at {stage}"
@@ -4071,15 +4401,29 @@ def format_orchestration_status_summary(snapshot: dict) -> str:
         if base_branch:
             branch_line += f" (base {base_branch})"
         lines.append(branch_line)
+    verification = (
+        merge_readiness.get("merge_result_verification")
+        if isinstance(merge_readiness, dict) and isinstance(merge_readiness.get("merge_result_verification"), dict)
+        else None
+    )
+    verification_text = ""
+    if verification is not None:
+        verification_status = str(verification.get("status") or "unknown")
+        verification_summary = _as_optional_string(verification.get("summary")) or verification_status
+        verification_text = f"; merge-result verification={verification_summary}"
+
     if isinstance(ci_status, dict):
         ci_overall = str(ci_status.get("overall") or "unknown").strip() or "unknown"
         pending = ci_status.get("pending_checks") if isinstance(ci_status.get("pending_checks"), list) else []
         failing = ci_status.get("failing_checks") if isinstance(ci_status.get("failing_checks"), list) else []
         lines.append(
-            f"PR readiness: ci={ci_overall}, pending={len(pending)}, failing={len(failing)}"
+            f"PR readiness: ci={ci_overall}, pending={len(pending)}, failing={len(failing)}{verification_text}"
         )
     elif isinstance(merge_readiness, dict):
-        lines.append(f"PR readiness: {str(merge_readiness.get('status') or 'unknown')}")
+        readiness_line = f"PR readiness: {str(merge_readiness.get('status') or 'unknown')}"
+        if verification_text:
+            readiness_line += verification_text
+        lines.append(readiness_line)
     if state_source:
         lines.append(f"State source: {state_source}")
     if source_comment:
@@ -4138,8 +4482,18 @@ def load_issue_status_snapshot(repo: str, issue: dict, merge_policy: dict) -> di
         if isinstance(pull_request, dict)
         else None
     )
+    stored_merge_readiness = payload.get("merge_readiness") if isinstance(payload.get("merge_readiness"), dict) else None
+    stored_merge_result_verification = None
+    if isinstance(stored_merge_readiness, dict) and isinstance(
+        stored_merge_readiness.get("merge_result_verification"), dict
+    ):
+        stored_merge_result_verification = stored_merge_readiness.get("merge_result_verification")
     merge_readiness = (
-        evaluate_pr_merge_readiness(pull_request=pull_request, merge_policy=merge_policy)
+        evaluate_pr_merge_readiness(
+            pull_request=pull_request,
+            merge_policy=merge_policy,
+            merge_result_verification=stored_merge_result_verification,
+        )
         if isinstance(pull_request, dict)
         else None
     )
@@ -4180,7 +4534,17 @@ def load_pr_status_snapshot(repo: str, pr_number: int, merge_policy: dict) -> di
     issue_number = issue_numbers[0] if issue_numbers else payload.get("issue")
     ci_status = current_codehost_provider().read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
     required_file_validation = validate_required_files_in_pr(pull_request=pull_request, linked_issues=linked_issues)
-    merge_readiness = evaluate_pr_merge_readiness(pull_request=pull_request, merge_policy=merge_policy)
+    stored_merge_readiness = payload.get("merge_readiness") if isinstance(payload.get("merge_readiness"), dict) else None
+    stored_merge_result_verification = None
+    if isinstance(stored_merge_readiness, dict) and isinstance(
+        stored_merge_readiness.get("merge_result_verification"), dict
+    ):
+        stored_merge_result_verification = stored_merge_readiness.get("merge_result_verification")
+    merge_readiness = evaluate_pr_merge_readiness(
+        pull_request=pull_request,
+        merge_policy=merge_policy,
+        merge_result_verification=stored_merge_result_verification,
+    )
     decomposition = build_decomposition_rollup_from_recovered_state(
         recovered_state=pr_state,
         parent_issue=issue_number if type(issue_number) is int else None,
@@ -9171,6 +9535,7 @@ def main() -> int:
                                 ci_checks=ci_checks_payload,
                                 decomposition=pr_recovered_decomposition_rollup,
                                 project_config=project_config,
+                                repo_dir=os.getcwd(),
                                 dry_run=args.dry_run,
                             )
                             return _finish_main(0, original_process_cwd)
@@ -10786,6 +11151,7 @@ def main() -> int:
                                     ci_checks=ci_checks_payload,
                                     decomposition=decomposition_rollup,
                                     project_config=project_config,
+                                    repo_dir=os.getcwd(),
                                     dry_run=args.dry_run,
                                 )
                                 remove_agent_failure_label_from_issue(

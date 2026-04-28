@@ -38,6 +38,9 @@ const projectConfigScaffold = `{
       "pre_pr_update": null,
       "post_pr_update": null
     },
+    "verification": {
+      "focused_commands": []
+    },
     "readiness": {
       "required_checks": [],
       "required_approvals": 1,

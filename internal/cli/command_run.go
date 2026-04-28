@@ -263,7 +263,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
 			return 1
 		}
-		pythonArgs = append(pythonArgs, "--autonomous-session-file", workerPaths.sessionPath)
+		pythonArgs = append(pythonArgs, "--autonomous-session-file", workerPaths.SessionPath)
 		if *postBatchVerify {
 			pythonArgs = append(pythonArgs, "--post-batch-verify")
 		}

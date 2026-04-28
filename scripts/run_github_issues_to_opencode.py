@@ -1142,21 +1142,24 @@ def sort_autonomous_issues(issues: list[dict], scope_defaults: dict) -> list[dic
 
 def load_autonomous_session_state(path: str | None) -> dict:
     if not path:
-        return {"processed_issues": {}}
+        return {"processed_issues": {}, "checkpoint": {}}
     try:
         with open(path, encoding="utf-8") as handle:
             payload = json.load(handle)
     except FileNotFoundError:
-        return {"processed_issues": {}}
+        return {"processed_issues": {}, "checkpoint": {}}
     except (OSError, json.JSONDecodeError) as exc:
         print(f"Warning: unable to load autonomous session state from {path}: {exc}", file=sys.stderr)
-        return {"processed_issues": {}}
+        return {"processed_issues": {}, "checkpoint": {}}
     if not isinstance(payload, dict):
-        return {"processed_issues": {}}
+        return {"processed_issues": {}, "checkpoint": {}}
     processed_issues = payload.get("processed_issues")
     if not isinstance(processed_issues, dict):
         processed_issues = {}
-    return {"processed_issues": processed_issues}
+    checkpoint = payload.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        checkpoint = {}
+    return {"processed_issues": processed_issues, "checkpoint": checkpoint}
 
 
 def save_autonomous_session_state(path: str | None, state: dict) -> None:
@@ -1219,6 +1222,122 @@ def filter_autonomous_issues_for_single_pass(
             continue
         filtered.append(issue)
     return filtered, skipped
+
+
+def _compact_autonomous_status_counts(counts: dict | None) -> str:
+    if not isinstance(counts, dict):
+        return "processed=0, failures=0"
+    parts = [
+        f"processed={int(counts.get('processed') or 0)}",
+        f"failures={int(counts.get('failures') or 0)}",
+    ]
+    optional_fields = (
+        ("skipped_existing_pr", "skipped_existing_pr"),
+        ("skipped_existing_branch", "skipped_existing_branch"),
+        ("skipped_out_of_scope", "skipped_out_of_scope"),
+    )
+    for key, label in optional_fields:
+        value = int(counts.get(key) or 0)
+        if value > 0:
+            parts.append(f"{label}={value}")
+    return ", ".join(parts)
+
+
+def update_autonomous_session_checkpoint(
+    state: dict,
+    *,
+    run_id: str,
+    phase: str,
+    batch_index: int,
+    total_batches: int,
+    counts: dict[str, int],
+    done: list[str] | None,
+    current: str | None,
+    next_items: list[str] | None,
+    issue_pr_actions: list[str] | None,
+    in_progress: list[str] | None,
+    blockers: list[str] | None,
+    next_checkpoint: str | None,
+) -> dict:
+    checkpoint = {
+        "run_id": run_id,
+        "phase": str(phase or "running").strip() or "running",
+        "batch_index": max(batch_index, 0),
+        "total_batches": max(total_batches, 0),
+        "counts": {
+            "processed": int(counts.get("processed") or 0),
+            "failures": int(counts.get("failures") or 0),
+            "skipped_existing_pr": int(counts.get("skipped_existing_pr") or 0),
+            "skipped_existing_branch": int(counts.get("skipped_existing_branch") or 0),
+            "skipped_out_of_scope": int(counts.get("skipped_out_of_scope") or 0),
+        },
+        "done": [item for item in done or [] if str(item).strip()],
+        "current": _as_optional_string(current),
+        "next": [item for item in next_items or [] if str(item).strip()],
+        "issue_pr_actions": [item for item in issue_pr_actions or [] if str(item).strip()],
+        "in_progress": [item for item in in_progress or [] if str(item).strip()],
+        "blockers": [item for item in blockers or [] if str(item).strip()],
+        "next_checkpoint": _as_optional_string(next_checkpoint),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    state["checkpoint"] = checkpoint
+    return state
+
+
+def format_autonomous_session_status_summary(state: dict) -> str:
+    checkpoint = state.get("checkpoint") if isinstance(state, dict) else None
+    if not isinstance(checkpoint, dict) or not checkpoint:
+        processed_issue_count = len(autonomous_session_processed_issue_numbers(state))
+        return (
+            "Autonomous session status\n"
+            f"Done: processed issues recorded={processed_issue_count}\n"
+            "Current: no active checkpoint has been recorded yet\n"
+            "Next: start or resume the autonomous batch loop\n"
+            "Issue/PR actions: none\n"
+            "In progress: none\n"
+            "Blockers: none\n"
+            "Next checkpoint: when the first batch starts"
+        )
+
+    done_items = checkpoint.get("done") if isinstance(checkpoint.get("done"), list) else []
+    next_items = checkpoint.get("next") if isinstance(checkpoint.get("next"), list) else []
+    actions = checkpoint.get("issue_pr_actions") if isinstance(checkpoint.get("issue_pr_actions"), list) else []
+    in_progress = checkpoint.get("in_progress") if isinstance(checkpoint.get("in_progress"), list) else []
+    blockers = checkpoint.get("blockers") if isinstance(checkpoint.get("blockers"), list) else []
+    batch_index = int(checkpoint.get("batch_index") or 0)
+    total_batches = int(checkpoint.get("total_batches") or 0)
+    phase = str(checkpoint.get("phase") or "running").strip() or "running"
+    updated_at = _as_optional_string(checkpoint.get("updated_at")) or "unknown"
+    counts_summary = _compact_autonomous_status_counts(
+        checkpoint.get("counts") if isinstance(checkpoint.get("counts"), dict) else None
+    )
+
+    lines = [
+        f"Autonomous session status: {phase}",
+        f"Batch: {batch_index}/{total_batches}" if total_batches > 0 else "Batch: not started",
+        f"Done: {'; '.join(done_items) if done_items else 'none yet'}",
+        f"Current: {_as_optional_string(checkpoint.get('current')) or 'idle'}",
+        f"Next: {'; '.join(next_items) if next_items else 'no queued batches'}",
+        f"Issue/PR actions: {'; '.join(actions) if actions else 'none'}",
+        f"In progress: {'; '.join(in_progress) if in_progress else 'none'}",
+        f"Blockers: {'; '.join(blockers) if blockers else 'none'}",
+        f"Next checkpoint: {_as_optional_string(checkpoint.get('next_checkpoint')) or 'after the next autonomous batch'}",
+        f"Counts: {counts_summary}",
+        f"Updated: {updated_at}",
+    ]
+    return "\n".join(lines)
+
+
+def preview_autonomous_issue_queue(issues: list[dict], start_index: int, limit: int = 3) -> list[str]:
+    if limit <= 0:
+        return []
+    preview: list[str] = []
+    for issue in issues[start_index : start_index + limit]:
+        preview.append(format_issue_label_from_issue(issue))
+    remaining = max(len(issues) - (start_index + limit), 0)
+    if remaining > 0:
+        preview.append(f"{remaining} more queued")
+    return preview
 
 
 def run_capture(command: list[str]) -> str:
@@ -3971,12 +4090,16 @@ def run_status_command(*, args: argparse.Namespace, repo: str, merge_policy: dic
     issue_number_arg = getattr(args, "issue", None)
     pr_number_arg = getattr(args, "pr", None)
     from_review_comments = bool(getattr(args, "from_review_comments", False))
+    autonomous_session_file = _as_optional_string(getattr(args, "autonomous_session_file", None))
     if issue_number_arg is not None and pr_number_arg is not None:
         raise RuntimeError("Use either --issue or --pr with --status, not both.")
     if pr_number_arg is not None and from_review_comments:
         raise RuntimeError("--status does not use --from-review-comments.")
     if issue_number_arg is None and pr_number_arg is None:
-        raise RuntimeError("--status requires --issue <number> or --pr <number>.")
+        if not autonomous_session_file:
+            raise RuntimeError("--status requires --issue <number>, --pr <number>, or --autonomous-session-file <path>.")
+        print(format_autonomous_session_status_summary(load_autonomous_session_state(autonomous_session_file)))
+        return 0
 
     if issue_number_arg is not None:
         issue = current_tracker_provider().get_issue(repo=repo, issue_id=issue_number_arg)
@@ -8425,7 +8548,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--status",
         action="store_true",
-        help="Print a concise orchestration status summary for --issue or --pr and exit.",
+        help=(
+            "Print a concise orchestration status summary for --issue, --pr, or "
+            "--autonomous-session-file and exit."
+        ),
     )
     return parser
 
@@ -9483,7 +9609,32 @@ def main() -> int:
     touched_prs: list[str] = []
     reported_issue_failures: set[int] = set()
 
-    for issue in issues:
+    if autonomous_mode and issue_number_arg is None:
+        update_autonomous_session_checkpoint(
+            autonomous_session_state,
+            run_id=run_id,
+            phase="running",
+            batch_index=0,
+            total_batches=len(issues),
+            counts={
+                "processed": processed,
+                "failures": failures,
+                "skipped_existing_pr": skipped_existing_pr,
+                "skipped_existing_branch": skipped_existing_branch,
+                "skipped_out_of_scope": skipped_out_of_scope,
+            },
+            done=[f"Loaded autonomous queue with {len(issues)} issue(s)"],
+            current="Idle between autonomous batches",
+            next_items=preview_autonomous_issue_queue(issues, start_index=0),
+            issue_pr_actions=[],
+            in_progress=[],
+            blockers=[],
+            next_checkpoint="when batch 1 starts",
+        )
+        save_autonomous_session_state(autonomous_session_file, autonomous_session_state)
+        print(format_autonomous_session_status_summary(autonomous_session_state))
+
+    for batch_index, issue in enumerate(issues, start=1):
         try:
             failure_stage = "issue_setup"
             batch_issue_number = issue["number"]
@@ -9513,6 +9664,35 @@ def main() -> int:
             orchestration_attempt = 1
             supports_github_issue_ops = issue_tracker(issue) == TRACKER_GITHUB and type(issue["number"]) is int
             decomposition_assessment = assess_issue_decomposition_need(issue)
+            batch_done_summary = f"Started batch {batch_index}/{len(issues)} for {issue_label}"
+            batch_current_summary = f"Batch {batch_index}/{len(issues)} running for {issue_label}"
+            batch_action_items = [f"Inspect {issue_label} and choose issue-flow or PR-review path"]
+            batch_in_progress_items = [f"autonomous batch {batch_index}/{len(issues)} for {issue_label}"]
+            batch_blockers: list[str] = []
+
+            if autonomous_mode and issue_number_arg is None:
+                update_autonomous_session_checkpoint(
+                    autonomous_session_state,
+                    run_id=run_id,
+                    phase="running",
+                    batch_index=batch_index,
+                    total_batches=len(issues),
+                    counts={
+                        "processed": processed,
+                        "failures": failures,
+                        "skipped_existing_pr": skipped_existing_pr,
+                        "skipped_existing_branch": skipped_existing_branch,
+                        "skipped_out_of_scope": skipped_out_of_scope,
+                    },
+                    done=[batch_done_summary],
+                    current=batch_current_summary,
+                    next_items=preview_autonomous_issue_queue(issues, start_index=batch_index),
+                    issue_pr_actions=batch_action_items,
+                    in_progress=batch_in_progress_items,
+                    blockers=batch_blockers,
+                    next_checkpoint=f"after batch {batch_index}/{len(issues)} finishes",
+                )
+                save_autonomous_session_state(autonomous_session_file, autonomous_session_state)
 
             scope_decision = evaluate_issue_scope(issue=issue, scope_defaults=scope_defaults)
             scope_eligible = bool(scope_decision.get("eligible", True))
@@ -9539,6 +9719,10 @@ def main() -> int:
                         )
                 else:
                     skipped_out_of_scope += 1
+                    batch_done_summary = f"Skipped {issue_label} as out-of-scope"
+                    batch_current_summary = f"Batch {batch_index}/{len(issues)} paused on scope gating for {issue_label}"
+                    batch_action_items = [f"Posted blocked state and scope decision for {issue_label}"]
+                    batch_blockers = [scope_reason]
                     if supports_issue_tracker_ops:
                         safe_post_orchestration_state_comment(
                             repo=repo,
@@ -9593,6 +9777,9 @@ def main() -> int:
                         )
                     else:
                         skipped_existing_pr += 1
+                        batch_done_summary = f"Skipped {issue_label} because a linked PR already exists"
+                        batch_current_summary = f"Batch {batch_index}/{len(issues)} completed without issue-flow for {issue_label}"
+                        batch_action_items = [f"Left linked PR in place for {issue_label}"]
                         linked_pr_number = linked_open_pr.get("number")
                         linked_pr_url = str(linked_open_pr.get("url") or "").strip()
                         linked_pr_context = (
@@ -9616,6 +9803,9 @@ def main() -> int:
                     )
                 else:
                     skipped_existing_branch += 1
+                    batch_done_summary = f"Skipped {issue_label} because branch '{issue_branch}' already exists"
+                    batch_current_summary = f"Batch {batch_index}/{len(issues)} completed without branch reuse for {issue_label}"
+                    batch_action_items = [f"Did not reuse existing branch '{issue_branch}' for {issue_label}"]
                     print(
                         f"Skipping {issue_label}: branch '{issue_branch}' already exists on origin "
                         "(--force-reprocess or --no-skip-if-branch-exists to override)."
@@ -9715,6 +9905,10 @@ def main() -> int:
                     clarification_answer=clarification_answer,
                 )
                 if mode == "skip":
+                    batch_done_summary = f"Skipped {issue_label}: {mode_reason}"
+                    batch_current_summary = f"Batch {batch_index}/{len(issues)} paused for {issue_label}"
+                    batch_action_items = [f"Recovery state kept {issue_label} out of the autonomous batch"]
+                    batch_blockers = [mode_reason]
                     print(
                         f"Skipping {issue_label}: {mode_reason} "
                         "(use --force-issue-flow to override)."
@@ -9783,6 +9977,9 @@ def main() -> int:
                         )
                         raise
                     processed += 1
+                    batch_done_summary = f"Completed conflict recovery setup for {recovery_label}"
+                    batch_current_summary = f"Batch {batch_index}/{len(issues)} finished for {recovery_label}"
+                    batch_action_items = [f"Ran conflict recovery against base '{recovery_base_branch}'"]
                     continue
 
                 if autonomous_mode:
@@ -9960,6 +10157,9 @@ def main() -> int:
                                         decomposition=decomposition_rollup,
                                     ),
                                 )
+                                batch_done_summary = f"Prepared approved child issues for parent issue #{issue['number']}"
+                                batch_current_summary = f"Batch {batch_index}/{len(issues)} waiting on child execution for issue #{issue['number']}"
+                                batch_action_items = ["Created missing decomposition child issues", "Posted parent roll-up update"]
                                 processed += 1
                                 continue
 
@@ -9996,6 +10196,10 @@ def main() -> int:
                                         decomposition=decomposition_rollup,
                                     ),
                                 )
+                                batch_done_summary = f"Stopped issue #{issue['number']} until missing child issues are created"
+                                batch_current_summary = f"Batch {batch_index}/{len(issues)} blocked on decomposition child creation"
+                                batch_action_items = ["Kept approved decomposition plan in waiting state"]
+                                batch_blockers = ["approved decomposition plan still has missing child issues"]
                                 print(
                                     f"Approved decomposition plan for issue #{issue['number']} still has "
                                     f"{len(missing_children)} missing child issue(s); rerun with "
@@ -10064,6 +10268,9 @@ def main() -> int:
                                         decomposition=decomposition_rollup,
                                     ),
                                 )
+                                batch_done_summary = f"No runnable decomposition child remained for issue #{issue['number']}"
+                                batch_current_summary = f"Batch {batch_index}/{len(issues)} completed without a child execution"
+                                batch_action_items = ["Refreshed decomposition roll-up from child states"]
                                 print(
                                     f"Issue #{issue['number']} has no unblocked child issues ready to run; "
                                     f"{format_decomposition_rollup_context(decomposition_rollup)}"
@@ -10179,6 +10386,10 @@ def main() -> int:
                                 decomposition=decomposition_rollup,
                             ),
                         )
+                        batch_done_summary = f"Posted planning-only decomposition plan for issue #{issue['number']}"
+                        batch_current_summary = f"Batch {batch_index}/{len(issues)} waiting for plan approval"
+                        batch_action_items = ["Posted decomposition plan", "Stopped before agent execution"]
+                        batch_blockers = ["task requires planning-only decomposition before implementation"]
                         processed += 1
                         print(
                             f"Issue #{issue['number']} needs decomposition; posted planning-only plan "
@@ -10334,6 +10545,9 @@ def main() -> int:
                                     issue_number=issue["number"],
                                     dry_run=args.dry_run,
                                 )
+                                batch_done_summary = f"Linked PR #{pr_number} is still waiting for CI"
+                                batch_current_summary = f"Batch {batch_index}/{len(issues)} completed in PR-review mode for {issue_label}"
+                                batch_action_items = [f"Kept PR #{pr_number} in waiting-for-ci state"]
                                 mark_autonomous_session_issue_processed(
                                     autonomous_session_state,
                                     issue_number=batch_issue_number,
@@ -10386,6 +10600,10 @@ def main() -> int:
                                         issue_number=issue["number"],
                                         dry_run=args.dry_run,
                                     )
+                                    batch_done_summary = f"Linked PR #{pr_number} is blocked on transient CI failure"
+                                    batch_current_summary = f"Batch {batch_index}/{len(issues)} completed without a code retry for {issue_label}"
+                                    batch_action_items = [f"Stopped PR #{pr_number} after classifying CI failure as transient"]
+                                    batch_blockers = [diagnostics_summary]
                                     continue
 
                                 if current_attempt >= max_attempts:
@@ -10425,6 +10643,10 @@ def main() -> int:
                                         issue_number=issue["number"],
                                         dry_run=args.dry_run,
                                     )
+                                    batch_done_summary = f"Linked PR #{pr_number} reached the CI retry limit"
+                                    batch_current_summary = f"Batch {batch_index}/{len(issues)} blocked on CI for {issue_label}"
+                                    batch_action_items = [f"Left PR #{pr_number} for manual CI follow-up"]
+                                    batch_blockers = [diagnostics_summary]
                                     continue
 
                                 retry_attempt = current_attempt + 1
@@ -10492,6 +10714,9 @@ def main() -> int:
                                     issue_number=issue["number"],
                                     dry_run=args.dry_run,
                                 )
+                                batch_done_summary = f"Linked PR #{pr_number} is ready to merge"
+                                batch_current_summary = f"Batch {batch_index}/{len(issues)} finished after successful CI for {issue_label}"
+                                batch_action_items = [f"Finalized PR #{pr_number} after green CI"]
                                 mark_autonomous_session_issue_processed(
                                     autonomous_session_state,
                                     issue_number=batch_issue_number,
@@ -10512,6 +10737,9 @@ def main() -> int:
                                 issue_number=issue["number"],
                                 dry_run=args.dry_run,
                             )
+                            batch_done_summary = f"Linked PR #{pr_number} remains ready for review"
+                            batch_current_summary = f"Batch {batch_index}/{len(issues)} completed without new review work for {issue_label}"
+                            batch_action_items = [f"Kept PR #{pr_number} in ready-for-review state"]
                             mark_autonomous_session_issue_processed(
                                 autonomous_session_state,
                                 issue_number=batch_issue_number,
@@ -10554,6 +10782,9 @@ def main() -> int:
                                 issue_number=issue["number"],
                                 dry_run=args.dry_run,
                             )
+                            batch_done_summary = f"No actionable review comments remained for PR #{pr_number}"
+                            batch_current_summary = f"Batch {batch_index}/{len(issues)} is waiting for new PR feedback"
+                            batch_action_items = [f"Posted waiting-for-author state for PR #{pr_number}"]
                             continue
 
                     safe_post_orchestration_state_comment(
@@ -10919,6 +11150,10 @@ def main() -> int:
                                     decomposition=decomposition_rollup,
                                 ) | {"question": question, "reason": reason},
                             )
+                            batch_done_summary = f"Paused {issue_label} for author clarification"
+                            batch_current_summary = f"Batch {batch_index}/{len(issues)} waiting for author reply on {issue_label}"
+                            batch_action_items = [f"Posted clarification request for {issue_label}"]
+                            batch_blockers = [reason or question]
                             print(
                                 f"Paused {issue_label} for author clarification: {question}"
                             )
@@ -11067,6 +11302,9 @@ def main() -> int:
                             )
                         if not args.dry_run:
                             run_command(["git", "checkout", base_branch])
+                        batch_done_summary = f"No code changes needed for {issue_label}"
+                        batch_current_summary = f"Batch {batch_index}/{len(issues)} finished with existing branch state for {issue_label}"
+                        batch_action_items = ["Skipped commit and PR because working tree was unchanged"]
                         mark_autonomous_session_issue_processed(
                             autonomous_session_state,
                             issue_number=batch_issue_number,
@@ -11127,6 +11365,7 @@ def main() -> int:
                 if pr_url:
                     touched_prs.append(pr_url)
                     print(f"PR status for {issue_label}: {pr_status} ({pr_url})")
+                    batch_action_items = [f"Updated PR state for {issue_label}: {pr_status} ({pr_url})"]
                 if mode == "issue-flow" and supports_github_issue_ops:
                     safe_post_orchestration_state_comment(
                         repo=repo,
@@ -11214,6 +11453,12 @@ def main() -> int:
                     issue_number=batch_issue_number,
                     status=("ready-for-review" if mode == "issue-flow" else "waiting-for-ci"),
                 )
+                batch_done_summary = (
+                    f"Prepared issue #{issue['number']} for review"
+                    if mode == "issue-flow"
+                    else f"Advanced linked PR #{state_pr_number} to waiting-for-ci"
+                )
+                batch_current_summary = f"Batch {batch_index}/{len(issues)} finished for {issue_label}"
                 save_autonomous_session_state(
                     autonomous_session_file,
                     autonomous_session_state,
@@ -11328,6 +11573,10 @@ def main() -> int:
                     dry_run=args.dry_run,
                     already_reported_issue_numbers=reported_issue_failures,
                 )
+            batch_done_summary = f"Failed {issue_label} during {failure_stage}"
+            batch_current_summary = f"Batch {batch_index}/{len(issues)} failed for {issue_label}"
+            batch_action_items = [f"Posted failure diagnostics for {issue_label}"]
+            batch_blockers = [short_error_text(str(exc))]
             print(f"{issue_label.capitalize()} failed: {exc}", file=sys.stderr)
             if args.stop_on_error:
                 break
@@ -11344,6 +11593,61 @@ def main() -> int:
                     ),
                     dry_run=args.dry_run,
                 )
+            if autonomous_mode and issue_number_arg is None:
+                update_autonomous_session_checkpoint(
+                    autonomous_session_state,
+                    run_id=run_id,
+                    phase="running",
+                    batch_index=batch_index,
+                    total_batches=len(issues),
+                    counts={
+                        "processed": processed,
+                        "failures": failures,
+                        "skipped_existing_pr": skipped_existing_pr,
+                        "skipped_existing_branch": skipped_existing_branch,
+                        "skipped_out_of_scope": skipped_out_of_scope,
+                    },
+                    done=[batch_done_summary],
+                    current=batch_current_summary,
+                    next_items=preview_autonomous_issue_queue(issues, start_index=batch_index),
+                    issue_pr_actions=batch_action_items,
+                    in_progress=[],
+                    blockers=batch_blockers,
+                    next_checkpoint=(
+                        "final autonomous summary"
+                        if batch_index >= len(issues)
+                        else f"when batch {batch_index + 1}/{len(issues)} starts"
+                    ),
+                )
+                save_autonomous_session_state(autonomous_session_file, autonomous_session_state)
+                print(format_autonomous_session_status_summary(autonomous_session_state))
+
+    if autonomous_mode and issue_number_arg is None:
+        update_autonomous_session_checkpoint(
+            autonomous_session_state,
+            run_id=run_id,
+            phase="completed",
+            batch_index=len(issues),
+            total_batches=len(issues),
+            counts={
+                "processed": processed,
+                "failures": failures,
+                "skipped_existing_pr": skipped_existing_pr,
+                "skipped_existing_branch": skipped_existing_branch,
+                "skipped_out_of_scope": skipped_out_of_scope,
+            },
+            done=[f"Autonomous batch loop finished across {len(issues)} issue(s)"],
+            current="Idle between autonomous runs",
+            next_items=[],
+            issue_pr_actions=(
+                [f"Touched {len(touched_prs)} PR(s)"] if touched_prs else ["No PR updates were needed in the last batch"]
+            ),
+            in_progress=[],
+            blockers=([f"{failures} batch failure(s) need follow-up"] if failures > 0 else []),
+            next_checkpoint="when the next autonomous invocation starts",
+        )
+        save_autonomous_session_state(autonomous_session_file, autonomous_session_state)
+        print(format_autonomous_session_status_summary(autonomous_session_state))
 
     print(
         "Done. "

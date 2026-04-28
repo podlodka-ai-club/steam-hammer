@@ -71,6 +71,11 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --pr 72 --from
 python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 45 --base current --runner opencode --agent build
 ```
 
+**Read autonomous batch status from the session checkpoint file:**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --status --autonomous-session-file .orchestrator/session.json
+```
+
 **Use Jira as the issue source:**
 ```bash
 export JIRA_BASE_URL=https://mycompany.atlassian.net

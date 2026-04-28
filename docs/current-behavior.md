@@ -59,13 +59,15 @@
 
 - `run daemon` уже существует и повторно вызывает batch issue flow по polling interval.
 - Текущий daemon режим остается осторожным: GitHub-only, с ограниченной concurrency и опорой на существующий Python runner.
+- Во время autonomous batch loop сохраняется session-level checkpoint в `--autonomous-session-file`: done/current/next, issue/PR actions, blockers, счетчики и next checkpoint.
+- `status` теперь умеет читать не только issue/PR state comments, но и session-level checkpoint из `--autonomous-session-file`, чтобы оператор мог спросить прогресс посреди длинной batch-сессии.
 - Safe bounded smoke path для текущего entrypoint задокументирован в `docs/daemon-smoke-test.md`.
 - Это рабочий автономный entrypoint ранней стадии, а не финальный service-grade orchestrator.
 
 ## Что еще не доведено до North Star
 
 - Основной execution core пока не перенесен в Go и остается крупным Python runner'ом.
-- Нет product-grade status UX наподобие отдельной `status`/`resume` поверхности для оператора.
+- Нет еще полноценной interactive `resume` поверхности и richer operator UX поверх сохраненного session checkpoint.
 - Нет dedicated conflict-recovery mode, который чинит только branch divergence без полного повторного issue run.
 - Нет обязательного post-batch verification workflow, который сам создает follow-up issue/checklist после крупных merge batches.
 - Нет полного auto-merge/deploy loop.
@@ -74,7 +76,7 @@
 ## Ближайшие практические зоны улучшения
 
 1. Прогнать daemon smoke test на чистом `main` и зафиксировать expected operator path.
-2. Улучшить видимость статуса: отдельный CLI/status summary для текущего orchestration state и daemon progress.
+2. Развить session checkpoint дальше: richer `resume`, history по batch checkpoint и более явные operator actions.
 3. Уменьшить шум и длительность full Python verification.
 4. Добавить dedicated conflict-recovery path для reused branches и stacked batches.
 5. Автоматизировать post-batch verification и follow-up issue creation.

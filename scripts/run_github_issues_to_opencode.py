@@ -1196,11 +1196,39 @@ def evaluate_pr_readiness(*args, **kwargs) -> dict[str, object]:
         required_checks = []
 
     ci_checks = ci_status.get("checks") if isinstance(ci_status.get("checks"), list) else []
+    ci_overall = str(ci_status.get("overall") or "").strip().lower()
     ci_checks_by_name = {
         _check_name_key(check.get("name")): check
         for check in ci_checks
         if isinstance(check, dict) and _check_name_key(check.get("name"))
     }
+
+    if bool(readiness_policy.get("require_green_checks")):
+        failing_ci_checks = [
+            check for check in ci_checks if isinstance(check, dict) and str(check.get("state") or "") == "failure"
+        ]
+        pending_ci_checks = [
+            check for check in ci_checks if isinstance(check, dict) and str(check.get("state") or "") == "pending"
+        ]
+        if ci_overall == "failure" or failing_ci_checks:
+            summary = format_failing_ci_checks_summary(failing_ci_checks)
+            return {
+                "status": "blocked",
+                "next_action": "inspect_failing_ci_checks",
+                "error": short_error_text(summary or "CI checks are failing"),
+            }
+        if ci_overall == "pending" or pending_ci_checks:
+            return {
+                "status": "waiting-for-ci",
+                "next_action": "wait_for_ci",
+                "error": "Waiting for CI checks to finish",
+            }
+        if not ci_checks:
+            return {
+                "status": "waiting-for-ci",
+                "next_action": "wait_for_ci",
+                "error": "Waiting for CI checks to start",
+            }
 
     matched_required_checks: list[dict] = []
     missing_required_checks: list[str] = []

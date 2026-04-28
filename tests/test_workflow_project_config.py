@@ -138,6 +138,56 @@ class WorkflowProjectConfigTests(unittest.TestCase):
         self.assertEqual(readiness["status"], "waiting-for-ci")
         self.assertIn("ci/lint", str(readiness["error"]))
 
+    def test_readiness_blocks_when_green_checks_are_required_and_ci_is_failing(self) -> None:
+        project_config = {
+            "workflow": {
+                "readiness": {
+                    "require_green_checks": True,
+                    "require_required_file_evidence": False,
+                }
+            }
+        }
+        pull_request = {
+            "reviews": [],
+            "author": {"login": "author"},
+            "files": [{"path": "README.md"}],
+        }
+        ci_status = {
+            "overall": "failure",
+            "checks": [{"name": "ci/test", "state": "failure", "url": "https://example/check/1"}],
+            "failing_checks": [{"name": "ci/test", "state": "failure", "url": "https://example/check/1"}],
+        }
+
+        readiness = evaluate_pr_readiness(project_config, pull_request, ci_status, linked_issues=[])
+
+        self.assertEqual(readiness["status"], "blocked")
+        self.assertEqual(readiness["next_action"], "inspect_failing_ci_checks")
+
+    def test_readiness_waits_when_green_checks_are_required_but_not_started(self) -> None:
+        project_config = {
+            "workflow": {
+                "readiness": {
+                    "require_green_checks": True,
+                    "require_required_file_evidence": False,
+                }
+            }
+        }
+        pull_request = {
+            "reviews": [],
+            "author": {"login": "author"},
+            "files": [{"path": "README.md"}],
+        }
+        ci_status = {
+            "overall": "success",
+            "checks": [],
+            "failing_checks": [],
+        }
+
+        readiness = evaluate_pr_readiness(project_config, pull_request, ci_status, linked_issues=[])
+
+        self.assertEqual(readiness["status"], "waiting-for-ci")
+        self.assertEqual(readiness["next_action"], "wait_for_ci")
+
 
 if __name__ == "__main__":
     unittest.main()

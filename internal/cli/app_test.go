@@ -67,6 +67,18 @@ func TestDoctorCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--doctor", "--repo", "owner/repo", "--dry-run"})
 }
 
+func TestAutoDoctorCommandWiresPythonRunner(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"autodoctor", "--repo", "owner/repo", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--doctor", "--repo", "owner/repo", "--dry-run"})
+}
+
 func TestInitCreatesConfigScaffolds(t *testing.T) {
 	targetDir := t.TempDir()
 	var out strings.Builder

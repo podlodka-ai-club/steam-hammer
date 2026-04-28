@@ -233,6 +233,26 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(readiness["status"], "blocked")
         self.assertEqual(readiness["next_action"], "inspect_merge_requirements")
 
+    def test_run_merge_for_pull_request_reports_manual_merge_when_auto_merge_disabled(self) -> None:
+        completed = self.mod.subprocess.CompletedProcess(
+            args=["gh", "pr", "merge"],
+            returncode=1,
+            stdout="",
+            stderr="GraphQL: Auto-merge is not enabled for this repository",
+        )
+
+        with mock.patch.object(self.mod.subprocess, "run", return_value=completed):
+            with self.assertRaises(self.mod.MergeRequestNotAcceptedError) as context:
+                self.mod.run_merge_for_pull_request(
+                    repo="owner/repo",
+                    pr_number=42,
+                    merge_policy={"auto": True, "method": "squash"},
+                    dry_run=False,
+                )
+
+        self.assertEqual(context.exception.status, "ready-to-merge")
+        self.assertEqual(context.exception.next_action, "merge_manually_or_enable_auto_merge")
+
     def test_normalize_review_items_includes_actionable_approved_review_summary(self) -> None:
         reviews = [
             {

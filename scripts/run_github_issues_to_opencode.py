@@ -753,6 +753,7 @@ WORKFLOW_COMMAND_ORDER = ["setup", "test", "lint", "build", "e2e"]
 WORKFLOW_CHECK_COMMAND_ORDER = ["test", "lint", "build", "e2e"]
 WORKFLOW_HOOK_NAMES = ["pre_agent", "post_agent", "pre_pr_update", "post_pr_update"]
 MERGE_METHOD_CHOICES = {"merge", "squash", "rebase"}
+MERGE_METHOD_FLAGS = {"merge": "--merge", "squash": "--squash", "rebase": "--rebase"}
 MERGEABLE_READY_STATES = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
 
 CI_PENDING_CHECK_RUN_STATUSES = {"queued", "in_progress", "requested", "waiting", "pending"}
@@ -840,6 +841,14 @@ class TokenBudgetExceededError(RuntimeError):
             f"Agent stopped: token budget of {_format_budget_message_count(budget) or budget} exceeded "
             f"(reached ~{_format_budget_message_count(reached) or reached}). Use --token-budget to raise the limit or split the issue."
         )
+
+
+class MergeRequestNotAcceptedError(RuntimeError):
+    def __init__(self, *, status: str, next_action: str, message: str):
+        self.status = status
+        self.next_action = next_action
+        self.message = message
+        super().__init__(message)
 
 
 def configured_workflow_commands(project_config: dict) -> list[tuple[str, str]]:
@@ -1946,7 +1955,41 @@ def run_merge_for_pull_request(repo: str, pr_number: int, merge_policy: dict, dr
         )
         return
 
-    run_command(command)
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+
+    stderr = str(result.stderr or "").strip()
+    stdout = str(result.stdout or "").strip()
+    detail = stderr or stdout or f"Command failed: {' '.join(command)}"
+    normalized = detail.lower()
+    if "auto-merge" in normalized and (
+        "not enabled" in normalized
+        or "not allowed" in normalized
+        or "enablepullrequestautomerge" in normalized
+        or "disabled" in normalized
+    ):
+        raise MergeRequestNotAcceptedError(
+            status="ready-to-merge",
+            next_action="merge_manually_or_enable_auto_merge",
+            message=short_error_text(
+                "Repository policy rejected GitHub auto-merge; merge manually or enable auto-merge for this repository."
+            ),
+        )
+    if (
+        "review required" in normalized
+        or "required approving review" in normalized
+        or "required status check" in normalized
+        or "protected branch" in normalized
+        or "pull request is not mergeable" in normalized
+        or "base branch policy" in normalized
+    ):
+        raise MergeRequestNotAcceptedError(
+            status="blocked",
+            next_action="inspect_merge_requirements",
+            message=short_error_text(detail),
+        )
+    raise RuntimeError(detail)
 
 
 def finalize_pr_after_ci_success(
@@ -1965,6 +2008,7 @@ def finalize_pr_after_ci_success(
     attempt: int,
     ci_checks: list[dict] | None,
     decomposition: dict | None,
+    project_config: dict,
     dry_run: bool,
 ) -> dict:
     pull_request = fetch_pull_request(repo=repo, number=pr_number)
@@ -2005,6 +2049,57 @@ def finalize_pr_after_ci_success(
             f"PR #{pr_number} CI passed but required file evidence check failed. "
             f"Missing files: {missing_summary}"
         )
+        return state
+
+    readiness = evaluate_pr_readiness(
+        pull_request=pull_request,
+        ci_status={"checks": ci_checks or []},
+        required_file_validation=required_file_validation,
+        project_config=project_config,
+    )
+    readiness_status = str(readiness.get("status") or "blocked")
+    if readiness_status != "ready-to-merge":
+        state = build_orchestration_state(
+            status=readiness_status,
+            task_type="pr",
+            issue_number=issue_number,
+            pr_number=pr_number,
+            branch=branch,
+            base_branch=base_branch,
+            runner=runner,
+            agent=agent,
+            model=model,
+            attempt=attempt,
+            stage="ci_checks",
+            next_action=str(readiness.get("next_action") or "ready_for_merge"),
+            error=_as_optional_string(readiness.get("error")),
+            ci_checks=ci_checks,
+            decomposition=decomposition,
+            required_file_validation=required_file_validation,
+            merge_policy=merge_policy,
+        )
+        safe_post_orchestration_state_comment(
+            repo=repo,
+            target_type=target_type,
+            target_number=target_number,
+            dry_run=dry_run,
+            state=state,
+        )
+        if readiness_status == "ready-for-review":
+            print(
+                f"CI checks passed for PR #{pr_number}, but review requirements are not met yet: "
+                f"{_as_optional_string(readiness.get('error')) or 'waiting for review'}"
+            )
+        elif readiness_status == "waiting-for-ci":
+            print(
+                f"PR #{pr_number} is still waiting for required checks: "
+                f"{_as_optional_string(readiness.get('error')) or 'waiting for CI'}"
+            )
+        else:
+            print(
+                f"PR #{pr_number} is not ready to merge yet: "
+                f"{_as_optional_string(readiness.get('error')) or 'readiness policy blocked'}"
+            )
         return state
 
     merge_readiness = evaluate_pr_merge_readiness(
@@ -2054,17 +2149,48 @@ def finalize_pr_after_ci_success(
     state_stage = "merge_gate"
     state_next_action = "ready_for_merge"
     if merge_policy.get("auto"):
-        run_merge_for_pull_request(
-            repo=repo,
-            pr_number=pr_number,
-            merge_policy=merge_policy,
-            dry_run=dry_run,
-        )
-        state_stage = "merge_execution"
-        state_next_action = "await_github_auto_merge"
-        print(
-            f"CI checks passed for PR #{pr_number}; merge gate passed and GitHub auto-merge was requested."
-        )
+        try:
+            run_merge_for_pull_request(
+                repo=repo,
+                pr_number=pr_number,
+                merge_policy=merge_policy,
+                dry_run=dry_run,
+            )
+            state_stage = "merge_execution"
+            state_next_action = "await_github_auto_merge"
+            print(
+                f"CI checks passed for PR #{pr_number}; merge gate passed and GitHub auto-merge was requested."
+            )
+        except MergeRequestNotAcceptedError as exc:
+            state = build_orchestration_state(
+                status=exc.status,
+                task_type="pr",
+                issue_number=issue_number,
+                pr_number=pr_number,
+                branch=branch,
+                base_branch=base_branch,
+                runner=runner,
+                agent=agent,
+                model=model,
+                attempt=attempt,
+                stage="merge_gate",
+                next_action=exc.next_action,
+                error=exc.message,
+                ci_checks=ci_checks,
+                decomposition=decomposition,
+                required_file_validation=required_file_validation,
+                merge_readiness=merge_readiness,
+                merge_policy=merge_policy,
+            )
+            safe_post_orchestration_state_comment(
+                repo=repo,
+                target_type=target_type,
+                target_number=target_number,
+                dry_run=dry_run,
+                state=state,
+            )
+            print(f"CI checks passed for PR #{pr_number}, but auto-merge was not accepted: {exc.message}")
+            return state
     else:
         print(
             f"CI checks passed for PR #{pr_number}; merge gate passed and auto-merge is disabled, marking ready-to-merge."
@@ -6315,28 +6441,27 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
         )
 
     commands = config.get("commands")
-    if commands is None:
-        return
-    if not isinstance(commands, dict):
-        raise RuntimeError("Project config key 'workflow.commands' must be an object")
+    if commands is not None:
+        if not isinstance(commands, dict):
+            raise RuntimeError("Project config key 'workflow.commands' must be an object")
 
-    supported_commands = set(WORKFLOW_COMMAND_ORDER)
-    unsupported_commands = sorted(set(commands) - supported_commands)
-    if unsupported_commands:
-        raise RuntimeError(
-            f"Unsupported key(s) in project config {config_path} under 'workflow.commands': "
-            + ", ".join(unsupported_commands)
-        )
+        supported_commands = set(WORKFLOW_COMMAND_ORDER)
+        unsupported_commands = sorted(set(commands) - supported_commands)
+        if unsupported_commands:
+            raise RuntimeError(
+                f"Unsupported key(s) in project config {config_path} under 'workflow.commands': "
+                + ", ".join(unsupported_commands)
+            )
 
-    for key in supported_commands:
-        if key in commands and commands[key] is not None and not isinstance(commands[key], str):
-            raise RuntimeError(
-                f"Project config key 'workflow.commands.{key}' must be a string or null"
-            )
-        if key in commands and isinstance(commands[key], str) and not commands[key].strip():
-            raise RuntimeError(
-                f"Project config key 'workflow.commands.{key}' must be a non-empty string or null"
-            )
+        for key in supported_commands:
+            if key in commands and commands[key] is not None and not isinstance(commands[key], str):
+                raise RuntimeError(
+                    f"Project config key 'workflow.commands.{key}' must be a string or null"
+                )
+            if key in commands and isinstance(commands[key], str) and not commands[key].strip():
+                raise RuntimeError(
+                    f"Project config key 'workflow.commands.{key}' must be a non-empty string or null"
+                )
 
     hooks = config.get("hooks")
     if hooks is not None:
@@ -7772,6 +7897,7 @@ def main() -> int:
             workflow_checks = configured_workflow_commands(project_config)
             configured_hooks = workflow_hooks(project_config)
             readiness_policy = workflow_readiness_policy(project_config)
+            merge_policy = workflow_merge_policy(project_config)
 
             configured_command_names: list[str] = []
             if setup_command is not None:
@@ -7801,6 +7927,14 @@ def main() -> int:
                     readiness_parts.append("require_mergeable=true")
                 if readiness_parts:
                     print("Readiness policy: " + "; ".join(readiness_parts))
+            if merge_policy:
+                merge_parts: list[str] = []
+                if "method" in merge_policy:
+                    merge_parts.append(f"method={merge_policy['method']}")
+                if "auto" in merge_policy:
+                    merge_parts.append(f"auto={str(bool(merge_policy['auto'])).lower()}")
+                if merge_parts:
+                    print("Merge policy: " + "; ".join(merge_parts))
             if selected_preset is not None:
                 print(f"Selected preset: {selected_preset}")
             if max_attempts != BUILTIN_DEFAULTS["max_attempts"] or escalate_to_preset is not None:
@@ -8221,61 +8355,26 @@ def main() -> int:
                         )
 
                     if ci_overall == "success":
-                        required_file_validation = validate_required_files_in_pr(
-                            pull_request=pull_request,
-                            linked_issues=load_linked_issue_context(repo=repo, pull_request=pull_request),
-                        )
-                        readiness = evaluate_pr_readiness(
-                            pull_request=pull_request,
-                            ci_status=ci_status,
-                            required_file_validation=required_file_validation,
-                            project_config=project_config,
-                        )
-                        safe_post_orchestration_state_comment(
+                        linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                        finalize_pr_after_ci_success(
                             repo=repo,
+                            pr_number=pr_number_arg,
+                            linked_issues=linked_issues,
+                            merge_policy=merge_policy,
                             target_type="pr",
                             target_number=pr_number_arg,
+                            issue_number=None,
+                            branch=active_branch,
+                            base_branch=str(pr_state_context["base_branch"] or "") or None,
+                            runner=args.runner,
+                            agent=args.agent,
+                            model=args.model,
+                            attempt=current_attempt,
+                            ci_checks=ci_checks_payload,
+                            decomposition=pr_recovered_decomposition_rollup,
+                            project_config=project_config,
                             dry_run=args.dry_run,
-                            state=build_orchestration_state(
-                                status=str(readiness.get("status") or "ready-to-merge"),
-                                task_type="pr",
-                                issue_number=None,
-                                pr_number=pr_number_arg,
-                                branch=active_branch,
-                                base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
-                                attempt=current_attempt,
-                                stage="ci_checks",
-                                next_action=str(readiness.get("next_action") or "ready_for_merge"),
-                                error=_as_optional_string(readiness.get("error")),
-                                ci_checks=ci_checks_payload,
-                                decomposition=pr_recovered_decomposition_rollup,
-                                required_file_validation=required_file_validation,
-                                merge_policy=merge_policy,
-                            ),
                         )
-                        readiness_status = str(readiness.get("status") or "ready-to-merge")
-                        if readiness_status == "ready-to-merge":
-                            print(
-                                f"CI checks passed for PR #{pr_number_arg}; marking orchestration state as ready-to-merge."
-                            )
-                        elif readiness_status == "ready-for-review":
-                            print(
-                                f"CI checks passed for PR #{pr_number_arg}, but review requirements are not met yet: "
-                                f"{_as_optional_string(readiness.get('error')) or 'waiting for review'}"
-                            )
-                        elif readiness_status == "waiting-for-ci":
-                            print(
-                                f"PR #{pr_number_arg} is still waiting for required checks: "
-                                f"{_as_optional_string(readiness.get('error')) or 'waiting for CI'}"
-                            )
-                        else:
-                            print(
-                                f"PR #{pr_number_arg} is not ready to merge yet: "
-                                f"{_as_optional_string(readiness.get('error')) or 'readiness policy blocked'}"
-                            )
                         return _finish_main(0, original_process_cwd)
 
                 safe_post_orchestration_state_comment(
@@ -9540,17 +9639,7 @@ def main() -> int:
                                 )
 
                             if ci_overall == "success":
-                                required_file_validation = validate_required_files_in_pr(
-                                    pull_request=pull_request,
-                                    linked_issues=[issue],
-                                )
-                                readiness = evaluate_pr_readiness(
-                                    pull_request=pull_request,
-                                    ci_status=ci_status,
-                                    required_file_validation=required_file_validation,
-                                    project_config=project_config,
-                                )
-                                safe_post_orchestration_state_comment(
+                                finalize_pr_after_ci_success(
                                     repo=repo,
                                     pr_number=pr_number,
                                     linked_issues=[issue],
@@ -9566,50 +9655,9 @@ def main() -> int:
                                     attempt=current_attempt,
                                     ci_checks=ci_checks_payload,
                                     decomposition=decomposition_rollup,
+                                    project_config=project_config,
                                     dry_run=args.dry_run,
-                                    state=build_orchestration_state(
-                                        status=str(readiness.get("status") or "ready-to-merge"),
-                                        task_type="pr",
-                                        issue_number=issue["number"],
-                                        pr_number=state_pr_number,
-                                        branch=issue_branch,
-                                        base_branch=target_base_branch,
-                                        runner=args.runner,
-                                        agent=args.agent,
-                                        model=args.model,
-                                        attempt=current_attempt,
-                                        stage="ci_checks",
-                                        next_action=str(readiness.get("next_action") or "ready_for_merge"),
-                                        error=_as_optional_string(readiness.get("error")),
-                                        ci_checks=ci_checks_payload,
-                                        decomposition=decomposition_rollup,
-                                        required_file_validation=required_file_validation,
-                                    ),
                                 )
-                                readiness_status = str(readiness.get("status") or "ready-to-merge")
-                                if readiness_status == "ready-to-merge":
-                                    print(
-                                        f"No actionable review comments for linked PR #{pr_number}; "
-                                        "CI checks passed, marking ready-to-merge."
-                                    )
-                                elif readiness_status == "ready-for-review":
-                                    print(
-                                        f"No actionable review comments for linked PR #{pr_number}; "
-                                        f"CI passed, but review requirements are not met yet: "
-                                        f"{_as_optional_string(readiness.get('error')) or 'waiting for review'}"
-                                    )
-                                elif readiness_status == "waiting-for-ci":
-                                    print(
-                                        f"No actionable review comments for linked PR #{pr_number}; "
-                                        f"still waiting for required checks: "
-                                        f"{_as_optional_string(readiness.get('error')) or 'waiting for CI'}"
-                                    )
-                                else:
-                                    print(
-                                        f"No actionable review comments for linked PR #{pr_number}; "
-                                        f"readiness policy is blocking merge: "
-                                        f"{_as_optional_string(readiness.get('error')) or 'blocked'}"
-                                    )
                                 remove_agent_failure_label_from_issue(
                                     repo=repo,
                                     issue_number=issue["number"],

@@ -1516,8 +1516,11 @@ def build_decomposition_rollup_from_plan_payload(payload: dict) -> dict:
     next_action_hint = str(payload.get("next_action") or "").strip() or (
         "execute_next_child" if next_child is not None else "all_children_complete"
     )
+    resume_context = payload.get("resume_context")
+    if not isinstance(resume_context, dict):
+        resume_context = None
 
-    return {
+    rollup = {
         "parent_issue": plan_parent_issue,
         "counts": counts,
         "children": rollup_children,
@@ -1532,6 +1535,9 @@ def build_decomposition_rollup_from_plan_payload(payload: dict) -> dict:
         "next_action_hint": next_action_hint,
         "source": "plan_payload",
     }
+    if resume_context is not None:
+        rollup["resume_context"] = dict(resume_context)
+    return rollup
 
 
 def build_decomposition_rollup_from_recovered_state(
@@ -1854,6 +1860,50 @@ def refresh_decomposition_plan_payload_from_child_states(
     return refreshed_payload
 
 
+def build_decomposition_resume_context(
+    parent_issue: dict,
+    parent_branch: str | None,
+    base_branch: str | None,
+    next_action: str,
+    selected_child: dict | None = None,
+) -> dict:
+    context = {
+        "task_type": "issue",
+        "parent_issue": parent_issue.get("number"),
+        "branch": str(parent_branch or "").strip(),
+        "base_branch": str(base_branch or "").strip(),
+        "next_action": str(next_action or "").strip(),
+        "resume_issue": parent_issue.get("number"),
+    }
+    if isinstance(selected_child, dict):
+        child_context = {
+            "order": selected_child.get("order"),
+            "title": str(selected_child.get("title") or "").strip(),
+            "issue_number": _as_positive_int(selected_child.get("issue_number")),
+        }
+        context["selected_child"] = child_context
+    return context
+
+
+def attach_decomposition_resume_context(
+    plan_payload: dict,
+    parent_issue: dict,
+    parent_branch: str | None,
+    base_branch: str | None,
+    next_action: str,
+    selected_child: dict | None = None,
+) -> dict:
+    annotated_payload = dict(plan_payload)
+    annotated_payload["resume_context"] = build_decomposition_resume_context(
+        parent_issue=parent_issue,
+        parent_branch=parent_branch,
+        base_branch=base_branch,
+        next_action=next_action,
+        selected_child=selected_child,
+    )
+    return annotated_payload
+
+
 def build_decomposition_child_execution_note(
     parent_issue: dict,
     decomposition_rollup: dict,
@@ -1908,6 +1958,16 @@ def post_parent_decomposition_rollup_update(
         next_action = str(refreshed_payload.get("next_action") or "execute_next_child")
         error = None
 
+    refreshed_payload = attach_decomposition_resume_context(
+        plan_payload=refreshed_payload,
+        parent_issue=parent_issue,
+        parent_branch=parent_branch,
+        base_branch=base_branch,
+        next_action=next_action,
+        selected_child=next_child,
+    )
+    rollup = build_decomposition_rollup_from_plan_payload(refreshed_payload)
+
     post_decomposition_plan_comment(
         repo=repo,
         issue_number=parent_issue["number"],
@@ -1948,6 +2008,8 @@ def _build_child_issue_body(
     parent_issue: dict,
     child: dict,
     created_dependencies: dict[int, dict],
+    parent_branch: str | None = None,
+    base_branch: str | None = None,
 ) -> str:
     parent_number = parent_issue.get("number")
     parent_title = str(parent_issue.get("title") or "(untitled)").strip()
@@ -1979,6 +2041,21 @@ def _build_child_issue_body(
         if dependency_lines
         else "\nDepends on: none"
     )
+    branch_context_lines: list[str] = []
+    parent_branch_text = str(parent_branch or "").strip()
+    base_branch_text = str(base_branch or "").strip()
+    if parent_branch_text:
+        branch_context_lines.append(f"- Parent orchestration branch: `{parent_branch_text}`")
+    if base_branch_text:
+        branch_context_lines.append(f"- Base branch: `{base_branch_text}`")
+    branch_context_text = "\n".join(branch_context_lines) or "- Branch context will be selected by the parent orchestration run."
+    parent_ref = format_issue_ref_from_issue(parent_issue)
+    resume_lines = [
+        f"- Preferred resume path: rerun the orchestrator for parent issue {parent_ref}; it will select the next unblocked child in dependency order.",
+        f"- Parent issue branch context: `{parent_branch_text or 'resolved at runtime'}`.",
+    ]
+    if dependency_lines:
+        resume_lines.append("- Do not start this task until the listed dependencies are completed.")
 
     acceptance = child.get("acceptance")
     acceptance_lines: list[str] = []
@@ -1991,11 +2068,17 @@ def _build_child_issue_body(
     if not acceptance_lines:
         acceptance_lines = ["- Implementation is complete and validated."]
 
+    resume_text = "\n".join(resume_lines)
+
     return (
         "Child task generated from decomposition plan\n\n"
-        f"Parent issue: #{parent_number} ({parent_title})\n"
+        f"Parent issue: {parent_ref} ({parent_title})\n"
         f"Execution order: {execution_order_text}\n"
         f"{dependency_text}\n\n"
+        "Branch context:\n"
+        f"{branch_context_text}\n\n"
+        "Resume instructions:\n"
+        f"{resume_text}\n\n"
         f"Suggested acceptance criteria:\n" + "\n".join(acceptance_lines)
     )
 
@@ -2006,12 +2089,20 @@ def create_decomposition_child_issue(
     child: dict,
     created_dependencies: dict[int, dict],
     dry_run: bool,
+    parent_branch: str | None = None,
+    base_branch: str | None = None,
 ) -> dict:
     child_title = str(child.get("title") or "")[:120]
     if not child_title:
         raise RuntimeError("Cannot create child issue with empty title")
 
-    body = _build_child_issue_body(parent_issue, child, created_dependencies)
+    body = _build_child_issue_body(
+        parent_issue,
+        child,
+        created_dependencies,
+        parent_branch=parent_branch,
+        base_branch=base_branch,
+    )
     if dry_run:
         print(f"[dry-run] Would create child issue for order {child.get('order')} of parent #{parent_issue.get('number')}")
         return {
@@ -3420,6 +3511,9 @@ def format_decomposition_plan_comment(payload: dict) -> str:
     created_children = payload.get("created_children")
     if not isinstance(created_children, list):
         created_children = []
+    resume_context = payload.get("resume_context")
+    if not isinstance(resume_context, dict):
+        resume_context = {}
 
     reason_lines = "\n".join(f"- `{reason}`" for reason in reasons) or "- `manual`"
     child_lines: list[str] = []
@@ -3450,6 +3544,29 @@ def format_decomposition_plan_comment(payload: dict) -> str:
             created_entry = f"- {order}. {title}"
         created_lines.append(created_entry)
     created_text = "\n".join(created_lines) or "No child issues created yet."
+    resume_lines: list[str] = []
+    resume_branch = str(resume_context.get("branch") or "").strip()
+    resume_base = str(resume_context.get("base_branch") or "").strip()
+    resume_action = str(resume_context.get("next_action") or payload.get("next_action") or "").strip()
+    resume_issue = resume_context.get("resume_issue")
+    if resume_branch:
+        resume_lines.append(f"- branch: `{resume_branch}`")
+    if resume_base:
+        resume_lines.append(f"- base branch: `{resume_base}`")
+    if is_trackable_issue_number(resume_issue):
+        resume_lines.append(f"- resume parent issue: `{resume_issue}`")
+    if resume_action:
+        resume_lines.append(f"- next action: `{resume_action}`")
+    selected_child = resume_context.get("selected_child") if isinstance(resume_context.get("selected_child"), dict) else None
+    if isinstance(selected_child, dict):
+        child_order = selected_child.get("order")
+        child_title = str(selected_child.get("title") or "").strip()
+        child_issue_number = _as_positive_int(selected_child.get("issue_number"))
+        child_text = f"{child_order}: {child_title}" if child_title else str(child_order)
+        if child_issue_number is not None:
+            child_text = f"{child_text} (#{child_issue_number})"
+        resume_lines.append(f"- selected child: `{child_text}`")
+    resume_text = "\n".join(resume_lines) or "- Resume context will be filled in when execution starts."
 
     if status == "children_created":
         status_note = (
@@ -3477,6 +3594,8 @@ def format_decomposition_plan_comment(payload: dict) -> str:
         f"{reason_lines}\n\n"
         "Proposed child tasks:\n"
         f"{children_text}\n\n"
+        "Execution context:\n"
+        f"{resume_text}\n\n"
         f"Created child issues:\n{created_text}\n\n"
         f"Recommended next action: {next_action}\n\n"
         f"{DECOMPOSITION_PLAN_MARKER}\n"
@@ -6910,6 +7029,8 @@ def main() -> int:
                                         child=child,
                                         created_dependencies=created_children,
                                         dry_run=args.dry_run,
+                                        parent_branch=issue_branch,
+                                        base_branch=base_branch if base_branch else None,
                                     )
                                     created_order = child.get("order")
                                     if type(created_order) is int and created_order > 0:
@@ -6944,6 +7065,21 @@ def main() -> int:
                                     latest_payload_dict["status"] = "children_created"
                                     latest_payload_dict["next_action"] = "execute_children_in_order"
 
+                                latest_payload_dict = attach_decomposition_resume_context(
+                                    plan_payload=latest_payload_dict,
+                                    parent_issue=issue,
+                                    parent_branch=issue_branch,
+                                    base_branch=base_branch if base_branch else None,
+                                    next_action=str(
+                                        latest_payload_dict.get("next_action")
+                                        or "execute_children_in_order"
+                                    ),
+                                )
+
+                                decomposition_rollup = build_decomposition_rollup_from_plan_payload(
+                                    payload=latest_payload_dict,
+                                )
+
                                 post_decomposition_plan_comment(
                                     repo=repo,
                                     issue_number=issue["number"],
@@ -6973,12 +7109,20 @@ def main() -> int:
                                             if all_children_created
                                             else "Waiting for all child issue creation in approved plan"
                                         ),
+                                        decomposition=decomposition_rollup,
                                     ),
                                 )
                                 processed += 1
                                 continue
 
                             if missing_children:
+                                latest_payload_dict = attach_decomposition_resume_context(
+                                    plan_payload=latest_payload_dict,
+                                    parent_issue=issue,
+                                    parent_branch=issue_branch,
+                                    base_branch=base_branch if base_branch else None,
+                                    next_action="create_missing_child_issues",
+                                )
                                 decomposition_rollup = build_decomposition_rollup_from_plan_payload(
                                     payload=latest_payload_dict,
                                 )
@@ -7015,6 +7159,21 @@ def main() -> int:
                             latest_payload_dict = refresh_decomposition_plan_payload_from_child_states(
                                 repo=repo,
                                 plan_payload=latest_payload_dict,
+                            )
+                            decomposition_rollup = build_decomposition_rollup_from_plan_payload(
+                                payload=latest_payload_dict,
+                            )
+                            selected_child = decomposition_rollup.get("next_child")
+                            latest_payload_dict = attach_decomposition_resume_context(
+                                plan_payload=latest_payload_dict,
+                                parent_issue=issue,
+                                parent_branch=issue_branch,
+                                base_branch=base_branch if base_branch else None,
+                                next_action=str(
+                                    latest_payload_dict.get("next_action")
+                                    or ("execute_next_child" if isinstance(selected_child, dict) else "review_completed_children")
+                                ),
+                                selected_child=selected_child if isinstance(selected_child, dict) else None,
                             )
                             decomposition_rollup = build_decomposition_rollup_from_plan_payload(
                                 payload=latest_payload_dict,
@@ -7133,6 +7292,13 @@ def main() -> int:
 
                     if not selected_decomposition_child:
                         payload = build_decomposition_plan_payload(issue=issue, assessment=assessment)
+                        payload = attach_decomposition_resume_context(
+                            plan_payload=payload,
+                            parent_issue=issue,
+                            parent_branch=issue_branch,
+                            base_branch=base_branch if base_branch else None,
+                            next_action="approve_plan_or_rerun_with_decompose_never",
+                        )
                         post_decomposition_plan_comment(
                             repo=repo,
                             issue_number=issue["number"],

@@ -54,6 +54,9 @@ BUILTIN_DEFAULTS = {
     "dir": ".",
 }
 
+PRESET_TIER_ORDER = ("cheap", "default", "hard")
+ROUTING_RULE_TASK_TYPES = {"issue", "pr"}
+
 TRACKER_GITHUB = "github"
 TRACKER_JIRA = "jira"
 TRACKER_CHOICES = {TRACKER_GITHUB, TRACKER_JIRA}
@@ -6896,6 +6899,236 @@ def preset_cli_defaults(project_config: dict, preset_name: str | None) -> dict:
     return cli_defaults
 
 
+def _argv_has_flag(argv: list[str], *flags: str) -> bool:
+    for flag in flags:
+        if any(arg == flag or arg.startswith(f"{flag}=") for arg in argv):
+            return True
+    return False
+
+
+def _preset_tier(preset_name: str | None) -> str | None:
+    normalized = _as_optional_string(preset_name)
+    if normalized in PRESET_TIER_ORDER:
+        return normalized
+    return None
+
+
+def _tier_rank(tier: str | None) -> int | None:
+    if tier is None:
+        return None
+    try:
+        return PRESET_TIER_ORDER.index(tier)
+    except ValueError:
+        return None
+
+
+def _cap_preset_to_budget_tier(project_config: dict, preset_name: str | None, max_model_tier: str | None) -> str | None:
+    normalized_preset = _as_optional_string(preset_name)
+    normalized_tier = _as_optional_string(max_model_tier)
+    if normalized_preset is None or normalized_tier is None:
+        return normalized_preset
+
+    preset_rank = _tier_rank(_preset_tier(normalized_preset))
+    budget_rank = _tier_rank(normalized_tier)
+    if preset_rank is None or budget_rank is None or preset_rank <= budget_rank:
+        return normalized_preset
+
+    presets = project_config.get("presets")
+    if not isinstance(presets, dict):
+        return normalized_preset
+
+    for candidate in reversed(PRESET_TIER_ORDER[: budget_rank + 1]):
+        if candidate in presets:
+            return candidate
+    return normalized_preset
+
+
+def _matches_routing_rule(
+    rule_when: dict,
+    issue: dict,
+    task_type: str,
+    scope_eligible: bool,
+    needs_decomposition: bool,
+) -> bool:
+    labels = _normalize_match_list(rule_when.get("labels"))
+    if labels:
+        issue_labels = set(_issue_label_names(issue))
+        if not any(label in issue_labels for label in labels):
+            return False
+
+    task_types = _normalize_match_list(rule_when.get("task_types"))
+    if task_types and task_type.strip().lower() not in task_types:
+        return False
+
+    scope = _as_optional_string(rule_when.get("scope"))
+    if scope == "in" and not scope_eligible:
+        return False
+    if scope == "out" and scope_eligible:
+        return False
+
+    if "needs_decomposition" in rule_when and bool(rule_when.get("needs_decomposition")) != needs_decomposition:
+        return False
+
+    return True
+
+
+def choose_routed_preset(
+    project_config: dict,
+    issue: dict,
+    task_type: str,
+    scope_eligible: bool,
+    needs_decomposition: bool,
+) -> str | None:
+    routing = project_config.get("routing")
+    if isinstance(routing, dict):
+        rules = routing.get("rules") if isinstance(routing.get("rules"), list) else []
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            when = rule.get("when")
+            if not isinstance(when, dict):
+                continue
+            if _matches_routing_rule(when, issue, task_type, scope_eligible, needs_decomposition):
+                routed_preset = _as_optional_string(rule.get("preset"))
+                if routed_preset is not None:
+                    return routed_preset
+
+        default_preset = _as_optional_string(routing.get("default_preset"))
+        if default_preset is not None:
+            return default_preset
+
+    presets = project_config.get("presets")
+    if not isinstance(presets, dict) or not presets:
+        return None
+    if needs_decomposition and "hard" in presets:
+        return "hard"
+    if "cheap" in presets:
+        return "cheap"
+    if "default" in presets:
+        return "default"
+    if "hard" in presets:
+        return "hard"
+    return None
+
+
+def resolve_task_execution_settings(
+    args: argparse.Namespace,
+    argv: list[str],
+    project_config: dict,
+    issue: dict,
+    task_type: str,
+    scope_eligible: bool,
+    needs_decomposition: bool,
+) -> dict[str, object]:
+    settings: dict[str, object] = {
+        "preset": _as_optional_string(getattr(args, "preset", None)),
+        "runner": getattr(args, "runner", BUILTIN_DEFAULTS["runner"]),
+        "agent": getattr(args, "agent", BUILTIN_DEFAULTS["agent"]),
+        "model": getattr(args, "model", BUILTIN_DEFAULTS["model"]),
+        "track_tokens": bool(getattr(args, "track_tokens", BUILTIN_DEFAULTS["track_tokens"])),
+        "token_budget": getattr(args, "token_budget", BUILTIN_DEFAULTS["token_budget"]),
+        "agent_timeout_seconds": getattr(
+            args,
+            "agent_timeout_seconds",
+            BUILTIN_DEFAULTS["agent_timeout_seconds"],
+        ),
+        "agent_idle_timeout_seconds": getattr(
+            args,
+            "agent_idle_timeout_seconds",
+            BUILTIN_DEFAULTS["agent_idle_timeout_seconds"],
+        ),
+        "max_attempts": getattr(args, "max_attempts", BUILTIN_DEFAULTS["max_attempts"]),
+        "escalate_to_preset": _as_optional_string(
+            getattr(args, "escalate_to_preset", BUILTIN_DEFAULTS["escalate_to_preset"])
+        ),
+    }
+
+    explicit_preset = _argv_has_flag(argv, "--preset")
+    selected_preset = settings["preset"] if explicit_preset else choose_routed_preset(
+        project_config=project_config,
+        issue=issue,
+        task_type=task_type,
+        scope_eligible=scope_eligible,
+        needs_decomposition=needs_decomposition,
+    )
+    selected_preset = _as_optional_string(selected_preset)
+
+    if selected_preset is not None:
+        settings["preset"] = selected_preset
+        preset_defaults = preset_cli_defaults(project_config, selected_preset)
+        explicit_overrides = {
+            "runner": _argv_has_flag(argv, "--runner"),
+            "agent": _argv_has_flag(argv, "--agent"),
+            "model": _argv_has_flag(argv, "--model"),
+            "track_tokens": _argv_has_flag(argv, "--track-tokens"),
+            "token_budget": _argv_has_flag(argv, "--token-budget", "--max-tokens"),
+            "agent_timeout_seconds": _argv_has_flag(argv, "--agent-timeout-seconds"),
+            "agent_idle_timeout_seconds": _argv_has_flag(argv, "--agent-idle-timeout-seconds"),
+            "max_attempts": _argv_has_flag(argv, "--max-attempts"),
+            "escalate_to_preset": _argv_has_flag(argv, "--escalate-to-preset"),
+        }
+        for key, value in preset_defaults.items():
+            if key == "preset" or explicit_overrides.get(key, False):
+                continue
+            settings[key] = value
+
+    budgets = project_config.get("budgets") if isinstance(project_config.get("budgets"), dict) else {}
+    max_model_tier = _as_optional_string(budgets.get("max_model_tier"))
+    if max_model_tier is not None:
+        capped_preset = _cap_preset_to_budget_tier(project_config, _as_optional_string(settings.get("preset")), max_model_tier)
+        if capped_preset != settings.get("preset"):
+            settings["preset"] = capped_preset
+            capped_defaults = preset_cli_defaults(project_config, capped_preset)
+            for key, value in capped_defaults.items():
+                if key != "preset":
+                    settings[key] = value
+        settings["max_model_tier"] = max_model_tier
+
+    max_attempts_cap = _as_positive_int(budgets.get("max_attempts_per_task"))
+    if max_attempts_cap is not None:
+        current_attempts = _as_positive_int(settings.get("max_attempts")) or BUILTIN_DEFAULTS["max_attempts"]
+        settings["max_attempts"] = min(current_attempts, max_attempts_cap)
+
+    runtime_cap_minutes = _as_positive_int(budgets.get("max_runtime_minutes"))
+    if runtime_cap_minutes is not None:
+        runtime_cap_seconds = runtime_cap_minutes * 60
+        current_timeout = _as_positive_int(settings.get("agent_timeout_seconds")) or runtime_cap_seconds
+        settings["agent_timeout_seconds"] = min(current_timeout, runtime_cap_seconds)
+
+    cost_budget_usd = budgets.get("max_cost_usd")
+    if isinstance(cost_budget_usd, (int, float)):
+        settings["cost_budget_usd"] = float(cost_budget_usd)
+
+    return settings
+
+
+def build_attempt_execution_plan(project_config: dict, initial_settings: dict[str, object]) -> list[dict[str, object]]:
+    max_attempts = _as_positive_int(initial_settings.get("max_attempts")) or 1
+    max_model_tier = _as_optional_string(initial_settings.get("max_model_tier"))
+    plan: list[dict[str, object]] = []
+    current_settings = dict(initial_settings)
+
+    for attempt in range(1, max_attempts + 1):
+        attempt_settings = dict(current_settings)
+        attempt_settings["attempt"] = attempt
+        plan.append(attempt_settings)
+
+        next_preset = _as_optional_string(current_settings.get("escalate_to_preset"))
+        if next_preset is None:
+            continue
+        next_preset = _cap_preset_to_budget_tier(project_config, next_preset, max_model_tier)
+        if next_preset is None:
+            continue
+        next_defaults = preset_cli_defaults(project_config, next_preset)
+        current_settings = dict(current_settings)
+        current_settings.update(next_defaults)
+        current_settings["preset"] = next_preset
+        if max_model_tier is not None:
+            current_settings["max_model_tier"] = max_model_tier
+
+    return plan
+
+
 def without_keys(config: dict, *keys: str) -> dict:
     return {key: value for key, value in config.items() if key not in keys}
 
@@ -7340,6 +7573,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=BUILTIN_DEFAULTS["max_attempts"],
         help="Retry policy placeholder: maximum attempts before escalation or failure.",
+    )
+    parser.add_argument(
+        "--escalate-to-preset",
+        dest="escalate_to_preset",
+        help="Preset to switch to on later attempts after failures.",
     )
     parser.add_argument(
         "--opencode-auto-approve",
@@ -9680,10 +9918,10 @@ def main() -> int:
                                 pr_number=None,
                                 branch=issue_branch,
                                 base_branch=target_base_branch,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
-                                attempt=orchestration_attempt,
+                                runner=active_runner,
+                                agent=active_agent,
+                                model=active_model,
+                                attempt=active_attempt,
                                 stage="agent_run",
                                 next_action="wait_for_agent_result",
                                 error=None,
@@ -9930,10 +10168,10 @@ def main() -> int:
                                     pr_number=parse_pr_number_from_url(pr_url),
                                     branch=issue_branch,
                                     base_branch=target_base_branch,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
-                                    attempt=orchestration_attempt,
+                                    runner=active_runner,
+                                    agent=active_agent,
+                                    model=active_model,
+                                    attempt=active_attempt,
                                     stage="pr_ready",
                                     next_action="wait_for_review",
                                     error=None,
@@ -10085,10 +10323,10 @@ def main() -> int:
                                 pr_number=parse_pr_number_from_url(pr_url),
                                 branch=issue_branch,
                                 base_branch=target_base_branch,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
-                                attempt=orchestration_attempt,
+                                runner=active_runner,
+                                agent=active_agent,
+                                model=active_model,
+                                attempt=active_attempt,
                                 stage="pr_ready",
                                 next_action="wait_for_review",
                                 error=None,

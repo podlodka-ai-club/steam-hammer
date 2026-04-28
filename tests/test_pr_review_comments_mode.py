@@ -630,6 +630,7 @@ class PrReviewModeTests(unittest.TestCase):
                 mock.patch.object(self.mod, "ensure_clean_worktree"),
                 mock.patch.object(self.mod, "current_branch", return_value="feature/pr23"),
                 mock.patch.object(self.mod, "detect_repo", return_value="owner/repo"),
+                mock.patch.object(self.mod, "fetch_issue_comments", return_value=[]),
                 mock.patch.object(self.mod, "fetch_pull_request", return_value=pull_request),
                 mock.patch.object(self.mod, "local_branch_exists", return_value=True),
                 mock.patch.object(self.mod, "fetch_pr_review_threads", return_value=[]),
@@ -676,6 +677,7 @@ class PrReviewModeTests(unittest.TestCase):
                 mock.patch.object(self.mod, "ensure_clean_worktree"),
                 mock.patch.object(self.mod, "current_branch", return_value="issue-fix/25-issue"),
                 mock.patch.object(self.mod, "detect_repo", return_value="owner/repo"),
+                mock.patch.object(self.mod, "fetch_issue_comments", return_value=[]),
                 mock.patch.object(self.mod, "fetch_pull_request", return_value=pull_request),
                 mock.patch("sys.stderr", new_callable=io.StringIO) as stderr_mock,
             ):
@@ -715,6 +717,7 @@ class PrReviewModeTests(unittest.TestCase):
                 mock.patch.object(self.mod, "ensure_clean_worktree"),
                 mock.patch.object(self.mod, "current_branch", return_value="issue-fix/25-issue"),
                 mock.patch.object(self.mod, "detect_repo", return_value="owner/repo"),
+                mock.patch.object(self.mod, "fetch_issue_comments", return_value=[]),
                 mock.patch.object(self.mod, "fetch_pull_request", return_value=pull_request),
                 mock.patch.object(self.mod, "fetch_pr_review_threads", return_value=[]),
                 mock.patch.object(self.mod, "fetch_pr_conversation_comments", return_value=[]),
@@ -923,6 +926,7 @@ class PrReviewModeTests(unittest.TestCase):
                 mock.patch.object(self.mod, "detect_repo", return_value="owner/repo"),
                 mock.patch.object(self.mod, "detect_default_branch", return_value="main"),
                 mock.patch.object(self.mod, "fetch_issue", return_value=issue),
+                mock.patch.object(self.mod, "fetch_issue_comments", return_value=[]),
                 mock.patch.object(self.mod, "find_open_pr_for_issue", return_value=linked_pr),
                 mock.patch.object(self.mod, "fetch_pull_request", return_value=pull_request),
                 mock.patch.object(self.mod, "fetch_pr_review_threads", return_value=[]),
@@ -943,6 +947,7 @@ class PrReviewModeTests(unittest.TestCase):
                 mock.patch.object(self.mod, "ensure_pr", return_value=("reused", "")),
                 mock.patch.object(self.mod, "push_branch"),
                 mock.patch.object(self.mod, "commit_changes"),
+                mock.patch.object(self.mod, "remove_agent_failure_label_from_issue"),
             ):
                 previous_cwd = os.getcwd()
                 try:

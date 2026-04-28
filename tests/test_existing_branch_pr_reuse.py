@@ -1,3 +1,4 @@
+import contextlib
 import io
 import unittest
 from unittest.mock import patch
@@ -254,6 +255,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
         with (
             patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
             patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.safe_report_issue_automation_failure"),
             patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"),
             patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
             patch(
@@ -265,6 +267,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                     "url": "https://github.com/owner/repo/issues/33",
                 },
             ),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
             patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
             patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
             patch(
@@ -272,6 +275,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 side_effect=RuntimeError("sync failed"),
             ),
             patch("scripts.run_github_issues_to_opencode.run_agent") as run_agent_mock,
+            patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"),
             patch("sys.stderr", new_callable=io.StringIO) as stderr_mock,
         ):
             exit_code = main()
@@ -318,6 +322,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                     "url": "https://github.com/owner/repo/issues/33",
                 },
             ),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
             patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
             patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
             patch(
@@ -332,6 +337,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 return_value=("reused", "https://github.com/owner/repo/pull/34"),
             ) as ensure_pr_mock,
             patch("scripts.run_github_issues_to_opencode.run_command") as run_command_mock,
+            patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"),
         ):
             exit_code = main()
 
@@ -389,89 +395,99 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             if command == ["git", "merge", "--no-edit", "-X", "theirs", "origin/main"]:
                 raise RuntimeError("Command failed: git merge --no-edit -X theirs origin/main")
 
-        with (
-            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
-            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
-            patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"),
-            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
-            patch(
-                "scripts.run_github_issues_to_opencode.fetch_issue",
-                return_value={
-                    "number": 35,
-                    "title": "Auto-resolve PR conflicts in pr-review mode",
-                    "body": "Fix conflict handling",
-                    "url": "https://github.com/owner/repo/issues/35",
-                },
-            ),
-            patch(
-                "scripts.run_github_issues_to_opencode.find_open_pr_for_issue",
-                return_value={
-                    "number": 77,
-                    "headRefName": "issue-fix/35-auto-resolve-pr-conflicts",
-                    "baseRefName": "main",
-                },
-            ),
-            patch(
-                "scripts.run_github_issues_to_opencode.fetch_pull_request",
-                return_value={
-                    "number": 77,
-                    "title": "Fix sync conflicts",
-                    "url": "https://github.com/owner/repo/pull/77",
-                    "state": "OPEN",
-                    "mergeStateStatus": "DIRTY",
-                    "body": "PR body",
-                    "reviews": [],
-                    "author": {"login": "pr-owner"},
-                },
-            ),
-            patch(
-                "scripts.run_github_issues_to_opencode.fetch_pr_review_threads",
-                return_value=[
-                    {
-                        "isResolved": False,
-                        "comments": {
-                            "nodes": [
-                                {
-                                    "body": "Please resolve sync conflicts automatically",
-                                    "path": "scripts/run_github_issues_to_opencode.py",
-                                    "line": 1,
-                                    "outdated": False,
-                                    "author": {"login": "reviewer"},
-                                    "url": "https://github.com/owner/repo/pull/77#discussion_r1",
-                                }
-                            ]
-                        },
-                    }
-                ],
-            ),
-            patch(
-                "scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments",
-                return_value=[],
-            ),
-            patch("scripts.run_github_issues_to_opencode.load_linked_issue_context", return_value=[]),
-            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
-            patch(
-                "scripts.run_github_issues_to_opencode.current_head_sha",
-                side_effect=["sha-before-rebase", "sha-before-merge", "sha-after-merge"],
-            ),
-            patch(
-                "scripts.run_github_issues_to_opencode.list_conflicted_paths",
-                return_value=["README.md"],
-            ),
-            patch("scripts.run_github_issues_to_opencode.command_succeeds", return_value=True),
-            patch(
-                "scripts.run_github_issues_to_opencode.run_command",
-                side_effect=run_command_side_effect,
-            ),
-            patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0),
-            patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False),
-            patch("scripts.run_github_issues_to_opencode.push_branch") as push_branch_mock,
-            patch(
-                "scripts.run_github_issues_to_opencode.ensure_pr",
-                return_value=("reused", "https://github.com/owner/repo/pull/77"),
-            ) as ensure_pr_mock,
-            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
-        ):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_issue",
+                    return_value={
+                        "number": 35,
+                        "title": "Auto-resolve PR conflicts in pr-review mode",
+                        "body": "Fix conflict handling",
+                        "url": "https://github.com/owner/repo/issues/35",
+                    },
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.find_open_pr_for_issue",
+                    return_value={
+                        "number": 77,
+                        "headRefName": "issue-fix/35-auto-resolve-pr-conflicts",
+                        "baseRefName": "main",
+                    },
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_pull_request",
+                    return_value={
+                        "number": 77,
+                        "title": "Fix sync conflicts",
+                        "url": "https://github.com/owner/repo/pull/77",
+                        "state": "OPEN",
+                        "mergeStateStatus": "DIRTY",
+                        "body": "PR body",
+                        "reviews": [],
+                        "author": {"login": "pr-owner"},
+                    },
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_pr_review_threads",
+                    return_value=[
+                        {
+                            "isResolved": False,
+                            "comments": {
+                                "nodes": [
+                                    {
+                                        "body": "Please resolve sync conflicts automatically",
+                                        "path": "scripts/run_github_issues_to_opencode.py",
+                                        "line": 1,
+                                        "outdated": False,
+                                        "author": {"login": "reviewer"},
+                                        "url": "https://github.com/owner/repo/pull/77#discussion_r1",
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                )
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]))
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[])
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.load_linked_issue_context", return_value=[]))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.current_head_sha",
+                    side_effect=["sha-before-rebase", "sha-before-merge", "sha-after-merge"],
+                )
+            )
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.list_conflicted_paths", return_value=["README.md"])
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.command_succeeds", return_value=True))
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.run_command", side_effect=run_command_side_effect)
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False))
+            push_branch_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.push_branch"))
+            ensure_pr_mock = stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.ensure_pr",
+                    return_value=("reused", "https://github.com/owner/repo/pull/77"),
+                )
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"))
+            stdout_mock = stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
             exit_code = main()
 
         self.assertEqual(exit_code, 0)
@@ -534,65 +550,71 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             "dry_run": False,
         })()
 
-        with (
-            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
-            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
-            patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"),
-            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
-            patch(
-                "scripts.run_github_issues_to_opencode.fetch_issue",
-                return_value={
-                    "number": 35,
-                    "title": "Auto-resolve PR conflicts in pr-review mode",
-                    "body": "Fix conflict handling",
-                    "url": "https://github.com/owner/repo/issues/35",
-                },
-            ),
-            patch(
-                "scripts.run_github_issues_to_opencode.find_open_pr_for_issue",
-                return_value={
-                    "number": 77,
-                    "headRefName": "issue-fix/35-auto-resolve-pr-conflicts",
-                    "baseRefName": "main",
-                },
-            ),
-            patch(
-                "scripts.run_github_issues_to_opencode.fetch_pull_request",
-                return_value={
-                    "number": 77,
-                    "title": "Fix sync conflicts",
-                    "url": "https://github.com/owner/repo/pull/77",
-                    "state": "OPEN",
-                    "mergeStateStatus": "DIRTY",
-                    "body": "PR body",
-                    "reviews": [],
-                    "author": {"login": "pr-owner"},
-                },
-            ),
-            patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]),
-            patch(
-                "scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments",
-                return_value=[],
-            ),
-            patch(
-                "scripts.run_github_issues_to_opencode.normalize_review_items",
-                return_value=([], {}),
-            ),
-            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
-            patch(
-                "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
-                return_value=True,
-            ),
-            patch("scripts.run_github_issues_to_opencode.run_agent") as run_agent_mock,
-            patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False),
-            patch("scripts.run_github_issues_to_opencode.push_branch") as push_branch_mock,
-            patch(
-                "scripts.run_github_issues_to_opencode.ensure_pr",
-                return_value=("reused", "https://github.com/owner/repo/pull/77"),
-            ) as ensure_pr_mock,
-            patch("scripts.run_github_issues_to_opencode.run_command") as run_command_mock,
-            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
-        ):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_issue",
+                    return_value={
+                        "number": 35,
+                        "title": "Auto-resolve PR conflicts in pr-review mode",
+                        "body": "Fix conflict handling",
+                        "url": "https://github.com/owner/repo/issues/35",
+                    },
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.find_open_pr_for_issue",
+                    return_value={
+                        "number": 77,
+                        "headRefName": "issue-fix/35-auto-resolve-pr-conflicts",
+                        "baseRefName": "main",
+                    },
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_pull_request",
+                    return_value={
+                        "number": 77,
+                        "title": "Fix sync conflicts",
+                        "url": "https://github.com/owner/repo/pull/77",
+                        "state": "OPEN",
+                        "mergeStateStatus": "DIRTY",
+                        "body": "PR body",
+                        "reviews": [],
+                        "author": {"login": "pr-owner"},
+                    },
+                )
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]))
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[])
+            )
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.normalize_review_items", return_value=([], {}))
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"))
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.sync_reused_branch_with_base", return_value=True)
+            )
+            run_agent_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_agent"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False))
+            push_branch_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.push_branch"))
+            ensure_pr_mock = stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.ensure_pr",
+                    return_value=("reused", "https://github.com/owner/repo/pull/77"),
+                )
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_command"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"))
+            stdout_mock = stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
             exit_code = main()
 
         self.assertEqual(exit_code, 0)

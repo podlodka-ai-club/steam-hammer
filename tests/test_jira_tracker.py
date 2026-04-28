@@ -341,6 +341,7 @@ class JiraTrackerTests(unittest.TestCase):
                     patch("scripts.run_github_issues_to_opencode.detect_repo", return_value="owner/repo"),
                     patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
                     patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue) as fetch_issue_mock,
+                    patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
                     patch("scripts.run_github_issues_to_opencode.fetch_jira_issue") as fetch_jira_issue_mock,
                     patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
                     patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False),
@@ -397,6 +398,7 @@ class JiraTrackerTests(unittest.TestCase):
                     patch("scripts.run_github_issues_to_opencode.push_branch"),
                     patch("scripts.run_github_issues_to_opencode.ensure_pr", return_value=("created", "")),
                     patch("scripts.run_github_issues_to_opencode.run_configured_workflow_checks", return_value=[]),
+                    patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"),
                 ):
                     exit_code = main()
         finally:

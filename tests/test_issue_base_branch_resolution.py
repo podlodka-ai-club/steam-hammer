@@ -133,6 +133,7 @@ class IssueBaseBranchResolutionTests(unittest.TestCase):
                     "url": "https://github.com/owner/repo/issues/23",
                 },
             ),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
             patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
             patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused") as prepare_issue_branch_mock,
             patch("scripts.run_github_issues_to_opencode.sync_reused_branch_with_base") as sync_reused_branch_with_base_mock,
@@ -143,6 +144,7 @@ class IssueBaseBranchResolutionTests(unittest.TestCase):
                 "scripts.run_github_issues_to_opencode.ensure_pr",
                 return_value=("reused", "https://github.com/owner/repo/pull/24"),
             ) as ensure_pr_mock,
+            patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"),
             patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
         ):
             exit_code = main()
@@ -223,6 +225,7 @@ class IssueBaseBranchResolutionTests(unittest.TestCase):
                     "url": "https://github.com/owner/repo/issues/23",
                 },
             ),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
             patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
             patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused") as prepare_issue_branch_mock,
             patch("scripts.run_github_issues_to_opencode.sync_reused_branch_with_base"),
@@ -233,6 +236,7 @@ class IssueBaseBranchResolutionTests(unittest.TestCase):
                 "scripts.run_github_issues_to_opencode.ensure_pr",
                 return_value=("reused", "https://github.com/owner/repo/pull/24"),
             ) as ensure_pr_mock,
+            patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"),
             patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
         ):
             exit_code = main()

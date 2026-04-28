@@ -1334,6 +1334,17 @@ class TokenBudgetExceededError(RuntimeError):
         )
 
 
+class CostBudgetExceededError(RuntimeError):
+    def __init__(self, budget: float, reached: float, item_label: str):
+        self.budget = budget
+        self.reached = reached
+        self.item_label = item_label
+        super().__init__(
+            f"Agent stopped: cost budget of ${budget:.4f} exceeded "
+            f"(reached ~${reached:.4f}). Lower the task scope, switch to a cheaper preset/model, or raise the configured budget."
+        )
+
+
 class MergeRequestNotAcceptedError(RuntimeError):
     def __init__(self, *, status: str, next_action: str, message: str):
         self.status = status

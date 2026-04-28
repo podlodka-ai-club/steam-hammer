@@ -69,6 +69,7 @@ BUILTIN_DEFAULTS = {
     "skip_if_pr_exists": True,
     "skip_if_branch_exists": True,
     "force_reprocess": False,
+    "conflict_recovery_only": False,
     "sync_reused_branch": True,
     "sync_strategy": "rebase",
     "base_branch": "default",
@@ -6792,6 +6793,79 @@ def list_conflicted_paths() -> list[str]:
     return [line.strip() for line in output.splitlines() if line.strip()]
 
 
+def build_branch_sync_result(
+    *,
+    branch_name: str,
+    remote_base_ref: str,
+    requested_strategy: str,
+    applied_strategy: str,
+    status: str,
+    changed: bool,
+    auto_resolved: bool,
+) -> dict[str, object]:
+    return {
+        "branch_name": branch_name,
+        "remote_base_ref": remote_base_ref,
+        "requested_strategy": requested_strategy,
+        "applied_strategy": applied_strategy,
+        "status": status,
+        "changed": changed,
+        "auto_resolved": auto_resolved,
+    }
+
+
+def print_branch_sync_result(result: dict[str, object], *, dry_run: bool = False) -> None:
+    branch_name = str(result.get("branch_name") or "")
+    remote_base_ref = str(result.get("remote_base_ref") or "")
+    applied_strategy = str(result.get("applied_strategy") or "")
+    status = str(result.get("status") or "")
+    prefix = "[dry-run] " if dry_run else ""
+
+    if status == "already-current":
+        print(
+            f"{prefix}Conflict recovery result for branch '{branch_name}': already current with '{remote_base_ref}'"
+        )
+        return
+
+    if status == "auto-resolved":
+        print(
+            f"{prefix}Conflict recovery result for branch '{branch_name}': auto-resolved conflicts against "
+            f"'{remote_base_ref}' via {applied_strategy}"
+        )
+        return
+
+    if status == "synced-cleanly":
+        print(
+            f"{prefix}Conflict recovery result for branch '{branch_name}': synced cleanly with "
+            f"'{remote_base_ref}' via {applied_strategy}"
+        )
+        return
+
+    print(
+        f"{prefix}Conflict recovery result for branch '{branch_name}': status={status or 'unknown'} "
+        f"against '{remote_base_ref}'"
+    )
+
+
+def push_recovered_branch(branch_name: str, result: dict[str, object], dry_run: bool) -> None:
+    changed = bool(result.get("changed"))
+    if not changed:
+        return
+
+    applied_strategy = str(result.get("applied_strategy") or "")
+    force_with_lease = applied_strategy == "rebase"
+    push_branch(
+        branch_name=branch_name,
+        dry_run=dry_run,
+        force_with_lease=force_with_lease,
+    )
+    prefix = "[dry-run] " if dry_run else ""
+    print(
+        f"{prefix}Conflict recovery push result for branch '{branch_name}': pushed "
+        f"(force-with-lease: {'yes' if force_with_lease else 'no'})"
+    )
+
+
 def auto_resolve_merge_conflicts_with_base() -> int:
     conflicted_paths = list_conflicted_paths()
     if not conflicted_paths:
@@ -6805,7 +6879,11 @@ def auto_resolve_merge_conflicts_with_base() -> int:
     return len(conflicted_paths)
 
 
-def merge_sync_with_auto_resolution(remote_base_ref: str, branch_name: str) -> bool:
+def merge_sync_with_auto_resolution(
+    remote_base_ref: str,
+    branch_name: str,
+    requested_strategy: str,
+) -> dict[str, object]:
     before_sync_sha = current_head_sha()
     print(
         f"Sync attempt: merge reused branch '{branch_name}' with '{remote_base_ref}' "
@@ -6838,7 +6916,15 @@ def merge_sync_with_auto_resolution(remote_base_ref: str, branch_name: str) -> b
         print(f"Reused branch '{branch_name}' updated after sync")
     else:
         print(f"Reused branch '{branch_name}' already up to date with '{remote_base_ref}'")
-    return synced
+    return build_branch_sync_result(
+        branch_name=branch_name,
+        remote_base_ref=remote_base_ref,
+        requested_strategy=requested_strategy,
+        applied_strategy="merge",
+        status="auto-resolved" if synced else "already-current",
+        changed=synced,
+        auto_resolved=synced,
+    )
 
 
 def prepare_issue_branch(
@@ -6887,7 +6973,7 @@ def sync_reused_branch_with_base(
     branch_name: str,
     strategy: str,
     dry_run: bool,
-) -> bool:
+) -> dict[str, object]:
     if strategy not in {"rebase", "merge"}:
         raise RuntimeError(
             f"Unsupported sync strategy '{strategy}'. Use one of: rebase, merge"
@@ -6900,7 +6986,15 @@ def sync_reused_branch_with_base(
             f"[dry-run] Would sync reused branch '{branch_name}' with '{remote_base_ref}' "
             f"using '{strategy}' strategy"
         )
-        return False
+        return build_branch_sync_result(
+            branch_name=branch_name,
+            remote_base_ref=remote_base_ref,
+            requested_strategy=strategy,
+            applied_strategy=strategy,
+            status="dry-run",
+            changed=False,
+            auto_resolved=False,
+        )
 
     print(
         f"Sync attempt: reused branch '{branch_name}' with '{remote_base_ref}' "
@@ -6913,6 +7007,7 @@ def sync_reused_branch_with_base(
         return merge_sync_with_auto_resolution(
             remote_base_ref=remote_base_ref,
             branch_name=branch_name,
+            requested_strategy=strategy,
         )
 
     before_sync_sha = current_head_sha()
@@ -6927,6 +7022,7 @@ def sync_reused_branch_with_base(
         return merge_sync_with_auto_resolution(
             remote_base_ref=remote_base_ref,
             branch_name=branch_name,
+            requested_strategy=strategy,
         )
 
     after_sync_sha = current_head_sha()
@@ -6935,7 +7031,33 @@ def sync_reused_branch_with_base(
         print(f"Reused branch '{branch_name}' updated after rebase sync")
     else:
         print(f"Reused branch '{branch_name}' already up to date with '{remote_base_ref}'")
-    return synced
+    return build_branch_sync_result(
+        branch_name=branch_name,
+        remote_base_ref=remote_base_ref,
+        requested_strategy=strategy,
+        applied_strategy="rebase",
+        status="synced-cleanly" if synced else "already-current",
+        changed=synced,
+        auto_resolved=False,
+    )
+
+
+def run_conflict_recovery_for_branch(
+    *,
+    branch_name: str,
+    base_branch: str,
+    strategy: str,
+    dry_run: bool,
+) -> dict[str, object]:
+    result = sync_reused_branch_with_base(
+        base_branch=base_branch,
+        branch_name=branch_name,
+        strategy=strategy,
+        dry_run=dry_run,
+    )
+    print_branch_sync_result(result, dry_run=dry_run)
+    push_recovered_branch(branch_name=branch_name, result=result, dry_run=dry_run)
+    return result
 
 
 def commit_changes(
@@ -8925,6 +9047,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--conflict-recovery-only",
+        action="store_true",
+        help=(
+            "Run reused-branch conflict recovery only: sync an existing issue or PR branch "
+            "with base, push the result, and skip any agent work."
+        ),
+    )
+    parser.add_argument(
         "--sync-reused-branch",
         dest="sync_reused_branch",
         action="store_true",
@@ -9083,6 +9213,7 @@ def main() -> int:
     status_mode = bool(getattr(args, "status", False))
     from_review_comments = bool(getattr(args, "from_review_comments", False))
     force_issue_flow = bool(getattr(args, "force_issue_flow", False))
+    conflict_recovery_only = bool(getattr(args, "conflict_recovery_only", False))
     skip_if_pr_exists = bool(getattr(args, "skip_if_pr_exists", False))
     skip_if_branch_exists = bool(getattr(args, "skip_if_branch_exists", False))
     force_reprocess = bool(getattr(args, "force_reprocess", False))
@@ -9187,6 +9318,8 @@ def main() -> int:
             if issue_number_arg is not None and pr_number_arg is not None:
                 raise RuntimeError("Use either --issue or --pr, not both.")
             pr_mode_requested = pr_number_arg is not None or from_review_comments
+            if conflict_recovery_only and issue_number_arg is None and pr_number_arg is None:
+                raise RuntimeError("--conflict-recovery-only requires --issue or --pr.")
             if from_review_comments and pr_number_arg is None:
                 raise RuntimeError("--from-review-comments requires --pr <number>.")
             if pr_number_arg is not None and not from_review_comments:
@@ -9338,6 +9471,36 @@ def main() -> int:
 
                 checkout_pr_target_branch(branch_name=target_pr_branch, dry_run=args.dry_run)
                 switched_branch = (not args.dry_run) and original_branch != target_pr_branch
+
+            if conflict_recovery_only:
+                target_base_branch = str(pull_request.get("baseRefName") or "").strip()
+                if not target_base_branch:
+                    raise RuntimeError(
+                        f"PR #{pr_number_arg} has empty baseRefName; cannot run conflict recovery"
+                    )
+                if args.dry_run:
+                    print(
+                        f"[dry-run] Selected mode: conflict-recovery-only (PR #{pr_number_arg}; "
+                        f"branch '{target_pr_branch}' -> base '{target_base_branch}')"
+                    )
+                else:
+                    print(
+                        f"Selected mode: conflict-recovery-only (PR #{pr_number_arg}; "
+                        f"branch '{target_pr_branch}' -> base '{target_base_branch}')"
+                    )
+                try:
+                    run_conflict_recovery_for_branch(
+                        branch_name=target_pr_branch,
+                        base_branch=target_base_branch,
+                        strategy=args.sync_strategy,
+                        dry_run=args.dry_run,
+                    )
+                except RuntimeError as exc:
+                    print(
+                        f"Conflict recovery result for branch '{target_pr_branch}': needs manual intervention ({exc})"
+                    )
+                    raise
+                return _finish_main(0, original_process_cwd)
 
             recovered_pr_state: dict | None = None
             pr_clarification_answer: dict | None = None
@@ -10272,6 +10435,70 @@ def main() -> int:
                     )
                     continue
 
+                if conflict_recovery_only:
+                    recovery_branch = issue_branch
+                    recovery_base_branch = base_branch
+                    recovery_label = issue_label
+                    if mode == "pr-review":
+                        if linked_open_pr is None:
+                            raise RuntimeError(
+                                f"Internal error: PR-review mode selected without linked PR for {issue_label}"
+                            )
+                        linked_pr_number = linked_open_pr.get("number")
+                        recovery_branch = str(linked_open_pr.get("headRefName") or "").strip()
+                        recovery_base_branch = str(linked_open_pr.get("baseRefName") or base_branch).strip()
+                        if not recovery_branch:
+                            raise RuntimeError(
+                                f"Linked PR for {issue_label} has empty headRefName; cannot run conflict recovery"
+                            )
+                        if not recovery_base_branch:
+                            raise RuntimeError(
+                                f"Linked PR for {issue_label} has empty baseRefName; cannot run conflict recovery"
+                            )
+                        recovery_label = (
+                            f"PR #{linked_pr_number}" if type(linked_pr_number) is int else issue_label
+                        )
+
+                    selected_mode_text = (
+                        f"[dry-run] Selected mode: conflict-recovery-only (reason: {mode_reason}; "
+                        f"target: {recovery_label}; branch '{recovery_branch}' -> base '{recovery_base_branch}')"
+                        if args.dry_run
+                        else f"Selected mode: conflict-recovery-only (reason: {mode_reason}; "
+                        f"target: {recovery_label}; branch '{recovery_branch}' -> base '{recovery_base_branch}')"
+                    )
+                    print(selected_mode_text)
+
+                    failure_stage = "prepare_branch"
+                    branch_status = prepare_issue_branch(
+                        base_branch=recovery_base_branch,
+                        branch_name=recovery_branch,
+                        dry_run=args.dry_run,
+                        fail_on_existing=args.fail_on_existing,
+                    )
+                    print(f"Branch status for {recovery_label}: {branch_status}")
+                    if branch_status != "reused":
+                        raise RuntimeError(
+                            f"Conflict recovery only requires an existing branch, but '{recovery_branch}' "
+                            "was not found locally or on origin. Run the normal issue/PR flow first."
+                        )
+
+                    failure_stage = "sync_branch"
+                    try:
+                        run_conflict_recovery_for_branch(
+                            branch_name=recovery_branch,
+                            base_branch=recovery_base_branch,
+                            strategy=args.sync_strategy,
+                            dry_run=args.dry_run,
+                        )
+                    except RuntimeError as exc:
+                        print(
+                            f"Conflict recovery result for branch '{recovery_branch}': "
+                            f"needs manual intervention ({exc})"
+                        )
+                        raise
+                    processed += 1
+                    continue
+
                 if autonomous_mode:
                     if recovered_status == "failed" and orchestration_attempt > max_attempts:
                         print(
@@ -11184,17 +11411,18 @@ def main() -> int:
                 )
                 print(f"Branch status for {issue_label}: {branch_status}")
 
-                reused_branch_sync_changed = False
+                reused_branch_sync_result: dict[str, object] | None = None
 
                 if branch_status == "reused":
                     if args.sync_reused_branch:
                         failure_stage = "sync_branch"
-                        reused_branch_sync_changed = sync_reused_branch_with_base(
+                        reused_branch_sync_result = sync_reused_branch_with_base(
                             base_branch=target_base_branch,
                             branch_name=issue_branch,
                             strategy=args.sync_strategy,
                             dry_run=args.dry_run,
                         )
+                        print_branch_sync_result(reused_branch_sync_result, dry_run=args.dry_run)
                     else:
                         prefix = "[dry-run] " if args.dry_run else ""
                         print(
@@ -11401,12 +11629,19 @@ def main() -> int:
                                 run_command(["git", "checkout", base_branch])
                             continue
                 if not args.dry_run and not has_changes():
-                    if branch_status == "reused" and args.sync_reused_branch and reused_branch_sync_changed:
+                    if (
+                        branch_status == "reused"
+                        and args.sync_reused_branch
+                        and isinstance(reused_branch_sync_result, dict)
+                        and bool(reused_branch_sync_result.get("changed"))
+                    ):
                         print(
                             f"No file changes from agent for {issue_label}; "
                             "pushing sync-only branch updates"
                         )
-                        used_force_with_lease = args.sync_strategy == "rebase"
+                        used_force_with_lease = (
+                            str(reused_branch_sync_result.get("applied_strategy") or "") == "rebase"
+                        )
                         failure_stage = "workflow_hooks"
                         run_configured_workflow_hooks(
                             hook_name="pre_pr_update",
@@ -11553,8 +11788,9 @@ def main() -> int:
                     force_with_lease=(
                         branch_status == "reused"
                         and args.sync_reused_branch
-                        and args.sync_strategy == "rebase"
-                        and reused_branch_sync_changed
+                        and isinstance(reused_branch_sync_result, dict)
+                        and bool(reused_branch_sync_result.get("changed"))
+                        and str(reused_branch_sync_result.get("applied_strategy") or "") == "rebase"
                     ),
                 )
                 pr_status, pr_url = current_codehost_provider().ensure_pr(

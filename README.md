@@ -56,6 +56,16 @@ python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --r
 python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --force-issue-flow
 ```
 
+**Conflict recovery only for an existing reused issue branch:**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --conflict-recovery-only --sync-strategy rebase
+```
+
+**Conflict recovery only for an existing PR branch:**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --pr 72 --from-review-comments --conflict-recovery-only --allow-pr-branch-switch
+```
+
 **Issue run stacked on current branch (opt-in):**
 ```bash
 python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 45 --base current --runner opencode --agent build
@@ -174,9 +184,11 @@ go run ./cmd/orchestrator run issue --id 20 --repo owner/repo
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --agent build --model openai/gpt-4o
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --model openai/gpt-5.3-codex --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
 go run ./cmd/orchestrator run issue --id 31 --repo owner/repo --force-issue-flow
+go run ./cmd/orchestrator run issue --id 31 --repo owner/repo --conflict-recovery-only --sync-strategy rebase
 go run ./cmd/orchestrator run issue --id 45 --repo owner/repo --base current --runner opencode --agent build
 go run ./cmd/orchestrator run daemon --repo owner/repo --limit 5 --poll-interval-seconds 120
 go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --allow-pr-branch-switch
+go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --conflict-recovery-only --allow-pr-branch-switch
 go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --runner opencode --agent review --model openai/gpt-4o --opencode-auto-approve --agent-timeout-seconds 900 --dry-run
 go run ./cmd/orchestrator run daemon --repo owner/repo --limit 1 --poll-interval-seconds 120
 ```
@@ -186,9 +198,11 @@ The Go handlers translate CLI intent into the current Python runner arguments, e
 Compatibility boundary for Phase 1:
 
 - `run issue` supports single-issue execution through the Python runner. `--issue N` is accepted as a compatibility alias for `--id N`.
+- `run issue --conflict-recovery-only` reuses an existing issue or linked PR branch, syncs it with base, reports whether it was already current, synced cleanly, auto-resolved, or needs manual intervention, and then stops before agent execution.
 - `status` prints a concise summary from the latest parseable orchestration state comment for a single issue or PR, including current state, next action, blockers, source thread/comment, and PR readiness when available.
 - `run daemon` polls tracker issues through the Python runner in autonomous batch mode, reuses orchestration state, and keeps concurrency at one worktree task at a time.
 - `run pr` supports PR review-comments execution. `--pr N` is accepted as a compatibility alias for `--id N`, and `--from-review-comments` is accepted as a no-op because the command always selects that mode.
+- `run pr --conflict-recovery-only` syncs the current PR branch with its base and exits before fetching review work for the agent.
 - `run daemon` repeatedly invokes the existing Python batch issue flow with `--limit` / `--state` polling semantics; use `--dry-run` to execute a single poll without looping.
 - `run daemon` does not write a dedicated logfile today; operator evidence comes from terminal `stdout` / `stderr` unless you redirect it explicitly.
 - `doctor` accepts `--doctor` as a no-op because the command already selects diagnostics mode.

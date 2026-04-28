@@ -676,7 +676,10 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
             patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
             patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=issue_comments),
             patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
-            patch("scripts.run_github_issues_to_opencode.sync_reused_branch_with_base", return_value=False),
+            patch(
+                "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
+                return_value={"status": "already-current", "changed": False, "applied_strategy": "rebase"},
+            ),
             patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0) as run_agent_mock,
             patch("scripts.run_github_issues_to_opencode.commit_changes"),
             patch("scripts.run_github_issues_to_opencode.push_branch"),
@@ -833,7 +836,10 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
             patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
             patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=issue_comments),
             patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
-            patch("scripts.run_github_issues_to_opencode.sync_reused_branch_with_base", return_value=False),
+            patch(
+                "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
+                return_value={"status": "already-current", "changed": False, "applied_strategy": "rebase"},
+            ),
             patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0) as run_agent_mock,
             patch("scripts.run_github_issues_to_opencode.commit_changes"),
             patch("scripts.run_github_issues_to_opencode.push_branch"),
@@ -1523,7 +1529,10 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
                 ],
             ),
             patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
-            patch("scripts.run_github_issues_to_opencode.sync_reused_branch_with_base", return_value=False),
+            patch(
+                "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
+                return_value={"status": "already-current", "changed": False, "applied_strategy": "rebase"},
+            ),
             patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0) as run_agent_mock,
             patch("scripts.run_github_issues_to_opencode.ensure_pr", return_value=("reused", "")),
             patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"),
@@ -1766,7 +1775,12 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
                 )
             )
             stack.enter_context(patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"))
-            stack.enter_context(patch("scripts.run_github_issues_to_opencode.sync_reused_branch_with_base", return_value=False))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
+                    return_value={"status": "already-current", "changed": False, "applied_strategy": "rebase"},
+                )
+            )
             run_agent_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0))
             stack.enter_context(patch("scripts.run_github_issues_to_opencode.commit_changes"))
             stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_configured_workflow_checks", return_value=[]))

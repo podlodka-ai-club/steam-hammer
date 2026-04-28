@@ -494,6 +494,7 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 	skipIfBranchExists := fs.Bool("skip-if-branch-exists", true, "skip issue processing when deterministic issue branch exists on origin")
 	noSkipIfBranchExists := fs.Bool("no-skip-if-branch-exists", false, "do not skip issue processing when deterministic issue branch exists on origin")
 	forceReprocess := fs.Bool("force-reprocess", false, "override skip guards")
+	conflictRecoveryOnly := fs.Bool("conflict-recovery-only", false, "sync an existing reused branch with base and stop before any agent work")
 	syncReusedBranch := fs.Bool("sync-reused-branch", true, "sync reused issue branches before running the agent")
 	noSyncReusedBranch := fs.Bool("no-sync-reused-branch", false, "disable sync for reused issue branches before the agent step")
 	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
@@ -551,6 +552,9 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 	if *forceReprocess {
 		pythonArgs = append(pythonArgs, "--force-reprocess")
 	}
+	if *conflictRecoveryOnly {
+		pythonArgs = append(pythonArgs, "--conflict-recovery-only")
+	}
 	if *noSyncReusedBranch {
 		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
 	} else if flagWasPassed(fs, "sync-reused-branch") && *syncReusedBranch {
@@ -580,6 +584,8 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	isolateWorktree := fs.Bool("isolate-worktree", false, "run in a temporary git worktree")
 	postSummary := fs.Bool("post-pr-summary", false, "post a summary comment after success")
 	followupPrefix := fs.String("pr-followup-branch-prefix", "", "optional follow-up branch prefix")
+	conflictRecoveryOnly := fs.Bool("conflict-recovery-only", false, "sync the current PR branch with base and stop before any agent work")
+	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -613,6 +619,12 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	}
 	if *followupPrefix != "" {
 		pythonArgs = append(pythonArgs, "--pr-followup-branch-prefix", *followupPrefix)
+	}
+	if *syncStrategy != "" {
+		pythonArgs = append(pythonArgs, "--sync-strategy", *syncStrategy)
+	}
+	if *conflictRecoveryOnly {
+		pythonArgs = append(pythonArgs, "--conflict-recovery-only")
 	}
 	return a.runPython(ctx, pythonArgs)
 }

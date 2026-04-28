@@ -200,6 +200,7 @@ func TestRunIssueCommandMapsPythonRunnerFlags(t *testing.T) {
 		"--no-skip-if-pr-exists",
 		"--no-skip-if-branch-exists",
 		"--force-reprocess",
+		"--conflict-recovery-only",
 		"--no-sync-reused-branch",
 		"--sync-strategy", "merge",
 	})
@@ -217,6 +218,7 @@ func TestRunIssueCommandMapsPythonRunnerFlags(t *testing.T) {
 		"--no-skip-if-pr-exists",
 		"--no-skip-if-branch-exists",
 		"--force-reprocess",
+		"--conflict-recovery-only",
 		"--no-sync-reused-branch",
 		"--sync-strategy", "merge",
 	})
@@ -341,6 +343,18 @@ func TestRunPRCommandAcceptsPythonPRFlags(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments"})
+}
+
+func TestRunPRCommandForwardsConflictRecoveryOnly(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "pr", "--id", "72", "--conflict-recovery-only", "--sync-strategy", "merge"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments", "--sync-strategy", "merge", "--conflict-recovery-only"})
 }
 
 func TestRunPRCommandMapsCoreCompatibilityFlags(t *testing.T) {

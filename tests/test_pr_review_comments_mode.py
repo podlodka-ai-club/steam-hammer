@@ -942,7 +942,15 @@ class PrReviewModeTests(unittest.TestCase):
                     ],
                 ),
                 mock.patch.object(self.mod, "prepare_issue_branch", return_value="reused"),
-                mock.patch.object(self.mod, "sync_reused_branch_with_base", return_value=False),
+                mock.patch.object(
+                    self.mod,
+                    "sync_reused_branch_with_base",
+                    return_value={
+                        "status": "already-current",
+                        "changed": False,
+                        "applied_strategy": "rebase",
+                    },
+                ),
                 mock.patch.object(self.mod, "run_agent", return_value=0) as run_agent_mock,
                 mock.patch.object(self.mod, "ensure_pr", return_value=("reused", "")),
                 mock.patch.object(self.mod, "push_branch"),

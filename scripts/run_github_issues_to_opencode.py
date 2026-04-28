@@ -3718,6 +3718,363 @@ def format_recovered_state_context(state: dict) -> str:
     return details
 
 
+def _humanize_status_token(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    return text.replace("_", " ").replace("-", " ")
+
+
+def _status_payload(state: dict | None) -> dict:
+    payload = state.get("payload") if isinstance(state, dict) else None
+    return payload if isinstance(payload, dict) else {}
+
+
+def _collect_status_done_items(
+    *,
+    issue_number: int | str | None,
+    pr_number: int | None,
+    branch: str | None,
+    required_file_validation: dict | None,
+    ci_status: dict | None,
+    merge_readiness: dict | None,
+    decomposition: dict | None,
+) -> list[str]:
+    done: list[str] = []
+    if is_trackable_issue_number(issue_number):
+        done.append(f"issue {format_issue_ref(issue_number)}")
+    if isinstance(pr_number, int) and pr_number > 0:
+        done.append(f"pr #{pr_number}")
+    if branch:
+        done.append(f"branch {branch}")
+
+    if isinstance(required_file_validation, dict) and str(required_file_validation.get("status") or "") == "passed":
+        required_count = _as_positive_int(required_file_validation.get("required_file_count")) or 0
+        if required_count > 0:
+            done.append("required files matched")
+
+    if isinstance(ci_status, dict) and str(ci_status.get("overall") or "") == "success":
+        done.append("ci green")
+
+    if isinstance(merge_readiness, dict) and str(merge_readiness.get("status") or "") == "ready-to-merge":
+        done.append("merge ready")
+
+    if isinstance(decomposition, dict):
+        progress = decomposition.get("progress") if isinstance(decomposition.get("progress"), dict) else {}
+        completed = _as_positive_int(progress.get("completed")) or 0
+        total = _as_positive_int(progress.get("total")) or 0
+        if total > 0:
+            done.append(f"children {completed}/{total} done")
+
+    return done
+
+
+def _summarize_current_status(
+    state: dict | None,
+    *,
+    ci_status: dict | None,
+    merge_readiness: dict | None,
+) -> str:
+    if not isinstance(state, dict):
+        return "no orchestration state recorded yet"
+
+    payload = _status_payload(state)
+    status = str(state.get("status") or payload.get("status") or "unknown").strip() or "unknown"
+    stage = str(payload.get("stage") or "").strip()
+
+    if isinstance(ci_status, dict) and status == "waiting-for-ci":
+        pending = ci_status.get("pending_checks") if isinstance(ci_status.get("pending_checks"), list) else []
+        failing = ci_status.get("failing_checks") if isinstance(ci_status.get("failing_checks"), list) else []
+        if failing:
+            return f"{status} at {stage or 'unknown stage'}; {format_failing_ci_checks_summary(failing)}"
+        if pending:
+            return f"{status} at {stage or 'unknown stage'}; waiting on {len(pending)} pending CI check(s)"
+        if not ci_status.get("has_checks"):
+            return f"{status} at {stage or 'unknown stage'}; waiting for CI checks to start"
+
+    if isinstance(merge_readiness, dict) and status == "ready-to-merge":
+        merge_state = str(merge_readiness.get("merge_state_status") or "").strip()
+        if merge_state:
+            return f"{status} at {stage or 'unknown stage'}; merge state {merge_state}"
+
+    if stage:
+        return f"{status} at {stage}"
+    return status
+
+
+def _collect_status_blockers(
+    state: dict | None,
+    *,
+    required_file_validation: dict | None,
+    ci_status: dict | None,
+    merge_readiness: dict | None,
+    decomposition: dict | None,
+) -> list[str]:
+    blockers: list[str] = []
+    payload = _status_payload(state)
+    state_error = _as_optional_string(payload.get("error"))
+    if state_error:
+        blockers.append(state_error)
+
+    if isinstance(required_file_validation, dict) and str(required_file_validation.get("status") or "") == "blocked":
+        missing_files = required_file_validation.get("missing_files")
+        missing_summary = ", ".join(sorted(str(path) for path in missing_files or [] if str(path).strip()))
+        if missing_summary:
+            blockers.append(f"missing required files: {missing_summary}")
+
+    if isinstance(ci_status, dict):
+        failing_checks = ci_status.get("failing_checks") if isinstance(ci_status.get("failing_checks"), list) else []
+        if failing_checks:
+            blockers.append(format_failing_ci_checks_summary(failing_checks))
+
+    if isinstance(merge_readiness, dict):
+        readiness_status = str(merge_readiness.get("status") or "")
+        readiness_error = _as_optional_string(merge_readiness.get("error"))
+        if readiness_error and readiness_status in {"blocked", "waiting-for-author"}:
+            blockers.append(readiness_error)
+
+    if isinstance(decomposition, dict):
+        decomposition_blockers = decomposition.get("blockers") if isinstance(decomposition.get("blockers"), list) else []
+        blockers_text = _safe_join_sorted(decomposition_blockers)
+        if blockers_text:
+            blockers.append(f"decomposition blockers: {blockers_text}")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for blocker in blockers:
+        text = blocker.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped
+
+
+def format_orchestration_status_summary(snapshot: dict) -> str:
+    target_type = str(snapshot.get("target_type") or "unknown")
+    target_number = snapshot.get("target_number")
+    latest_state = snapshot.get("latest_state") if isinstance(snapshot.get("latest_state"), dict) else None
+    payload = _status_payload(latest_state)
+    issue_number = snapshot.get("issue_number")
+    pr_number = snapshot.get("pr_number")
+    branch = _as_optional_string(snapshot.get("branch"))
+    base_branch = _as_optional_string(snapshot.get("base_branch"))
+    linked_issue_numbers = snapshot.get("linked_issue_numbers") if isinstance(snapshot.get("linked_issue_numbers"), list) else []
+    source_comment = _as_optional_string(snapshot.get("source_comment"))
+    ci_status = snapshot.get("ci_status") if isinstance(snapshot.get("ci_status"), dict) else None
+    merge_readiness = snapshot.get("merge_readiness") if isinstance(snapshot.get("merge_readiness"), dict) else None
+    required_file_validation = (
+        snapshot.get("required_file_validation")
+        if isinstance(snapshot.get("required_file_validation"), dict)
+        else None
+    )
+    decomposition = snapshot.get("decomposition") if isinstance(snapshot.get("decomposition"), dict) else None
+
+    status = str(snapshot.get("latest_status") or payload.get("status") or "new").strip() or "new"
+    done_items = _collect_status_done_items(
+        issue_number=issue_number,
+        pr_number=pr_number,
+        branch=branch,
+        required_file_validation=required_file_validation,
+        ci_status=ci_status,
+        merge_readiness=merge_readiness,
+        decomposition=decomposition,
+    )
+    blockers = _collect_status_blockers(
+        latest_state,
+        required_file_validation=required_file_validation,
+        ci_status=ci_status,
+        merge_readiness=merge_readiness,
+        decomposition=decomposition,
+    )
+    next_action = _as_optional_string(payload.get("next_action")) or _as_optional_string(snapshot.get("next_action")) or "inspect tracker comments"
+    current = _summarize_current_status(latest_state, ci_status=ci_status, merge_readiness=merge_readiness)
+
+    if target_type == "issue":
+        target_label = format_issue_ref(target_number)
+    elif target_type == "pr":
+        target_label = f"#{target_number}"
+    else:
+        target_label = str(target_number or "unknown")
+
+    lines = [
+        f"Target: {target_type} {target_label}",
+        f"Latest state: {status}",
+        f"Done: {', '.join(done_items) if done_items else 'none yet'}",
+        f"Current: {current}",
+        f"Next: {_humanize_status_token(next_action)}",
+        f"Blockers: {'; '.join(blockers) if blockers else 'none'}",
+    ]
+
+    if is_trackable_issue_number(issue_number):
+        lines.append(f"Issue: {format_issue_ref(issue_number)}")
+    if isinstance(pr_number, int) and pr_number > 0:
+        lines.append(f"PR: #{pr_number}")
+    if linked_issue_numbers:
+        lines.append(
+            "Linked issues: " + ", ".join(format_issue_ref(number) for number in linked_issue_numbers if is_trackable_issue_number(number))
+        )
+    if branch:
+        branch_line = f"Branch: {branch}"
+        if base_branch:
+            branch_line += f" (base {base_branch})"
+        lines.append(branch_line)
+    if isinstance(ci_status, dict):
+        ci_overall = str(ci_status.get("overall") or "unknown").strip() or "unknown"
+        pending = ci_status.get("pending_checks") if isinstance(ci_status.get("pending_checks"), list) else []
+        failing = ci_status.get("failing_checks") if isinstance(ci_status.get("failing_checks"), list) else []
+        lines.append(
+            f"PR readiness: ci={ci_overall}, pending={len(pending)}, failing={len(failing)}"
+        )
+    elif isinstance(merge_readiness, dict):
+        lines.append(f"PR readiness: {str(merge_readiness.get('status') or 'unknown')}")
+    if source_comment:
+        lines.append(f"Source comment: {source_comment}")
+    created_at = _as_optional_string(latest_state.get("created_at") if isinstance(latest_state, dict) else None)
+    if created_at:
+        lines.append(f"Updated: {created_at}")
+    return "\n".join(lines)
+
+
+def load_issue_status_snapshot(repo: str, issue: dict, merge_policy: dict) -> dict:
+    issue_number = issue.get("number")
+    issue_comments = current_tracker_provider().list_issue_comments(repo=repo, issue_id=issue_number)
+    issue_state, issue_warnings = select_latest_parseable_orchestration_state(
+        comments=issue_comments,
+        source_label=format_issue_label_from_issue(issue),
+    )
+
+    linked_open_pr = current_codehost_provider().find_open_pr_for_issue(repo=repo, issue=issue)
+    pull_request: dict | None = None
+    pr_state: dict | None = None
+    pr_warnings: list[str] = []
+    if isinstance(linked_open_pr, dict):
+        linked_pr_number = linked_open_pr.get("number")
+        if type(linked_pr_number) is int:
+            pull_request = current_codehost_provider().fetch_pull_request(repo=repo, number=linked_pr_number)
+            pr_comments = current_codehost_provider().list_pr_comments(repo=repo, pr_number=linked_pr_number)
+            pr_state, pr_warnings = select_latest_parseable_orchestration_state(
+                comments=pr_comments,
+                source_label=f"pr #{linked_pr_number}",
+            )
+
+    latest_state = merge_latest_recovered_state([issue_state, pr_state])
+    payload = _status_payload(latest_state)
+    issue_number_value = latest_state.get("payload", {}).get("issue") if isinstance(latest_state, dict) else None
+    if not is_trackable_issue_number(issue_number_value):
+        issue_number_value = issue_number
+
+    pr_number = payload.get("pr") if type(payload.get("pr")) is int else None
+    if pr_number is None and isinstance(pull_request, dict) and type(pull_request.get("number")) is int:
+        pr_number = pull_request.get("number")
+
+    branch = _as_optional_string(payload.get("branch")) or _as_optional_string(
+        pull_request.get("headRefName") if isinstance(pull_request, dict) else None
+    )
+    base_branch = _as_optional_string(payload.get("base_branch")) or _as_optional_string(
+        pull_request.get("baseRefName") if isinstance(pull_request, dict) else None
+    )
+    ci_status = (
+        current_codehost_provider().read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
+        if isinstance(pull_request, dict)
+        else None
+    )
+    required_file_validation = (
+        validate_required_files_in_pr(pull_request=pull_request, linked_issues=[issue])
+        if isinstance(pull_request, dict)
+        else None
+    )
+    merge_readiness = (
+        evaluate_pr_merge_readiness(pull_request=pull_request, merge_policy=merge_policy)
+        if isinstance(pull_request, dict)
+        else None
+    )
+    decomposition = build_decomposition_rollup_from_recovered_state(
+        recovered_state=latest_state,
+        parent_issue=issue_number if type(issue_number) is int else None,
+    )
+
+    return {
+        "target_type": "issue",
+        "target_number": issue_number,
+        "issue_number": issue_number_value,
+        "pr_number": pr_number,
+        "latest_state": latest_state,
+        "latest_status": str(latest_state.get("status") or "new") if isinstance(latest_state, dict) else "new",
+        "next_action": payload.get("next_action"),
+        "branch": branch,
+        "base_branch": base_branch,
+        "source_comment": _as_optional_string(latest_state.get("url") if isinstance(latest_state, dict) else None),
+        "ci_status": ci_status,
+        "required_file_validation": required_file_validation,
+        "merge_readiness": merge_readiness,
+        "decomposition": decomposition,
+        "warnings": issue_warnings + pr_warnings,
+    }
+
+
+def load_pr_status_snapshot(repo: str, pr_number: int, merge_policy: dict) -> dict:
+    pull_request = current_codehost_provider().fetch_pull_request(repo=repo, number=pr_number)
+    pr_comments = current_codehost_provider().list_pr_comments(repo=repo, pr_number=pr_number)
+    pr_state, warnings = select_latest_parseable_orchestration_state(
+        comments=pr_comments,
+        source_label=f"pr #{pr_number}",
+    )
+    payload = _status_payload(pr_state)
+    linked_issues = current_codehost_provider().load_pr_linked_issue_context(repo=repo, pull_request=pull_request)
+    issue_numbers = [issue.get("number") for issue in linked_issues if is_trackable_issue_number(issue.get("number"))]
+    issue_number = issue_numbers[0] if issue_numbers else payload.get("issue")
+    ci_status = current_codehost_provider().read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
+    required_file_validation = validate_required_files_in_pr(pull_request=pull_request, linked_issues=linked_issues)
+    merge_readiness = evaluate_pr_merge_readiness(pull_request=pull_request, merge_policy=merge_policy)
+    decomposition = build_decomposition_rollup_from_recovered_state(
+        recovered_state=pr_state,
+        parent_issue=issue_number if type(issue_number) is int else None,
+    )
+
+    return {
+        "target_type": "pr",
+        "target_number": pr_number,
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "linked_issue_numbers": issue_numbers,
+        "latest_state": pr_state,
+        "latest_status": str(pr_state.get("status") or "new") if isinstance(pr_state, dict) else "new",
+        "next_action": payload.get("next_action"),
+        "branch": _as_optional_string(payload.get("branch")) or _as_optional_string(pull_request.get("headRefName")),
+        "base_branch": _as_optional_string(payload.get("base_branch")) or _as_optional_string(pull_request.get("baseRefName")),
+        "source_comment": _as_optional_string(pr_state.get("url") if isinstance(pr_state, dict) else None),
+        "ci_status": ci_status,
+        "required_file_validation": required_file_validation,
+        "merge_readiness": merge_readiness,
+        "decomposition": decomposition,
+        "warnings": warnings,
+    }
+
+
+def run_status_command(*, args: argparse.Namespace, repo: str, merge_policy: dict) -> int:
+    issue_number_arg = getattr(args, "issue", None)
+    pr_number_arg = getattr(args, "pr", None)
+    from_review_comments = bool(getattr(args, "from_review_comments", False))
+    if issue_number_arg is not None and pr_number_arg is not None:
+        raise RuntimeError("Use either --issue or --pr with --status, not both.")
+    if pr_number_arg is not None and from_review_comments:
+        raise RuntimeError("--status does not use --from-review-comments.")
+    if issue_number_arg is None and pr_number_arg is None:
+        raise RuntimeError("--status requires --issue <number> or --pr <number>.")
+
+    if issue_number_arg is not None:
+        issue = current_tracker_provider().get_issue(repo=repo, issue_id=issue_number_arg)
+        snapshot = load_issue_status_snapshot(repo=repo, issue=issue, merge_policy=merge_policy)
+    else:
+        snapshot = load_pr_status_snapshot(repo=repo, pr_number=pr_number_arg, merge_policy=merge_policy)
+
+    for warning in snapshot.get("warnings") or []:
+        print(f"Warning: {warning}", file=sys.stderr)
+    print(format_orchestration_status_summary(snapshot))
+    return 0
+
+
 def _comment_author_login(comment: dict) -> str:
     user = comment.get("user") if isinstance(comment, dict) else None
     if isinstance(user, dict):
@@ -8661,6 +9018,11 @@ def build_parser() -> argparse.ArgumentParser:
             "(still does not start an agent run)."
         ),
     )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Print a concise orchestration status summary for --issue or --pr and exit.",
+    )
     return parser
 
 
@@ -8715,6 +9077,7 @@ def main() -> int:
     issue_number_arg = getattr(args, "issue", None)
     tracker = _parse_tracker(getattr(args, "tracker", BUILTIN_DEFAULTS["tracker"]))
     pr_number_arg = getattr(args, "pr", None)
+    status_mode = bool(getattr(args, "status", False))
     from_review_comments = bool(getattr(args, "from_review_comments", False))
     force_issue_flow = bool(getattr(args, "force_issue_flow", False))
     skip_if_pr_exists = bool(getattr(args, "skip_if_pr_exists", False))
@@ -8836,13 +9199,23 @@ def main() -> int:
             configure_active_providers(tracker_provider, codehost_provider)
             if issue_number_arg is not None:
                 issue_number_arg = normalize_issue_number(issue_number_arg, tracker=tracker)
+                setattr(args, "issue", issue_number_arg)
+
+            if status_mode and pr_number_arg is not None and type(pr_number_arg) is not int:
+                raise RuntimeError("--pr must be an integer pull request number")
+
+            repo = args.repo or codehost_provider.detect_repo()
+            if status_mode:
+                return _finish_main(
+                    run_status_command(args=args, repo=repo, merge_policy=merge_policy),
+                    original_process_cwd,
+                )
 
             if not pr_mode_requested and base_branch_mode == "current":
                 for warning in current_branch_stack_warnings():
                     print(f"Warning: {warning}", file=sys.stderr)
 
             ensure_clean_worktree()
-            repo = args.repo or codehost_provider.detect_repo()
             if setup_command is not None:
                 failure_stage = "workflow_setup"
                 _run_workflow_shell_command(

@@ -152,6 +152,8 @@ Available commands:
 go run ./cmd/orchestrator init
 go run ./cmd/orchestrator doctor --repo owner/repo
 go run ./cmd/orchestrator autodoctor --repo owner/repo
+go run ./cmd/orchestrator status --issue 71 --repo owner/repo
+go run ./cmd/orchestrator status --pr 72 --repo owner/repo
 go run ./cmd/orchestrator run issue --id 71 --repo owner/repo --dry-run
 go run ./cmd/orchestrator run daemon --repo owner/repo --dry-run --max-cycles 1 --poll-interval-seconds 1
 go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --dry-run
@@ -166,6 +168,8 @@ Common Python-runner examples map to the Go wrapper as follows:
 go run ./cmd/orchestrator doctor --repo owner/repo
 go run ./cmd/orchestrator doctor --doctor-smoke-check --runner opencode --model openai/gpt-5.3-codex
 go run ./cmd/orchestrator autodoctor --repo owner/repo
+go run ./cmd/orchestrator status --issue 20 --repo owner/repo
+go run ./cmd/orchestrator status --pr 22 --repo owner/repo
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --agent build --model openai/gpt-4o
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --model openai/gpt-5.3-codex --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
@@ -182,6 +186,7 @@ The Go handlers translate CLI intent into the current Python runner arguments, e
 Compatibility boundary for Phase 1:
 
 - `run issue` supports single-issue execution through the Python runner. `--issue N` is accepted as a compatibility alias for `--id N`.
+- `status` prints a concise summary from the latest parseable orchestration state comment for a single issue or PR, including current state, next action, blockers, source comment, and PR readiness when available.
 - `run daemon` polls tracker issues through the Python runner in autonomous batch mode, reuses orchestration state, and keeps concurrency at one worktree task at a time.
 - `run pr` supports PR review-comments execution. `--pr N` is accepted as a compatibility alias for `--id N`, and `--from-review-comments` is accepted as a no-op because the command always selects that mode.
 - `run daemon` repeatedly invokes the existing Python batch issue flow with `--limit` / `--state` polling semantics; use `--dry-run` to execute a single poll without looping.

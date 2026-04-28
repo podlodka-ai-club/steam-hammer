@@ -187,6 +187,7 @@ Project config currently supports these sections:
 - `scope.defaults.priority.allow|deny|order` (priority labels used for filtering and autonomous ordering)
 - `scope.defaults.freshness.max_age_days|max_idle_days` (positive integers for autonomous freshness guards)
 - `retry.max_attempts|escalate_to_preset` (positive integer plus escalation placeholder)
+- `budgets.max_attempts_per_task|max_runtime_minutes|max_cost_usd|max_model_tier`
 - `communication.verbosity` (`low`, `normal`, `high`)
 - `presets.<name>.runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts|escalate_to_preset`
 
@@ -200,6 +201,8 @@ Preset resolution order is:
 - legacy non-preset defaults
 
 Selected preset values are applied before explicit CLI flags, so manual `--runner`, `--model`, `--agent`, and similar flags remain the final override layer.
+
+When no explicit `--preset` is provided, the orchestrator can now choose a preset per task from `routing.rules` and then cap it with project `budgets`. Matching rules win first, then `routing.default_preset`, then built-in cheap/default/hard heuristics when those presets exist.
 
 Scope rules are evaluated before any issue-mode agent execution:
 
@@ -308,6 +311,37 @@ Example `project-config.json` preset and retry block:
       "max_attempts": 3,
       "escalate_to_preset": null
     }
+  }
+}
+```
+
+Example `project-config.json` routing and budget block:
+
+```json
+{
+  "routing": {
+    "default_preset": "default",
+    "rules": [
+      {
+        "when": {
+          "labels": ["docs", "chore"],
+          "task_types": ["issue"]
+        },
+        "preset": "cheap"
+      },
+      {
+        "when": {
+          "needs_decomposition": true
+        },
+        "preset": "hard"
+      }
+    ]
+  },
+  "budgets": {
+    "max_attempts_per_task": 3,
+    "max_runtime_minutes": 20,
+    "max_cost_usd": 2.5,
+    "max_model_tier": "hard"
   }
 }
 ```

@@ -56,6 +56,9 @@ BUILTIN_DEFAULTS = {
     "dir": ".",
 }
 
+PRESET_TIER_ORDER = ("cheap", "default", "hard")
+ROUTING_RULE_TASK_TYPES = {"issue", "pr"}
+
 TRACKER_GITHUB = "github"
 TRACKER_JIRA = "jira"
 TRACKER_CHOICES = {TRACKER_GITHUB, TRACKER_JIRA}
@@ -1283,6 +1286,8 @@ def failure_next_action_for_stage(failure_stage: str) -> str:
         return "stage_or-remove-residual-untracked-files"
     if failure_stage == "token_budget":
         return "raise_token_budget_or_split_issue"
+    if failure_stage == "cost_budget":
+        return "raise_cost_budget_or_split_issue"
     return "inspect_error_and_retry"
 
 
@@ -1326,6 +1331,17 @@ class TokenBudgetExceededError(RuntimeError):
         super().__init__(
             f"Agent stopped: token budget of {_format_budget_message_count(budget) or budget} exceeded "
             f"(reached ~{_format_budget_message_count(reached) or reached}). Use --token-budget to raise the limit or split the issue."
+        )
+
+
+class CostBudgetExceededError(RuntimeError):
+    def __init__(self, budget: float, reached: float, item_label: str):
+        self.budget = budget
+        self.reached = reached
+        self.item_label = item_label
+        super().__init__(
+            f"Agent stopped: cost budget of ${budget:.4f} exceeded "
+            f"(reached ~${reached:.4f}). Lower the task scope, switch to a cheaper preset/model, or raise the configured budget."
         )
 
 
@@ -6175,6 +6191,7 @@ def run_agent(
     prompt_override: str | None = None,
     track_tokens: bool = False,
     token_budget: int | None = None,
+    cost_budget_usd: float | None = None,
     run_stats: dict[str, object] | None = None,
     agent_result: dict[str, object] | None = None,
 ) -> int:
@@ -6195,6 +6212,7 @@ def run_agent(
         opencode_auto_approve=opencode_auto_approve,
         track_tokens=track_tokens,
         token_budget=token_budget,
+        cost_budget_usd=cost_budget_usd,
         run_stats=run_stats,
         agent_result=agent_result,
     )
@@ -6255,6 +6273,7 @@ def run_agent_with_prompt(
     image_paths: list[str] | None = None,
     track_tokens: bool = False,
     token_budget: int | None = None,
+    cost_budget_usd: float | None = None,
     run_stats: dict[str, object] | None = None,
     agent_result: dict[str, object] | None = None,
 ) -> int:
@@ -6314,6 +6333,25 @@ def run_agent_with_prompt(
         budget_error = TokenBudgetExceededError(
             budget=token_budget,
             reached=total_tokens,
+            item_label=item_label,
+        )
+        print(str(budget_error))
+        raise budget_error
+
+    def _raise_if_cost_budget_exceeded() -> None:
+        if cost_budget_usd is None or cost_usd is None or cost_usd <= cost_budget_usd:
+            return
+
+        _record_agent_run_stats(
+            run_stats=run_stats,
+            start=start,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+        )
+        budget_error = CostBudgetExceededError(
+            budget=cost_budget_usd,
+            reached=cost_usd,
             item_label=item_label,
         )
         print(str(budget_error))
@@ -6392,6 +6430,10 @@ def run_agent_with_prompt(
                         process.kill()
                         process.wait(timeout=10)
                         _raise_if_token_budget_exceeded()
+                    if cost_budget_usd is not None and cost_usd is not None and cost_usd > cost_budget_usd:
+                        process.kill()
+                        process.wait(timeout=10)
+                        _raise_if_cost_budget_exceeded()
                 if tag == "stderr":
                     captured_output.append(line)
                     print(line, end="", file=sys.stderr)
@@ -6418,6 +6460,8 @@ def run_agent_with_prompt(
                         total_tokens = _total_tracked_tokens(tokens_in=tokens_in, tokens_out=tokens_out)
                         if token_budget is not None and total_tokens is not None and total_tokens > token_budget:
                             _raise_if_token_budget_exceeded()
+                        if cost_budget_usd is not None and cost_usd is not None and cost_usd > cost_budget_usd:
+                            _raise_if_cost_budget_exceeded()
                     if tag == "stderr":
                         captured_output.append(line)
                         print(line, end="", file=sys.stderr)
@@ -7186,6 +7230,100 @@ def _validate_project_scope(config: dict, config_path: str) -> None:
                 )
 
 
+def _validate_project_routing(config: dict, config_path: str) -> None:
+    supported_routing_keys = {"default_preset", "rules"}
+    unsupported_routing = sorted(set(config) - supported_routing_keys)
+    if unsupported_routing:
+        raise RuntimeError(
+            f"Unsupported key(s) in project config {config_path} under 'routing': "
+            + ", ".join(unsupported_routing)
+        )
+
+    if "default_preset" in config:
+        value = config["default_preset"]
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError("Project config key 'routing.default_preset' must be a non-empty string")
+
+    if "rules" not in config:
+        return
+
+    rules = config["rules"]
+    if not isinstance(rules, list):
+        raise RuntimeError("Project config key 'routing.rules' must be an array")
+
+    for index, rule in enumerate(rules):
+        prefix = f"routing.rules[{index}]"
+        if not isinstance(rule, dict):
+            raise RuntimeError(f"Project config key '{prefix}' must be an object")
+        unsupported_rule = sorted(set(rule) - {"when", "preset"})
+        if unsupported_rule:
+            raise RuntimeError(
+                f"Unsupported key(s) in project config {config_path} under '{prefix}': "
+                + ", ".join(unsupported_rule)
+            )
+
+        preset_value = rule.get("preset")
+        if not isinstance(preset_value, str) or not preset_value.strip():
+            raise RuntimeError(f"Project config key '{prefix}.preset' must be a non-empty string")
+
+        when = rule.get("when")
+        if not isinstance(when, dict):
+            raise RuntimeError(f"Project config key '{prefix}.when' must be an object")
+
+        unsupported_when = sorted(set(when) - {"labels", "task_types", "scope", "needs_decomposition"})
+        if unsupported_when:
+            raise RuntimeError(
+                f"Unsupported key(s) in project config {config_path} under '{prefix}.when': "
+                + ", ".join(unsupported_when)
+            )
+
+        for list_key in ["labels", "task_types"]:
+            if list_key not in when:
+                continue
+            values = when[list_key]
+            if not isinstance(values, list) or not all(isinstance(item, str) and item.strip() for item in values):
+                raise RuntimeError(f"Project config key '{prefix}.when.{list_key}' must be an array of non-empty strings")
+            if list_key == "task_types":
+                invalid = sorted({str(item) for item in values if str(item).strip().lower() not in ROUTING_RULE_TASK_TYPES})
+                if invalid:
+                    raise RuntimeError(
+                        f"Project config key '{prefix}.when.task_types' supports only: "
+                        + ", ".join(sorted(ROUTING_RULE_TASK_TYPES))
+                    )
+
+        if "scope" in when:
+            scope_value = when["scope"]
+            if scope_value not in {"in", "out"}:
+                raise RuntimeError(f"Project config key '{prefix}.when.scope' must be one of: in, out")
+
+        if "needs_decomposition" in when and not isinstance(when["needs_decomposition"], bool):
+            raise RuntimeError(f"Project config key '{prefix}.when.needs_decomposition' must be a boolean")
+
+
+def _validate_project_budgets(config: dict, config_path: str) -> None:
+    supported_budget_keys = {"max_attempts_per_task", "max_runtime_minutes", "max_cost_usd", "max_model_tier"}
+    unsupported = sorted(set(config) - supported_budget_keys)
+    if unsupported:
+        raise RuntimeError(
+            f"Unsupported key(s) in project config {config_path} under 'budgets': "
+            + ", ".join(unsupported)
+        )
+
+    for int_key in ["max_attempts_per_task", "max_runtime_minutes"]:
+        if int_key in config and (type(config[int_key]) is not int or config[int_key] <= 0):
+            raise RuntimeError(f"Project config key 'budgets.{int_key}' must be a positive integer")
+
+    if "max_cost_usd" in config:
+        value = config["max_cost_usd"]
+        if not isinstance(value, (int, float)) or value <= 0:
+            raise RuntimeError("Project config key 'budgets.max_cost_usd' must be a positive number")
+
+    if "max_model_tier" in config:
+        value = _as_optional_string(config["max_model_tier"])
+        if value not in PRESET_TIER_ORDER:
+            raise RuntimeError("Project config key 'budgets.max_model_tier' must be one of: cheap, default, hard")
+
+
 def _validate_project_retry(config: dict, config_path: str) -> None:
     supported_retry_keys = {"max_attempts", "escalate_to_preset"}
     unsupported_retry = sorted(set(config) - supported_retry_keys)
@@ -7312,7 +7450,9 @@ def validate_project_config(config: dict, config_path: str) -> dict:
         "workflow",
         "defaults",
         "scope",
+        "routing",
         "retry",
+        "budgets",
         "communication",
         "presets",
     }
@@ -7324,7 +7464,7 @@ def validate_project_config(config: dict, config_path: str) -> dict:
             f"Unsupported key(s) in project config {config_path}: {unsupported_text}"
         )
 
-    for key in ["workflow", "defaults", "scope", "retry", "communication", "presets"]:
+    for key in ["workflow", "defaults", "scope", "routing", "retry", "budgets", "communication", "presets"]:
         if key in config and not isinstance(config[key], dict):
             raise RuntimeError(f"Project config key '{key}' must be an object")
 
@@ -7340,9 +7480,17 @@ def validate_project_config(config: dict, config_path: str) -> dict:
     if isinstance(scope, dict):
         _validate_project_scope(scope, config_path)
 
+    routing = config.get("routing")
+    if isinstance(routing, dict):
+        _validate_project_routing(routing, config_path)
+
     retry = config.get("retry")
     if isinstance(retry, dict):
         _validate_project_retry(retry, config_path)
+
+    budgets = config.get("budgets")
+    if isinstance(budgets, dict):
+        _validate_project_budgets(budgets, config_path)
 
     communication = config.get("communication")
     if isinstance(communication, dict):
@@ -7359,6 +7507,22 @@ def validate_project_config(config: dict, config_path: str) -> dict:
             raise RuntimeError(
                 f"Project config key 'defaults.preset' references unknown preset '{default_preset}'"
             )
+    if isinstance(routing, dict):
+        routing_default_preset = _as_optional_string(routing.get("default_preset"))
+        if routing_default_preset is not None and routing_default_preset not in preset_names:
+            raise RuntimeError(
+                f"Project config key 'routing.default_preset' references unknown preset '{routing_default_preset}'"
+            )
+        routing_rules = routing.get("rules") if isinstance(routing.get("rules"), list) else []
+        for index, rule in enumerate(routing_rules):
+            if not isinstance(rule, dict):
+                continue
+            routed_preset = _as_optional_string(rule.get("preset"))
+            if routed_preset is not None and routed_preset not in preset_names:
+                raise RuntimeError(
+                    f"Project config key 'routing.rules[{index}].preset' references unknown preset '{routed_preset}'"
+                )
+
     if isinstance(retry, dict):
         _validate_retry_references(retry, preset_names, config_path, "retry")
     if isinstance(presets, dict):
@@ -7621,6 +7785,247 @@ def preset_cli_defaults(project_config: dict, preset_name: str | None) -> dict:
         if key in preset_config:
             cli_defaults[key] = preset_config[key]
     return cli_defaults
+
+
+def _argv_has_flag(argv: list[str], *flags: str) -> bool:
+    for flag in flags:
+        if any(arg == flag or arg.startswith(f"{flag}=") for arg in argv):
+            return True
+    return False
+
+
+def _preset_tier(preset_name: str | None) -> str | None:
+    normalized = _as_optional_string(preset_name)
+    if normalized in PRESET_TIER_ORDER:
+        return normalized
+    return None
+
+
+def _tier_rank(tier: str | None) -> int | None:
+    if tier is None:
+        return None
+    try:
+        return PRESET_TIER_ORDER.index(tier)
+    except ValueError:
+        return None
+
+
+def _cap_preset_to_budget_tier(project_config: dict, preset_name: str | None, max_model_tier: str | None) -> str | None:
+    normalized_preset = _as_optional_string(preset_name)
+    normalized_tier = _as_optional_string(max_model_tier)
+    if normalized_preset is None or normalized_tier is None:
+        return normalized_preset
+
+    preset_rank = _tier_rank(_preset_tier(normalized_preset))
+    budget_rank = _tier_rank(normalized_tier)
+    if preset_rank is None or budget_rank is None or preset_rank <= budget_rank:
+        return normalized_preset
+
+    presets = project_config.get("presets")
+    if not isinstance(presets, dict):
+        return normalized_preset
+
+    for candidate in reversed(PRESET_TIER_ORDER[: budget_rank + 1]):
+        if candidate in presets:
+            return candidate
+    return normalized_preset
+
+
+def _matches_routing_rule(
+    rule_when: dict,
+    issue: dict,
+    task_type: str,
+    scope_eligible: bool,
+    needs_decomposition: bool,
+) -> bool:
+    labels = _normalize_match_list(rule_when.get("labels"))
+    if labels:
+        issue_labels = set(_issue_label_names(issue))
+        if not any(label in issue_labels for label in labels):
+            return False
+
+    task_types = _normalize_match_list(rule_when.get("task_types"))
+    if task_types and task_type.strip().lower() not in task_types:
+        return False
+
+    scope = _as_optional_string(rule_when.get("scope"))
+    if scope == "in" and not scope_eligible:
+        return False
+    if scope == "out" and scope_eligible:
+        return False
+
+    if "needs_decomposition" in rule_when and bool(rule_when.get("needs_decomposition")) != needs_decomposition:
+        return False
+
+    return True
+
+
+def choose_routed_preset(
+    project_config: dict,
+    issue: dict,
+    task_type: str,
+    scope_eligible: bool,
+    needs_decomposition: bool,
+) -> str | None:
+    routing = project_config.get("routing")
+    if isinstance(routing, dict):
+        rules = routing.get("rules") if isinstance(routing.get("rules"), list) else []
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            when = rule.get("when")
+            if not isinstance(when, dict):
+                continue
+            if _matches_routing_rule(when, issue, task_type, scope_eligible, needs_decomposition):
+                routed_preset = _as_optional_string(rule.get("preset"))
+                if routed_preset is not None:
+                    return routed_preset
+
+        default_preset = _as_optional_string(routing.get("default_preset"))
+        if default_preset is not None:
+            return default_preset
+
+    presets = project_config.get("presets")
+    if not isinstance(presets, dict) or not presets:
+        return None
+    if needs_decomposition and "hard" in presets:
+        return "hard"
+    if "cheap" in presets:
+        return "cheap"
+    if "default" in presets:
+        return "default"
+    if "hard" in presets:
+        return "hard"
+    return None
+
+
+def resolve_task_execution_settings(
+    args: argparse.Namespace,
+    argv: list[str],
+    project_config: dict,
+    issue: dict,
+    task_type: str,
+    scope_eligible: bool,
+    needs_decomposition: bool,
+) -> dict[str, object]:
+    settings: dict[str, object] = {
+        "preset": _as_optional_string(getattr(args, "preset", None)),
+        "runner": getattr(args, "runner", BUILTIN_DEFAULTS["runner"]),
+        "agent": getattr(args, "agent", BUILTIN_DEFAULTS["agent"]),
+        "model": getattr(args, "model", BUILTIN_DEFAULTS["model"]),
+        "track_tokens": bool(getattr(args, "track_tokens", BUILTIN_DEFAULTS["track_tokens"])),
+        "token_budget": getattr(args, "token_budget", BUILTIN_DEFAULTS["token_budget"]),
+        "agent_timeout_seconds": getattr(
+            args,
+            "agent_timeout_seconds",
+            BUILTIN_DEFAULTS["agent_timeout_seconds"],
+        ),
+        "agent_idle_timeout_seconds": getattr(
+            args,
+            "agent_idle_timeout_seconds",
+            BUILTIN_DEFAULTS["agent_idle_timeout_seconds"],
+        ),
+        "max_attempts": getattr(args, "max_attempts", BUILTIN_DEFAULTS["max_attempts"]),
+        "escalate_to_preset": _as_optional_string(
+            getattr(args, "escalate_to_preset", BUILTIN_DEFAULTS["escalate_to_preset"])
+        ),
+    }
+
+    explicit_preset = _argv_has_flag(argv, "--preset")
+    selected_preset = settings["preset"] if explicit_preset else choose_routed_preset(
+        project_config=project_config,
+        issue=issue,
+        task_type=task_type,
+        scope_eligible=scope_eligible,
+        needs_decomposition=needs_decomposition,
+    )
+    selected_preset = _as_optional_string(selected_preset)
+
+    if selected_preset is not None:
+        settings["preset"] = selected_preset
+        preset_defaults = preset_cli_defaults(project_config, selected_preset)
+        explicit_overrides = {
+            "runner": _argv_has_flag(argv, "--runner"),
+            "agent": _argv_has_flag(argv, "--agent"),
+            "model": _argv_has_flag(argv, "--model"),
+            "track_tokens": _argv_has_flag(argv, "--track-tokens"),
+            "token_budget": _argv_has_flag(argv, "--token-budget", "--max-tokens"),
+            "agent_timeout_seconds": _argv_has_flag(argv, "--agent-timeout-seconds"),
+            "agent_idle_timeout_seconds": _argv_has_flag(argv, "--agent-idle-timeout-seconds"),
+            "max_attempts": _argv_has_flag(argv, "--max-attempts"),
+            "escalate_to_preset": _argv_has_flag(argv, "--escalate-to-preset"),
+        }
+        for key, value in preset_defaults.items():
+            if key == "preset" or explicit_overrides.get(key, False):
+                continue
+            settings[key] = value
+
+    budgets = project_config.get("budgets") if isinstance(project_config.get("budgets"), dict) else {}
+    max_model_tier = _as_optional_string(budgets.get("max_model_tier"))
+    if max_model_tier is not None:
+        capped_preset = _cap_preset_to_budget_tier(project_config, _as_optional_string(settings.get("preset")), max_model_tier)
+        if capped_preset != settings.get("preset"):
+            settings["preset"] = capped_preset
+            capped_defaults = preset_cli_defaults(project_config, capped_preset)
+            for key, value in capped_defaults.items():
+                if key != "preset":
+                    settings[key] = value
+        settings["max_model_tier"] = max_model_tier
+
+    max_attempts_cap = _as_positive_int(budgets.get("max_attempts_per_task"))
+    if max_attempts_cap is not None:
+        current_attempts = _as_positive_int(settings.get("max_attempts")) or BUILTIN_DEFAULTS["max_attempts"]
+        settings["max_attempts"] = min(current_attempts, max_attempts_cap)
+
+    runtime_cap_minutes = _as_positive_int(budgets.get("max_runtime_minutes"))
+    if runtime_cap_minutes is not None:
+        runtime_cap_seconds = runtime_cap_minutes * 60
+        current_timeout = _as_positive_int(settings.get("agent_timeout_seconds")) or runtime_cap_seconds
+        settings["agent_timeout_seconds"] = min(current_timeout, runtime_cap_seconds)
+
+    cost_budget_usd = budgets.get("max_cost_usd")
+    if isinstance(cost_budget_usd, (int, float)):
+        settings["cost_budget_usd"] = float(cost_budget_usd)
+
+    return settings
+
+
+def build_attempt_execution_plan(project_config: dict, initial_settings: dict[str, object]) -> list[dict[str, object]]:
+    max_attempts = _as_positive_int(initial_settings.get("max_attempts")) or 1
+    max_model_tier = _as_optional_string(initial_settings.get("max_model_tier"))
+    plan: list[dict[str, object]] = []
+    current_settings = dict(initial_settings)
+
+    for attempt in range(1, max_attempts + 1):
+        attempt_settings = dict(current_settings)
+        attempt_settings["attempt"] = attempt
+        plan.append(attempt_settings)
+
+        next_preset = _as_optional_string(current_settings.get("escalate_to_preset"))
+        if next_preset is None:
+            continue
+        next_preset = _cap_preset_to_budget_tier(project_config, next_preset, max_model_tier)
+        if next_preset is None:
+            continue
+        next_defaults = preset_cli_defaults(project_config, next_preset)
+        current_settings = dict(current_settings)
+        current_settings.update(next_defaults)
+        current_settings["preset"] = next_preset
+        if max_model_tier is not None:
+            current_settings["max_model_tier"] = max_model_tier
+
+    return plan
+
+
+def _attempt_settings_summary(attempt_settings: dict[str, object]) -> str:
+    runner = str(attempt_settings.get("runner") or BUILTIN_DEFAULTS["runner"])
+    model = attempt_settings.get("model") or "default"
+    preset = _as_optional_string(attempt_settings.get("preset"))
+    attempt = _as_positive_int(attempt_settings.get("attempt")) or 1
+    max_attempts = _as_positive_int(attempt_settings.get("max_attempts")) or 1
+    if preset is None:
+        return f"attempt {attempt}/{max_attempts} (runner={runner}, model={model})"
+    return f"attempt {attempt}/{max_attempts} using preset {preset} (runner={runner}, model={model})"
 
 
 def without_keys(config: dict, *keys: str) -> dict:
@@ -8075,6 +8480,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Retry policy placeholder: maximum attempts before escalation or failure.",
     )
     parser.add_argument(
+        "--escalate-to-preset",
+        dest="escalate_to_preset",
+        help="Preset to switch to on later attempts after failures.",
+    )
+    parser.add_argument(
         "--opencode-auto-approve",
         action="store_true",
         help=(
@@ -8514,6 +8924,10 @@ def main() -> int:
             pr_recovered_decomposition_rollup: dict | None = None
             pr_agent_run_stats: dict[str, object] | None = None
             workflow_check_results: list[dict] | None = None
+            pr_runner = args.runner
+            pr_agent = args.agent
+            pr_model = args.model
+            pr_attempt = 1
             original_cwd = os.getcwd()
             original_branch = current_branch()
             switched_branch = False
@@ -8701,9 +9115,9 @@ def main() -> int:
                                     pr_number=pr_number_arg,
                                     branch=active_branch,
                                     base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
+                                    runner=pr_runner,
+                                    agent=pr_agent,
+                                    model=pr_model,
                                     attempt=current_attempt,
                                     stage="ci_checks",
                                     next_action="wait_for_ci",
@@ -9190,6 +9604,8 @@ def main() -> int:
                         failure_stage = "residual_untracked_validation"
                     elif isinstance(exc, TokenBudgetExceededError):
                         failure_stage = "token_budget"
+                    elif isinstance(exc, CostBudgetExceededError):
+                        failure_stage = "cost_budget"
 
                     failure_status = failure_state_for_stage(failure_stage)
                     next_action = failure_next_action_for_stage(failure_stage)
@@ -9211,9 +9627,9 @@ def main() -> int:
                             pr_number=failed_pr_number,
                             branch=str(pr_state_context.get("branch") or "") or None,
                             base_branch=str(pr_state_context.get("base_branch") or "") or None,
-                            runner=args.runner,
-                            agent=args.agent,
-                            model=args.model,
+                            runner=locals().get("pr_runner", args.runner),
+                            agent=locals().get("pr_agent", args.agent),
+                            model=locals().get("pr_model", args.model),
                             attempt=pr_attempt,
                             stage=failure_stage,
                             next_action=next_action,
@@ -9292,6 +9708,7 @@ def main() -> int:
             state_attempt = 1
             orchestration_attempt = 1
             supports_github_issue_ops = issue_tracker(issue) == TRACKER_GITHUB and type(issue["number"]) is int
+            decomposition_assessment = assess_issue_decomposition_need(issue)
 
             scope_decision = evaluate_issue_scope(issue=issue, scope_defaults=scope_defaults)
             scope_eligible = bool(scope_decision.get("eligible", True))
@@ -9331,10 +9748,10 @@ def main() -> int:
                                 pr_number=None,
                                 branch=issue_branch,
                                 base_branch=base_branch if base_branch else None,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
-                                attempt=1,
+                                runner=active_runner,
+                                agent=active_agent,
+                                model=active_model,
+                                attempt=active_attempt,
                                 stage="scope_check",
                                 next_action="adjust_scope_or_force_reprocess",
                                 error=short_error_text(scope_reason),
@@ -9558,6 +9975,7 @@ def main() -> int:
             if mode == "issue-flow" and decompose_mode != "never":
                 failure_stage = "decomposition_preflight"
                 should_plan, assessment = should_issue_decompose(issue, decompose_mode)
+                decomposition_assessment = assessment
                 latest_plan = None
                 plan_warnings: list[str] = []
                 latest_payload_dict = {}
@@ -10248,7 +10666,7 @@ def main() -> int:
                         target_type=state_target_type,
                         target_number=state_target_number,
                         dry_run=args.dry_run,
-                        state=build_orchestration_state(
+                            state=build_orchestration_state(
                                 status="in-progress",
                                 task_type="pr",
                                 issue_number=issue["number"],
@@ -10319,6 +10737,60 @@ def main() -> int:
                             )
                     target_base_branch = base_branch
 
+                execution_settings = resolve_task_execution_settings(
+                    args=args,
+                    argv=raw_argv,
+                    project_config=project_config,
+                    issue=issue,
+                    task_type="pr" if mode == "pr-review" else "issue",
+                    scope_eligible=scope_eligible,
+                    needs_decomposition=bool(decomposition_assessment.get("needs_decomposition")),
+                )
+                active_runner = str(execution_settings.get("runner") or args.runner)
+                active_agent = str(execution_settings.get("agent") or args.agent)
+                active_model = execution_settings.get("model")
+                active_preset = _as_optional_string(execution_settings.get("preset"))
+                active_track_tokens = bool(execution_settings.get("track_tokens", False))
+                active_token_budget = execution_settings.get("token_budget")
+                active_cost_budget_usd = execution_settings.get("cost_budget_usd")
+                active_timeout_seconds = int(
+                    execution_settings.get("agent_timeout_seconds") or args.agent_timeout_seconds
+                )
+                active_idle_timeout_seconds = execution_settings.get("agent_idle_timeout_seconds")
+                active_max_attempts = int(execution_settings.get("max_attempts") or max_attempts)
+                active_escalate_to_preset = _as_optional_string(execution_settings.get("escalate_to_preset"))
+                attempt_plan = build_attempt_execution_plan(project_config, execution_settings)
+                if not attempt_plan:
+                    attempt_plan = [dict(execution_settings) | {"attempt": state_attempt or 1}]
+                elif state_attempt > 1:
+                    attempt_plan = [
+                        dict(attempt_settings) | {"attempt": state_attempt + index - 1}
+                        for index, attempt_settings in enumerate(attempt_plan, start=1)
+                    ]
+                if attempt_plan:
+                    first_attempt_settings = attempt_plan[0]
+                    active_attempt = int(first_attempt_settings.get("attempt") or state_attempt)
+                    active_runner = str(first_attempt_settings.get("runner") or active_runner)
+                    active_agent = str(first_attempt_settings.get("agent") or active_agent)
+                    active_model = first_attempt_settings.get("model")
+                    active_preset = _as_optional_string(first_attempt_settings.get("preset"))
+                    active_track_tokens = bool(first_attempt_settings.get("track_tokens", active_track_tokens))
+                    active_token_budget = first_attempt_settings.get("token_budget")
+                    active_cost_budget_usd = first_attempt_settings.get("cost_budget_usd")
+                    active_timeout_seconds = int(
+                        first_attempt_settings.get("agent_timeout_seconds") or active_timeout_seconds
+                    )
+                    active_idle_timeout_seconds = first_attempt_settings.get("agent_idle_timeout_seconds")
+                    active_max_attempts = int(first_attempt_settings.get("max_attempts") or active_max_attempts)
+                    active_escalate_to_preset = _as_optional_string(first_attempt_settings.get("escalate_to_preset"))
+
+                if active_preset is not None:
+                    preset_prefix = "[dry-run] " if args.dry_run else ""
+                    print(
+                        f"{preset_prefix}Execution preset for {issue_label}: {active_preset} "
+                        f"(runner={active_runner}, model={active_model or 'default'}, attempts={active_max_attempts})"
+                    )
+
                 stacked_base_context = (
                     target_base_branch if mode == "issue-flow" and base_branch_mode == "current" else None
                 )
@@ -10337,10 +10809,10 @@ def main() -> int:
                                 pr_number=None,
                                 branch=issue_branch,
                                 base_branch=target_base_branch,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
-                                attempt=orchestration_attempt,
+                                runner=active_runner,
+                                agent=active_agent,
+                                model=active_model,
+                                attempt=active_attempt,
                                 stage="agent_run",
                                 next_action="wait_for_agent_result",
                                 error=None,
@@ -10408,36 +10880,95 @@ def main() -> int:
                         cwd=os.getcwd(),
                         env=issue_hook_env,
                     )
-                    failure_stage = "agent_run"
                     issue_agent_run_stats = {}
                     agent_result: dict[str, object] = {}
-                    exit_code = run_agent(
-                        issue=issue,
-                        runner=args.runner,
-                        agent=args.agent,
-                        model=args.model,
-                        dry_run=args.dry_run,
-                        timeout_seconds=args.agent_timeout_seconds,
-                        idle_timeout_seconds=args.agent_idle_timeout_seconds,
-                        opencode_auto_approve=args.opencode_auto_approve,
-                        image_paths=issue_image_paths,
-                        prompt_override=prompt_override,
-                        track_tokens=track_tokens,
-                        token_budget=token_budget,
-                        run_stats=issue_agent_run_stats,
-                        agent_result=agent_result,
-                    )
-                    if exit_code != 0:
+                    agent_error: RuntimeError | None = None
+                    for attempt_settings in attempt_plan:
+                        active_attempt = int(attempt_settings.get("attempt") or state_attempt)
+                        state_attempt = active_attempt
+                        active_runner = str(attempt_settings.get("runner") or active_runner)
+                        active_agent = str(attempt_settings.get("agent") or active_agent)
+                        active_model = attempt_settings.get("model")
+                        active_preset = _as_optional_string(attempt_settings.get("preset"))
+                        active_track_tokens = bool(attempt_settings.get("track_tokens", active_track_tokens))
+                        active_token_budget = attempt_settings.get("token_budget")
+                        active_cost_budget_usd = attempt_settings.get("cost_budget_usd")
+                        active_timeout_seconds = int(
+                            attempt_settings.get("agent_timeout_seconds") or active_timeout_seconds
+                        )
+                        active_idle_timeout_seconds = attempt_settings.get("agent_idle_timeout_seconds")
+                        active_max_attempts = int(attempt_settings.get("max_attempts") or active_max_attempts)
+                        active_escalate_to_preset = _as_optional_string(attempt_settings.get("escalate_to_preset"))
+                        issue_agent_run_stats = {}
+                        agent_result = {}
+
+                        if active_attempt > 1:
+                            print(f"Retrying {issue_label}: {_attempt_settings_summary(attempt_settings)}")
+                            safe_post_orchestration_state_comment(
+                                repo=repo,
+                                target_type=state_target_type,
+                                target_number=state_target_number,
+                                dry_run=args.dry_run,
+                                state=build_orchestration_state(
+                                    status="in-progress",
+                                    task_type="issue" if mode == "issue-flow" else "pr",
+                                    issue_number=issue["number"],
+                                    pr_number=state_pr_number,
+                                    branch=issue_branch,
+                                    base_branch=target_base_branch,
+                                    runner=active_runner,
+                                    agent=active_agent,
+                                    model=active_model,
+                                    attempt=active_attempt,
+                                    stage="agent_run",
+                                    next_action="wait_for_agent_result",
+                                    error=None,
+                                    decomposition=decomposition_rollup,
+                                ),
+                            )
+
+                        failure_stage = "agent_run"
+                        exit_code = run_agent(
+                            issue=issue,
+                            runner=active_runner,
+                            agent=active_agent,
+                            model=active_model,
+                            dry_run=args.dry_run,
+                            timeout_seconds=active_timeout_seconds,
+                            idle_timeout_seconds=active_idle_timeout_seconds,
+                            opencode_auto_approve=args.opencode_auto_approve,
+                            image_paths=issue_image_paths,
+                            prompt_override=prompt_override,
+                            track_tokens=active_track_tokens,
+                            token_budget=active_token_budget,
+                            cost_budget_usd=active_cost_budget_usd,
+                            run_stats=issue_agent_run_stats,
+                            agent_result=agent_result,
+                        )
+                        if exit_code == 0:
+                            agent_error = None
+                            break
+
                         exit_summary = describe_exit_code(exit_code)
                         diagnosis = classify_opencode_failure(
                             return_code=exit_code,
-                            model=args.model,
-                        ) if args.runner == "opencode" else None
+                            model=active_model,
+                        ) if active_runner == "opencode" else None
                         message = (
                             f"Agent failed for {issue_label} with {exit_summary}"
                             + (f" ({diagnosis})" if diagnosis else "")
                         )
-                        raise RuntimeError(message)
+                        agent_error = RuntimeError(message)
+                        if active_attempt >= active_max_attempts:
+                            break
+                        next_attempt = active_attempt + 1
+                        print(
+                            f"{message}; escalating to attempt {next_attempt}/{active_max_attempts}."
+                        )
+
+                    if agent_error is not None:
+                        raise agent_error
+
                     failure_stage = "workflow_hooks"
                     run_workflow_hook(
                         hooks=configured_hooks,
@@ -10471,10 +11002,10 @@ def main() -> int:
                                     pr_number=state_pr_number,
                                     branch=issue_branch,
                                     base_branch=target_base_branch,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
-                                    attempt=1,
+                                    runner=active_runner,
+                                    agent=active_agent,
+                                    model=active_model,
+                                    attempt=active_attempt,
                                     stage="agent_run",
                                     next_action="await_author_reply",
                                     error=reason or question,
@@ -10495,9 +11026,9 @@ def main() -> int:
                                     parent_issue=decomposition_parent_issue,
                                     parent_branch=decomposition_parent_branch,
                                     base_branch=base_branch if base_branch else None,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
+                                    runner=active_runner,
+                                    agent=active_agent,
+                                    model=active_model,
                                     plan_payload=decomposition_parent_payload,
                                     dry_run=args.dry_run,
                                 )
@@ -10554,9 +11085,9 @@ def main() -> int:
                                     pr_number=state_pr_number,
                                     branch=issue_branch,
                                     base_branch=target_base_branch,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
+                                    runner=active_runner,
+                                    agent=active_agent,
+                                    model=active_model,
                                     attempt=state_attempt,
                                     stage="changes_pushed",
                                     next_action="wait_for_ci",
@@ -10578,10 +11109,10 @@ def main() -> int:
                                     pr_number=parse_pr_number_from_url(pr_url),
                                     branch=issue_branch,
                                     base_branch=target_base_branch,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
-                                    attempt=orchestration_attempt,
+                                    runner=active_runner,
+                                    agent=active_agent,
+                                    model=active_model,
+                                    attempt=active_attempt,
                                     stage="pr_ready",
                                     next_action="wait_for_review",
                                     error=None,
@@ -10607,9 +11138,9 @@ def main() -> int:
                                 parent_issue=decomposition_parent_issue,
                                 parent_branch=decomposition_parent_branch,
                                 base_branch=base_branch if base_branch else None,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
+                                runner=active_runner,
+                                agent=active_agent,
+                                model=active_model,
                                 plan_payload=decomposition_parent_payload,
                                 dry_run=args.dry_run,
                             )
@@ -10682,10 +11213,10 @@ def main() -> int:
                             pr_number=parse_pr_number_from_url(pr_url),
                             branch=issue_branch,
                             base_branch=target_base_branch,
-                            runner=args.runner,
-                            agent=args.agent,
-                            model=args.model,
-                            attempt=orchestration_attempt,
+                            runner=active_runner,
+                            agent=active_agent,
+                            model=active_model,
+                            attempt=active_attempt,
                             stage="pr_ready",
                             next_action="wait_for_review",
                             error=None,
@@ -10707,10 +11238,10 @@ def main() -> int:
                             pr_number=state_pr_number,
                             branch=issue_branch,
                             base_branch=target_base_branch,
-                            runner=args.runner,
-                            agent=args.agent,
-                            model=args.model,
-                            attempt=state_attempt,
+                            runner=active_runner,
+                            agent=active_agent,
+                            model=active_model,
+                            attempt=active_attempt,
                             stage="changes_pushed",
                             next_action="wait_for_ci",
                             error=None,
@@ -10762,9 +11293,9 @@ def main() -> int:
                         parent_issue=decomposition_parent_issue,
                         parent_branch=decomposition_parent_branch,
                         base_branch=base_branch if base_branch else None,
-                        runner=args.runner,
-                        agent=args.agent,
-                        model=args.model,
+                                runner=active_runner,
+                                agent=active_agent,
+                                model=active_model,
                         plan_payload=decomposition_parent_payload,
                         dry_run=args.dry_run,
                     )
@@ -10783,6 +11314,8 @@ def main() -> int:
                 failure_stage = "residual_untracked_validation"
             elif isinstance(exc, TokenBudgetExceededError):
                 failure_stage = "token_budget"
+            elif isinstance(exc, CostBudgetExceededError):
+                failure_stage = "cost_budget"
 
             failure_status = failure_state_for_stage(failure_stage)
             next_action = failure_next_action_for_stage(failure_stage)
@@ -10803,9 +11336,9 @@ def main() -> int:
                         pr_number=state_pr_number,
                         branch=locals().get("issue_branch", None),
                         base_branch=locals().get("target_base_branch", None),
-                        runner=args.runner,
-                        agent=args.agent,
-                        model=args.model,
+                        runner=active_runner,
+                        agent=active_agent,
+                        model=active_model,
                         attempt=state_attempt,
                         stage=failure_stage,
                         next_action=next_action,
@@ -10827,9 +11360,9 @@ def main() -> int:
                         parent_issue=decomposition_parent_issue,
                         parent_branch=decomposition_parent_branch,
                         base_branch=base_branch if base_branch else None,
-                        runner=args.runner,
-                        agent=args.agent,
-                        model=args.model,
+                        runner=active_runner,
+                        agent=active_agent,
+                        model=active_model,
                         plan_payload=decomposition_parent_payload,
                         dry_run=args.dry_run,
                     )
@@ -10848,9 +11381,9 @@ def main() -> int:
                     error=str(exc),
                     branch=locals().get("issue_branch", None),
                     base_branch=locals().get("target_base_branch", None),
-                    runner=args.runner,
-                    agent=args.agent,
-                    model=args.model,
+                    runner=active_runner,
+                    agent=active_agent,
+                    model=active_model,
                     residual_untracked_files=residual_untracked_files,
                     next_action=next_action,
                     dry_run=args.dry_run,

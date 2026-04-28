@@ -7331,9 +7331,9 @@ def main() -> int:
                     pr_number=pr_number_arg,
                     branch=active_branch,
                     base_branch=str(pr_state_context["base_branch"] or "") or None,
-                    runner=args.runner,
-                    agent=args.agent,
-                    model=args.model,
+                    runner=pr_runner,
+                    agent=pr_agent,
+                    model=pr_model,
                     attempt=pr_attempt,
                     stage="agent_run",
                     next_action="wait_for_agent_result",
@@ -7380,9 +7380,9 @@ def main() -> int:
                                 pr_number=pr_number_arg,
                                 branch=active_branch,
                                 base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
+                                runner=pr_runner,
+                                agent=pr_agent,
+                                model=pr_model,
                                 attempt=current_attempt,
                                 stage="ci_checks",
                                 next_action="wait_for_ci",
@@ -7417,9 +7417,9 @@ def main() -> int:
                                     pr_number=pr_number_arg,
                                     branch=active_branch,
                                     base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
+                                    runner=pr_runner,
+                                    agent=pr_agent,
+                                    model=pr_model,
                                     attempt=current_attempt,
                                     stage="ci_checks",
                                     next_action="retry_ci_after_transient_failure",
@@ -7448,9 +7448,9 @@ def main() -> int:
                                     pr_number=pr_number_arg,
                                     branch=active_branch,
                                     base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
+                                    runner=pr_runner,
+                                    agent=pr_agent,
+                                    model=pr_model,
                                     attempt=current_attempt,
                                     stage="ci_checks",
                                     next_action="manual_ci_fix_required",
@@ -7489,9 +7489,9 @@ def main() -> int:
                                 pr_number=pr_number_arg,
                                 branch=active_branch,
                                 base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
+                                runner=pr_runner,
+                                agent=pr_agent,
+                                model=pr_model,
                                 attempt=retry_attempt,
                                 stage="ci_checks",
                                 next_action="run_ci_fix_agent",
@@ -7527,9 +7527,9 @@ def main() -> int:
                                     pr_number=pr_number_arg,
                                     branch=active_branch,
                                     base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
+                                    runner=pr_runner,
+                                    agent=pr_agent,
+                                    model=pr_model,
                                     attempt=current_attempt,
                                     stage="ci_checks",
                                     next_action="update_pr_with_required_files",
@@ -7557,9 +7557,9 @@ def main() -> int:
                                 pr_number=pr_number_arg,
                                 branch=active_branch,
                                 base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
+                                runner=pr_runner,
+                                agent=pr_agent,
+                                model=pr_model,
                                 attempt=current_attempt,
                                 stage="ci_checks",
                                 next_action="ready_for_merge",
@@ -7586,9 +7586,9 @@ def main() -> int:
                         pr_number=pr_number_arg,
                         branch=active_branch,
                         base_branch=str(pr_state_context["base_branch"] or "") or None,
-                        runner=args.runner,
-                        agent=args.agent,
-                        model=args.model,
+                        runner=pr_runner,
+                        agent=pr_agent,
+                        model=pr_model,
                         attempt=pr_attempt,
                                  stage="review_feedback",
                                  next_action="await_new_review_comments",
@@ -7642,7 +7642,7 @@ def main() -> int:
                 timeout_seconds=int(pr_execution_settings.get("agent_timeout_seconds") or args.agent_timeout_seconds),
                 idle_timeout_seconds=pr_execution_settings.get("agent_idle_timeout_seconds"),
                 opencode_auto_approve=args.opencode_auto_approve,
-                track_tokens=track_tokens,
+                track_tokens=bool(pr_execution_settings.get("track_tokens", False)),
                 token_budget=pr_execution_settings.get("token_budget"),
                 cost_budget_usd=pr_execution_settings.get("cost_budget_usd"),
                 run_stats=pr_agent_run_stats,
@@ -7686,10 +7686,10 @@ def main() -> int:
                             pr_number=pr_number_arg,
                             branch=active_branch,
                             base_branch=str(pr_state_context["base_branch"] or "") or None,
-                            runner=args.runner,
-                            agent=args.agent,
-                            model=args.model,
-                            attempt=1,
+                            runner=pr_runner,
+                            agent=pr_agent,
+                            model=pr_model,
+                            attempt=pr_attempt,
                             stage="agent_run",
                             next_action="await_author_reply",
                             error=reason or question,
@@ -7715,9 +7715,9 @@ def main() -> int:
                         pr_number=pr_number_arg,
                         branch=active_branch,
                         base_branch=str(pr_state_context["base_branch"] or "") or None,
-                        runner=args.runner,
-                        agent=args.agent,
-                        model=args.model,
+                        runner=pr_runner,
+                        agent=pr_agent,
+                        model=pr_model,
                         attempt=pr_attempt,
                         stage="post_agent_check",
                         next_action="await_more_feedback_or_manual_changes",
@@ -7764,9 +7764,9 @@ def main() -> int:
                         pr_number=pr_number_arg,
                         branch=active_branch,
                         base_branch=str(pr_state_context["base_branch"] or "") or None,
-                        runner=args.runner,
-                        agent=args.agent,
-                        model=args.model,
+                        runner=pr_runner,
+                        agent=pr_agent,
+                        model=pr_model,
                         attempt=pr_attempt,
                         stage="changes_pushed",
                         next_action="wait_for_ci",
@@ -7823,9 +7823,9 @@ def main() -> int:
                             pr_number=failed_pr_number,
                             branch=str(pr_state_context.get("branch") or "") or None,
                             base_branch=str(pr_state_context.get("base_branch") or "") or None,
-                            runner=args.runner,
-                            agent=args.agent,
-                            model=args.model,
+                            runner=locals().get("pr_runner", args.runner),
+                            agent=locals().get("pr_agent", args.agent),
+                            model=locals().get("pr_model", args.model),
                             attempt=pr_attempt,
                             stage=failure_stage,
                             next_action=next_action,
@@ -7898,6 +7898,22 @@ def main() -> int:
             selected_decomposition_child = False
             issue_agent_run_stats: dict[str, object] | None = None
             state_attempt = 1
+            active_attempt = state_attempt
+            active_runner = str(getattr(args, "runner", BUILTIN_DEFAULTS["runner"]))
+            active_agent = str(getattr(args, "agent", BUILTIN_DEFAULTS["agent"]))
+            active_model = getattr(args, "model", BUILTIN_DEFAULTS["model"])
+            active_preset = _as_optional_string(getattr(args, "preset", None))
+            active_track_tokens = bool(getattr(args, "track_tokens", BUILTIN_DEFAULTS["track_tokens"]))
+            active_token_budget = getattr(args, "token_budget", BUILTIN_DEFAULTS["token_budget"])
+            active_cost_budget_usd: float | None = None
+            active_timeout_seconds = int(
+                getattr(args, "agent_timeout_seconds", BUILTIN_DEFAULTS["agent_timeout_seconds"])
+            )
+            active_idle_timeout_seconds = getattr(args, "agent_idle_timeout_seconds", None)
+            active_max_attempts = int(getattr(args, "max_attempts", BUILTIN_DEFAULTS["max_attempts"]))
+            active_escalate_to_preset = _as_optional_string(
+                getattr(args, "escalate_to_preset", BUILTIN_DEFAULTS["escalate_to_preset"])
+            )
             supports_github_issue_ops = issue_tracker(issue) == TRACKER_GITHUB and type(issue["number"]) is int
             decomposition_assessment = assess_issue_decomposition_need(issue)
 
@@ -8963,6 +8979,7 @@ def main() -> int:
                 active_agent = str(execution_settings.get("agent") or args.agent)
                 active_model = execution_settings.get("model")
                 active_preset = _as_optional_string(execution_settings.get("preset"))
+                active_track_tokens = bool(execution_settings.get("track_tokens", False))
                 active_token_budget = execution_settings.get("token_budget")
                 active_cost_budget_usd = execution_settings.get("cost_budget_usd")
                 active_timeout_seconds = int(
@@ -8972,6 +8989,8 @@ def main() -> int:
                 active_max_attempts = int(execution_settings.get("max_attempts") or max_attempts)
                 active_escalate_to_preset = _as_optional_string(execution_settings.get("escalate_to_preset"))
                 attempt_plan = build_attempt_execution_plan(project_config, execution_settings)
+                if attempt_plan:
+                    active_attempt = int(attempt_plan[0].get("attempt") or state_attempt)
 
                 if active_preset is not None:
                     preset_prefix = "[dry-run] " if args.dry_run else ""
@@ -9057,17 +9076,18 @@ def main() -> int:
                     agent_result: dict[str, object] = {}
                     exit_code = run_agent(
                         issue=issue,
-                        runner=args.runner,
-                        agent=args.agent,
-                        model=args.model,
+                        runner=active_runner,
+                        agent=active_agent,
+                        model=active_model,
                         dry_run=args.dry_run,
-                        timeout_seconds=args.agent_timeout_seconds,
-                        idle_timeout_seconds=args.agent_idle_timeout_seconds,
+                        timeout_seconds=active_timeout_seconds,
+                        idle_timeout_seconds=active_idle_timeout_seconds,
                         opencode_auto_approve=args.opencode_auto_approve,
                         image_paths=issue_image_paths,
                         prompt_override=prompt_override,
-                        track_tokens=track_tokens,
-                        token_budget=token_budget,
+                        track_tokens=active_track_tokens,
+                        token_budget=active_token_budget,
+                        cost_budget_usd=active_cost_budget_usd,
                         run_stats=issue_agent_run_stats,
                         agent_result=agent_result,
                     )
@@ -9075,8 +9095,8 @@ def main() -> int:
                         exit_summary = describe_exit_code(exit_code)
                         diagnosis = classify_opencode_failure(
                             return_code=exit_code,
-                            model=args.model,
-                        ) if args.runner == "opencode" else None
+                            model=active_model,
+                        ) if active_runner == "opencode" else None
                         message = (
                             f"Agent failed for {issue_label} with {exit_summary}"
                             + (f" ({diagnosis})" if diagnosis else "")
@@ -9107,10 +9127,10 @@ def main() -> int:
                                     pr_number=state_pr_number,
                                     branch=issue_branch,
                                     base_branch=target_base_branch,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
-                                    attempt=1,
+                                    runner=active_runner,
+                                    agent=active_agent,
+                                    model=active_model,
+                                    attempt=active_attempt,
                                     stage="agent_run",
                                     next_action="await_author_reply",
                                     error=reason or question,
@@ -9131,9 +9151,9 @@ def main() -> int:
                                     parent_issue=decomposition_parent_issue,
                                     parent_branch=decomposition_parent_branch,
                                     base_branch=base_branch if base_branch else None,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
+                                    runner=active_runner,
+                                    agent=active_agent,
+                                    model=active_model,
                                     plan_payload=decomposition_parent_payload,
                                     dry_run=args.dry_run,
                                 )
@@ -9189,9 +9209,9 @@ def main() -> int:
                                     pr_number=state_pr_number,
                                     branch=issue_branch,
                                     base_branch=target_base_branch,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
+                                    runner=active_runner,
+                                    agent=active_agent,
+                                    model=active_model,
                                     attempt=state_attempt,
                                     stage="changes_pushed",
                                     next_action="wait_for_ci",
@@ -9265,9 +9285,9 @@ def main() -> int:
                                 pr_number=state_pr_number,
                                 branch=issue_branch,
                                 base_branch=target_base_branch,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
+                                runner=active_runner,
+                                agent=active_agent,
+                                model=active_model,
                                 attempt=state_attempt,
                                 stage="post_agent_check",
                                 next_action="await_more_context",
@@ -9376,9 +9396,9 @@ def main() -> int:
                                 pr_number=state_pr_number,
                                 branch=issue_branch,
                                 base_branch=target_base_branch,
-                                runner=args.runner,
-                                agent=args.agent,
-                                model=args.model,
+                                runner=active_runner,
+                                agent=active_agent,
+                                model=active_model,
                                 attempt=state_attempt,
                                 stage="changes_pushed",
                                 next_action="wait_for_ci",
@@ -9442,9 +9462,9 @@ def main() -> int:
                         pr_number=state_pr_number,
                         branch=locals().get("issue_branch", None),
                         base_branch=locals().get("target_base_branch", None),
-                        runner=args.runner,
-                        agent=args.agent,
-                        model=args.model,
+                        runner=active_runner,
+                        agent=active_agent,
+                        model=active_model,
                         attempt=state_attempt,
                         stage=failure_stage,
                         next_action=next_action,

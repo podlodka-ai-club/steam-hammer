@@ -1448,6 +1448,114 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertIn("retry limit reached", posted_state["error"])
         self.assertIn("retry limit reached", stdout_mock.getvalue())
 
+    def test_main_issue_flow_uses_routed_execution_settings_for_agent_run(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=100,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="claude",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=1800,
+            agent_idle_timeout_seconds=None,
+            token_budget=50000,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            dir=".",
+            local_config="local-config.json",
+            project_config="project-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            max_attempts=4,
+            decompose="never",
+            create_child_issues=False,
+            track_tokens=False,
+            isolate_worktree=True,
+        )
+        issue = {
+            "number": 100,
+            "title": "Budget-aware routing",
+            "body": "Route routine tasks cheaply and cap execution budgets.",
+            "url": "https://example/issues/100",
+            "labels": [{"name": "docs"}],
+        }
+        project_config = {
+            "routing": {
+                "default_preset": "default",
+                "rules": [{"when": {"labels": ["docs"]}, "preset": "cheap"}],
+            },
+            "budgets": {
+                "max_attempts_per_task": 2,
+                "max_runtime_minutes": 5,
+                "max_cost_usd": 0.5,
+                "max_model_tier": "default",
+            },
+            "presets": {
+                "cheap": {
+                    "runner": "opencode",
+                    "agent": "build",
+                    "model": "openai/gpt-4o-mini",
+                    "token_budget": 8000,
+                    "agent_timeout_seconds": 900,
+                    "max_attempts": 3,
+                },
+                "default": {"runner": "opencode", "model": "openai/gpt-4o"},
+            },
+        }
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.load_project_config", return_value=project_config))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="created"))
+            run_agent_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.commit_changes"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_configured_workflow_checks", return_value=[]))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.push_branch"))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.ensure_pr",
+                    return_value=("created", "https://example/pull/100"),
+                )
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"))
+            state_post_mock = stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment")
+            )
+
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        run_agent_mock.assert_called_once()
+        self.assertEqual(run_agent_mock.call_args.kwargs["runner"], "opencode")
+        self.assertEqual(run_agent_mock.call_args.kwargs["model"], "openai/gpt-4o-mini")
+        self.assertEqual(run_agent_mock.call_args.kwargs["token_budget"], 8000)
+        self.assertEqual(run_agent_mock.call_args.kwargs["timeout_seconds"], 300)
+        self.assertEqual(run_agent_mock.call_args.kwargs["cost_budget_usd"], 0.5)
+        self.assertFalse(run_agent_mock.call_args.kwargs["track_tokens"])
+
+        posted_states = [call.kwargs["state"] for call in state_post_mock.call_args_list]
+        self.assertTrue(any(state.get("runner") == "opencode" for state in posted_states))
+        self.assertTrue(any(state.get("model") == "openai/gpt-4o-mini" for state in posted_states))
+
     def test_main_issue_flow_posts_blocked_state_when_token_budget_exceeded(self) -> None:
         args = argparse.Namespace(
             repo="owner/repo",

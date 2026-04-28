@@ -86,6 +86,7 @@ def push_recovered_branch(
     dry_run: bool,
     *,
     push_branch: Callable[..., None],
+    expected_repo_root: str | None = None,
 ) -> None:
     changed = bool(result.get("changed"))
     if not changed:
@@ -97,6 +98,7 @@ def push_recovered_branch(
         branch_name=branch_name,
         dry_run=dry_run,
         force_with_lease=force_with_lease,
+        expected_repo_root=expected_repo_root,
     )
     prefix = "[dry-run] " if dry_run else ""
     print(
@@ -311,7 +313,11 @@ def run_conflict_recovery_for_branch(
     print_branch_sync_result: Callable[..., None],
     verify_recovered_branch: Callable[[dict[str, object]], None] | None = None,
     push_recovered_branch: Callable[..., None],
+    verify_git_context: Callable[[], None] | None = None,
+    expected_repo_root: str | None = None,
 ) -> dict[str, object]:
+    if verify_git_context is not None:
+        verify_git_context()
     result = sync_reused_branch_with_base(
         base_branch=base_branch,
         branch_name=branch_name,
@@ -321,5 +327,10 @@ def run_conflict_recovery_for_branch(
     print_branch_sync_result(result, dry_run=dry_run)
     if verify_recovered_branch is not None:
         verify_recovered_branch(result)
-    push_recovered_branch(branch_name=branch_name, result=result, dry_run=dry_run)
+    push_recovered_branch(
+        branch_name=branch_name,
+        result=result,
+        dry_run=dry_run,
+        expected_repo_root=expected_repo_root,
+    )
     return result

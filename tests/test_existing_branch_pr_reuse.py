@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.run_github_issues_to_opencode import (
+    BranchContextMismatchError,
     ensure_pr,
     main,
     prepare_issue_branch,
@@ -14,7 +15,17 @@ from scripts.run_github_issues_to_opencode import (
 
 class ExistingBranchAndPrReuseTests(unittest.TestCase):
     @patch("scripts.run_github_issues_to_opencode.run_command")
-    def test_push_branch_uses_force_with_lease_when_requested(self, run_command_mock) -> None:
+    @patch("scripts.run_github_issues_to_opencode.current_repo_root", return_value="/repo")
+    @patch(
+        "scripts.run_github_issues_to_opencode.current_branch",
+        return_value="issue-fix/33-sync-reused-branch",
+    )
+    def test_push_branch_uses_force_with_lease_when_requested(
+        self,
+        _current_branch,
+        _current_repo_root,
+        run_command_mock,
+    ) -> None:
         push_branch(
             branch_name="issue-fix/33-sync-reused-branch",
             dry_run=False,
@@ -333,6 +344,11 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
             patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"),
             patch(
+                "scripts.run_github_issues_to_opencode.current_branch",
+                return_value="issue-fix/33-sync-reused-branch",
+            ),
+            patch("scripts.run_github_issues_to_opencode.current_repo_root", return_value="/tmp/worker-33"),
+            patch(
                 "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
                 return_value={
                     "status": "synced-cleanly",
@@ -363,6 +379,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 branch_name="issue-fix/33-sync-reused-branch",
                 dry_run=False,
                 force_with_lease=True,
+                expected_repo_root="/tmp/worker-33",
             ),
             push_branch_mock.call_args_list,
         )
@@ -380,6 +397,74 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             fail_on_existing=False,
             stacked_base_context=None,
         )
+
+    def test_main_posts_branch_context_failure_before_commit(self) -> None:
+        args = type("Args", (), {
+            "repo": "owner/repo",
+            "issue": 192,
+            "state": "open",
+            "limit": 10,
+            "runner": "opencode",
+            "agent": "build",
+            "model": None,
+            "agent_timeout_seconds": 900,
+            "agent_idle_timeout_seconds": None,
+            "opencode_auto_approve": False,
+            "branch_prefix": "issue-fix",
+            "include_empty": False,
+            "stop_on_error": False,
+            "fail_on_existing": False,
+            "force_issue_flow": False,
+            "sync_reused_branch": True,
+            "sync_strategy": "rebase",
+            "dir": ".",
+            "local_config": "local-config.json",
+            "dry_run": False,
+        })()
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_issue",
+                return_value={
+                    "number": 192,
+                    "title": "Automate failed recovery follow-up",
+                    "body": "Fix the worker isolation bug",
+                    "url": "https://github.com/owner/repo/issues/192",
+                },
+            ),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="created"),
+            patch("scripts.run_github_issues_to_opencode.current_repo_root", return_value="/tmp/worker-192"),
+            patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0),
+            patch("scripts.run_github_issues_to_opencode.has_changes", return_value=True),
+            patch(
+                "scripts.run_github_issues_to_opencode.commit_changes",
+                side_effect=BranchContextMismatchError(
+                    operation="commit issue changes",
+                    expected_branch="issue-fix/192-automate-failed-recovery-fol",
+                    actual_branch="issue-fix/194-extract-go-worker-registry",
+                    expected_repo_root="/tmp/worker-192",
+                    actual_repo_root="/tmp/worker-194",
+                ),
+            ),
+            patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment") as state_post_mock,
+            patch("scripts.run_github_issues_to_opencode.safe_report_issue_automation_failure"),
+            patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("branch_context_validation", str(state_post_mock.call_args))
+        state_payload = state_post_mock.call_args.kwargs["state"]
+        self.assertEqual(state_payload["stage"], "branch_context_validation")
+        self.assertEqual(state_payload["next_action"], "restore_worker_branch_context_and_retry")
+        self.assertIn("expected branch 'issue-fix/192-automate-failed-recovery-fol'", state_payload["error"])
+        self.assertIn("Issue #192 failed", stderr_mock.getvalue())
 
     def test_main_pr_review_mode_rerun_with_conflicted_open_pr_auto_resolves_and_pushes(self) -> None:
         args = type("Args", (), {
@@ -482,6 +567,15 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             stack.enter_context(patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"))
             stack.enter_context(
                 patch(
+                    "scripts.run_github_issues_to_opencode.current_branch",
+                    return_value="issue-fix/35-auto-resolve-pr-conflicts",
+                )
+            )
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.current_repo_root", return_value="/tmp/worker-35")
+            )
+            stack.enter_context(
+                patch(
                     "scripts.run_github_issues_to_opencode.current_head_sha",
                     side_effect=["sha-before-rebase", "sha-before-merge", "sha-after-merge"],
                 )
@@ -519,6 +613,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 branch_name="issue-fix/35-auto-resolve-pr-conflicts",
                 dry_run=False,
                 force_with_lease=False,
+                expected_repo_root="/tmp/worker-35",
             ),
             push_branch_mock.call_args_list,
         )
@@ -580,6 +675,11 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
             patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
             patch(
+                "scripts.run_github_issues_to_opencode.current_branch",
+                return_value="issue-fix/33-recover-branch",
+            ),
+            patch("scripts.run_github_issues_to_opencode.current_repo_root", return_value="/tmp/worker-33"),
+            patch(
                 "scripts.run_github_issues_to_opencode.fetch_issue",
                 return_value={
                     "number": 33,
@@ -622,6 +722,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             branch_name="issue-fix/33-recover-branch",
             dry_run=False,
             force_with_lease=True,
+            expected_repo_root="/tmp/worker-33",
         )
         output = stdout_mock.getvalue()
         self.assertIn("Selected mode: conflict-recovery-only", output)
@@ -656,6 +757,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
             patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
             patch("scripts.run_github_issues_to_opencode.current_branch", return_value="feature/pr-72"),
+            patch("scripts.run_github_issues_to_opencode.current_repo_root", return_value="/tmp/pr-72"),
             patch("scripts.run_github_issues_to_opencode.checkout_pr_target_branch"),
             patch(
                 "scripts.run_github_issues_to_opencode.fetch_pull_request",
@@ -728,6 +830,11 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
             patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
             patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch(
+                "scripts.run_github_issues_to_opencode.current_branch",
+                return_value="issue-fix/33-recover-branch",
+            ),
+            patch("scripts.run_github_issues_to_opencode.current_repo_root", return_value="/tmp/worker-33"),
             patch(
                 "scripts.run_github_issues_to_opencode.fetch_issue",
                 return_value={
@@ -843,6 +950,15 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             stack.enter_context(patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"))
             stack.enter_context(
                 patch(
+                    "scripts.run_github_issues_to_opencode.current_branch",
+                    return_value="issue-fix/35-auto-resolve-pr-conflicts",
+                )
+            )
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.current_repo_root", return_value="/tmp/worker-35")
+            )
+            stack.enter_context(
+                patch(
                     "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
                     return_value={
                         "status": "auto-resolved",
@@ -879,6 +995,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 branch_name="issue-fix/35-auto-resolve-pr-conflicts",
                 dry_run=False,
                 force_with_lease=False,
+                expected_repo_root="/tmp/worker-35",
             ),
             push_branch_mock.call_args_list,
         )
@@ -986,6 +1103,15 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             stack.enter_context(patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"))
             stack.enter_context(
                 patch(
+                    "scripts.run_github_issues_to_opencode.current_branch",
+                    return_value="issue-fix/35-auto-sync-stale-pr",
+                )
+            )
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.current_repo_root", return_value="/tmp/worker-35")
+            )
+            stack.enter_context(
+                patch(
                     "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
                     return_value={
                         "status": "synced-cleanly",
@@ -1022,6 +1148,7 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
                 branch_name="issue-fix/35-auto-sync-stale-pr",
                 dry_run=False,
                 force_with_lease=True,
+                expected_repo_root="/tmp/worker-35",
             ),
             push_branch_mock.call_args_list,
         )

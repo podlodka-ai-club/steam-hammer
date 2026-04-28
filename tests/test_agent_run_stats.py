@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.run_github_issues_to_opencode import (
+    CostBudgetExceededError,
     TokenBudgetExceededError,
     _build_agent_run_stats,
     _parse_cost_value,
@@ -216,6 +217,43 @@ class AgentRunStatsTests(unittest.TestCase):
         self.assertEqual(run_stats["tokens_in"], 20000)
         self.assertEqual(run_stats["tokens_out"], 1400)
         self.assertEqual(run_stats["tokens_total"], 21400)
+
+    def test_run_agent_with_prompt_stops_when_cost_budget_exceeded(self) -> None:
+        process = self._FakeProcess(
+            stdout_lines=["Estimated cost: $0.4200\n"],
+            poll_results=[None, None, 0],
+        )
+        run_stats: dict[str, object] = {}
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.subprocess.Popen", return_value=process),
+            patch(
+                "scripts.run_github_issues_to_opencode.time.monotonic",
+                side_effect=[0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            with self.assertRaises(CostBudgetExceededError) as exc_info:
+                run_agent_with_prompt(
+                    prompt="fix it",
+                    item_label="issue #100",
+                    runner="opencode",
+                    agent="build",
+                    model=None,
+                    dry_run=False,
+                    timeout_seconds=900,
+                    idle_timeout_seconds=None,
+                    opencode_auto_approve=False,
+                    track_tokens=True,
+                    token_budget=None,
+                    cost_budget_usd=0.1,
+                    run_stats=run_stats,
+                )
+
+        self.assertTrue(process.killed)
+        self.assertIn("cost budget of $0.1000 exceeded", str(exc_info.exception))
+        self.assertIn("Agent stopped: cost budget of $0.1000 exceeded", stdout_mock.getvalue())
+        self.assertEqual(run_stats["cost_usd"], 0.42)
 
 
 if __name__ == "__main__":

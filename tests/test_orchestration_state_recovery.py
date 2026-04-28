@@ -675,6 +675,111 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertIn("Use strict mode by default.", prompt_override)
         self.assertIn("Selected mode: issue-flow", stdout_mock.getvalue())
 
+    def test_main_retries_agent_with_escalated_attempt_plan(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=100,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="claude",
+            agent="build",
+            model=None,
+            preset=None,
+            max_attempts=1,
+            escalate_to_preset=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            decompose="never",
+            create_child_issues=False,
+            track_tokens=False,
+            dir=".",
+            local_config="local-config.json",
+            project_config="project-config.json",
+            dry_run=False,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            isolate_worktree=True,
+        )
+        issue = {
+            "number": 100,
+            "title": "Budget-aware routing",
+            "body": "Route cheap tasks first",
+            "url": "https://example/issues/100",
+            "labels": [{"name": "docs"}],
+            "author": {"login": "issue-author"},
+        }
+        project_config = {
+            "routing": {"default_preset": "cheap"},
+            "presets": {
+                "cheap": {
+                    "runner": "opencode",
+                    "model": "openai/gpt-4o-mini",
+                    "max_attempts": 2,
+                    "escalate_to_preset": "default",
+                },
+                "default": {
+                    "runner": "claude",
+                    "model": "claude-sonnet-4-5",
+                    "max_attempts": 2,
+                },
+            },
+        }
+        run_calls: list[tuple[str, object]] = []
+
+        def fake_run_agent(**kwargs):
+            run_calls.append((kwargs["runner"], kwargs["model"]))
+            if len(run_calls) == 1:
+                return 1
+            return 0
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.load_project_config", return_value=project_config),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]),
+            patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False),
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="created"),
+            patch("scripts.run_github_issues_to_opencode.run_agent", side_effect=fake_run_agent),
+            patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False),
+            patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"),
+            patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment") as state_comment_mock,
+            patch("scripts.run_github_issues_to_opencode.run_command"),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            run_calls,
+            [
+                ("opencode", "openai/gpt-4o-mini"),
+                ("claude", "claude-sonnet-4-5"),
+            ],
+        )
+        retry_state = state_comment_mock.call_args_list[1].kwargs["state"]
+        self.assertEqual(retry_state["status"], "in-progress")
+        self.assertEqual(retry_state["attempt"], 2)
+        self.assertEqual(retry_state["runner"], "claude")
+        self.assertEqual(retry_state["model"], "claude-sonnet-4-5")
+        self.assertIn("Retrying issue #100: attempt 2/2 using preset default", stdout_mock.getvalue())
+
     def test_main_parent_decomposition_executes_selected_child_issue(self) -> None:
         args = argparse.Namespace(
             repo="owner/repo",

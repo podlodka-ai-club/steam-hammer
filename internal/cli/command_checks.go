@@ -106,7 +106,7 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 		return a.runDetachedStatusList(*workerDir, *asJSON)
 	}
 	if strings.TrimSpace(*worker) != "" {
-		return a.runDetachedStatus(*workerDir, *worker)
+		return a.runDetachedStatus(*workerDir, *worker, *asJSON)
 	}
 
 	pythonArgs := []string{runnerScript, "--status"}

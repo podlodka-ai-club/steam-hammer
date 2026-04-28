@@ -65,6 +65,7 @@ type detachedWorkerLinkedReport struct {
 	Next        string `json:"next,omitempty"`
 	Blockers    string `json:"blockers,omitempty"`
 	PR          string `json:"pr,omitempty"`
+	PRReadiness string `json:"pr_readiness,omitempty"`
 	Updated     string `json:"updated,omitempty"`
 }
 
@@ -83,7 +84,40 @@ type detachedWorkerReport struct {
 	Log           detachedWorkerLogReport      `json:"log"`
 	Linked        *detachedWorkerLinkedReport  `json:"linked,omitempty"`
 	Session       *detachedWorkerSessionReport `json:"session,omitempty"`
+	Batch         *detachedBatchStatusReport   `json:"batch,omitempty"`
 	Next          string                       `json:"next,omitempty"`
+}
+
+type detachedBatchStatusReport struct {
+	RequestedIssueIDs []string                   `json:"requested_issue_ids,omitempty"`
+	Done              []string                   `json:"done,omitempty"`
+	Current           []string                   `json:"current,omitempty"`
+	Next              []string                   `json:"next,omitempty"`
+	ChildWorkers      []detachedBatchChildReport `json:"child_workers,omitempty"`
+	LinkedPRs         []string                   `json:"linked_prs,omitempty"`
+	Conflicts         []string                   `json:"conflicts,omitempty"`
+	Verification      []string                   `json:"verification,omitempty"`
+	Failures          []string                   `json:"failures,omitempty"`
+}
+
+type detachedBatchChildReport struct {
+	IssueID       string                      `json:"issue_id,omitempty"`
+	WorkerName    string                      `json:"worker_name,omitempty"`
+	ProcessStatus string                      `json:"process_status,omitempty"`
+	LatestState   string                      `json:"latest_state,omitempty"`
+	Current       string                      `json:"current,omitempty"`
+	Next          string                      `json:"next,omitempty"`
+	Blockers      string                      `json:"blockers,omitempty"`
+	PR            string                      `json:"pr,omitempty"`
+	PRReadiness   string                      `json:"pr_readiness,omitempty"`
+	LogLines      int                         `json:"log_lines,omitempty"`
+	LogPath       string                      `json:"log_path,omitempty"`
+	ClonePath     string                      `json:"clone_path,omitempty"`
+	StartedAt     string                      `json:"started_at,omitempty"`
+	StatePath     string                      `json:"state_path,omitempty"`
+	StatusCommand string                      `json:"status_command,omitempty"`
+	Linked        *detachedWorkerLinkedReport `json:"linked,omitempty"`
+	NextCommand   string                      `json:"next_command,omitempty"`
 }
 
 type detachedWorkerPaths struct {
@@ -260,7 +294,7 @@ func readDetachedWorkerState(path string) (detachedWorkerState, error) {
 	return state, nil
 }
 
-func (a *App) runDetachedStatus(configuredRoot, name string) int {
+func (a *App) runDetachedStatus(configuredRoot, name string, asJSON bool) int {
 	workerPaths, err := resolveDetachedWorkerPaths(configuredRoot, ".", normalizeWorkerLookupName(name), workerLookupID(name))
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
@@ -274,6 +308,15 @@ func (a *App) runDetachedStatus(configuredRoot, name string) int {
 		}
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect detached worker state: %v\n", err)
 		return 1
+	}
+	if asJSON {
+		payload, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to encode detached worker report: %v\n", err)
+			return 1
+		}
+		_, _ = fmt.Fprintf(a.out, "%s\n", payload)
+		return 0
 	}
 	state := report.Worker
 	_, _ = fmt.Fprintf(a.out, "worker: %s\n", state.Name)
@@ -312,6 +355,16 @@ func (a *App) runDetachedStatus(configuredRoot, name string) int {
 		_, _ = fmt.Fprintf(a.out, "session-phase: %s\n", report.Session.Phase)
 		_, _ = fmt.Fprintf(a.out, "session-current: %s\n", report.Session.Current)
 		_, _ = fmt.Fprintf(a.out, "session-counts: processed=%d failures=%d\n", report.Session.Processed, report.Session.Failures)
+	}
+	if report.Batch != nil {
+		_, _ = fmt.Fprintf(a.out, "batch-child-workers: %d\n", len(report.Batch.ChildWorkers))
+		_, _ = fmt.Fprintf(a.out, "batch-done: %s\n", joinOrNone(report.Batch.Done))
+		_, _ = fmt.Fprintf(a.out, "batch-current: %s\n", joinOrNone(report.Batch.Current))
+		_, _ = fmt.Fprintf(a.out, "batch-next: %s\n", joinOrNone(report.Batch.Next))
+		_, _ = fmt.Fprintf(a.out, "batch-linked-prs: %s\n", joinOrNone(report.Batch.LinkedPRs))
+		_, _ = fmt.Fprintf(a.out, "batch-conflicts: %s\n", joinOrNone(report.Batch.Conflicts))
+		_, _ = fmt.Fprintf(a.out, "batch-verification: %s\n", joinOrNone(report.Batch.Verification))
+		_, _ = fmt.Fprintf(a.out, "batch-failures: %s\n", joinOrNone(report.Batch.Failures))
 	}
 	_, _ = fmt.Fprintf(a.out, "next: %s\n", report.Next)
 	return 0
@@ -406,10 +459,18 @@ func detachedWorkerReports(configuredRoot string) ([]detachedWorkerReport, error
 }
 
 func detachedWorkerReportFromStateFile(statePath string) (detachedWorkerReport, error) {
+	return detachedWorkerReportFromStateFileWithBatch(statePath, true)
+}
+
+func detachedWorkerReportFromStateFileWithBatch(statePath string, includeBatch bool) (detachedWorkerReport, error) {
 	state, err := readDetachedWorkerState(statePath)
 	if err != nil {
 		return detachedWorkerReport{}, err
 	}
+	return detachedWorkerReportFromState(state, includeBatch)
+}
+
+func detachedWorkerReportFromState(state detachedWorkerState, includeBatch bool) (detachedWorkerReport, error) {
 	processStatus := detachedProcessStatus(state.PID)
 	logReport, err := detachedWorkerLogSummary(state.LogPath)
 	if err != nil {
@@ -426,6 +487,11 @@ func detachedWorkerReportFromStateFile(statePath string) (detachedWorkerReport, 
 	}
 	if session, err := detachedWorkerSessionStatus(state.SessionPath); err == nil {
 		report.Session = session
+	}
+	if includeBatch && state.Batch != nil {
+		if batch, err := detachedBatchStatus(*state.Batch); err == nil {
+			report.Batch = batch
+		}
 	}
 	return report, nil
 }
@@ -512,6 +578,8 @@ func detachedWorkerLinkedStatus(state detachedWorkerState) (*detachedWorkerLinke
 			linked.Blockers = value
 		case "pr":
 			linked.PR = value
+		case "pr readiness":
+			linked.PRReadiness = value
 		case "updated":
 			linked.Updated = value
 		}
@@ -617,4 +685,170 @@ func detachedWorkerStateFromOptions(name, mode, targetKind, targetID string, opt
 		ClonePath:   strings.TrimSpace(*opts.dir),
 		WorkDir:     paths.workDir,
 	}
+}
+
+func detachedBatchStatus(batch detachedBatchMetadata) (*detachedBatchStatusReport, error) {
+	report := &detachedBatchStatusReport{
+		RequestedIssueIDs: append([]string(nil), batch.ChildIssueIDs...),
+		Done:              []string{},
+		Current:           []string{},
+		Next:              []string{},
+		ChildWorkers:      []detachedBatchChildReport{},
+		LinkedPRs:         []string{},
+		Conflicts:         []string{},
+		Verification:      []string{},
+		Failures:          []string{},
+	}
+	for _, child := range batch.ChildWorkers {
+		state, err := readDetachedWorkerState(child.StatePath)
+		if err != nil {
+			return nil, err
+		}
+		workerReport, err := detachedWorkerReportFromState(state, false)
+		if err != nil {
+			return nil, err
+		}
+		childReport := detachedBatchChildReport{
+			IssueID:       child.IssueID,
+			WorkerName:    child.WorkerName,
+			ProcessStatus: workerReport.ProcessStatus,
+			LogLines:      workerReport.Log.Lines,
+			LogPath:       child.LogPath,
+			ClonePath:     child.ClonePath,
+			StartedAt:     child.StartedAt,
+			StatePath:     child.StatePath,
+			StatusCommand: child.StatusCommand,
+			NextCommand:   workerReport.Next,
+			Linked:        workerReport.Linked,
+		}
+		if workerReport.Linked != nil {
+			childReport.LatestState = workerReport.Linked.LatestState
+			childReport.Current = workerReport.Linked.Current
+			childReport.Next = workerReport.Linked.Next
+			childReport.Blockers = workerReport.Linked.Blockers
+			childReport.PR = workerReport.Linked.PR
+			childReport.PRReadiness = workerReport.Linked.PRReadiness
+		}
+		report.ChildWorkers = append(report.ChildWorkers, childReport)
+
+		issueLabel := batchIssueLabel(child.IssueID)
+		if isBatchDoneState(workerReport.Linked) {
+			report.Done = append(report.Done, batchStatusEntry(issueLabel, childReport.LatestState, childReport.PR))
+		} else {
+			current := childReport.Current
+			if strings.TrimSpace(current) == "" {
+				current = childReport.LatestState
+			}
+			if strings.TrimSpace(current) == "" {
+				current = workerReport.ProcessStatus
+			}
+			report.Current = append(report.Current, batchStatusEntry(issueLabel, current, childReport.PR))
+		}
+
+		next := strings.TrimSpace(childReport.Next)
+		if next == "" {
+			next = workerReport.Next
+		}
+		if next != "" {
+			report.Next = append(report.Next, fmt.Sprintf("%s: %s", issueLabel, next))
+		}
+		if childReport.PR != "" {
+			report.LinkedPRs = append(report.LinkedPRs, fmt.Sprintf("%s -> %s", issueLabel, childReport.PR))
+		}
+		if childReport.PRReadiness != "" {
+			report.Verification = append(report.Verification, fmt.Sprintf("%s: %s", issueLabel, childReport.PRReadiness))
+		}
+		for _, text := range []string{childReport.Blockers, childReport.Current, childReport.Next, childReport.PRReadiness} {
+			if containsBatchConflict(text) {
+				entry := fmt.Sprintf("%s: %s", issueLabel, strings.TrimSpace(text))
+				report.Conflicts = append(report.Conflicts, entry)
+			}
+			if containsBatchFailure(text) {
+				entry := fmt.Sprintf("%s: %s", issueLabel, strings.TrimSpace(text))
+				report.Failures = append(report.Failures, entry)
+			}
+		}
+		if workerReport.Linked != nil && strings.EqualFold(workerReport.Linked.LatestState, "failed") {
+			report.Failures = append(report.Failures, batchStatusEntry(issueLabel, workerReport.Linked.LatestState, childReport.PR))
+		}
+	}
+	report.Done = dedupeStrings(report.Done)
+	report.Current = dedupeStrings(report.Current)
+	report.Next = dedupeStrings(report.Next)
+	report.LinkedPRs = dedupeStrings(report.LinkedPRs)
+	report.Conflicts = dedupeStrings(report.Conflicts)
+	report.Verification = dedupeStrings(report.Verification)
+	report.Failures = dedupeStrings(report.Failures)
+	return report, nil
+}
+
+func batchIssueLabel(issueID string) string {
+	trimmed := strings.TrimSpace(issueID)
+	if trimmed == "" {
+		return "issue"
+	}
+	return fmt.Sprintf("issue #%s", trimmed)
+}
+
+func batchStatusEntry(issueLabel, value, pr string) string {
+	entry := fmt.Sprintf("%s: %s", issueLabel, strings.TrimSpace(value))
+	if strings.TrimSpace(pr) != "" {
+		entry += fmt.Sprintf(" (%s)", strings.TrimSpace(pr))
+	}
+	return entry
+}
+
+func isBatchDoneState(linked *detachedWorkerLinkedReport) bool {
+	if linked == nil {
+		return false
+	}
+	switch strings.TrimSpace(strings.ToLower(linked.LatestState)) {
+	case "ready-for-review", "waiting-for-ci", "ready-to-merge":
+		return true
+	default:
+		return false
+	}
+}
+
+func containsBatchConflict(raw string) bool {
+	text := strings.ToLower(strings.TrimSpace(raw))
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "conflict")
+}
+
+func containsBatchFailure(raw string) bool {
+	text := strings.ToLower(strings.TrimSpace(raw))
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "failed") || strings.Contains(text, "failure")
+}
+
+func dedupeStrings(values []string) []string {
+	if len(values) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+func joinOrNone(values []string) string {
+	if len(values) == 0 {
+		return "none"
+	}
+	return strings.Join(values, "; ")
 }

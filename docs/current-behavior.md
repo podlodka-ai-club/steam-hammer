@@ -63,7 +63,7 @@
 - Текущий daemon режим остается осторожным: GitHub-only, с ограниченной concurrency и опорой на существующий Python runner.
 - Для `run issue`, `run pr` и `run daemon` появился first-class `--detach` path: worker стартует в фоне и пишет `worker.json`/`worker.log` в `.orchestrator/workers/<issue-N|pr-N|daemon>/`.
 - Во время autonomous batch loop сохраняется session-level checkpoint в `--autonomous-session-file`: done/current/next, issue/PR actions, blockers, счетчики и next checkpoint.
-- `status` теперь умеет читать не только issue/PR state comments, но и session-level checkpoint из `--autonomous-session-file`, а также detached worker metadata через `--worker` и `--workers`, чтобы оператор мог проверить pid/process state, log progress, clone path, linked issue/PR state и session checkpoint без ручных `ps`/`wc -l`/path lookup. Для worker surfaces доступен `--json`.
+- `status` теперь умеет читать не только issue/PR state comments, но и session-level checkpoint из `--autonomous-session-file`, а также detached worker metadata через `--worker` и `--workers`, чтобы оператор мог проверить pid/process state, log progress, clone path, linked issue/PR state и session checkpoint без ручных `ps`/`wc -l`/path lookup. Для worker surfaces доступен `--json`, а `status --worker issue-N` для detached batch child дополнительно сводит batch-level done/current/next, child workers, linked PRs, conflicts, verification и failures.
 - Safe bounded smoke path для текущего entrypoint задокументирован в `docs/daemon-smoke-test.md`.
 - Это рабочий автономный entrypoint ранней стадии, а не финальный service-grade orchestrator.
 

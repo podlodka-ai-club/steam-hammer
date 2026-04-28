@@ -456,6 +456,47 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(linked[0]["number"], 17)
         self.assertEqual(linked[0]["body"], "Issue body context")
 
+    def test_fetch_actionable_pr_review_feedback_uses_active_codehost_provider(self) -> None:
+        pull_request = {
+            "number": 23,
+            "reviews": [],
+            "author": {"login": "alice"},
+        }
+        provider = mock.Mock()
+        provider.fetch_pull_request.return_value = pull_request
+        provider.fetch_pr_review_threads.return_value = []
+        provider.fetch_pr_conversation_comments.return_value = []
+
+        with (
+            mock.patch.object(self.mod, "current_codehost_provider", return_value=provider),
+            mock.patch.object(
+                self.mod,
+                "fetch_pull_request",
+                side_effect=AssertionError("should use codehost provider"),
+            ),
+            mock.patch.object(
+                self.mod,
+                "fetch_pr_review_threads",
+                side_effect=AssertionError("should use codehost provider"),
+            ),
+            mock.patch.object(
+                self.mod,
+                "fetch_pr_conversation_comments",
+                side_effect=AssertionError("should use codehost provider"),
+            ),
+        ):
+            returned_pr, review_items, review_stats = self.mod.fetch_actionable_pr_review_feedback(
+                repo="owner/repo",
+                pr_number=23,
+            )
+
+        provider.fetch_pull_request.assert_called_once_with(repo="owner/repo", number=23)
+        provider.fetch_pr_review_threads.assert_called_once_with(repo="owner/repo", number=23)
+        provider.fetch_pr_conversation_comments.assert_called_once_with(repo="owner/repo", pr_number=23)
+        self.assertEqual(returned_pr, pull_request)
+        self.assertEqual(review_items, [])
+        self.assertEqual(review_stats["threads_total"], 0)
+
     def test_fetch_pr_review_threads_raises_when_pr_missing(self) -> None:
         graphql_response = {
             "data": {

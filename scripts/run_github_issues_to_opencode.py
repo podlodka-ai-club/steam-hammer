@@ -3778,9 +3778,10 @@ def fetch_actionable_pr_review_feedback(
     pr_number: int,
     pull_request: dict | None = None,
 ) -> tuple[dict, list[dict], dict[str, int]]:
-    current_pull_request = pull_request or fetch_pull_request(repo=repo, number=pr_number)
-    threads = fetch_pr_review_threads(repo=repo, number=pr_number)
-    conversation_comments = fetch_pr_conversation_comments(repo=repo, pr_number=pr_number)
+    codehost_provider = current_codehost_provider()
+    current_pull_request = pull_request or codehost_provider.fetch_pull_request(repo=repo, number=pr_number)
+    threads = codehost_provider.fetch_pr_review_threads(repo=repo, number=pr_number)
+    conversation_comments = codehost_provider.fetch_pr_conversation_comments(repo=repo, pr_number=pr_number)
     reviews = current_pull_request.get("reviews")
     if not isinstance(reviews, list):
         reviews = []
@@ -6519,28 +6520,27 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
         )
 
     commands = config.get("commands")
-    if commands is None:
-        return
-    if not isinstance(commands, dict):
-        raise RuntimeError("Project config key 'workflow.commands' must be an object")
+    if commands is not None:
+        if not isinstance(commands, dict):
+            raise RuntimeError("Project config key 'workflow.commands' must be an object")
 
-    supported_commands = set(WORKFLOW_COMMAND_ORDER)
-    unsupported_commands = sorted(set(commands) - supported_commands)
-    if unsupported_commands:
-        raise RuntimeError(
-            f"Unsupported key(s) in project config {config_path} under 'workflow.commands': "
-            + ", ".join(unsupported_commands)
-        )
+        supported_commands = set(WORKFLOW_COMMAND_ORDER)
+        unsupported_commands = sorted(set(commands) - supported_commands)
+        if unsupported_commands:
+            raise RuntimeError(
+                f"Unsupported key(s) in project config {config_path} under 'workflow.commands': "
+                + ", ".join(unsupported_commands)
+            )
 
-    for key in supported_commands:
-        if key in commands and commands[key] is not None and not isinstance(commands[key], str):
-            raise RuntimeError(
-                f"Project config key 'workflow.commands.{key}' must be a string or null"
-            )
-        if key in commands and isinstance(commands[key], str) and not commands[key].strip():
-            raise RuntimeError(
-                f"Project config key 'workflow.commands.{key}' must be a non-empty string or null"
-            )
+        for key in supported_commands:
+            if key in commands and commands[key] is not None and not isinstance(commands[key], str):
+                raise RuntimeError(
+                    f"Project config key 'workflow.commands.{key}' must be a string or null"
+                )
+            if key in commands and isinstance(commands[key], str) and not commands[key].strip():
+                raise RuntimeError(
+                    f"Project config key 'workflow.commands.{key}' must be a non-empty string or null"
+                )
 
     hooks = config.get("hooks")
     if hooks is not None:
@@ -8253,7 +8253,10 @@ def main() -> int:
             while True:
                 pr_attempt = attempt
                 ci_prompt_override: str | None = None
-                linked_issues = load_linked_issue_context(repo=repo, pull_request=pull_request)
+                linked_issues = current_codehost_provider().load_pr_linked_issue_context(
+                    repo=repo,
+                    pull_request=pull_request,
+                )
                 recovered_pr_status = ""
                 if isinstance(recovered_pr_state, dict):
                     recovered_pr_status = str(recovered_pr_state.get("status") or "")

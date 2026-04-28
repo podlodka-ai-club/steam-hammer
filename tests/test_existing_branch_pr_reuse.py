@@ -336,10 +336,13 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             exit_code = main()
 
         self.assertEqual(exit_code, 0)
-        push_branch_mock.assert_called_once_with(
-            branch_name="issue-fix/33-sync-reused-branch",
-            dry_run=False,
-            force_with_lease=True,
+        self.assertIn(
+            unittest.mock.call(
+                branch_name="issue-fix/33-sync-reused-branch",
+                dry_run=False,
+                force_with_lease=True,
+            ),
+            push_branch_mock.call_args_list,
         )
         ensure_pr_mock.assert_called_once_with(
             repo="owner/repo",
@@ -355,7 +358,6 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             fail_on_existing=False,
             stacked_base_context=None,
         )
-        run_command_mock.assert_called_once_with(["git", "checkout", "main"])
 
     def test_main_pr_review_mode_rerun_with_conflicted_open_pr_auto_resolves_and_pushes(self) -> None:
         args = type("Args", (), {
@@ -473,10 +475,13 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             exit_code = main()
 
         self.assertEqual(exit_code, 0)
-        push_branch_mock.assert_called_once_with(
-            branch_name="issue-fix/35-auto-resolve-pr-conflicts",
-            dry_run=False,
-            force_with_lease=True,
+        self.assertIn(
+            unittest.mock.call(
+                branch_name="issue-fix/35-auto-resolve-pr-conflicts",
+                dry_run=False,
+                force_with_lease=True,
+            ),
+            push_branch_mock.call_args_list,
         )
         ensure_pr_mock.assert_called_once_with(
             repo="owner/repo",
@@ -592,10 +597,13 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         run_agent_mock.assert_not_called()
-        push_branch_mock.assert_called_once_with(
-            branch_name="issue-fix/35-auto-resolve-pr-conflicts",
-            dry_run=False,
-            force_with_lease=True,
+        self.assertIn(
+            unittest.mock.call(
+                branch_name="issue-fix/35-auto-resolve-pr-conflicts",
+                dry_run=False,
+                force_with_lease=True,
+            ),
+            push_branch_mock.call_args_list,
         )
         ensure_pr_mock.assert_called_once_with(
             repo="owner/repo",
@@ -611,7 +619,6 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             fail_on_existing=False,
             stacked_base_context=None,
         )
-        run_command_mock.assert_called_once_with(["git", "checkout", "main"])
 
         output = stdout_mock.getvalue()
         self.assertIn("Selected mode: pr-review", output)

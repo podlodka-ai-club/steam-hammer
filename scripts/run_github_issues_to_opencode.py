@@ -44,6 +44,7 @@ from scripts.orchestration_state import (
     select_latest_parseable_orchestration_state,
 )
 from scripts import branch_recovery as _branch_recovery
+from scripts import github_lifecycle as _github_lifecycle
 from scripts.provider_helpers import (
     CodeHostProvider,
     GitHubCodeHostProvider as _GitHubCodeHostProvider,
@@ -2091,79 +2092,30 @@ def current_head_sha() -> str:
 
 
 def detect_repo() -> str:
-    output = run_capture(
-        ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]
-    )
-    repo = output.strip()
-    if not repo:
-        raise RuntimeError("Unable to detect GitHub repository. Use --repo owner/name.")
-    return repo
+    return _github_lifecycle.detect_repo(run_capture=run_capture)
 
 
 def detect_default_branch(repo: str) -> str:
-    output = run_capture(
-        [
-            "gh",
-            "repo",
-            "view",
-            repo,
-            "--json",
-            "defaultBranchRef",
-            "--jq",
-            ".defaultBranchRef.name",
-        ]
-    )
-    branch = output.strip()
-    if not branch:
-        raise RuntimeError(
-            "Unable to detect repository default branch. Use a valid --repo or check gh auth context."
-        )
-    return branch
+    return _github_lifecycle.detect_default_branch(repo, run_capture=run_capture)
 
 
 def fetch_issues(repo: str, state: str, limit: int) -> list[dict]:
-    output = run_capture(
-        [
-            "gh",
-            "issue",
-            "list",
-            "--repo",
-            repo,
-            "--state",
-            state,
-            "--limit",
-            str(limit),
-            "--json",
-            "number,title,body,url,state,labels,author,assignees,createdAt,updatedAt",
-        ]
+    return _github_lifecycle.fetch_issues(
+        repo,
+        state,
+        limit,
+        run_capture=run_capture,
+        tracker_github=TRACKER_GITHUB,
     )
-    issues = json.loads(output)
-    if not isinstance(issues, list):
-        raise RuntimeError("Unexpected response from gh issue list")
-    for issue in issues:
-        if isinstance(issue, dict):
-            issue.setdefault("tracker", TRACKER_GITHUB)
-    return issues
 
 
 def fetch_issue(repo: str, number: int) -> dict:
-    output = run_capture(
-        [
-            "gh",
-            "issue",
-            "view",
-            str(number),
-            "--repo",
-            repo,
-            "--json",
-            "number,title,body,url,state,labels,author,assignees,createdAt,updatedAt",
-        ]
+    return _github_lifecycle.fetch_issue(
+        repo,
+        number,
+        run_capture=run_capture,
+        tracker_github=TRACKER_GITHUB,
     )
-    issue = json.loads(output)
-    if not isinstance(issue, dict):
-        raise RuntimeError(f"Unexpected response fetching issue #{number}")
-    issue.setdefault("tracker", TRACKER_GITHUB)
-    return issue
 
 
 KNOWN_IMAGE_EXTENSIONS = {
@@ -2392,10 +2344,7 @@ def download_issue_images(image_urls: list[str], destination_dir: str, issue_num
 
 
 def split_repo_name(repo: str) -> tuple[str, str]:
-    owner, separator, name = repo.partition("/")
-    if not separator or not owner or not name:
-        raise RuntimeError(f"Invalid repo format '{repo}'. Expected owner/name.")
-    return owner, name
+    return _github_lifecycle.split_repo_name(repo)
 
 
 def _normalize_required_file_path(value: str) -> str:
@@ -2578,84 +2527,11 @@ def validate_required_files_in_pr(pull_request: dict, linked_issues: list[dict] 
 
 
 def fetch_pull_request(repo: str, number: int) -> dict:
-    output = run_capture(
-        [
-            "gh",
-            "pr",
-            "view",
-            str(number),
-            "--repo",
-            repo,
-            "--json",
-            "number,title,body,url,state,mergeStateStatus,mergeable,isDraft,reviewDecision,headRefName,headRefOid,baseRefName,author,closingIssuesReferences,reviews,files",
-        ]
-    )
-    pull_request = json.loads(output)
-    if not isinstance(pull_request, dict):
-        raise RuntimeError(f"Unexpected response fetching PR #{number}")
-    return pull_request
+    return _github_lifecycle.fetch_pull_request(repo, number, run_capture=run_capture)
 
 
 def fetch_pr_review_threads(repo: str, number: int) -> list[dict]:
-    owner, name = split_repo_name(repo)
-    query = """
-query($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) {
-      reviewThreads(first: 100) {
-        nodes {
-          isResolved
-          isOutdated
-          comments(first: 100) {
-            nodes {
-              body
-              path
-              line
-              outdated
-              url
-              author {
-                login
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-""".strip()
-    output = run_capture(
-        [
-            "gh",
-            "api",
-            "graphql",
-            "-f",
-            f"query={query}",
-            "-F",
-            f"owner={owner}",
-            "-F",
-            f"name={name}",
-            "-F",
-            f"number={number}",
-        ]
-    )
-    payload = json.loads(output)
-    if not isinstance(payload, dict):
-        raise RuntimeError("Unexpected response from gh api while fetching PR review threads")
-
-    repository_data = payload.get("data", {}).get("repository")
-    if not isinstance(repository_data, dict):
-        raise RuntimeError("Unexpected GraphQL payload while fetching PR review threads")
-    pull_request = repository_data.get("pullRequest")
-    if pull_request is None:
-        raise RuntimeError(f"Pull request #{number} not found in repository {repo}")
-    if not isinstance(pull_request, dict):
-        raise RuntimeError("Unexpected pullRequest payload while fetching review threads")
-
-    threads = pull_request.get("reviewThreads", {}).get("nodes", [])
-    if not isinstance(threads, list):
-        raise RuntimeError("Unexpected reviewThreads payload while fetching PR review threads")
-    return threads
+    return _github_lifecycle.fetch_pr_review_threads(repo, number, run_capture=run_capture)
 
 
 def _submitted_at_key(review: dict) -> str:
@@ -4689,107 +4565,32 @@ def load_linked_issue_context(repo: str, pull_request: dict) -> list[dict]:
 
 
 def pr_links_issue(pr: dict, issue: dict) -> bool:
-    references = pr.get("closingIssuesReferences")
-    if isinstance(references, list):
-        for reference in references:
-            if not isinstance(reference, dict):
-                continue
-            if issue_tracker(issue) == TRACKER_GITHUB and reference.get("number") == issue.get("number"):
-                return True
-
-    issue_ref = format_issue_ref_from_issue(issue)
-    issue_ref_lower = issue_ref.lower()
-    title = str(pr.get("title") or "")
-    body = str(pr.get("body") or "")
-    if issue_ref_lower in title.lower() or issue_ref_lower in body.lower():
-        return True
-
-    head_ref = str(pr.get("headRefName") or "")
-    if issue_tracker(issue) == TRACKER_GITHUB:
-        issue_number = issue.get("number")
-        if re.search(rf"(^|[^0-9]){issue_number}([^0-9]|$)", head_ref):
-            return True
-    elif issue_ref_lower in head_ref.lower():
-        return True
-
-    return False
+    return _github_lifecycle.pr_links_issue(
+        pr,
+        issue,
+        issue_tracker=issue_tracker,
+        tracker_github=TRACKER_GITHUB,
+        format_issue_ref_from_issue=format_issue_ref_from_issue,
+    )
 
 
 def find_open_pr_for_issue(repo: str, issue: dict) -> dict | None:
-    output = run_capture(
-        [
-            "gh",
-            "pr",
-            "list",
-            "--repo",
-            repo,
-            "--state",
-            "open",
-            "--limit",
-            "100",
-            "--json",
-            "number,title,url,body,headRefName,baseRefName,closingIssuesReferences",
-        ]
+    return _github_lifecycle.find_open_pr_for_issue(
+        repo,
+        issue,
+        run_capture=run_capture,
+        issue_tracker=issue_tracker,
+        tracker_github=TRACKER_GITHUB,
+        format_issue_ref_from_issue=format_issue_ref_from_issue,
     )
-    prs = json.loads(output)
-    if not isinstance(prs, list):
-        raise RuntimeError("Unexpected response from gh pr list while searching linked PR")
-
-    for pr in prs:
-        if isinstance(pr, dict) and pr_links_issue(pr, issue=issue):
-            return pr
-    return None
 
 
 def fetch_pr_review_comments(repo: str, pr_number: int) -> list[dict]:
-    output = run_capture(
-        [
-            "gh",
-            "api",
-            f"repos/{repo}/pulls/{pr_number}/comments",
-            "--method",
-            "GET",
-            "-f",
-            "per_page=100",
-        ]
-    )
-    comments = json.loads(output)
-    if not isinstance(comments, list):
-        raise RuntimeError("Unexpected response from gh api while fetching PR review comments")
-
-    normalized_comments: list[dict] = []
-    for comment in comments:
-        if not isinstance(comment, dict):
-            continue
-        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
-        normalized_comments.append(
-            {
-                "author": str(user.get("login") or "unknown"),
-                "path": str(comment.get("path") or ""),
-                "line": comment.get("line"),
-                "body": str(comment.get("body") or "").strip(),
-                "url": str(comment.get("html_url") or ""),
-            }
-        )
-    return normalized_comments
+    return _github_lifecycle.fetch_pr_review_comments(repo, pr_number, run_capture=run_capture)
 
 
 def fetch_issue_comments(repo: str, issue_number: int) -> list[dict]:
-    output = run_capture(
-        [
-            "gh",
-            "api",
-            f"repos/{repo}/issues/{issue_number}/comments",
-            "--method",
-            "GET",
-            "-f",
-            "per_page=100",
-        ]
-    )
-    comments = json.loads(output)
-    if not isinstance(comments, list):
-        raise RuntimeError("Unexpected response from gh api while fetching issue comments")
-    return comments
+    return _github_lifecycle.fetch_issue_comments(repo, issue_number, run_capture=run_capture)
 
 
 def fetch_commit_check_runs(repo: str, head_sha: str) -> list[dict]:
@@ -5174,21 +4975,11 @@ def orchestration_attempt_from_state(state: dict | None) -> int:
 
 
 def fetch_pr_conversation_comments(repo: str, pr_number: int) -> list[dict]:
-    comments = fetch_issue_comments(repo=repo, issue_number=pr_number)
-
-    normalized_comments: list[dict] = []
-    for comment in comments:
-        if not isinstance(comment, dict):
-            continue
-        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
-        normalized_comments.append(
-            {
-                "author": str(user.get("login") or "unknown"),
-                "body": str(comment.get("body") or "").strip(),
-                "url": str(comment.get("html_url") or ""),
-            }
-        )
-    return normalized_comments
+    return _github_lifecycle.fetch_pr_conversation_comments(
+        repo,
+        pr_number,
+        fetch_issue_comments=fetch_issue_comments,
+    )
 
 
 def current_branch() -> str:
@@ -5245,11 +5036,13 @@ def slugify(text: str) -> str:
 
 
 def branch_name_for_issue(issue: dict, prefix: str) -> str:
-    tracker = issue_tracker(issue)
-    issue_ref = str(issue.get("number") or "").strip()
-    if tracker == TRACKER_JIRA:
-        issue_ref = issue_ref.lower()
-    return f"{prefix}/{issue_ref}-{slugify(issue['title'])}"
+    return _github_lifecycle.branch_name_for_issue(
+        issue,
+        prefix,
+        issue_tracker=issue_tracker,
+        tracker_jira=TRACKER_JIRA,
+        slugify=slugify,
+    )
 
 
 def has_changes() -> bool:
@@ -5285,7 +5078,7 @@ def stage_worktree_changes(pre_run_untracked_files: set[str] | None = None) -> N
 
 
 def sanitize_branch_for_path(branch_name: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9._-]+", "-", branch_name).strip("-") or "pr-branch"
+    return _github_lifecycle.sanitize_branch_for_path(branch_name)
 
 
 def checkout_pr_target_branch(branch_name: str, dry_run: bool) -> None:
@@ -7165,106 +6958,28 @@ def open_pr(
     dry_run: bool,
     stacked_base_context: str | None = None,
 ) -> str:
-    issue_ref = format_issue_ref_from_issue(issue)
-    title = issue_commit_title(issue)
-    body = (
-        "## Summary\n"
-        f"- Implements fix for {issue_ref}\n"
-        f"- Source issue: {issue['url']}\n\n"
+    return _github_lifecycle.open_pr(
+        repo,
+        base_branch,
+        branch_name,
+        issue,
+        dry_run,
+        run_capture=run_capture,
+        format_issue_ref_from_issue=format_issue_ref_from_issue,
+        issue_commit_title=issue_commit_title,
+        issue_tracker=issue_tracker,
+        tracker_github=TRACKER_GITHUB,
+        stacked_base_context=stacked_base_context,
     )
-    if issue_tracker(issue) == TRACKER_GITHUB:
-        body += f"Closes {issue_ref}\n"
-    if stacked_base_context:
-        body += (
-            "\n## Stack Context\n"
-            f"- Stacked on current branch: `{stacked_base_context}`\n"
-            f"- Base for this PR is `{stacked_base_context}` (not repository default branch)\n"
-        )
-    if dry_run:
-        print(
-            f"[dry-run] Would create PR '{title}' from '{branch_name}' to '{base_branch}'"
-        )
-        return ""
-    output = run_capture(
-        [
-            "gh",
-            "pr",
-            "create",
-            "--repo",
-            repo,
-            "--base",
-            base_branch,
-            "--head",
-            branch_name,
-            "--title",
-            title,
-            "--body",
-            body,
-        ]
-    )
-    return output.strip()
 
 
 def find_existing_pr(repo: str, base_branch: str, branch_name: str) -> dict | None:
-    output = run_capture(
-        [
-            "gh",
-            "pr",
-            "list",
-            "--repo",
-            repo,
-            "--base",
-            base_branch,
-            "--head",
-            branch_name,
-            "--state",
-            "open",
-            "--limit",
-            "1",
-            "--json",
-            "number,url,baseRefName",
-        ]
+    return _github_lifecycle.find_existing_pr(
+        repo,
+        base_branch,
+        branch_name,
+        run_capture=run_capture,
     )
-    prs = json.loads(output)
-    if not isinstance(prs, list):
-        raise RuntimeError("Unexpected response from gh pr list")
-    if prs:
-        pr = prs[0]
-        if not isinstance(pr, dict):
-            raise RuntimeError("Unexpected PR entry format from gh pr list")
-        return pr
-
-    output = run_capture(
-        [
-            "gh",
-            "pr",
-            "list",
-            "--repo",
-            repo,
-            "--head",
-            branch_name,
-            "--state",
-            "open",
-            "--limit",
-            "2",
-            "--json",
-            "number,url,baseRefName",
-        ]
-    )
-    prs = json.loads(output)
-    if not isinstance(prs, list):
-        raise RuntimeError("Unexpected response from gh pr list")
-    if not prs:
-        return None
-    if len(prs) > 1:
-        raise RuntimeError(
-            f"Multiple open PRs found for head '{branch_name}'. Resolve ambiguity manually."
-        )
-
-    pr = prs[0]
-    if not isinstance(pr, dict):
-        raise RuntimeError("Unexpected PR entry format from gh pr list")
-    return pr
 
 
 def ensure_pr(
@@ -7276,52 +6991,28 @@ def ensure_pr(
     fail_on_existing: bool,
     stacked_base_context: str | None = None,
 ) -> tuple[str, str]:
-    existing_pr = find_existing_pr(repo=repo, base_branch=base_branch, branch_name=branch_name)
-    if existing_pr is not None:
-        pr_url = str(existing_pr.get("url", "")).strip()
-        pr_number = existing_pr.get("number")
-        existing_base = str(existing_pr.get("baseRefName", "")).strip()
-        if fail_on_existing:
-            if existing_base and existing_base != base_branch:
-                raise RuntimeError(
-                    f"PR already exists for branch '{branch_name}' to '{existing_base}' "
-                    f"(#{pr_number}; selected base '{base_branch}') and --fail-on-existing is enabled"
-                )
-            raise RuntimeError(
-                f"PR already exists for branch '{branch_name}' to '{base_branch}' "
-                f"(#{pr_number}) and --fail-on-existing is enabled"
-            )
-
-        if dry_run:
-            if existing_base and existing_base != base_branch:
-                print(
-                    f"[dry-run] Would reuse existing PR #{pr_number} from '{branch_name}' to "
-                    f"'{existing_base}' (selected base branch: '{base_branch}')"
-                )
-            else:
-                print(
-                    f"[dry-run] Would reuse existing PR #{pr_number} from '{branch_name}' to '{base_branch}'"
-                )
-        else:
-            if existing_base and existing_base != base_branch:
-                print(
-                    f"Reusing existing PR #{pr_number}: {pr_url} "
-                    f"(base '{existing_base}', selected base '{base_branch}')"
-                )
-            else:
-                print(f"Reusing existing PR #{pr_number}: {pr_url}")
-
-        return "reused", pr_url
-
-    pr_url = open_pr(
-        repo=repo,
-        base_branch=base_branch,
-        branch_name=branch_name,
-        issue=issue,
-        dry_run=dry_run,
+    return _github_lifecycle.ensure_pr(
+        repo,
+        base_branch,
+        branch_name,
+        issue,
+        dry_run,
+        fail_on_existing,
+        find_existing_pr=lambda repo_arg, base_arg, branch_arg: find_existing_pr(
+            repo=repo_arg,
+            base_branch=base_arg,
+            branch_name=branch_arg,
+        ),
+        open_pr=lambda repo_arg, base_arg, branch_arg, issue_arg, dry_run_arg, stacked_base_context_arg: open_pr(
+            repo=repo_arg,
+            base_branch=base_arg,
+            branch_name=branch_arg,
+            issue=issue_arg,
+            dry_run=dry_run_arg,
+            stacked_base_context=stacked_base_context_arg,
+        ),
         stacked_base_context=stacked_base_context,
     )
-    return "created", pr_url
 
 
 def resolve_local_config_path(raw_path: str | None, target_dir: str) -> str:

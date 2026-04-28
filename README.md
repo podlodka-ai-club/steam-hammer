@@ -170,10 +170,14 @@ go run ./cmd/orchestrator autodoctor --repo owner/repo
 go run ./cmd/orchestrator verify --repo owner/repo
 go run ./cmd/orchestrator status --issue 71 --repo owner/repo
 go run ./cmd/orchestrator status --pr 72 --repo owner/repo
+go run ./cmd/orchestrator status --worker issue-71
+go run ./cmd/orchestrator status --autonomous-session-file .orchestrator/workers/daemon/session.json
 go run ./cmd/orchestrator run issue --id 71 --repo owner/repo --dry-run
+go run ./cmd/orchestrator run issue --id 71 --repo owner/repo --detach
 go run ./cmd/orchestrator run daemon --repo owner/repo --dry-run --max-cycles 1 --poll-interval-seconds 1 --post-batch-verify
 go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --dry-run
-go run ./cmd/orchestrator run daemon --repo owner/repo --dry-run
+go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --detach
+go run ./cmd/orchestrator run daemon --repo owner/repo --detach
 ```
 
 Bounded daemon smoke-test guidance, including the exact safe operator command and observed output, is documented in [`docs/daemon-smoke-test.md`](docs/daemon-smoke-test.md).
@@ -187,7 +191,10 @@ go run ./cmd/orchestrator autodoctor --repo owner/repo
 go run ./cmd/orchestrator verify --repo owner/repo --create-followup-issue
 go run ./cmd/orchestrator status --issue 20 --repo owner/repo
 go run ./cmd/orchestrator status --pr 22 --repo owner/repo
+go run ./cmd/orchestrator status --worker issue-20
+go run ./cmd/orchestrator status --autonomous-session-file .orchestrator/workers/daemon/session.json
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo
+go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --detach
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --agent build --model openai/gpt-4o
 go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --model openai/gpt-5.3-codex --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
 go run ./cmd/orchestrator run issue --id 31 --repo owner/repo --force-issue-flow
@@ -195,18 +202,21 @@ go run ./cmd/orchestrator run issue --id 31 --repo owner/repo --conflict-recover
 go run ./cmd/orchestrator run issue --id 45 --repo owner/repo --base current --runner opencode --agent build
 go run ./cmd/orchestrator run daemon --repo owner/repo --limit 5 --poll-interval-seconds 120
 go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --allow-pr-branch-switch
+go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --detach
 go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --conflict-recovery-only --allow-pr-branch-switch
 go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --runner opencode --agent review --model openai/gpt-4o --opencode-auto-approve --agent-timeout-seconds 900 --dry-run
-go run ./cmd/orchestrator run daemon --repo owner/repo --limit 1 --poll-interval-seconds 120
+go run ./cmd/orchestrator run daemon --repo owner/repo --limit 1 --poll-interval-seconds 120 --detach
 ```
 
 The Go handlers translate CLI intent into the current Python runner arguments, except `init`, which creates config scaffolds directly in Go. Use `--help` on any command to inspect flags without invoking the runner, and use `--dry-run` for issue/PR/daemon runs to avoid starting agents.
+
+Detached worker files live under `<repo>/.orchestrator/workers/` by default, or under `--worker-dir` if you override it. The predictable worker names are `issue-N`, `pr-N`, and `daemon`, each with `worker.json` metadata and `worker.log`; detached daemon runs also keep `session.json` in the same directory.
 
 Compatibility boundary for Phase 1:
 
 - `run issue` supports single-issue execution through the Python runner. `--issue N` is accepted as a compatibility alias for `--id N`.
 - `run issue --conflict-recovery-only` reuses an existing issue or linked PR branch, syncs it with base, reports whether it was already current, synced cleanly, auto-resolved, or needs manual intervention, and then stops before agent execution.
-- `status` prints a concise summary from the latest parseable orchestration state comment for a single issue or PR, including current state, next action, blockers, source thread/comment, and PR readiness when available.
+- `status` prints a concise summary from the latest parseable orchestration state comment for a single issue or PR, including current state, next action, blockers, source thread/comment, and PR readiness when available. It also accepts `--worker NAME` for detached runtime/process metadata and `--autonomous-session-file PATH` for daemon batch checkpoints.
 - `run daemon` polls tracker issues through the Python runner in autonomous batch mode, reuses orchestration state, and keeps concurrency at one worktree task at a time.
 - A single `run daemon` invocation now keeps a per-run batch session so later poll cycles skip issues that already reached handoff states such as `ready-for-review`, `waiting-for-ci`, or `ready-to-merge`; this lets bounded runs make progress across distinct selected issues.
 - `verify` runs the repository post-batch verification path (`python3 -m unittest discover -s tests -q` and `go test ./...` when available), prints a concise pass/fail summary, and can create a GitHub follow-up issue on failure.
@@ -214,7 +224,7 @@ Compatibility boundary for Phase 1:
 - `run pr --conflict-recovery-only` syncs the current PR branch with its base and exits before fetching review work for the agent.
 - `run daemon` repeatedly invokes the existing Python batch issue flow with `--limit` / `--state` polling semantics; use `--dry-run` to execute a single poll without looping. Add `--post-batch-verify` to run the same verification path automatically after the batch finishes.
 - The per-run skip list is scoped to the current daemon invocation only, so `--force-reprocess` still works for intentional reruns in later invocations.
-- `run daemon` does not write a dedicated logfile today; operator evidence comes from terminal `stdout` / `stderr` unless you redirect it explicitly.
+- `run issue`, `run pr`, and `run daemon` accept `--detach` to start a background worker and write predictable metadata/log files under `.orchestrator/workers/`.
 - `doctor` accepts `--doctor` as a no-op because the command already selects diagnostics mode.
 - `autodoctor` currently routes to the same diagnostics as `doctor`, so workflow-config validation is available from both entrypoints.
 - `init` creates local scaffolds for `project-config.json` and `local-config.json` so users can start with the Go CLI instead of copying files manually.

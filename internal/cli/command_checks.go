@@ -70,8 +70,10 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 	issue := fs.Int("issue", 0, "GitHub issue number")
 	pr := fs.Int("pr", 0, "GitHub pull request number")
 	worker := fs.String("worker", "", "detached worker name: issue-N, pr-N, or daemon")
+	workers := fs.Bool("workers", false, "list detached workers from the local registry")
 	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
 	autonomousSessionFile := fs.String("autonomous-session-file", "", "read daemon batch status from a session checkpoint file")
+	asJSON := fs.Bool("json", false, "print machine-readable JSON")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -93,9 +95,15 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 	if strings.TrimSpace(*autonomousSessionFile) != "" {
 		targets++
 	}
+	if *workers {
+		targets++
+	}
 	if targets != 1 {
-		_, _ = fmt.Fprintln(a.err, "status requires exactly one of --issue N, --pr N, --worker NAME, or --autonomous-session-file PATH")
+		_, _ = fmt.Fprintln(a.err, "status requires exactly one of --issue N, --pr N, --worker NAME, --workers, or --autonomous-session-file PATH")
 		return 2
+	}
+	if *workers {
+		return a.runDetachedStatusList(*workerDir, *asJSON)
 	}
 	if strings.TrimSpace(*worker) != "" {
 		return a.runDetachedStatus(*workerDir, *worker)

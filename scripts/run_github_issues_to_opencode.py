@@ -21,6 +21,25 @@ import threading
 import time
 import signal
 
+from scripts.orchestration_state import (
+    CLARIFICATION_REQUEST_MARKER,
+    DECOMPOSITION_PLAN_MARKER,
+    ORCHESTRATION_CLAIM_MARKER,
+    ORCHESTRATION_STATE_MARKER,
+    build_orchestration_claim,
+    is_active_orchestration_claim,
+    latest_clarification_request_from_agent_output,
+    next_orchestration_attempt,
+    normalize_orchestration_state_status,
+    parse_clarification_request_text,
+    parse_decomposition_plan_comment_body,
+    parse_orchestration_claim_comment_body,
+    parse_orchestration_state_comment_body,
+    select_latest_parseable_decomposition_plan,
+    select_latest_parseable_orchestration_claim,
+    select_latest_parseable_orchestration_state,
+)
+
 
 LOCAL_CONFIG_RELATIVE_PATH = "local-config.json"
 PROJECT_CONFIG_RELATIVE_PATH = "project-config.json"
@@ -75,12 +94,8 @@ JIRA_ENV_VARS = {
 }
 JIRA_ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
 
-ORCHESTRATION_STATE_MARKER = "<!-- orchestration-state:v1 -->"
-ORCHESTRATION_CLAIM_MARKER = "<!-- orchestration-claim:v1 -->"
 AGENT_FAILURE_REPORT_MARKER = "<!-- orchestration-agent-failure:v1 -->"
 SCOPE_DECISION_MARKER = "<!-- orchestration-scope:v1 -->"
-DECOMPOSITION_PLAN_MARKER = "<!-- orchestration-decomposition:v1 -->"
-CLARIFICATION_REQUEST_MARKER = "<!-- orchestration-clarification-request:v1 -->"
 DECOMPOSITION_CHILD_ORDER_PREFIX = "Step"
 AGENT_FAILURE_LABEL_NAME = "auto:agent-failed"
 AGENT_FAILURE_LABEL_COLOR = "B60205"
@@ -2887,291 +2902,6 @@ def finalize_pr_after_ci_success(
         state=state,
     )
     return state
-
-
-def _first_json_object(raw: str) -> dict:
-    start = raw.find("{")
-    if start < 0:
-        raise ValueError("state payload is missing JSON object")
-    payload, _offset = json.JSONDecoder().raw_decode(raw[start:])
-    if not isinstance(payload, dict):
-        raise ValueError("state payload JSON must be an object")
-    return payload
-
-
-def parse_clarification_request_text(raw: str) -> tuple[dict | None, str | None]:
-    if CLARIFICATION_REQUEST_MARKER not in raw:
-        return None, None
-
-    after_marker = raw.split(CLARIFICATION_REQUEST_MARKER, maxsplit=1)[1].strip()
-    if not after_marker:
-        return None, "marker found but payload is empty"
-
-    fenced_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", after_marker, flags=re.DOTALL)
-    candidates = fenced_matches if fenced_matches else [after_marker]
-
-    parse_errors: list[str] = []
-    for candidate in candidates:
-        try:
-            payload = _first_json_object(candidate)
-        except (ValueError, json.JSONDecodeError) as exc:
-            parse_errors.append(str(exc))
-            continue
-
-        question = _as_optional_string(payload.get("question"))
-        if not question:
-            parse_errors.append("clarification payload must include a non-empty 'question'")
-            continue
-
-        normalized_payload = dict(payload)
-        normalized_payload["question"] = question
-        normalized_payload["reason"] = _as_optional_string(payload.get("reason")) or question
-        return normalized_payload, None
-
-    if parse_errors:
-        return None, parse_errors[-1]
-    return None, "unable to parse clarification payload"
-
-
-def latest_clarification_request_from_agent_output(output: str) -> dict | None:
-    payload, _error = parse_clarification_request_text(output)
-    return payload
-
-
-def parse_orchestration_state_comment_body(body: str) -> tuple[dict | None, str | None]:
-    if ORCHESTRATION_STATE_MARKER not in body:
-        return None, None
-
-    after_marker = body.split(ORCHESTRATION_STATE_MARKER, maxsplit=1)[1].strip()
-    if not after_marker:
-        return None, "marker found but payload is empty"
-
-    fenced_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", after_marker, flags=re.DOTALL)
-    candidates = fenced_matches if fenced_matches else [after_marker]
-
-    parse_errors: list[str] = []
-    for candidate in candidates:
-        try:
-            return _first_json_object(candidate), None
-        except (ValueError, json.JSONDecodeError) as exc:
-            parse_errors.append(str(exc))
-
-    if parse_errors:
-        return None, parse_errors[-1]
-    return None, "unable to parse state payload"
-
-
-def normalize_orchestration_state_status(state_payload: dict) -> str:
-    status_raw = state_payload.get("status")
-    if not isinstance(status_raw, str):
-        status_raw = state_payload.get("state")
-    return str(status_raw or "").strip().lower()
-
-
-def select_latest_parseable_orchestration_state(
-    comments: list[dict],
-    source_label: str,
-) -> tuple[dict | None, list[str]]:
-    latest: dict | None = None
-    warnings: list[str] = []
-
-    for comment in comments:
-        if not isinstance(comment, dict):
-            continue
-
-        body = str(comment.get("body") or "")
-        payload, error = parse_orchestration_state_comment_body(body)
-        if payload is None:
-            if error:
-                created_at = str(comment.get("created_at") or "unknown-time")
-                url = str(comment.get("html_url") or "")
-                context = f" at {url}" if url else ""
-                warnings.append(
-                    f"ignoring malformed orchestration state comment in {source_label}"
-                    f" ({created_at}){context}: {error}"
-                )
-            continue
-
-        created_at = str(comment.get("created_at") or "")
-        candidate = {
-            "source": source_label,
-            "created_at": created_at,
-            "url": str(comment.get("html_url") or ""),
-            "comment_id": comment.get("id"),
-            "payload": payload,
-            "status": normalize_orchestration_state_status(payload),
-        }
-        if latest is None or created_at >= str(latest.get("created_at") or ""):
-            latest = candidate
-
-    return latest, warnings
-
-
-def parse_orchestration_claim_comment_body(body: str) -> tuple[dict | None, str | None]:
-    if ORCHESTRATION_CLAIM_MARKER not in body:
-        return None, None
-
-    after_marker = body.split(ORCHESTRATION_CLAIM_MARKER, maxsplit=1)[1].strip()
-    if not after_marker:
-        return None, "marker found but payload is empty"
-
-    fenced_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", after_marker, flags=re.DOTALL)
-    candidates = fenced_matches if fenced_matches else [after_marker]
-
-    parse_errors: list[str] = []
-    for candidate in candidates:
-        try:
-            return _first_json_object(candidate), None
-        except (ValueError, json.JSONDecodeError) as exc:
-            parse_errors.append(str(exc))
-
-    if parse_errors:
-        return None, parse_errors[-1]
-    return None, "unable to parse claim payload"
-
-
-def select_latest_parseable_orchestration_claim(
-    comments: list[dict],
-    source_label: str,
-) -> tuple[dict | None, list[str]]:
-    latest: dict | None = None
-    warnings: list[str] = []
-
-    for comment in comments:
-        if not isinstance(comment, dict):
-            continue
-
-        body = str(comment.get("body") or "")
-        payload, error = parse_orchestration_claim_comment_body(body)
-        if payload is None:
-            if error:
-                created_at = str(comment.get("created_at") or "unknown-time")
-                url = str(comment.get("html_url") or "")
-                context = f" at {url}" if url else ""
-                warnings.append(
-                    f"ignoring malformed orchestration claim comment in {source_label}"
-                    f" ({created_at}){context}: {error}"
-                )
-            continue
-
-        created_at = str(comment.get("created_at") or "")
-        candidate = {
-            "source": source_label,
-            "created_at": created_at,
-            "url": str(comment.get("html_url") or ""),
-            "comment_id": comment.get("id"),
-            "payload": payload,
-            "status": str(payload.get("status") or "").strip().lower(),
-        }
-        if latest is None or created_at >= str(latest.get("created_at") or ""):
-            latest = candidate
-
-    return latest, warnings
-
-
-def build_orchestration_claim(
-    issue_number: int,
-    run_id: str,
-    status: str,
-    ttl_seconds: int,
-) -> dict:
-    now = datetime.now(timezone.utc)
-    expires_at = now.timestamp() + max(ttl_seconds, 1)
-    return {
-        "status": status,
-        "issue": issue_number,
-        "run_id": run_id,
-        "worker": f"pid-{os.getpid()}",
-        "claimed_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "expires_at": datetime.fromtimestamp(expires_at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-
-
-def is_active_orchestration_claim(claim: dict | None, run_id: str | None = None) -> bool:
-    if not isinstance(claim, dict):
-        return False
-    payload = claim.get("payload") if isinstance(claim.get("payload"), dict) else claim
-    status = str(payload.get("status") or "").strip().lower()
-    if status != "claimed":
-        return False
-    if run_id is not None and str(payload.get("run_id") or "") == run_id:
-        return False
-    expires_at = _parse_iso_timestamp(payload.get("expires_at"))
-    if expires_at is None:
-        return False
-    return expires_at > datetime.now(timezone.utc)
-
-
-def next_orchestration_attempt(recovered_state: dict | None) -> int:
-    if not isinstance(recovered_state, dict):
-        return 1
-    payload = recovered_state.get("payload") if isinstance(recovered_state.get("payload"), dict) else {}
-    previous_attempt = payload.get("attempt")
-    if type(previous_attempt) is int and previous_attempt > 0:
-        return previous_attempt + 1
-    return 1
-
-
-def parse_decomposition_plan_comment_body(body: str) -> tuple[dict | None, str | None]:
-    if DECOMPOSITION_PLAN_MARKER not in body:
-        return None, None
-
-    after_marker = body.split(DECOMPOSITION_PLAN_MARKER, maxsplit=1)[1].strip()
-    if not after_marker:
-        return None, "marker found but payload is empty"
-
-    fenced_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", after_marker, flags=re.DOTALL)
-    candidates = fenced_matches if fenced_matches else [after_marker]
-
-    parse_errors: list[str] = []
-    for candidate in candidates:
-        try:
-            return _first_json_object(candidate), None
-        except (ValueError, json.JSONDecodeError) as exc:
-            parse_errors.append(str(exc))
-
-    if parse_errors:
-        return None, parse_errors[-1]
-    return None, "unable to parse decomposition payload"
-
-
-def select_latest_parseable_decomposition_plan(
-    comments: list[dict],
-    source_label: str,
-) -> tuple[dict | None, list[str]]:
-    latest: dict | None = None
-    warnings: list[str] = []
-
-    for comment in comments:
-        if not isinstance(comment, dict):
-            continue
-
-        body = str(comment.get("body") or "")
-        payload, error = parse_decomposition_plan_comment_body(body)
-        if payload is None:
-            if error:
-                created_at = str(comment.get("created_at") or "unknown-time")
-                url = str(comment.get("html_url") or "")
-                context = f" at {url}" if url else ""
-                warnings.append(
-                    f"ignoring malformed decomposition comment in {source_label}"
-                    f" ({created_at}){context}: {error}"
-                )
-            continue
-
-        created_at = str(comment.get("created_at") or "")
-        candidate = {
-            "source": source_label,
-            "created_at": created_at,
-            "url": str(comment.get("html_url") or ""),
-            "comment_id": comment.get("id"),
-            "payload": payload,
-            "status": str(payload.get("status") or "").strip().lower(),
-        }
-        if latest is None or created_at >= str(latest.get("created_at") or ""):
-            latest = candidate
-
-    return latest, warnings
 
 
 def build_decomposition_rollup_from_plan_payload(payload: dict) -> dict:

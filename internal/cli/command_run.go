@@ -377,6 +377,7 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 
 	flags := flagStateAdapter{fs: fs}
 	lastCode := 0
+	launchedStates := make([]detachedWorkerState, 0, len(ids.ids))
 	for _, id := range ids.ids {
 		pythonArgs := buildIssuePythonArgs(
 			opts,
@@ -403,7 +404,7 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
 				return 1
 			}
-			code := a.startDetachedWorker(detachedWorkerStateFromOptions(
+			startedState, code := a.startDetachedWorkerState(detachedWorkerStateFromOptions(
 				workerName("issue", strconv.Itoa(id)),
 				"run batch",
 				"issue",
@@ -417,6 +418,16 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 					return code
 				}
 				lastCode = code
+				continue
+			}
+			launchedStates = append(launchedStates, startedState)
+			launchedStates = withDetachedBatchMetadata(launchedStates, ids.ids)
+			if err := writeDetachedBatchStates(launchedStates); err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to write detached batch metadata: %v\n", err)
+				if *stopOnError {
+					return 1
+				}
+				lastCode = 1
 			}
 			continue
 		}

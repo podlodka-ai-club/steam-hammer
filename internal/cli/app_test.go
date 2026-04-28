@@ -481,6 +481,43 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 	}
 }
 
+func TestRunBatchDetachPersistsBatchMetadataForChildWorkers(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	targetDir := t.TempDir()
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+
+	code := app.Run([]string{"run", "batch", "--ids", "71,72", "--repo", "owner/repo", "--dir", targetDir, "--detach"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+
+	for _, issueID := range []string{"71", "72"} {
+		statePath := filepath.Join(targetDir, ".orchestrator", "workers", "issue-"+issueID, "worker.json")
+		state, err := readDetachedWorkerState(statePath)
+		if err != nil {
+			t.Fatalf("readDetachedWorkerState(%q) error = %v", statePath, err)
+		}
+		if state.Batch == nil {
+			t.Fatalf("worker batch metadata = nil for %s", issueID)
+		}
+		if !reflect.DeepEqual(state.Batch.ChildIssueIDs, []string{"71", "72"}) {
+			t.Fatalf("child issue ids = %#v, want [71 72]", state.Batch.ChildIssueIDs)
+		}
+		if len(state.Batch.ChildWorkers) != 2 {
+			t.Fatalf("child workers len = %d, want 2", len(state.Batch.ChildWorkers))
+		}
+		for _, worker := range state.Batch.ChildWorkers {
+			if worker.IssueID == "" || worker.WorkerName == "" || worker.LogPath == "" || worker.StatePath == "" || worker.ClonePath == "" || worker.StartedAt == "" || worker.StatusCommand == "" {
+				t.Fatalf("child worker metadata incomplete: %#v", worker)
+			}
+			if !strings.Contains(worker.StatusCommand, "orchestrator status --issue ") {
+				t.Fatalf("status command = %q, want issue status command", worker.StatusCommand)
+			}
+		}
+	}
+}
+
 func TestRunIssueCommandMapsCoreCompatibilityFlags(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -859,6 +896,38 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 		if !strings.Contains(printed, want) {
 			t.Fatalf("stdout = %q, want %q", printed, want)
 		}
+	}
+}
+
+func TestReadDetachedWorkerStateSupportsLegacyMetadataWithoutBatch(t *testing.T) {
+	targetDir := t.TempDir()
+	statePath := filepath.Join(targetDir, "worker.json")
+	raw := []byte("{\n" +
+		"  \"name\": \"issue-71\",\n" +
+		"  \"mode\": \"run issue\",\n" +
+		"  \"target_kind\": \"issue\",\n" +
+		"  \"target_id\": \"71\",\n" +
+		"  \"repo\": \"owner/repo\",\n" +
+		"  \"command\": [\"python3\", \"script.py\"],\n" +
+		"  \"started_at\": \"2026-04-28T12:00:00Z\",\n" +
+		"  \"pid\": 4242,\n" +
+		"  \"log_path\": \"/tmp/worker.log\",\n" +
+		"  \"state_path\": \"/tmp/worker.json\",\n" +
+		"  \"work_dir\": \"/repo\"\n" +
+		"}\n")
+	if err := os.WriteFile(statePath, raw, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	state, err := readDetachedWorkerState(statePath)
+	if err != nil {
+		t.Fatalf("readDetachedWorkerState() error = %v", err)
+	}
+	if state.Name != "issue-71" || state.TargetID != "71" {
+		t.Fatalf("state = %#v", state)
+	}
+	if state.Batch != nil {
+		t.Fatalf("legacy state batch = %#v, want nil", state.Batch)
 	}
 }
 

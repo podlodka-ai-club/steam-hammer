@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import abc
 import base64
 from datetime import datetime, timezone
 import hashlib
@@ -43,6 +42,18 @@ from scripts.orchestration_state import (
     select_latest_parseable_decomposition_plan,
     select_latest_parseable_orchestration_claim,
     select_latest_parseable_orchestration_state,
+)
+from scripts.provider_helpers import (
+    CodeHostProvider,
+    GitHubCodeHostProvider as _GitHubCodeHostProvider,
+    GitHubTrackerProvider as _GitHubTrackerProvider,
+    JiraTrackerProvider as _JiraTrackerProvider,
+    ProviderRuntime,
+    TrackerProvider,
+    UnsupportedCodeHostProvider as _UnsupportedCodeHostProvider,
+    fetch_jira_issue_comments as _provider_fetch_jira_issue_comments,
+    jira_text_to_adf as _provider_jira_text_to_adf,
+    post_jira_issue_comment as _provider_post_jira_issue_comment,
 )
 from scripts.project_config import (
     CODEHOST_BITBUCKET,
@@ -270,439 +281,70 @@ def format_issue_label_from_issue(issue: dict) -> str:
     return format_issue_label(issue.get("number"), tracker=issue_tracker(issue))
 
 
-class TrackerProvider(abc.ABC):
-    @property
-    @abc.abstractmethod
-    def name(self) -> str:
-        raise NotImplementedError
-
-    @property
-    def supports_issue_labels(self) -> bool:
-        return False
-
-    @abc.abstractmethod
-    def get_issue(self, repo: str, issue_id: int | str) -> dict:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def list_issues(self, repo: str, state: str, limit: int) -> list[dict]:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def list_issue_comments(self, repo: str, issue_id: int | str) -> list[dict]:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def post_issue_comment(self, repo: str, issue_id: int | str, body: str) -> None:
-        raise NotImplementedError
-
-    def create_child_issue(
-        self,
-        repo: str,
-        parent_issue: dict,
-        child: dict,
-        created_dependencies: dict[int, dict],
-        dry_run: bool,
-        parent_branch: str | None = None,
-        base_branch: str | None = None,
-    ) -> dict:
-        _ = (parent_branch, base_branch)
-        raise RuntimeError(f"Tracker provider '{self.name}' does not support child issue creation yet")
-
-    def add_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
-        _ = (repo, issue_id, label_name, dry_run)
-
-    def remove_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
-        _ = (repo, issue_id, label_name, dry_run)
-
-    def issue_has_label(self, repo: str, issue_id: int | str, label_name: str) -> bool:
-        _ = (repo, issue_id, label_name)
-        return False
+def _provider_runtime() -> ProviderRuntime:
+    return ProviderRuntime(
+        tracker_github=TRACKER_GITHUB,
+        tracker_jira=TRACKER_JIRA,
+        codehost_github=CODEHOST_GITHUB,
+        parse_tracker=_parse_tracker,
+        parse_codehost=_parse_codehost,
+        normalize_issue_number=normalize_issue_number,
+        jira_credentials_from_env=_jira_credentials_from_env,
+        jira_request_json=_jira_request_json,
+        fetch_jira_issue=fetch_jira_issue,
+        fetch_jira_issues=fetch_jira_issues,
+        jira_description_to_text=jira_description_to_text,
+        get_fetch_issue=lambda: fetch_issue,
+        get_fetch_issues=lambda: fetch_issues,
+        get_fetch_issue_comments=lambda: fetch_issue_comments,
+        get_fetch_jira_issue_comments=lambda: fetch_jira_issue_comments,
+        get_post_jira_issue_comment=lambda: post_jira_issue_comment,
+        get_run_command=lambda: run_command,
+        get_run_capture=lambda: run_capture,
+        get_create_decomposition_child_issue=lambda: create_decomposition_child_issue,
+        get_ensure_agent_failure_label=lambda: ensure_agent_failure_label,
+        get_format_issue_ref=lambda: format_issue_ref,
+        get_detect_repo=lambda: detect_repo,
+        get_detect_default_branch=lambda: detect_default_branch,
+        get_find_open_pr_for_issue=lambda: find_open_pr_for_issue,
+        get_fetch_pull_request=lambda: fetch_pull_request,
+        get_fetch_pr_review_threads=lambda: fetch_pr_review_threads,
+        get_fetch_pr_conversation_comments=lambda: fetch_pr_conversation_comments,
+        get_read_pr_ci_status_for_pull_request=lambda: read_pr_ci_status_for_pull_request,
+        get_load_linked_issue_context=lambda: load_linked_issue_context,
+        get_ensure_pr=lambda: ensure_pr,
+    )
 
 
-class CodeHostProvider(abc.ABC):
-    @property
-    @abc.abstractmethod
-    def name(self) -> str:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def detect_repo(self) -> str:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def detect_default_branch(self, repo: str) -> str:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def find_open_pr_for_issue(self, repo: str, issue: dict) -> dict | None:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def fetch_pull_request(self, repo: str, number: int) -> dict:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def list_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def fetch_pr_review_threads(self, repo: str, number: int) -> list[dict]:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def fetch_pr_conversation_comments(self, repo: str, pr_number: int) -> list[dict]:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def read_pr_ci_status_for_pull_request(self, repo: str, pull_request: dict) -> dict:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def load_pr_linked_issue_context(self, repo: str, pull_request: dict) -> list[dict]:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def ensure_pr(
-        self,
-        repo: str,
-        base_branch: str,
-        branch_name: str,
-        issue: dict,
-        dry_run: bool,
-        fail_on_existing: bool,
-        stacked_base_context: str | None = None,
-    ) -> tuple[str, str]:
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def post_pr_comment(self, repo: str, pr_number: int, body: str) -> None:
-        raise NotImplementedError
+class GitHubTrackerProvider(_GitHubTrackerProvider):
+    def __init__(self) -> None:
+        super().__init__(_provider_runtime())
 
 
-class GitHubTrackerProvider(TrackerProvider):
-    @property
-    def name(self) -> str:
-        return TRACKER_GITHUB
-
-    @property
-    def supports_issue_labels(self) -> bool:
-        return True
-
-    def get_issue(self, repo: str, issue_id: int | str) -> dict:
-        if type(issue_id) is not int:
-            raise RuntimeError(f"GitHub tracker requires integer issue numbers, got {issue_id!r}")
-        return fetch_issue(repo=repo, number=issue_id)
-
-    def list_issues(self, repo: str, state: str, limit: int) -> list[dict]:
-        return fetch_issues(repo=repo, state=state, limit=limit)
-
-    def list_issue_comments(self, repo: str, issue_id: int | str) -> list[dict]:
-        return fetch_issue_comments(repo=repo, issue_number=issue_id)
-
-    def post_issue_comment(self, repo: str, issue_id: int | str, body: str) -> None:
-        run_command([
-            "gh",
-            "issue",
-            "comment",
-            str(issue_id),
-            "--repo",
-            repo,
-            "--body",
-            body,
-        ])
-
-    def create_child_issue(
-        self,
-        repo: str,
-        parent_issue: dict,
-        child: dict,
-        created_dependencies: dict[int, dict],
-        dry_run: bool,
-        parent_branch: str | None = None,
-        base_branch: str | None = None,
-    ) -> dict:
-        return create_decomposition_child_issue(
-            repo=repo,
-            parent_issue=parent_issue,
-            child=child,
-            created_dependencies=created_dependencies,
-            dry_run=dry_run,
-            parent_branch=parent_branch,
-            base_branch=base_branch,
-        )
-
-    def add_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
-        ensure_agent_failure_label(repo=repo, dry_run=dry_run)
-        if dry_run:
-            print(f"[dry-run] Would add label '{label_name}' to issue {format_issue_ref(issue_id, tracker=self.name)}")
-            return
-        run_command([
-            "gh",
-            "issue",
-            "edit",
-            str(issue_id),
-            "--repo",
-            repo,
-            "--add-label",
-            label_name,
-        ])
-
-    def remove_issue_label(self, repo: str, issue_id: int | str, label_name: str, dry_run: bool) -> None:
-        if dry_run:
-            print(f"[dry-run] Would remove label '{label_name}' from issue {format_issue_ref(issue_id, tracker=self.name)} if present")
-            return
-        if not self.issue_has_label(repo=repo, issue_id=issue_id, label_name=label_name):
-            return
-        run_command([
-            "gh",
-            "issue",
-            "edit",
-            str(issue_id),
-            "--repo",
-            repo,
-            "--remove-label",
-            label_name,
-        ])
-
-    def issue_has_label(self, repo: str, issue_id: int | str, label_name: str) -> bool:
-        labels_output = run_capture([
-            "gh",
-            "issue",
-            "view",
-            str(issue_id),
-            "--repo",
-            repo,
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ])
-        labels = [line.strip() for line in labels_output.splitlines() if line.strip()]
-        return label_name in labels
+class JiraTrackerProvider(_JiraTrackerProvider):
+    def __init__(self) -> None:
+        super().__init__(_provider_runtime())
 
 
-def _jira_comment_to_internal_shape(comment_payload: dict, issue_key: str, base_url: str) -> dict:
-    author = comment_payload.get("author") if isinstance(comment_payload.get("author"), dict) else {}
-    comment_id = comment_payload.get("id")
-    comment_url = ""
-    if comment_id is not None:
-        comment_url = f"{base_url}/browse/{issue_key}?focusedCommentId={comment_id}#comment-{comment_id}"
-    return {
-        "id": comment_id,
-        "body": jira_description_to_text(comment_payload.get("body")),
-        "created_at": str(comment_payload.get("created") or ""),
-        "html_url": comment_url,
-        "author": str(author.get("displayName") or author.get("accountId") or "unknown"),
-    }
+class GitHubCodeHostProvider(_GitHubCodeHostProvider):
+    def __init__(self) -> None:
+        super().__init__(_provider_runtime())
+
+
+class UnsupportedCodeHostProvider(_UnsupportedCodeHostProvider):
+    pass
 
 
 def jira_text_to_adf(body: str) -> dict:
-    paragraphs: list[dict] = []
-    for line in body.splitlines():
-        if line.strip():
-            paragraphs.append(
-                {
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": line}],
-                }
-            )
-        else:
-            paragraphs.append({"type": "paragraph", "content": []})
-    if not paragraphs:
-        paragraphs.append({"type": "paragraph", "content": []})
-    return {"type": "doc", "version": 1, "content": paragraphs}
+    return _provider_jira_text_to_adf(body)
 
 
 def fetch_jira_issue_comments(issue_key: str) -> list[dict]:
-    credentials = _jira_credentials_from_env()
-    normalized_key = str(normalize_issue_number(issue_key, TRACKER_JIRA))
-    payload = _jira_request_json(
-        method="GET",
-        url=(
-            f"{credentials['base_url']}/rest/api/3/issue/"
-            f"{urllib.parse.quote(normalized_key)}/comment?maxResults=100"
-        ),
-    )
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Unexpected response fetching Jira comments for {normalized_key}")
-    comments = payload.get("comments")
-    if not isinstance(comments, list):
-        raise RuntimeError(f"Unexpected Jira comments payload for {normalized_key}")
-    return [
-        _jira_comment_to_internal_shape(item, issue_key=normalized_key, base_url=credentials["base_url"])
-        for item in comments
-        if isinstance(item, dict)
-    ]
+    return _provider_fetch_jira_issue_comments(issue_key=issue_key, runtime=_provider_runtime())
 
 
 def post_jira_issue_comment(issue_key: str, body: str) -> None:
-    credentials = _jira_credentials_from_env()
-    normalized_key = str(normalize_issue_number(issue_key, TRACKER_JIRA))
-    _jira_request_json(
-        method="POST",
-        url=f"{credentials['base_url']}/rest/api/3/issue/{urllib.parse.quote(normalized_key)}/comment",
-        payload={"body": jira_text_to_adf(body)},
-    )
-
-
-class JiraTrackerProvider(TrackerProvider):
-    @property
-    def name(self) -> str:
-        return TRACKER_JIRA
-
-    def get_issue(self, repo: str, issue_id: int | str) -> dict:
-        _ = repo
-        return fetch_jira_issue(issue_key=str(issue_id))
-
-    def list_issues(self, repo: str, state: str, limit: int) -> list[dict]:
-        _ = repo
-        jira_jql = {
-            "open": "status != Done ORDER BY created DESC",
-            "closed": "status = Done ORDER BY created DESC",
-            "all": "ORDER BY created DESC",
-        }[state]
-        return fetch_jira_issues(jql=jira_jql, limit=limit)
-
-    def list_issue_comments(self, repo: str, issue_id: int | str) -> list[dict]:
-        _ = repo
-        return fetch_jira_issue_comments(issue_key=str(issue_id))
-
-    def post_issue_comment(self, repo: str, issue_id: int | str, body: str) -> None:
-        _ = repo
-        post_jira_issue_comment(issue_key=str(issue_id), body=body)
-
-
-class GitHubCodeHostProvider(CodeHostProvider):
-    @property
-    def name(self) -> str:
-        return CODEHOST_GITHUB
-
-    def detect_repo(self) -> str:
-        return detect_repo()
-
-    def detect_default_branch(self, repo: str) -> str:
-        return detect_default_branch(repo)
-
-    def find_open_pr_for_issue(self, repo: str, issue: dict) -> dict | None:
-        return find_open_pr_for_issue(repo=repo, issue=issue)
-
-    def fetch_pull_request(self, repo: str, number: int) -> dict:
-        return fetch_pull_request(repo=repo, number=number)
-
-    def list_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
-        return fetch_issue_comments(repo=repo, issue_number=pr_number)
-
-    def fetch_pr_review_threads(self, repo: str, number: int) -> list[dict]:
-        return fetch_pr_review_threads(repo=repo, number=number)
-
-    def fetch_pr_conversation_comments(self, repo: str, pr_number: int) -> list[dict]:
-        return fetch_pr_conversation_comments(repo=repo, pr_number=pr_number)
-
-    def read_pr_ci_status_for_pull_request(self, repo: str, pull_request: dict) -> dict:
-        return read_pr_ci_status_for_pull_request(repo=repo, pull_request=pull_request)
-
-    def load_pr_linked_issue_context(self, repo: str, pull_request: dict) -> list[dict]:
-        return load_linked_issue_context(repo=repo, pull_request=pull_request)
-
-    def ensure_pr(
-        self,
-        repo: str,
-        base_branch: str,
-        branch_name: str,
-        issue: dict,
-        dry_run: bool,
-        fail_on_existing: bool,
-        stacked_base_context: str | None = None,
-    ) -> tuple[str, str]:
-        return ensure_pr(
-            repo=repo,
-            base_branch=base_branch,
-            branch_name=branch_name,
-            issue=issue,
-            dry_run=dry_run,
-            fail_on_existing=fail_on_existing,
-            stacked_base_context=stacked_base_context,
-        )
-
-    def post_pr_comment(self, repo: str, pr_number: int, body: str) -> None:
-        run_command([
-            "gh",
-            "pr",
-            "comment",
-            str(pr_number),
-            "--repo",
-            repo,
-            "--body",
-            body,
-        ])
-
-
-class UnsupportedCodeHostProvider(CodeHostProvider):
-    def __init__(self, name: str) -> None:
-        self._name = name
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    def _unsupported(self) -> RuntimeError:
-        return RuntimeError(
-            f"Code host provider '{self._name}' is not implemented yet. "
-            "Core orchestration now routes through the provider interface, so add a provider adapter instead of rewriting the flow."
-        )
-
-    def detect_repo(self) -> str:
-        raise self._unsupported()
-
-    def detect_default_branch(self, repo: str) -> str:
-        _ = repo
-        raise self._unsupported()
-
-    def find_open_pr_for_issue(self, repo: str, issue: dict) -> dict | None:
-        _ = (repo, issue)
-        raise self._unsupported()
-
-    def fetch_pull_request(self, repo: str, number: int) -> dict:
-        _ = (repo, number)
-        raise self._unsupported()
-
-    def list_pr_comments(self, repo: str, pr_number: int) -> list[dict]:
-        _ = (repo, pr_number)
-        raise self._unsupported()
-
-    def fetch_pr_review_threads(self, repo: str, number: int) -> list[dict]:
-        _ = (repo, number)
-        raise self._unsupported()
-
-    def fetch_pr_conversation_comments(self, repo: str, pr_number: int) -> list[dict]:
-        _ = (repo, pr_number)
-        raise self._unsupported()
-
-    def read_pr_ci_status_for_pull_request(self, repo: str, pull_request: dict) -> dict:
-        _ = (repo, pull_request)
-        raise self._unsupported()
-
-    def load_pr_linked_issue_context(self, repo: str, pull_request: dict) -> list[dict]:
-        _ = (repo, pull_request)
-        raise self._unsupported()
-
-    def ensure_pr(
-        self,
-        repo: str,
-        base_branch: str,
-        branch_name: str,
-        issue: dict,
-        dry_run: bool,
-        fail_on_existing: bool,
-        stacked_base_context: str | None = None,
-    ) -> tuple[str, str]:
-        _ = (repo, base_branch, branch_name, issue, dry_run, fail_on_existing, stacked_base_context)
-        raise self._unsupported()
-
-    def post_pr_comment(self, repo: str, pr_number: int, body: str) -> None:
-        _ = (repo, pr_number, body)
-        raise self._unsupported()
+    _provider_post_jira_issue_comment(issue_key=issue_key, body=body, runtime=_provider_runtime())
 
 
 ACTIVE_TRACKER_PROVIDER: TrackerProvider | None = None

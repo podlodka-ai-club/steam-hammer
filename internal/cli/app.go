@@ -8,11 +8,92 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"time"
 )
 
 const runnerScript = "scripts/run_github_issues_to_opencode.py"
+
+const defaultProjectConfigName = "project-config.json"
+const defaultLocalConfigName = "local-config.json"
+
+const projectConfigScaffold = `{
+  "defaults": {
+    "preset": "default",
+    "runner": "opencode",
+    "agent": "build",
+    "model": "openai/gpt-4o",
+    "track_tokens": false,
+    "token_budget": 20000,
+    "agent_timeout_seconds": 1200,
+    "agent_idle_timeout_seconds": 180,
+    "max_attempts": 2
+  },
+  "workflow": {
+    "commands": {
+      "test": "python -m unittest",
+      "lint": null,
+      "build": null
+    }
+  },
+  "retry": {
+    "max_attempts": 2,
+    "escalate_to_preset": "hard"
+  },
+  "presets": {
+    "cheap": {
+      "runner": "opencode",
+      "agent": "build",
+      "model": "openai/gpt-4o-mini",
+      "token_budget": 8000,
+      "max_attempts": 1,
+      "escalate_to_preset": "default"
+    },
+    "default": {
+      "runner": "opencode",
+      "agent": "build",
+      "model": "openai/gpt-4o",
+      "token_budget": 20000,
+      "max_attempts": 2,
+      "escalate_to_preset": "hard"
+    },
+    "hard": {
+      "runner": "claude",
+      "agent": "build",
+      "model": "claude-sonnet-4-5",
+      "token_budget": 40000,
+      "max_attempts": 3,
+      "escalate_to_preset": null
+    }
+  },
+  "communication": {
+    "verbosity": "normal"
+  }
+}
+`
+
+const localConfigScaffold = `{
+  "preset": "default",
+  "runner": "opencode",
+  "agent": "build",
+  "model": "openai/gpt-4o",
+  "agent_timeout_seconds": 1200,
+  "agent_idle_timeout_seconds": 180,
+  "token_budget": 20000,
+  "max_attempts": 2,
+  "opencode_auto_approve": true,
+  "fail_on_existing": false,
+  "force_issue_flow": false,
+  "skip_if_pr_exists": true,
+  "skip_if_branch_exists": true,
+  "force_reprocess": false,
+  "sync_reused_branch": true,
+  "sync_strategy": "rebase",
+  "base_branch": "default",
+  "create_child_issues": false
+}
+`
 
 type Runner interface {
 	Run(ctx context.Context, name string, args ...string) error
@@ -63,6 +144,8 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 	case "-h", "--help", "help":
 		_, _ = fmt.Fprint(a.out, usage())
 		return 0
+	case "init":
+		return a.runInit(args[1:])
 	case "doctor":
 		return a.runDoctor(ctx, args[1:])
 	case "run":
@@ -71,6 +154,55 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintf(a.err, "unknown command %q\n\n%s", args[0], usage())
 		return 2
 	}
+}
+
+func (a *App) runInit(args []string) int {
+	fs := newFlagSet("init", a.err)
+	dir := fs.String("dir", ".", "directory to write config scaffolds into")
+	project := fs.String("project-config", defaultProjectConfigName, "path to the repository project config scaffold")
+	local := fs.String("local-config", defaultLocalConfigName, "path to the user-local config scaffold")
+	force := fs.Bool("force", false, "overwrite existing scaffold files")
+	skipProject := fs.Bool("skip-project-config", false, "do not create the project config scaffold")
+	skipLocal := fs.Bool("skip-local-config", false, "do not create the local config scaffold")
+
+	if err := fs.Parse(args); err != nil {
+		return flagExitCode(err)
+	}
+	if fs.NArg() != 0 {
+		_, _ = fmt.Fprintf(a.err, "unexpected init argument: %s\n", fs.Arg(0))
+		return 2
+	}
+	if *skipProject && *skipLocal {
+		_, _ = fmt.Fprintln(a.err, "init has nothing to do: both scaffold outputs were skipped")
+		return 2
+	}
+
+	targetDir := *dir
+	if targetDir == "" {
+		targetDir = "."
+	}
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to create %s: %v\n", targetDir, err)
+		return 1
+	}
+
+	var writes []scaffoldTarget
+	if !*skipProject {
+		writes = append(writes, scaffoldTarget{path: resolveScaffoldPath(targetDir, *project, defaultProjectConfigName), contents: projectConfigScaffold})
+	}
+	if !*skipLocal {
+		writes = append(writes, scaffoldTarget{path: resolveScaffoldPath(targetDir, *local, defaultLocalConfigName), contents: localConfigScaffold})
+	}
+
+	for _, target := range writes {
+		if err := writeScaffold(target.path, target.contents, *force); err != nil {
+			_, _ = fmt.Fprintln(a.err, err.Error())
+			return 1
+		}
+		_, _ = fmt.Fprintf(a.out, "created %s\n", target.path)
+	}
+
+	return 0
 }
 
 func (a *App) runDoctor(ctx context.Context, args []string) int {
@@ -117,6 +249,8 @@ func (a *App) runRun(ctx context.Context, args []string) int {
 		return a.runDaemon(ctx, args[1:])
 	case "pr":
 		return a.runPR(ctx, args[1:])
+	case "daemon":
+		return a.runDaemon(ctx, args[1:])
 	default:
 		_, _ = fmt.Fprintf(a.err, "unknown run target %q\n\n%s", args[0], runUsage())
 		return 2
@@ -349,6 +483,122 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	return a.runPython(ctx, pythonArgs)
 }
 
+func (a *App) runDaemon(ctx context.Context, args []string) int {
+	if unsupported := firstUnsupportedFlag(args, unsupportedRunDaemonFlags); unsupported != "" {
+		_, _ = fmt.Fprintln(a.err, unsupported)
+		return 2
+	}
+
+	fs := newFlagSet("run daemon", a.err)
+	opts := commonOptions{}
+	addCommonFlags(fs, &opts)
+	limit := fs.Int("limit", 1, "maximum number of issues to process per poll")
+	state := fs.String("state", "open", "issue state filter: open, closed, or all")
+	interval := fs.Int("poll-interval-seconds", 120, "delay between daemon polls")
+	includeEmpty := fs.Bool("include-empty", false, "process issues even if body is empty")
+	stopOnError := fs.Bool("stop-on-error", false, "stop after first failed agent run inside a poll")
+	failOnExisting := fs.Bool("fail-on-existing", false, "fail if issue branch or PR already exists")
+	forceIssueFlow := fs.Bool("force-issue-flow", false, "disable auto-switch to PR-review mode")
+	skipIfPRExists := fs.Bool("skip-if-pr-exists", true, "skip issue processing when a linked open PR exists")
+	noSkipIfPRExists := fs.Bool("no-skip-if-pr-exists", false, "do not skip issue processing when a linked open PR exists")
+	skipIfBranchExists := fs.Bool("skip-if-branch-exists", true, "skip issue processing when deterministic issue branch exists on origin")
+	noSkipIfBranchExists := fs.Bool("no-skip-if-branch-exists", false, "do not skip issue processing when deterministic issue branch exists on origin")
+	forceReprocess := fs.Bool("force-reprocess", false, "override skip guards")
+	syncReusedBranch := fs.Bool("sync-reused-branch", true, "sync reused issue branches before running the agent")
+	noSyncReusedBranch := fs.Bool("no-sync-reused-branch", false, "disable sync for reused issue branches before the agent step")
+	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
+	base := ""
+	fs.StringVar(&base, "base", "", "base branch mode: default or current")
+	fs.StringVar(&base, "base-branch", "", "base branch mode: default or current")
+
+	if err := fs.Parse(args); err != nil {
+		return flagExitCode(err)
+	}
+	if fs.NArg() != 0 {
+		_, _ = fmt.Fprintf(a.err, "unexpected run daemon argument: %s\n", fs.Arg(0))
+		return 2
+	}
+	if *limit <= 0 {
+		_, _ = fmt.Fprintln(a.err, "run daemon requires --limit to be greater than zero")
+		return 2
+	}
+	if *interval < 0 {
+		_, _ = fmt.Fprintln(a.err, "run daemon requires --poll-interval-seconds to be zero or greater")
+		return 2
+	}
+	if *state != "open" && *state != "closed" && *state != "all" {
+		_, _ = fmt.Fprintln(a.err, "run daemon requires --state to be one of: open, closed, all")
+		return 2
+	}
+
+	pythonArgs := []string{runnerScript, "--limit", strconv.Itoa(*limit), "--state", *state}
+	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
+	if base != "" {
+		pythonArgs = append(pythonArgs, "--base", base)
+	}
+	if *includeEmpty {
+		pythonArgs = append(pythonArgs, "--include-empty")
+	}
+	if *stopOnError {
+		pythonArgs = append(pythonArgs, "--stop-on-error")
+	}
+	if *failOnExisting {
+		pythonArgs = append(pythonArgs, "--fail-on-existing")
+	}
+	if *forceIssueFlow {
+		pythonArgs = append(pythonArgs, "--force-issue-flow")
+	}
+	if *noSkipIfPRExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
+	} else if flagWasPassed(fs, "skip-if-pr-exists") && *skipIfPRExists {
+		pythonArgs = append(pythonArgs, "--skip-if-pr-exists")
+	} else if !*skipIfPRExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
+	}
+	if *noSkipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
+	} else if flagWasPassed(fs, "skip-if-branch-exists") && *skipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--skip-if-branch-exists")
+	} else if !*skipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
+	}
+	if *forceReprocess {
+		pythonArgs = append(pythonArgs, "--force-reprocess")
+	}
+	if *noSyncReusedBranch {
+		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
+	} else if flagWasPassed(fs, "sync-reused-branch") && *syncReusedBranch {
+		pythonArgs = append(pythonArgs, "--sync-reused-branch")
+	} else if !*syncReusedBranch {
+		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
+	}
+	if *syncStrategy != "" {
+		pythonArgs = append(pythonArgs, "--sync-strategy", *syncStrategy)
+	}
+
+	for {
+		code := a.runPython(ctx, pythonArgs)
+		if code != 0 {
+			return code
+		}
+		if *opts.dryRun {
+			return 0
+		}
+		if err := sleepContext(ctx, time.Duration(*interval)*time.Second); err != nil {
+			if errors.Is(err, context.Canceled) {
+				_, _ = fmt.Fprintln(a.err, "orchestrator: daemon canceled")
+				return 130
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				_, _ = fmt.Fprintln(a.err, "orchestrator: daemon timed out")
+				return 124
+			}
+			_, _ = fmt.Fprintf(a.err, "orchestrator: daemon sleep failed: %v\n", err)
+			return 1
+		}
+	}
+}
+
 func (a *App) runPython(ctx context.Context, args []string) int {
 	if err := a.runner.Run(ctx, "python3", args...); err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -478,6 +728,59 @@ func flagWasPassed(fs *flag.FlagSet, name string) bool {
 	return passed
 }
 
+type scaffoldTarget struct {
+	path     string
+	contents string
+}
+
+func resolveScaffoldPath(dir, configuredPath, defaultName string) string {
+	if configuredPath == "" {
+		return filepath.Join(dir, defaultName)
+	}
+	if filepath.IsAbs(configuredPath) {
+		return configuredPath
+	}
+	return filepath.Join(dir, configuredPath)
+}
+
+func writeScaffold(path, contents string, force bool) error {
+	if !force {
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("orchestrator: %s already exists (use --force to overwrite)", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("orchestrator: failed to inspect %s: %w", path, err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("orchestrator: failed to create %s: %w", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		return fmt.Errorf("orchestrator: failed to write %s: %w", path, err)
+	}
+	return nil
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 var unsupportedDoctorFlags = map[string]string{
 	"issue":                "use `orchestrator run issue --id N` instead",
 	"pr":                   "use `orchestrator run pr --id N` instead",
@@ -506,13 +809,16 @@ var unsupportedRunPRFlags = map[string]string{
 }
 
 var unsupportedRunDaemonFlags = map[string]string{
-	"issue":                "use `orchestrator run issue --id N` instead",
-	"pr":                   "use `orchestrator run pr --id N` instead",
-	"from-review-comments": "use `orchestrator run pr --id N` instead",
-	"doctor":               "use `orchestrator doctor` instead",
-	"doctor-smoke-check":   "use `orchestrator doctor --doctor-smoke-check` instead",
-	"base":                 "autonomous daemon polls tracker tasks instead of stacking a single issue branch",
-	"base-branch":          "autonomous daemon polls tracker tasks instead of stacking a single issue branch",
+	"issue":                     "use `orchestrator run issue --id N` for a one-shot issue run",
+	"pr":                        "use `orchestrator run pr --id N` for PR review mode",
+	"from-review-comments":      "PR review-comments mode is selected by `orchestrator run pr`",
+	"doctor":                    "use `orchestrator doctor` instead",
+	"doctor-smoke-check":        "use `orchestrator doctor --doctor-smoke-check` instead",
+	"id":                        "daemon mode polls issue batches; use `orchestrator run issue --id N` for a single issue",
+	"allow-pr-branch-switch":    "PR-only flag; use `orchestrator run pr` instead",
+	"isolate-worktree":          "PR-only flag; use `orchestrator run pr` instead",
+	"post-pr-summary":           "PR-only flag; use `orchestrator run pr` instead",
+	"pr-followup-branch-prefix": "PR-only flag; use `orchestrator run pr` instead",
 }
 
 func firstUnsupportedFlag(args []string, unsupported map[string]string) string {
@@ -547,16 +853,18 @@ func flagName(arg string) (string, bool) {
 
 func usage() string {
 	return `Usage:
-  orchestrator doctor [flags]
-  orchestrator run issue --id N [flags]
-  orchestrator run daemon [flags]
-  orchestrator run pr --id N [flags]
+	  orchestrator init [flags]
+	  orchestrator doctor [flags]
+	  orchestrator run issue --id N [flags]
+	  orchestrator run pr --id N [flags]
+	  orchestrator run daemon [flags]
 
 Commands:
-  doctor     Run environment diagnostics via the current Python runner.
-  run issue  Run issue orchestration via the current Python runner.
-  run daemon Run autonomous polling via the current Python runner.
-  run pr     Run PR review-comment orchestration via the current Python runner.
+	  init       Create local/project config scaffolds.
+	  doctor     Run environment diagnostics via the current Python runner.
+	  run issue  Run issue orchestration via the current Python runner.
+	  run pr     Run PR review-comment orchestration via the current Python runner.
+	  run daemon Poll for issue work via the current Python runner.
 
 Use "orchestrator <command> --help" for command flags.
 `
@@ -564,8 +872,8 @@ Use "orchestrator <command> --help" for command flags.
 
 func runUsage() string {
 	return `Usage:
-  orchestrator run issue --id N [flags]
-  orchestrator run daemon [flags]
-  orchestrator run pr --id N [flags]
+	  orchestrator run issue --id N [flags]
+	  orchestrator run pr --id N [flags]
+	  orchestrator run daemon [flags]
 `
 }

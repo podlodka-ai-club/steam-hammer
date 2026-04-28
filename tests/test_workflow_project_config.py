@@ -7,6 +7,7 @@ from scripts.run_github_issues_to_opencode import (
     count_current_pr_approvals,
     evaluate_pr_readiness,
     load_project_config,
+    workflow_merge_policy,
 )
 
 
@@ -58,6 +59,13 @@ class WorkflowProjectConfigTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "workflow.hooks"):
                 load_project_config(config_path)
+
+    def test_workflow_merge_policy_normalizes_auto_merge_to_auto(self) -> None:
+        merge_policy = workflow_merge_policy(
+            {"workflow": {"merge": {"auto_merge": True, "method": "squash"}}}
+        )
+
+        self.assertEqual(merge_policy, {"auto": True, "method": "squash"})
 
     def test_current_pr_approvals_use_latest_review_per_author(self) -> None:
         reviews = [

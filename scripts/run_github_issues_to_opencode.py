@@ -1532,14 +1532,11 @@ def workflow_merge_policy(project_config: dict) -> dict[str, object]:
     if "auto" in merge:
         normalized["auto"] = bool(merge.get("auto"))
     if "auto_merge" in merge:
-        normalized["auto_merge"] = bool(merge.get("auto_merge"))
-        normalized.setdefault("auto", normalized["auto_merge"])
+        normalized.setdefault("auto", bool(merge.get("auto_merge")))
     if "method" in merge:
         method = _as_optional_string(merge.get("method"))
         if method is not None:
             normalized["method"] = method
-    if "auto" in normalized and "auto_merge" not in normalized:
-        normalized["auto_merge"] = normalized["auto"]
     return normalized
 
 
@@ -8527,7 +8524,7 @@ def run_doctor(args: argparse.Namespace, raw_argv: list[str] | None = None) -> i
                 checks,
                 "PASS",
                 "Workflow config",
-                f"commands={command_names}; hooks={hook_names}; readiness={readiness_text}; auto_merge={merge_policy.get('auto_merge')}; merge_method={merge_policy.get('method')}",
+                f"commands={command_names}; hooks={hook_names}; readiness={readiness_text}; auto_merge={merge_policy.get('auto')}; merge_method={merge_policy.get('method')}",
             )
         except Exception as exc:  # noqa: BLE001
             _doctor_record(checks, "FAIL", "Project config", str(exc))

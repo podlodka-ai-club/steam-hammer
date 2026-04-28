@@ -103,6 +103,25 @@ There is no dedicated daemon logfile today.
 
 After #204, a small concurrent detached batch is only considered safe when operators explicitly verify ownership boundaries before any merge.
 
+Recorded outcome on 2026-04-28:
+
+- Status: green for the local detached/concurrent ownership smoke.
+- Evidence command 1: `go test ./internal/cli ./internal/core/workers`
+- Evidence command 2: `python3 -m unittest tests.test_staging_behavior tests.test_existing_branch_pr_reuse tests.test_post_batch_verification -q`
+- Result: both commands passed.
+- Blocker follow-up: not needed from this smoke run.
+
+What this smoke confirms:
+
+- `internal/cli` detached batch tests cover one worker per issue, fresh per-worker clone paths, and persisted batch metadata with per-child status commands.
+- `internal/core/workers` tests cover predictable worker registry paths and persisted clone/log/state metadata.
+- Python ownership tests fail commit/push before side effects when the current branch or repo root does not match the expected issue worker context.
+
+What this smoke does not claim:
+
+- This is not a fresh live GitHub batch that opens real PRs for 2-3 issues.
+- Operator ownership checks from the checklist below still remain the merge gate for any real detached batch.
+
 Recommended scope:
 
 - Use 2-3 issues only.

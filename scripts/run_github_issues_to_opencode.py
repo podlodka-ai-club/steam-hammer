@@ -756,6 +756,12 @@ def _label_already_exists_error(message: str) -> bool:
 WORKFLOW_COMMAND_ORDER = ["setup", "test", "lint", "build", "e2e"]
 WORKFLOW_CHECK_COMMAND_ORDER = ["test", "lint", "build", "e2e"]
 WORKFLOW_HOOK_NAMES = ["pre_agent", "post_agent", "pre_pr_update", "post_pr_update"]
+WORKFLOW_HOOK_ALIASES = {
+    "before_agent": "pre_agent",
+    "after_agent": "post_agent",
+    "before_pr_update": "pre_pr_update",
+    "after_pr_update": "post_pr_update",
+}
 MERGE_METHOD_CHOICES = {"merge", "squash", "rebase"}
 MERGEABLE_READY_STATES = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
 
@@ -901,7 +907,39 @@ def configured_setup_command(project_config: dict) -> str | None:
     return normalized or None
 
 
-def workflow_hooks(project_config: dict) -> dict[str, str]:
+def configured_setup_commands(project_config: dict) -> list[tuple[str, str]]:
+    command = configured_setup_command(project_config)
+    if command is None:
+        return []
+    return [("setup", command)]
+
+
+def _normalize_hook_command_list(value: object, config_key: str | None = None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            if config_key is not None:
+                raise RuntimeError(f"Project config key '{config_key}' must be a non-empty string or array of non-empty strings")
+            return []
+        return [normalized]
+    if not isinstance(value, list):
+        if config_key is not None:
+            raise RuntimeError(f"Project config key '{config_key}' must be a string, array of strings, or null")
+        return []
+
+    normalized_commands: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            if config_key is not None:
+                raise RuntimeError(f"Project config key '{config_key}' must contain non-empty strings")
+            continue
+        normalized_commands.append(item.strip())
+    return normalized_commands
+
+
+def configured_workflow_hooks(project_config: dict) -> dict[str, list[str]]:
     workflow = project_config.get("workflow") if isinstance(project_config, dict) else None
     if not isinstance(workflow, dict):
         return {}
@@ -910,14 +948,22 @@ def workflow_hooks(project_config: dict) -> dict[str, str]:
     if not isinstance(hooks, dict):
         return {}
 
-    configured: dict[str, str] = {}
-    for hook_name in WORKFLOW_HOOK_NAMES:
-        command = hooks.get(hook_name)
-        if not isinstance(command, str):
+    configured: dict[str, list[str]] = {}
+    for raw_hook_name, raw_value in hooks.items():
+        hook_name = WORKFLOW_HOOK_ALIASES.get(str(raw_hook_name), str(raw_hook_name))
+        if hook_name not in WORKFLOW_HOOK_NAMES:
             continue
-        normalized = command.strip()
-        if normalized:
-            configured[hook_name] = normalized
+        commands = _normalize_hook_command_list(raw_value)
+        if commands:
+            configured[hook_name] = commands
+    return configured
+
+
+def workflow_hooks(project_config: dict) -> dict[str, str]:
+    configured: dict[str, str] = {}
+    for hook_name, commands in configured_workflow_hooks(project_config).items():
+        if commands:
+            configured[hook_name] = commands[0]
     return configured
 
 
@@ -947,9 +993,18 @@ def workflow_readiness_policy(project_config: dict) -> dict[str, object]:
         approvals = _as_positive_int(readiness.get("required_approvals"))
         normalized["required_approvals"] = approvals if approvals is not None else 0
 
-    for key in ["require_review", "require_mergeable", "require_required_file_evidence"]:
-        if key in readiness:
-            normalized[key] = bool(readiness.get(key))
+    if "require_review" in readiness:
+        normalized["require_review"] = bool(readiness.get("require_review"))
+    if "require_review_approval" in readiness:
+        normalized["require_review"] = bool(readiness.get("require_review_approval"))
+    if "require_mergeable" in readiness:
+        normalized["require_mergeable"] = bool(readiness.get("require_mergeable"))
+    if "require_required_file_evidence" in readiness:
+        normalized["require_required_file_evidence"] = bool(readiness.get("require_required_file_evidence"))
+    if "require_green_checks" in readiness:
+        normalized["require_green_checks"] = bool(readiness.get("require_green_checks"))
+    if "require_local_workflow_checks" in readiness:
+        normalized["require_local_workflow_checks"] = bool(readiness.get("require_local_workflow_checks"))
     return normalized
 
 
@@ -965,10 +1020,15 @@ def workflow_merge_policy(project_config: dict) -> dict[str, object]:
     normalized: dict[str, object] = {}
     if "auto" in merge:
         normalized["auto"] = bool(merge.get("auto"))
+    if "auto_merge" in merge:
+        normalized["auto_merge"] = bool(merge.get("auto_merge"))
+        normalized.setdefault("auto", normalized["auto_merge"])
     if "method" in merge:
         method = _as_optional_string(merge.get("method"))
         if method is not None:
             normalized["method"] = method
+    if "auto" in normalized and "auto_merge" not in normalized:
+        normalized["auto_merge"] = normalized["auto"]
     return normalized
 
 
@@ -1049,6 +1109,38 @@ def run_workflow_hook(
     )
 
 
+def run_configured_workflow_hooks(
+    *,
+    hook_name: str,
+    configured_hooks: dict[str, list[str]],
+    dry_run: bool,
+    cwd: str | None = None,
+    context: dict[str, str] | None = None,
+) -> list[dict]:
+    hook_name = WORKFLOW_HOOK_ALIASES.get(hook_name, hook_name)
+    commands = configured_hooks.get(hook_name) or []
+    if not commands:
+        return []
+
+    env = os.environ.copy()
+    if context:
+        env.update({key: str(value) for key, value in context.items() if value is not None})
+
+    results: list[dict] = []
+    for index, command_text in enumerate(commands, start=1):
+        result = _run_workflow_shell_command(
+            kind="hook",
+            name=f"{hook_name}[{index}]",
+            command_text=command_text,
+            dry_run=dry_run,
+            cwd=cwd,
+            env=env,
+        )
+        result["hook"] = hook_name
+        results.append(result)
+    return results
+
+
 def _check_name_key(value: object) -> str:
     return str(value or "").strip().lower()
 
@@ -1084,13 +1176,20 @@ def count_approving_reviews(pull_request: dict) -> dict[str, object]:
     }
 
 
-def evaluate_pr_readiness(
-    *,
-    pull_request: dict,
-    ci_status: dict,
-    required_file_validation: dict[str, object],
-    project_config: dict,
-) -> dict[str, object]:
+def evaluate_pr_readiness(*args, **kwargs) -> dict[str, object]:
+    if args:
+        if len(args) < 3:
+            raise TypeError("evaluate_pr_readiness expected at least 3 positional arguments")
+        project_config = args[0]
+        pull_request = args[1]
+        ci_status = args[2]
+        required_file_validation = kwargs.get("required_file_validation") or {"status": "passed"}
+    else:
+        pull_request = kwargs["pull_request"]
+        ci_status = kwargs["ci_status"]
+        required_file_validation = kwargs.get("required_file_validation") or {"status": "passed"}
+        project_config = kwargs["project_config"]
+
     readiness_policy = workflow_readiness_policy(project_config)
     required_checks = readiness_policy.get("required_checks")
     if not isinstance(required_checks, list):
@@ -1171,7 +1270,7 @@ def evaluate_pr_readiness(
     if required_approvals > approved_count:
         return {
             "status": "ready-for-review",
-            "next_action": "wait_for_review",
+            "next_action": "await_required_approval" if args else "wait_for_review",
             "error": f"Waiting for required approvals: {approved_count}/{required_approvals}",
         }
 
@@ -1180,6 +1279,18 @@ def evaluate_pr_readiness(
         "next_action": "ready_for_merge",
         "error": None,
     }
+
+
+def count_current_pr_approvals(reviews: list[dict], pr_author_login: str = "") -> int:
+    return int(
+        count_approving_reviews(
+            {
+                "reviews": reviews,
+                "author": {"login": pr_author_login},
+            }
+        ).get("approved_count")
+        or 0
+    )
 
 
 def build_workflow_hook_env(
@@ -6070,14 +6181,13 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
     if commands is not None:
         if not isinstance(commands, dict):
             raise RuntimeError("Project config key 'workflow.commands' must be an object")
-
-    supported_commands = set(WORKFLOW_COMMAND_ORDER)
-    unsupported_commands = sorted(set(commands) - supported_commands)
-    if unsupported_commands:
-        raise RuntimeError(
-            f"Unsupported key(s) in project config {config_path} under 'workflow.commands': "
-            + ", ".join(unsupported_commands)
-        )
+        supported_commands = set(WORKFLOW_COMMAND_ORDER)
+        unsupported_commands = sorted(set(commands) - supported_commands)
+        if unsupported_commands:
+            raise RuntimeError(
+                f"Unsupported key(s) in project config {config_path} under 'workflow.commands': "
+                + ", ".join(unsupported_commands)
+            )
 
         for key in supported_commands:
             if key in commands and commands[key] is not None and not isinstance(commands[key], str):
@@ -6093,60 +6203,17 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
     if hooks is not None:
         if not isinstance(hooks, dict):
             raise RuntimeError("Project config key 'workflow.hooks' must be an object")
-        unsupported_hooks = sorted(set(hooks) - set(WORKFLOW_HOOK_NAMES))
+        supported_hooks = set(WORKFLOW_HOOK_NAMES) | set(WORKFLOW_HOOK_ALIASES)
+        unsupported_hooks = sorted(set(hooks) - supported_hooks)
         if unsupported_hooks:
             raise RuntimeError(
                 f"Unsupported key(s) in project config {config_path} under 'workflow.hooks': "
                 + ", ".join(unsupported_hooks)
             )
-        for hook_name in WORKFLOW_HOOK_NAMES:
+
+        for hook_name in supported_hooks:
             if hook_name in hooks:
-                _normalize_string_list_config(hooks.get(hook_name), f"workflow.hooks.{hook_name}")
-
-    readiness = config.get("readiness")
-    if readiness is not None:
-        if not isinstance(readiness, dict):
-            raise RuntimeError("Project config key 'workflow.readiness' must be an object")
-
-        supported_readiness_keys = {
-            "required_checks",
-            "required_approvals",
-            "require_review_approval",
-            "require_required_file_evidence",
-            "require_green_checks",
-            "require_local_workflow_checks",
-        }
-        unsupported_readiness = sorted(set(readiness) - supported_readiness_keys)
-        if unsupported_readiness:
-            raise RuntimeError(
-                f"Unsupported key(s) in project config {config_path} under 'workflow.readiness': "
-                + ", ".join(unsupported_readiness)
-            )
-
-    hooks = config.get("hooks")
-    if hooks is not None:
-        if not isinstance(hooks, dict):
-            raise RuntimeError("Project config key 'workflow.hooks' must be an object")
-
-        unsupported_hooks = sorted(set(hooks) - set(WORKFLOW_HOOK_NAMES))
-        if unsupported_hooks:
-            raise RuntimeError(
-                f"Unsupported key(s) in project config {config_path} under 'workflow.hooks': "
-                + ", ".join(unsupported_hooks)
-            )
-
-        for hook_name in WORKFLOW_HOOK_NAMES:
-            hook_value = hooks.get(hook_name)
-            if hook_name not in hooks:
-                continue
-            if hook_value is not None and not isinstance(hook_value, str):
-                raise RuntimeError(
-                    f"Project config key 'workflow.hooks.{hook_name}' must be a string or null"
-                )
-            if isinstance(hook_value, str) and not hook_value.strip():
-                raise RuntimeError(
-                    f"Project config key 'workflow.hooks.{hook_name}' must be a non-empty string or null"
-                )
+                _normalize_hook_command_list(hooks.get(hook_name), f"workflow.hooks.{hook_name}")
 
     readiness = config.get("readiness")
     if readiness is not None:
@@ -6157,8 +6224,11 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
             "required_checks",
             "required_approvals",
             "require_review",
+            "require_review_approval",
             "require_mergeable",
             "require_required_file_evidence",
+            "require_green_checks",
+            "require_local_workflow_checks",
         }
         unsupported_readiness = sorted(set(readiness) - supported_readiness_keys)
         if unsupported_readiness:
@@ -6186,7 +6256,14 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
                     "Project config key 'workflow.readiness.required_approvals' must be a non-negative integer"
                 )
 
-        for key in ["require_review", "require_mergeable", "require_required_file_evidence"]:
+        for key in [
+            "require_review",
+            "require_review_approval",
+            "require_mergeable",
+            "require_required_file_evidence",
+            "require_green_checks",
+            "require_local_workflow_checks",
+        ]:
             if key in readiness and not isinstance(readiness.get(key), bool):
                 raise RuntimeError(
                     f"Project config key 'workflow.readiness.{key}' must be a boolean"
@@ -6197,7 +6274,7 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
         if not isinstance(merge, dict):
             raise RuntimeError("Project config key 'workflow.merge' must be an object")
 
-        supported_merge_keys = {"auto", "method"}
+        supported_merge_keys = {"auto", "auto_merge", "method"}
         unsupported_merge = sorted(set(merge) - supported_merge_keys)
         if unsupported_merge:
             raise RuntimeError(
@@ -6207,6 +6284,8 @@ def _validate_project_workflow(config: dict, config_path: str) -> None:
 
         if "auto" in merge and not isinstance(merge.get("auto"), bool):
             raise RuntimeError("Project config key 'workflow.merge.auto' must be a boolean")
+        if "auto_merge" in merge and not isinstance(merge.get("auto_merge"), bool):
+            raise RuntimeError("Project config key 'workflow.merge.auto_merge' must be a boolean")
 
         if "method" in merge:
             method = merge.get("method")
@@ -7087,11 +7166,13 @@ def run_doctor(args: argparse.Namespace, raw_argv: list[str] | None = None) -> i
         try:
             project_config = load_project_config(project_config_path)
             workflow_commands = configured_setup_commands(project_config) + configured_workflow_commands(project_config)
-            workflow_hooks = configured_workflow_hooks(project_config)
+            configured_hook_groups = configured_workflow_hooks(project_config)
             readiness_policy = workflow_readiness_policy(project_config)
             merge_policy = workflow_merge_policy(project_config)
             command_names = ", ".join(name for name, _ in workflow_commands) or "none"
-            hook_names = ", ".join(sorted(name for name, values in workflow_hooks.items() if values)) or "none"
+            hook_names = ", ".join(
+                sorted(name for name, values in configured_hook_groups.items() if values)
+            ) or "none"
             readiness_parts = []
             required_checks = list(readiness_policy.get("required_checks") or [])
             if required_checks:
@@ -8203,11 +8284,11 @@ def main() -> int:
                 run_stats=pr_agent_run_stats,
                 agent_result=pr_agent_result,
             )
-            if workflow_hooks:
+            if configured_hooks:
                 failure_stage = "workflow_hooks"
                 run_configured_workflow_hooks(
-                    hook_name="after_agent",
-                    configured_hooks=workflow_hooks,
+                    hook_name="post_agent",
+                    configured_hooks=configured_hooks,
                     dry_run=args.dry_run,
                     cwd=os.getcwd(),
                     context=hook_context,
@@ -8329,11 +8410,11 @@ def main() -> int:
             )
 
             failure_stage = "commit_push"
-            if workflow_hooks:
+            if configured_hooks:
                 failure_stage = "workflow_hooks"
                 run_configured_workflow_hooks(
-                    hook_name="before_pr_update",
-                    configured_hooks=workflow_hooks,
+                    hook_name="pre_pr_update",
+                    configured_hooks=configured_hooks,
                     dry_run=args.dry_run,
                     cwd=os.getcwd(),
                     context=hook_context,
@@ -8436,11 +8517,11 @@ def main() -> int:
                             decomposition=pr_recovered_decomposition_rollup,
                         ),
                     )
-            if workflow_hooks:
+            if configured_hooks:
                 failure_stage = "workflow_hooks"
                 run_configured_workflow_hooks(
-                    hook_name="after_pr_update",
-                    configured_hooks=workflow_hooks,
+                    hook_name="post_pr_update",
+                    configured_hooks=configured_hooks,
                     dry_run=args.dry_run,
                     cwd=os.getcwd(),
                     context=hook_context,
@@ -9684,11 +9765,11 @@ def main() -> int:
                         env=issue_hook_env,
                     )
                     failure_stage = "agent_run"
-                    if workflow_hooks:
+                    if configured_hooks:
                         failure_stage = "workflow_hooks"
                         run_configured_workflow_hooks(
-                            hook_name="before_agent",
-                            configured_hooks=workflow_hooks,
+                            hook_name="pre_agent",
+                            configured_hooks=configured_hooks,
                             dry_run=args.dry_run,
                             cwd=os.getcwd(),
                             context=issue_hook_context,
@@ -9712,11 +9793,11 @@ def main() -> int:
                         run_stats=issue_agent_run_stats,
                         agent_result=agent_result,
                     )
-                    if workflow_hooks:
+                    if configured_hooks:
                         failure_stage = "workflow_hooks"
                         run_configured_workflow_hooks(
-                            hook_name="after_agent",
-                            configured_hooks=workflow_hooks,
+                            hook_name="post_agent",
+                            configured_hooks=configured_hooks,
                             dry_run=args.dry_run,
                             cwd=os.getcwd(),
                             context=issue_hook_context,
@@ -10001,11 +10082,11 @@ def main() -> int:
                 )
 
                 failure_stage = "commit_push"
-                if workflow_hooks:
+                if configured_hooks:
                     failure_stage = "workflow_hooks"
                     run_configured_workflow_hooks(
-                        hook_name="before_pr_update",
-                        configured_hooks=workflow_hooks,
+                        hook_name="pre_pr_update",
+                        configured_hooks=configured_hooks,
                         dry_run=args.dry_run,
                         cwd=os.getcwd(),
                         context=issue_hook_context,

@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import io
 import unittest
 from unittest.mock import patch
@@ -1135,7 +1136,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
             patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]),
             patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[]),
             patch(
-                "scripts.run_github_issues_to_opencode.read_pr_ci_status_for_pull_request",
+                "scripts.run_github_issues_to_opencode.wait_for_pr_ci_status",
                 return_value={
                     "head_sha": "abc123",
                     "overall": "pending",
@@ -1161,6 +1162,291 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertEqual(posted_state["status"], "waiting-for-ci")
         self.assertEqual(posted_state["stage"], "ci_checks")
         self.assertIn("CI checks are still pending", stdout_mock.getvalue())
+
+    def test_main_issue_flow_waiting_for_ci_failure_runs_ci_fix_retry_within_limit(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=52,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            token_budget=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            max_attempts=2,
+            decompose="never",
+            create_child_issues=False,
+            track_tokens=False,
+        )
+
+        issue = {
+            "number": 52,
+            "title": "Prevent duplicate processing",
+            "body": "Implement duplicate guards",
+            "url": "https://example/issues/52",
+        }
+        linked_pr = {
+            "number": 120,
+            "url": "https://example/pull/120",
+            "headRefName": "issue-fix/52-prevent-duplicate-processing",
+            "baseRefName": "main",
+        }
+        pull_request = {
+            "number": 120,
+            "title": "Fix duplicate processing",
+            "body": "PR body",
+            "url": "https://example/pull/120",
+            "state": "OPEN",
+            "mergeStateStatus": "CLEAN",
+            "headRefName": linked_pr["headRefName"],
+            "baseRefName": "main",
+            "reviews": [],
+            "author": {"login": "pr-owner"},
+        }
+        pr_state_comments = [
+            {
+                "id": 21,
+                "created_at": "2026-04-26T14:00:00Z",
+                "html_url": "https://example/pull/120#issuecomment-21",
+                "body": (
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"waiting-for-ci","attempt":1}\n'
+                    "```"
+                ),
+            }
+        ]
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=linked_pr))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_issue_comments",
+                    side_effect=[[], pr_state_comments],
+                )
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pull_request", return_value=pull_request))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[]))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.wait_for_pr_ci_status",
+                    return_value={
+                        "head_sha": "abc123",
+                        "overall": "failure",
+                        "checks": [{"name": "ci/test", "state": "failure", "url": "https://example/checks/1"}],
+                        "pending_checks": [],
+                        "failing_checks": [{"name": "ci/test", "state": "failure", "url": "https://example/checks/1"}],
+                    },
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.collect_failing_ci_diagnostics",
+                    return_value={
+                        "overall_classification": "real",
+                        "failing_checks": [
+                            {
+                                "name": "ci/test",
+                                "url": "https://example/checks/1",
+                                "classification": {"kind": "real", "reason": "test assertion failed"},
+                                "log_excerpt": "AssertionError: boom",
+                            }
+                        ],
+                    },
+                )
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.sync_reused_branch_with_base", return_value=False))
+            run_agent_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_agent", return_value=0))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.commit_changes"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_configured_workflow_checks", return_value=[]))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.push_branch"))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.ensure_pr",
+                    return_value=("reused", "https://example/pull/120"),
+                )
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"))
+            state_post_mock = stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment")
+            )
+            stdout_mock = stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        run_agent_mock.assert_called_once()
+        posted_states = [call.kwargs["state"] for call in state_post_mock.call_args_list]
+        self.assertTrue(any(state.get("next_action") == "run_ci_fix_agent" for state in posted_states))
+        self.assertTrue(any(state.get("status") == "waiting-for-ci" and state.get("attempt") == 2 for state in posted_states))
+        self.assertIn("Running CI fix attempt 2/2", stdout_mock.getvalue())
+
+    def test_main_issue_flow_waiting_for_ci_failure_blocks_when_retry_limit_reached(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=52,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            token_budget=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            max_attempts=1,
+            decompose="never",
+            create_child_issues=False,
+            track_tokens=False,
+        )
+
+        issue = {
+            "number": 52,
+            "title": "Prevent duplicate processing",
+            "body": "Implement duplicate guards",
+            "url": "https://example/issues/52",
+        }
+        linked_pr = {
+            "number": 120,
+            "url": "https://example/pull/120",
+            "headRefName": "issue-fix/52-prevent-duplicate-processing",
+            "baseRefName": "main",
+        }
+        pull_request = {
+            "number": 120,
+            "title": "Fix duplicate processing",
+            "body": "PR body",
+            "url": "https://example/pull/120",
+            "state": "OPEN",
+            "mergeStateStatus": "CLEAN",
+            "headRefName": linked_pr["headRefName"],
+            "baseRefName": "main",
+            "reviews": [],
+            "author": {"login": "pr-owner"},
+        }
+        pr_state_comments = [
+            {
+                "id": 21,
+                "created_at": "2026-04-26T14:00:00Z",
+                "html_url": "https://example/pull/120#issuecomment-21",
+                "body": (
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"waiting-for-ci","attempt":1}\n'
+                    "```"
+                ),
+            }
+        ]
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=linked_pr))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_issue_comments",
+                    side_effect=[[], pr_state_comments],
+                )
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pull_request", return_value=pull_request))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[]))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.wait_for_pr_ci_status",
+                    return_value={
+                        "head_sha": "abc123",
+                        "overall": "failure",
+                        "checks": [{"name": "ci/test", "state": "failure", "url": "https://example/checks/1"}],
+                        "pending_checks": [],
+                        "failing_checks": [{"name": "ci/test", "state": "failure", "url": "https://example/checks/1"}],
+                    },
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.collect_failing_ci_diagnostics",
+                    return_value={
+                        "overall_classification": "real",
+                        "failing_checks": [
+                            {
+                                "name": "ci/test",
+                                "url": "https://example/checks/1",
+                                "classification": {"kind": "real", "reason": "test assertion failed"},
+                                "log_excerpt": "AssertionError: boom",
+                            }
+                        ],
+                    },
+                )
+            )
+            prepare_issue_branch_mock = stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.prepare_issue_branch")
+            )
+            run_agent_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_agent"))
+            state_post_mock = stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment")
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"))
+            stdout_mock = stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        prepare_issue_branch_mock.assert_not_called()
+        run_agent_mock.assert_not_called()
+        posted_state = state_post_mock.call_args.kwargs["state"]
+        self.assertEqual(posted_state["status"], "blocked")
+        self.assertEqual(posted_state["next_action"], "manual_ci_fix_required")
+        self.assertEqual(posted_state["attempt"], 1)
+        self.assertIn("retry limit reached", posted_state["error"])
+        self.assertIn("retry limit reached", stdout_mock.getvalue())
 
     def test_main_issue_flow_posts_blocked_state_when_token_budget_exceeded(self) -> None:
         args = argparse.Namespace(

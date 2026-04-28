@@ -16,6 +16,7 @@ from scripts.run_github_issues_to_opencode import (
     format_recovered_state_context,
     format_decomposition_rollup_context,
     format_orchestration_state_comment,
+    format_orchestration_status_summary,
     parse_clarification_request_text,
     main,
     parse_orchestration_state_comment_body,
@@ -269,6 +270,49 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("ignoring malformed orchestration state comment", warnings[0])
 
+    def test_format_orchestration_status_summary_includes_done_current_next_and_blockers(self) -> None:
+        summary = format_orchestration_status_summary(
+            {
+                "target_type": "pr",
+                "target_number": 201,
+                "issue_number": 153,
+                "pr_number": 201,
+                "branch": "issue-fix/153-status",
+                "base_branch": "main",
+                "source_comment": "https://example/pr/201#issuecomment-9",
+                "latest_status": "blocked",
+                "latest_state": {
+                    "status": "blocked",
+                    "created_at": "2026-04-28T12:00:00Z",
+                    "source": "pr #201",
+                    "url": "https://example/pr/201#issuecomment-9",
+                    "payload": {
+                        "status": "blocked",
+                        "stage": "ci_checks",
+                        "next_action": "inspect_failing_ci_checks",
+                        "error": "CI failing checks: unit (https://ci.example/unit)",
+                    },
+                },
+                "ci_status": {
+                    "overall": "failure",
+                    "pending_checks": [],
+                    "failing_checks": [{"name": "unit", "url": "https://ci.example/unit"}],
+                    "checks": [{"name": "unit", "url": "https://ci.example/unit", "state": "failure"}],
+                },
+                "required_file_validation": {"status": "passed", "required_file_count": 1},
+                "merge_readiness": {"status": "blocked", "error": "GitHub has not marked this PR mergeable yet"},
+            }
+        )
+
+        self.assertIn("Target: pr #201", summary)
+        self.assertIn("Latest state: blocked", summary)
+        self.assertIn("Done: issue #153, pr #201, branch issue-fix/153-status, required files matched", summary)
+        self.assertIn("Current: blocked at ci_checks", summary)
+        self.assertIn("Next: inspect failing ci checks", summary)
+        self.assertIn("Blockers: CI failing checks: unit (https://ci.example/unit)", summary)
+        self.assertIn("State source: pr #201", summary)
+        self.assertIn("Source comment: https://example/pr/201#issuecomment-9", summary)
+
     def test_find_waiting_for_author_answer_uses_latest_author_reply_after_state(self) -> None:
         recovered_state = {
             "status": "waiting-for-author",
@@ -302,6 +346,138 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(answer)
         assert answer is not None
         self.assertIn("safer default", answer["body"])
+
+    def test_main_status_issue_uses_newer_linked_pr_state_summary(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            tracker="github",
+            codehost="github",
+            issue="153",
+            pr=None,
+            status=True,
+            from_review_comments=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            pr_followup_branch_prefix=None,
+            allow_pr_branch_switch=False,
+            isolate_worktree=False,
+            post_pr_summary=False,
+            track_tokens=False,
+            autonomous=False,
+            token_budget=None,
+            preset=None,
+            max_attempts=1,
+            escalate_to_preset=None,
+            base_branch="default",
+            decompose="auto",
+            create_child_issues=False,
+            dir=".",
+            project_config="project-config.json",
+            local_config="local-config.json",
+            dry_run=False,
+            doctor=False,
+            doctor_smoke_check=False,
+            runner="opencode",
+            agent="build",
+            model=None,
+            state="open",
+            limit=10,
+        )
+        issue = {
+            "number": 153,
+            "title": "Add operator status summary",
+            "body": "Required files:\n- internal/cli/app.go",
+            "url": "https://example/issues/153",
+        }
+        pull_request = {
+            "number": 201,
+            "title": "Add status summary",
+            "body": "Closes #153",
+            "url": "https://example/pr/201",
+            "state": "OPEN",
+            "mergeStateStatus": "CLEAN",
+            "mergeable": "MERGEABLE",
+            "isDraft": False,
+            "reviewDecision": "APPROVED",
+            "headRefName": "issue-fix/153-status",
+            "headRefOid": "deadbeef",
+            "baseRefName": "main",
+            "author": {"login": "bot"},
+            "reviews": [{"author": {"login": "reviewer"}, "state": "APPROVED", "submittedAt": "2026-04-28T11:30:00Z"}],
+            "files": [{"path": "internal/cli/app.go"}],
+            "closingIssuesReferences": [
+                {
+                    "number": 153,
+                    "title": "Add operator status summary",
+                    "body": "Required files:\n- internal/cli/app.go",
+                    "url": "https://example/issues/153",
+                }
+            ],
+        }
+        issue_comments = [
+            {
+                "id": 1,
+                "created_at": "2026-04-28T10:00:00Z",
+                "html_url": "https://example/issues/153#issuecomment-1",
+                "body": (
+                    f"{ORCHESTRATION_STATE_MARKER}\n"
+                    "```json\n"
+                    '{"status":"in-progress","stage":"agent_run","next_action":"wait_for_agent_result","branch":"issue-fix/153-status"}\n'
+                    "```"
+                ),
+            }
+        ]
+        pr_comments = [
+            {
+                "id": 9,
+                "created_at": "2026-04-28T12:00:00Z",
+                "html_url": "https://example/pr/201#issuecomment-9",
+                "body": (
+                    f"{ORCHESTRATION_STATE_MARKER}\n"
+                    "```json\n"
+                    '{"status":"waiting-for-ci","stage":"ci_checks","next_action":"wait_for_ci","branch":"issue-fix/153-status","base_branch":"main","pr":201,"issue":153}\n'
+                    "```"
+                ),
+            }
+        ]
+        ci_status = {
+            "overall": "pending",
+            "has_checks": True,
+            "pending_checks": [{"name": "test"}],
+            "failing_checks": [],
+            "checks": [{"name": "test", "state": "pending"}],
+        }
+
+        def fake_fetch_issue_comments(repo: str, issue_number: int) -> list[dict]:
+            self.assertEqual(repo, "owner/repo")
+            return issue_comments if issue_number == 153 else pr_comments
+
+        stdout = io.StringIO()
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.load_project_config", return_value={}),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value={"number": 201}),
+            patch("scripts.run_github_issues_to_opencode.fetch_pull_request", return_value=pull_request),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", side_effect=fake_fetch_issue_comments),
+            patch("scripts.run_github_issues_to_opencode.read_pr_ci_status_for_pull_request", return_value=ci_status),
+            patch("scripts.run_github_issues_to_opencode.evaluate_pr_merge_readiness", return_value={"status": "ready-to-merge"}),
+            contextlib.redirect_stdout(stdout),
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        rendered = stdout.getvalue()
+        self.assertIn("Target: issue #153", rendered)
+        self.assertIn("Latest state: waiting-for-ci", rendered)
+        self.assertIn("Done: issue #153, pr #201, branch issue-fix/153-status, required files matched", rendered)
+        self.assertIn("Current: waiting-for-ci at ci_checks; waiting on 1 pending CI check(s)", rendered)
+        self.assertIn("Next: wait for ci", rendered)
+        self.assertIn("PR readiness: ci=pending, pending=1, failing=0", rendered)
+        self.assertIn("State source: pr #201", rendered)
+        self.assertIn("Source comment: https://example/pr/201#issuecomment-9", rendered)
 
     def test_build_clarification_context_note_includes_question_and_answer(self) -> None:
         note = build_clarification_context_note(

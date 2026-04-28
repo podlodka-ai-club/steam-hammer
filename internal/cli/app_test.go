@@ -79,6 +79,30 @@ func TestAutoDoctorCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--doctor", "--repo", "owner/repo", "--dry-run"})
 }
 
+func TestStatusIssueCommandWiresPythonRunner(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"status", "--issue", "71", "--repo", "owner/repo", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--status", "--issue", "71", "--repo", "owner/repo", "--dry-run"})
+}
+
+func TestStatusPRCommandWiresPythonRunner(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"status", "--pr", "72", "--repo", "owner/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--status", "--pr", "72", "--repo", "owner/repo"})
+}
+
 func TestInitCreatesConfigScaffolds(t *testing.T) {
 	targetDir := t.TempDir()
 	var out strings.Builder

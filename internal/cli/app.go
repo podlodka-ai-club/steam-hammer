@@ -192,6 +192,8 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 		return a.runDoctor(ctx, args[1:])
 	case "autodoctor":
 		return a.runAutoDoctor(ctx, args[1:])
+	case "status":
+		return a.runStatus(ctx, args[1:])
 	case "run":
 		return a.runRun(ctx, args[1:])
 	default:
@@ -279,6 +281,35 @@ func (a *App) runDoctor(ctx context.Context, args []string) int {
 
 func (a *App) runAutoDoctor(ctx context.Context, args []string) int {
 	return a.runDoctor(ctx, args)
+}
+
+func (a *App) runStatus(ctx context.Context, args []string) int {
+	fs := newFlagSet("status", a.err)
+	opts := commonOptions{}
+	addCommonFlags(fs, &opts)
+	issue := fs.Int("issue", 0, "GitHub issue number")
+	pr := fs.Int("pr", 0, "GitHub pull request number")
+
+	if err := fs.Parse(args); err != nil {
+		return flagExitCode(err)
+	}
+	if fs.NArg() != 0 {
+		_, _ = fmt.Fprintf(a.err, "unexpected status argument: %s\n", fs.Arg(0))
+		return 2
+	}
+	if (*issue > 0 && *pr > 0) || (*issue <= 0 && *pr <= 0) {
+		_, _ = fmt.Fprintln(a.err, "status requires exactly one of --issue N or --pr N")
+		return 2
+	}
+
+	pythonArgs := []string{runnerScript, "--status"}
+	if *issue > 0 {
+		pythonArgs = append(pythonArgs, "--issue", strconv.Itoa(*issue))
+	} else {
+		pythonArgs = append(pythonArgs, "--pr", strconv.Itoa(*pr))
+	}
+	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
+	return a.runPython(ctx, pythonArgs)
 }
 
 func (a *App) runRun(ctx context.Context, args []string) int {
@@ -853,6 +884,7 @@ func usage() string {
 	  orchestrator init [flags]
 	  orchestrator doctor [flags]
 	  orchestrator autodoctor [flags]
+	  orchestrator status (--issue N | --pr N) [flags]
 	  orchestrator run issue --id N [flags]
 	  orchestrator run pr --id N [flags]
 	  orchestrator run daemon [flags]
@@ -861,6 +893,7 @@ func usage() string {
 	  init       Create local/project config scaffolds.
 	  doctor     Run environment diagnostics via the current Python runner.
 	  autodoctor Run doctor diagnostics with the same current checks.
+	  status     Print a concise orchestration status summary.
 	  run issue  Run issue orchestration via the current Python runner.
 	  run pr     Run PR review-comment orchestration via the current Python runner.
 	  run daemon Poll for issue work via the current Python runner.

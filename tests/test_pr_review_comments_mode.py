@@ -247,6 +247,166 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(readiness["status"], "blocked")
         self.assertEqual(readiness["next_action"], "inspect_merge_requirements")
 
+    def test_evaluate_pr_merge_readiness_blocks_failed_merge_result_verification(self) -> None:
+        readiness = self.mod.evaluate_pr_merge_readiness(
+            pull_request={
+                "mergeStateStatus": "CLEAN",
+                "mergeable": "MERGEABLE",
+                "reviewDecision": "APPROVED",
+                "isDraft": False,
+            },
+            merge_policy={"auto": False, "method": "squash"},
+            merge_result_verification={
+                "status": "failed",
+                "summary": "failed (0/1 passed; failed: go-test)",
+            },
+        )
+
+        self.assertEqual(readiness["status"], "blocked")
+        self.assertEqual(readiness["next_action"], "inspect_merge_result_verification")
+        self.assertEqual(
+            readiness["merge_result_verification"]["summary"],
+            "failed (0/1 passed; failed: go-test)",
+        )
+
+    def test_determine_merge_result_verification_need_skips_docs_only_pr(self) -> None:
+        decision = self.mod.determine_merge_result_verification_need(
+            repo="owner/repo",
+            pull_request={
+                "number": 42,
+                "baseRefName": "main",
+                "files": [{"path": "docs/runbook.md"}, {"path": "README.md"}],
+            },
+        )
+
+        self.assertFalse(decision["required"])
+        self.assertEqual(decision["reason"], "docs-only")
+
+    def test_determine_merge_result_verification_need_requires_central_runner_files(self) -> None:
+        with (
+            mock.patch.object(
+                self.mod,
+                "list_open_pull_requests",
+                return_value=[
+                    {
+                        "number": 77,
+                        "headRefName": "issue-fix/77-overlap",
+                        "baseRefName": "main",
+                    }
+                ],
+            ),
+            mock.patch.object(
+                self.mod,
+                "fetch_pull_request",
+                return_value={"files": [{"path": "internal/cli/app.go"}]},
+            ),
+        ):
+            decision = self.mod.determine_merge_result_verification_need(
+                repo="owner/repo",
+                pull_request={
+                    "number": 42,
+                    "baseRefName": "main",
+                    "files": [{"path": "internal/cli/app.go"}, {"path": "tests/test_app.py"}],
+                },
+            )
+
+        self.assertTrue(decision["required"])
+        self.assertEqual(decision["reason"], "central-runner-files")
+
+    def test_determine_merge_result_verification_need_requires_overlap_for_non_central_pr(self) -> None:
+        with (
+            mock.patch.object(
+                self.mod,
+                "list_open_pull_requests",
+                return_value=[
+                    {
+                        "number": 77,
+                        "headRefName": "issue-fix/77-overlap",
+                        "baseRefName": "main",
+                    }
+                ],
+            ),
+            mock.patch.object(
+                self.mod,
+                "fetch_pull_request",
+                return_value={"files": [{"path": "pkg/service/handler.py"}]},
+            ),
+        ):
+            decision = self.mod.determine_merge_result_verification_need(
+                repo="owner/repo",
+                pull_request={
+                    "number": 42,
+                    "baseRefName": "main",
+                    "files": [{"path": "pkg/service/handler.py"}],
+                },
+            )
+
+        self.assertTrue(decision["required"])
+        self.assertEqual(decision["reason"], "overlapping-open-prs")
+        self.assertEqual(decision["overlapping_prs"][0]["number"], 77)
+
+    def test_verify_pull_request_merge_result_uses_temp_clone(self) -> None:
+        with (
+            mock.patch.object(
+                self.mod,
+                "determine_merge_result_verification_need",
+                return_value={
+                    "required": True,
+                    "reason": "overlapping-open-prs",
+                    "summary": "required (overlaps with open PRs: #77)",
+                    "changed_files": ["pkg/service/handler.py"],
+                    "overlapping_prs": [{"number": 77, "files": ["pkg/service/handler.py"]}],
+                },
+            ),
+            mock.patch.object(
+                self.mod,
+                "merge_result_verification_commands",
+                return_value=[("go-test", "go test ./...")],
+            ),
+            mock.patch.object(self.mod.tempfile, "mkdtemp", return_value="/tmp/merge-verify-pr-42"),
+            mock.patch.object(self.mod, "run_command") as run_command_mock,
+            mock.patch.object(
+                self.mod,
+                "run_check_command",
+                side_effect=[
+                    (True, "", "", 0),
+                    (True, "ok", "", 0),
+                ],
+            ) as run_check_command_mock,
+            mock.patch.object(self.mod.shutil, "rmtree") as rmtree_mock,
+        ):
+            verification = self.mod.verify_pull_request_merge_result(
+                repo="owner/repo",
+                pull_request={
+                    "number": 42,
+                    "baseRefName": "main",
+                    "headRefName": "issue-fix/42-overlap",
+                },
+                project_config={},
+                repo_dir="/repo",
+                dry_run=False,
+            )
+
+        self.assertEqual(verification["status"], "passed")
+        self.assertEqual(verification["checkout"], "temp-clone")
+        run_command_mock.assert_has_calls(
+            [
+                mock.call(["git", "clone", "--quiet", "/repo", "/tmp/merge-verify-pr-42"]),
+                mock.call(["git", "-C", "/tmp/merge-verify-pr-42", "fetch", "origin", "main", "issue-fix/42-overlap"]),
+                mock.call(["git", "-C", "/tmp/merge-verify-pr-42", "checkout", "--detach", "origin/main"]),
+            ]
+        )
+        run_check_command_mock.assert_has_calls(
+            [
+                mock.call(
+                    ["git", "merge", "--no-ff", "--no-commit", "origin/issue-fix/42-overlap"],
+                    cwd="/tmp/merge-verify-pr-42",
+                ),
+                mock.call(["bash", "-lc", "go test ./..."], cwd="/tmp/merge-verify-pr-42"),
+            ]
+        )
+        rmtree_mock.assert_called_once_with("/tmp/merge-verify-pr-42", ignore_errors=True)
+
     def test_run_merge_for_pull_request_reports_manual_merge_when_auto_merge_disabled(self) -> None:
         completed = self.mod.subprocess.CompletedProcess(
             args=["gh", "pr", "merge"],

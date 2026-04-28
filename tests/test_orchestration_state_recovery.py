@@ -479,6 +479,48 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertIn("State source: pr #201", rendered)
         self.assertIn("Source comment: https://example/pr/201#issuecomment-9", rendered)
 
+    def test_format_status_summary_includes_merge_result_verification(self) -> None:
+        summary = format_orchestration_status_summary(
+            {
+                "target_type": "pr",
+                "target_number": 12,
+                "latest_state": {
+                    "status": "ready-to-merge",
+                    "payload": {
+                        "status": "ready-to-merge",
+                        "stage": "merge_gate",
+                        "next_action": "ready_for_merge",
+                    },
+                },
+                "latest_status": "ready-to-merge",
+                "pr_number": 12,
+                "branch": "issue-fix/12-status",
+                "base_branch": "main",
+                "ci_status": {
+                    "overall": "success",
+                    "pending_checks": [],
+                    "failing_checks": [],
+                },
+                "merge_readiness": {
+                    "status": "ready-to-merge",
+                    "merge_state_status": "CLEAN",
+                    "merge_result_verification": {
+                        "status": "passed",
+                        "summary": "passed (2/2 commands)",
+                    },
+                },
+            }
+        )
+
+        self.assertIn(
+            "Current: ready-to-merge at merge_gate; merge state CLEAN; merge-result verification passed",
+            summary,
+        )
+        self.assertIn(
+            "PR readiness: ci=success, pending=0, failing=0; merge-result verification=passed (2/2 commands)",
+            summary,
+        )
+
     def test_build_clarification_context_note_includes_question_and_answer(self) -> None:
         note = build_clarification_context_note(
             state={

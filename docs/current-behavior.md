@@ -40,6 +40,7 @@
 - Для decomposition используется отдельный маркер `<!-- orchestration-decomposition:v1 -->`.
 - Для agent failures публикуется structured failure report и ставится label `auto:agent-failed`.
 - Повторные one-shot запуски читают последний корректный orchestration state и умеют продолжать работу из `failed`, `waiting-for-ci`, `ready-for-review`, `ready-to-merge` и related states.
+- Границы между issue/PR state comments, detached worker metadata, verification verdicts и autonomous session checkpoint теперь отдельно зафиксированы в `docs/orchestration-state-boundaries.md`, чтобы перенос в Go не менял внешнее поведение.
 
 ### Decomposition и child issues
 

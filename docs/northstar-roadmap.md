@@ -53,6 +53,7 @@
 - Разбить крупный Python runner на меньшие модули по зонам ответственности.
 - Выделить boundaries для state, policy, workflow, recovery и provider access.
 - Сохранить текущее поведение тестами перед переносом.
+- Использовать `docs/orchestration-state-boundaries.md` как контракт для переноса issue/PR state, worker metadata, verification verdicts и session checkpoint в Go.
 
 Результат: дальнейший перенос в Go становится инженерно управляемым, а не big-bang rewrite.
 

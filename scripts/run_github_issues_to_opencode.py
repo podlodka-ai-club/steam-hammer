@@ -143,6 +143,7 @@ AUTONOMOUS_CLAIM_TTL_SECONDS = 3600
 AUTONOMOUS_BATCH_SINGLE_PASS_STATUSES = frozenset(
     {"ready-for-review", "waiting-for-ci", "ready-to-merge"}
 )
+ORCHESTRATION_DEPENDENCIES_MARKER = "<!-- orchestration-dependencies:v1 -->"
 DECOMPOSITION_CHILD_STATUSES = ("planned", "created", "in-progress", "done", "blocked")
 KNOWN_NO_EXTENSION_REQUIRED_FILES = frozenset(
     {
@@ -167,6 +168,10 @@ REQUIRED_FILE_HINT_LINE = re.compile(
 FILE_PATH_TOKEN_RE = re.compile(
     r"(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)?|[A-Za-z0-9._-]+\.[A-Za-z0-9][A-Za-z0-9._-]+"
 )
+AUTONOMOUS_DEPENDENCY_LINE_RE = re.compile(
+    r"(?im)^\s*(?:[-*]\s*)?(?:depends on|blocked by)\s*:?\s*(.+)$"
+)
+GITHUB_ISSUE_REFERENCE_RE = re.compile(r"(?<![A-Za-z0-9])#(\d+)\b")
 
 
 def _as_positive_int(value: object) -> int | None:
@@ -215,6 +220,103 @@ def _normalize_match_list(values: list[str] | None) -> list[str]:
         if item:
             normalized.append(item)
     return normalized
+
+
+def _first_json_object(raw: str) -> dict:
+    start = raw.find("{")
+    if start < 0:
+        raise ValueError("payload is missing JSON object")
+    payload, _offset = json.JSONDecoder().raw_decode(raw[start:])
+    if not isinstance(payload, dict):
+        raise ValueError("payload JSON must be an object")
+    return payload
+
+
+def _extract_issue_references_from_text(raw: str, tracker: str) -> list[int | str]:
+    if tracker == TRACKER_JIRA:
+        seen: set[str] = set()
+        matches: list[str] = []
+        for match in JIRA_ISSUE_KEY_RE.finditer(raw.upper()):
+            issue_key = match.group(0)
+            if issue_key not in seen:
+                seen.add(issue_key)
+                matches.append(issue_key)
+        return matches
+
+    seen_numbers: set[int] = set()
+    numbers: list[int] = []
+    for match in GITHUB_ISSUE_REFERENCE_RE.finditer(raw):
+        issue_number = _as_positive_int(match.group(1))
+        if issue_number is None or issue_number in seen_numbers:
+            continue
+        seen_numbers.add(issue_number)
+        numbers.append(issue_number)
+    return numbers
+
+
+def _normalize_dependency_refs(raw_values: object, tracker: str) -> list[int | str]:
+    if not isinstance(raw_values, list):
+        return []
+    normalized: list[int | str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        try:
+            issue_ref = normalize_issue_number(raw_value, tracker)
+        except RuntimeError:
+            continue
+        issue_key = str(issue_ref)
+        if issue_key in seen:
+            continue
+        seen.add(issue_key)
+        normalized.append(issue_ref)
+    return normalized
+
+
+def _dependency_refs_from_marker_payload(body: str, tracker: str) -> list[int | str]:
+    if ORCHESTRATION_DEPENDENCIES_MARKER not in body:
+        return []
+    after_marker = body.split(ORCHESTRATION_DEPENDENCIES_MARKER, maxsplit=1)[1].strip()
+    if not after_marker:
+        return []
+
+    fenced_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", after_marker, flags=re.DOTALL)
+    candidates = fenced_matches if fenced_matches else [after_marker]
+    for candidate in candidates:
+        try:
+            payload = _first_json_object(candidate)
+        except (ValueError, json.JSONDecodeError):
+            continue
+        dependency_refs = _normalize_dependency_refs(payload.get("depends_on"), tracker)
+        blocked_by_refs = _normalize_dependency_refs(payload.get("blocked_by"), tracker)
+        return dependency_refs + [ref for ref in blocked_by_refs if str(ref) not in {str(dep) for dep in dependency_refs}]
+    return []
+
+
+def parse_issue_dependency_references(issue: dict, comments: list[dict] | None = None) -> list[int | str]:
+    tracker = issue_tracker(issue)
+    self_ref = str(issue.get("number") or "").strip()
+    refs: list[int | str] = []
+    seen: set[str] = set()
+
+    text_sources = [str(issue.get("body") or "")]
+    if isinstance(comments, list):
+        text_sources.extend(str(comment.get("body") or "") for comment in comments if isinstance(comment, dict))
+
+    for text in text_sources:
+        for issue_ref in _dependency_refs_from_marker_payload(text, tracker):
+            issue_key = str(issue_ref)
+            if issue_key and issue_key != self_ref and issue_key not in seen:
+                seen.add(issue_key)
+                refs.append(issue_ref)
+        for match in AUTONOMOUS_DEPENDENCY_LINE_RE.finditer(text):
+            dependency_line = str(match.group(1) or "")
+            for issue_ref in _extract_issue_references_from_text(dependency_line, tracker):
+                issue_key = str(issue_ref)
+                if issue_key and issue_key != self_ref and issue_key not in seen:
+                    seen.add(issue_key)
+                    refs.append(issue_ref)
+
+    return refs
 
 
 def is_trackable_issue_number(value: object) -> bool:
@@ -1145,6 +1247,124 @@ def sort_autonomous_issues(issues: list[dict], scope_defaults: dict) -> list[dic
     return sorted(issues, key=sort_key)
 
 
+def _fetch_issue_comments_for_dependency_resolution(repo: str, issue: dict) -> list[dict]:
+    tracker = issue_tracker(issue)
+    issue_ref = issue.get("number")
+    if tracker == TRACKER_JIRA:
+        return fetch_jira_issue_comments(str(issue_ref))
+
+    issue_number = _as_positive_int(issue_ref)
+    if issue_number is None:
+        return []
+    return fetch_issue_comments(repo=repo, issue_number=issue_number)
+
+
+def _fetch_dependency_issue(repo: str, issue_ref: int | str, tracker: str) -> dict | None:
+    try:
+        normalized_ref = normalize_issue_number(issue_ref, tracker)
+    except RuntimeError:
+        return None
+    if tracker == TRACKER_JIRA:
+        return fetch_jira_issue(str(normalized_ref))
+    if not isinstance(normalized_ref, int):
+        return None
+    return fetch_issue(repo=repo, number=normalized_ref)
+
+
+def split_autonomous_issues_by_dependency_state(
+    repo: str,
+    issues: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    open_lookup: dict[tuple[str, str], dict] = {}
+    dependency_issue_cache: dict[tuple[str, str], dict | None] = {}
+    comments_cache: dict[tuple[str, str], list[dict]] = {}
+    runnable: list[dict] = []
+    blocked: list[dict] = []
+
+    for issue in issues:
+        tracker = issue_tracker(issue)
+        issue_number = issue.get("number")
+        if issue_number is None:
+            continue
+        issue_key = (tracker, str(issue_number))
+        open_lookup[issue_key] = issue
+        dependency_issue_cache[issue_key] = issue
+
+    for issue in issues:
+        tracker = issue_tracker(issue)
+        issue_number = issue.get("number")
+        if issue_number is None:
+            runnable.append(issue)
+            continue
+
+        issue_key = (tracker, str(issue_number))
+        issue_comments = comments_cache.get(issue_key)
+        if issue_comments is None:
+            issue_comments = _fetch_issue_comments_for_dependency_resolution(repo=repo, issue=issue)
+            comments_cache[issue_key] = issue_comments
+
+        dependency_refs = parse_issue_dependency_references(issue, comments=issue_comments)
+        blocking_refs: list[int | str] = []
+        unresolved_refs: list[int | str] = []
+
+        for dependency_ref in dependency_refs:
+            dependency_key = (tracker, str(dependency_ref))
+            dependency_issue = dependency_issue_cache.get(dependency_key)
+            if dependency_issue is None and dependency_key not in dependency_issue_cache:
+                dependency_issue = _fetch_dependency_issue(
+                    repo=repo,
+                    issue_ref=dependency_ref,
+                    tracker=tracker,
+                )
+                if isinstance(dependency_issue, dict):
+                    dependency_issue.setdefault("tracker", tracker)
+                dependency_issue_cache[dependency_key] = dependency_issue
+
+            dependency_issue = dependency_issue_cache.get(dependency_key)
+            if dependency_issue is None:
+                unresolved_refs.append(dependency_ref)
+                continue
+
+            dependency_state = str(dependency_issue.get("state") or "").strip().lower()
+            if dependency_key in open_lookup or dependency_state == "open":
+                blocking_refs.append(dependency_ref)
+
+        if blocking_refs or unresolved_refs:
+            blocked_entry = {
+                "issue": issue,
+                "depends_on": dependency_refs,
+                "open_dependencies": blocking_refs,
+                "unresolved_dependencies": unresolved_refs,
+            }
+            open_dependency_labels = ", ".join(
+                format_issue_ref(dependency_ref, tracker=tracker) for dependency_ref in blocking_refs
+            )
+            unresolved_dependency_labels = ", ".join(
+                format_issue_ref(dependency_ref, tracker=tracker) for dependency_ref in unresolved_refs
+            )
+            reasons: list[str] = []
+            if open_dependency_labels:
+                reasons.append(f"open dependencies {open_dependency_labels}")
+            if unresolved_dependency_labels:
+                reasons.append(f"unresolved dependencies {unresolved_dependency_labels}")
+            blocked_entry["reason"] = "; ".join(reasons) if reasons else "dependency state is unresolved"
+            blocked.append(blocked_entry)
+            continue
+
+        runnable.append(issue)
+
+    return runnable, blocked
+
+
+def format_autonomous_dependency_blocker(blocked_entry: dict) -> str:
+    issue = blocked_entry.get("issue") if isinstance(blocked_entry, dict) else None
+    if not isinstance(issue, dict):
+        return "blocked issue"
+    issue_label = format_issue_label_from_issue(issue)
+    reason = _as_optional_string(blocked_entry.get("reason")) or "dependency state is unresolved"
+    return f"{issue_label} skipped: {reason}"
+
+
 def load_autonomous_session_state(path: str | None) -> dict:
     if not path:
         return {"processed_issues": {}, "checkpoint": {}}
@@ -1239,6 +1459,7 @@ def _compact_autonomous_status_counts(counts: dict | None) -> str:
     optional_fields = (
         ("skipped_existing_pr", "skipped_existing_pr"),
         ("skipped_existing_branch", "skipped_existing_branch"),
+        ("skipped_blocked_dependencies", "skipped_blocked_dependencies"),
         ("skipped_out_of_scope", "skipped_out_of_scope"),
     )
     for key, label in optional_fields:
@@ -1276,6 +1497,7 @@ def update_autonomous_session_checkpoint(
             "failures": int(counts.get("failures") or 0),
             "skipped_existing_pr": int(counts.get("skipped_existing_pr") or 0),
             "skipped_existing_branch": int(counts.get("skipped_existing_branch") or 0),
+            "skipped_blocked_dependencies": int(counts.get("skipped_blocked_dependencies") or 0),
             "skipped_out_of_scope": int(counts.get("skipped_out_of_scope") or 0),
         },
         "done": [item for item in done or [] if str(item).strip()],
@@ -9883,6 +10105,7 @@ def main() -> int:
         issues = sort_autonomous_issues(issues=issues, scope_defaults=scope_defaults)
 
     autonomous_session_state = load_autonomous_session_state(autonomous_session_file)
+    blocked_dependency_entries: list[dict] = []
     if autonomous_mode and issue_number_arg is None:
         issues, skipped_session_issues = filter_autonomous_issues_for_single_pass(
             issues=issues,
@@ -9894,15 +10117,27 @@ def main() -> int:
                 "Skipping previously processed issues for this daemon invocation: "
                 f"{skipped_labels}"
             )
+        issues, blocked_dependency_entries = split_autonomous_issues_by_dependency_state(
+            repo=repo,
+            issues=issues,
+        )
+        if blocked_dependency_entries:
+            print("Skipping blocked issues for this daemon invocation:")
+            for blocked_entry in blocked_dependency_entries:
+                print(f"- {format_autonomous_dependency_blocker(blocked_entry)}")
 
     run_id = generate_run_id()
     failures = 0
     processed = 0
     skipped_existing_pr = 0
     skipped_existing_branch = 0
+    skipped_blocked_dependencies = len(blocked_dependency_entries)
     skipped_out_of_scope = 0
     touched_prs: list[str] = []
     reported_issue_failures: set[int] = set()
+    blocked_dependency_summaries = [
+        format_autonomous_dependency_blocker(blocked_entry) for blocked_entry in blocked_dependency_entries
+    ]
 
     post_batch_verification: dict[str, object] | None = None
     if autonomous_mode and issue_number_arg is None and post_batch_verify_mode:
@@ -9965,14 +10200,22 @@ def main() -> int:
                 "failures": failures,
                 "skipped_existing_pr": skipped_existing_pr,
                 "skipped_existing_branch": skipped_existing_branch,
+                "skipped_blocked_dependencies": skipped_blocked_dependencies,
                 "skipped_out_of_scope": skipped_out_of_scope,
             },
-            done=[f"Loaded autonomous queue with {len(issues)} issue(s)"],
+            done=[
+                f"Loaded autonomous queue with {len(issues)} runnable issue(s)",
+                *(
+                    [f"Skipped {skipped_blocked_dependencies} dependency-blocked issue(s)"]
+                    if skipped_blocked_dependencies > 0
+                    else []
+                ),
+            ],
             current="Idle between autonomous batches",
             next_items=preview_autonomous_issue_queue(issues, start_index=0),
             issue_pr_actions=[],
             in_progress=[],
-            blockers=[],
+            blockers=blocked_dependency_summaries,
             next_checkpoint="when batch 1 starts",
         )
         save_autonomous_session_state(autonomous_session_file, autonomous_session_state)
@@ -10026,6 +10269,7 @@ def main() -> int:
                         "failures": failures,
                         "skipped_existing_pr": skipped_existing_pr,
                         "skipped_existing_branch": skipped_existing_branch,
+                        "skipped_blocked_dependencies": skipped_blocked_dependencies,
                         "skipped_out_of_scope": skipped_out_of_scope,
                     },
                     done=[batch_done_summary],
@@ -10033,7 +10277,7 @@ def main() -> int:
                     next_items=preview_autonomous_issue_queue(issues, start_index=batch_index),
                     issue_pr_actions=batch_action_items,
                     in_progress=batch_in_progress_items,
-                    blockers=batch_blockers,
+                    blockers=blocked_dependency_summaries + batch_blockers,
                     next_checkpoint=f"after batch {batch_index}/{len(issues)} finishes",
                 )
                 save_autonomous_session_state(autonomous_session_file, autonomous_session_state)
@@ -11949,6 +12193,7 @@ def main() -> int:
                         "failures": failures,
                         "skipped_existing_pr": skipped_existing_pr,
                         "skipped_existing_branch": skipped_existing_branch,
+                        "skipped_blocked_dependencies": skipped_blocked_dependencies,
                         "skipped_out_of_scope": skipped_out_of_scope,
                     },
                     done=[batch_done_summary],
@@ -11956,7 +12201,7 @@ def main() -> int:
                     next_items=preview_autonomous_issue_queue(issues, start_index=batch_index),
                     issue_pr_actions=batch_action_items,
                     in_progress=[],
-                    blockers=batch_blockers,
+                    blockers=blocked_dependency_summaries + batch_blockers,
                     next_checkpoint=(
                         "final autonomous summary"
                         if batch_index >= len(issues)
@@ -11978,14 +12223,15 @@ def main() -> int:
                 "failures": failures,
                 "skipped_existing_pr": skipped_existing_pr,
                 "skipped_existing_branch": skipped_existing_branch,
+                "skipped_blocked_dependencies": skipped_blocked_dependencies,
                 "skipped_out_of_scope": skipped_out_of_scope,
             },
-            done=[f"Autonomous batch loop finished across {len(issues)} issue(s)"],
+            done=[f"Autonomous batch loop finished across {len(issues)} runnable issue(s)"],
             current="Idle between autonomous runs",
             next_items=[],
             issue_pr_actions=final_issue_pr_actions,
             in_progress=[],
-            blockers=final_blockers,
+            blockers=blocked_dependency_summaries + ([f"{failures} batch failure(s) need follow-up"] if failures > 0 else []),
             next_checkpoint="when the next autonomous invocation starts",
             verification=post_batch_verification,
         )

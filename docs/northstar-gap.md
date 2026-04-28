@@ -7,8 +7,9 @@
 MVP уже в основном собран.
 
 - Есть Go CLI surface: `init`, `doctor`, `autodoctor`, `run issue`, `run pr`, `run daemon`.
-- Есть рабочий GitHub runner с issue flow, PR review flow, state comments, recovery, decomposition, child issues, scope guards, workflow checks и базовым daemon polling.
-- Основной execution core пока все еще Python-based и GitHub-centric, а beta/target-state gaps остаются вокруг надежности автономного режима, наблюдаемости и архитектурного переноса.
+- Есть рабочий GitHub runner с issue flow, PR review flow, state comments, recovery, decomposition, child issues, scope guards, workflow checks, detached worker registry/status surfaces и базовым daemon polling.
+- После #204 / #207 branch/repo ownership guards и smoke criteria для detached batches больше не являются отсутствующей частью дизайна; они уже зафиксированы в текущем поведении и operator docs.
+- Оставшийся разрыв теперь уже не про базовую безопасность worker ownership, а про автоматизацию, production confidence и архитектурный перенос.
 
 ## Что больше не является gap
 
@@ -20,104 +21,68 @@ MVP уже в основном собран.
 - нет failure reporting и machine-readable orchestration states;
 - нет decomposition preflight и child issue creation;
 - нет project config для scope/workflow/readiness/merge/presets/budgets;
-- нет базового daemon/polling mode.
+- нет базового daemon/polling mode;
+- нет branch/repo ownership guards для detached workers;
+- нет traceable worker registry/status surface для проверки `issue -> branch -> clone_path -> linked PR`.
 
-## Оставшиеся beta gaps
+## Оставшиеся реальные gaps
 
-### 1. Надежность daemon режима
+### 1. Реальный smoke execution для detached/autonomous режима
 
-Daemon mode уже есть, но его зрелость пока ниже MVP issue/PR flows.
-
-Остается сделать:
-
-- smoke-tested operator path на чистом `main`;
-- более явную статусную поверхность для daemon runs и последних task states;
-- более уверенное resume/retry поведение после сбоев long-running batch runs;
-- понятные guardrails для post-restart continuation.
-
-### 2. Conflict recovery для reused branches
-
-Повторный запуск и sync branch уже реализованы, но batch retro показал, что этого недостаточно для плотных merge waves.
+Документация и safety criteria уже есть, но устойчивый подтвержденный runtime path еще не закрыт автоматикой.
 
 Остается сделать:
 
-- dedicated conflict-recovery mode, который занимается только sync/rebase/merge resolution;
-- отделение conflict recovery от полного revisit issue scope;
-- более короткий и читаемый output вокруг rebase/merge fallback.
+- регулярно прогоняемый smoke path на чистом `main`, а не только задокументированный checklist;
+- подтвержденный сценарий для 2-3 detached workers с проверкой ownership boundaries перед merge;
+- более надежный post-restart path для long-running autonomous runs, чтобы smoke был repeatable, а не ad-hoc.
 
-### 3. Visibility и operator ergonomics
+### 2. Autonomous merge queue
 
-Machine-readable state уже публикуется, но operator UX еще сырой.
-
-Остается сделать:
-
-- удобный `status`-style view для последнего состояния issue/PR/daemon cycle;
-- краткий сводный прогресс по batch/daemon runs;
-- более явные next actions для blocked/waiting states.
-
-### 4. Verification и test signal
-
-Workflow checks и readiness logic уже есть, но post-batch confidence и test ergonomics еще не закрыты.
+PR readiness и verification states уже есть, но оркестратор пока не доводит несколько задач через автономную очередь merge как обычный рабочий режим.
 
 Остается сделать:
 
-- автоматический post-batch verification/checklist flow;
-- follow-up issue creation при обнаружении регрессий после merge batch;
-- снижение шума full Python suite, особенно вокруг ожидаемых mocked `gh` warnings;
-- более быстрое разделение smoke/full verification modes.
+- явную merge-queue/promotion логику поверх существующих readiness signals;
+- policy-complete переход от `ready-to-merge` к фактическому merge без ручного диспетчерирования каждого PR;
+- безопасную batch/post-batch verification связку, чтобы merge queue опиралась на наблюдаемый verification signal.
 
-### 5. Runner structure и переносимость
+### 3. Полный перенос execution core в Go
 
-Функциональность выросла быстрее, чем внутренняя модульность Python runner'а.
-
-Остается сделать:
-
-- разбить крупный Python runner на меньшие модули;
-- сократить conflict surface в hot files;
-- упростить перенос execution core из Python в Go без повторной сборки всего поведения с нуля.
-
-### 6. Routing и escalation как зрелая система
-
-Presets, budgets, retry и routing config уже появились, но пока это не fully mature orchestration policy layer.
+Go CLI уже есть, но основной orchestration runtime все еще живет в Python runner'е.
 
 Остается сделать:
 
-- довести automatic preset selection и escalation до предсказуемого default behavior;
-- сделать retries/model escalation более прозрачными в status comments;
-- связать budget decisions с реальным execution loop, а не только с config surface.
+- перенести policy/state/execution loop из Python в Go без потери текущего внешнего поведения;
+- сократить зависимость новых возможностей от монолитного Python runner'а;
+- сделать Go core фактическим runtime, а не только CLI/bootstrap layer.
 
-## Оставшиеся target-state gaps
+### 4. Provider abstraction
 
-### 1. Полный Go execution core
+Текущая реализация все еще GitHub-centric, даже если North Star уже описывает несколько tracker/code-host направлений.
 
-- Go CLI уже есть, но core orchestration logic все еще живет в Python runner'е.
-- Еще не завершен перенос policy/state/provider/workflow execution в Go.
+Остается сделать:
 
-### 2. Multi-provider architecture
+- отделить provider interfaces от GitHub-specific runtime assumptions;
+- довести tracker/code host split до рабочего runtime abstraction layer;
+- добавить production-grade adapters beyond current GitHub path.
 
-- Реализация все еще GitHub-centric.
-- Нет production adapters для Bitbucket и custom API proxy.
-- Provider split tracker vs code host пока не является рабочим runtime core.
+## Что не стоит больше называть gap'ом
 
-### 3. Полный CI/review/merge/deploy loop
+- branch/repo ownership guards для concurrent detached workers;
+- worker registry/status surfaces, по которым можно восстановить ownership chain;
+- documentation-only описание detached smoke criteria без привязки к текущему поведению;
+- базовый daemon/polling entrypoint как таковой.
 
-- Review mode и readiness states уже есть.
-- Но еще нет полноценного autonomous cycle до merge/deploy с policy-complete execution.
-
-### 4. Full autonomy with strong policy layer
-
-- Scope and config groundwork уже заложены.
-- Но еще нет зрелого task selection/claiming/concurrency/policy engine, который устойчиво ведет mixed workloads без ручного сопровождения.
+`northstar.md` может продолжать описывать эти вещи как целевое состояние, но текущие gap docs должны отделять уже реализованные safety invariants от еще не автоматизированного runtime behavior.
 
 ## Ближайшие приоритеты
 
-1. Daemon smoke test на чистом `main`.
-2. Status visibility для one-shot и daemon runs.
-3. Снижение test noise и выделение быстрых verification paths.
-4. Dedicated conflict-recovery mode для reused branches.
-5. Post-batch verification и follow-up issue/checklist automation.
-6. Runner modularization перед следующим большим шагом переноса в Go.
+1. Прогнать и закрепить repeatable smoke execution на чистом `main` для detached/autonomous path.
+2. Довести autonomous merge queue поверх readiness/verification states.
+3. Продолжить перенос execution core из Python в Go.
+4. Вынести provider abstraction из GitHub-centric runtime.
 
 ## Итог
 
-Главный оставшийся разрыв с North Star больше не в отсутствии базовой оркестрации. Он сместился в надежность, прозрачность и архитектурную зрелость: daemon confidence, status UX, conflict recovery, verification discipline, modularization и постепенный перенос core logic в provider-agnostic Go orchestrator.
+Главный оставшийся разрыв с North Star больше не в отсутствии базовой оркестрации или ownership guardrails. Он сместился в четыре конкретные зоны: реальный smoke execution для автономного режима, autonomous merge queue, фактический Go execution core и provider-agnostic architecture.

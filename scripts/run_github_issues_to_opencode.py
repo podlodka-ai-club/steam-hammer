@@ -8196,7 +8196,7 @@ def main() -> int:
                     recovered_pr_status = str(recovered_pr_state.get("status") or "")
 
                 if not review_items:
-                    if recovered_pr_status == "waiting-for-ci":
+                    if recovered_pr_status in {"waiting-for-ci", "ready-to-merge"}:
                         current_attempt = orchestration_attempt_from_state(recovered_pr_state)
                         ci_status = wait_for_pr_ci_status(
                             repo=repo,
@@ -8353,60 +8353,25 @@ def main() -> int:
                                 f"Running CI fix attempt {retry_attempt}/{max_attempts}."
                             )
                         elif ci_overall == "success":
-                            required_file_validation = validate_required_files_in_pr(
-                                pull_request=pull_request,
-                                linked_issues=linked_issues,
-                            )
-                            readiness = evaluate_pr_readiness(
-                                pull_request=pull_request,
-                                ci_status=ci_status,
-                                required_file_validation=required_file_validation,
-                                project_config=project_config,
-                            )
-                            safe_post_orchestration_state_comment(
+                            finalize_pr_after_ci_success(
                                 repo=repo,
+                                pr_number=pr_number_arg,
+                                linked_issues=linked_issues,
+                                merge_policy=merge_policy,
                                 target_type="pr",
                                 target_number=pr_number_arg,
+                                issue_number=None,
+                                branch=active_branch,
+                                base_branch=str(pr_state_context["base_branch"] or "") or None,
+                                runner=args.runner,
+                                agent=args.agent,
+                                model=args.model,
+                                attempt=current_attempt,
+                                ci_checks=ci_checks_payload,
+                                decomposition=pr_recovered_decomposition_rollup,
+                                project_config=project_config,
                                 dry_run=args.dry_run,
-                                state=build_orchestration_state(
-                                    status=str(readiness.get("status") or "ready-to-merge"),
-                                    task_type="pr",
-                                    issue_number=None,
-                                    pr_number=pr_number_arg,
-                                    branch=active_branch,
-                                    base_branch=str(pr_state_context["base_branch"] or "") or None,
-                                    runner=args.runner,
-                                    agent=args.agent,
-                                    model=args.model,
-                                    attempt=current_attempt,
-                                    stage="ci_checks",
-                                    next_action=str(readiness.get("next_action") or "ready_for_merge"),
-                                    error=_as_optional_string(readiness.get("error")),
-                                    ci_checks=ci_checks_payload,
-                                    decomposition=pr_recovered_decomposition_rollup,
-                                    required_file_validation=required_file_validation,
-                                ),
                             )
-                            readiness_status = str(readiness.get("status") or "ready-to-merge")
-                            if readiness_status == "ready-to-merge":
-                                print(
-                                    f"CI checks passed for PR #{pr_number_arg}; marking orchestration state as ready-to-merge."
-                                )
-                            elif readiness_status == "ready-for-review":
-                                print(
-                                    f"CI checks passed for PR #{pr_number_arg}, but review requirements are not met yet: "
-                                    f"{_as_optional_string(readiness.get('error')) or 'waiting for review'}"
-                                )
-                            elif readiness_status == "waiting-for-ci":
-                                print(
-                                    f"PR #{pr_number_arg} is still waiting for required checks: "
-                                    f"{_as_optional_string(readiness.get('error')) or 'waiting for CI'}"
-                                )
-                            else:
-                                print(
-                                    f"PR #{pr_number_arg} is not ready to merge yet: "
-                                    f"{_as_optional_string(readiness.get('error')) or 'readiness policy blocked'}"
-                                )
                             return _finish_main(0, original_process_cwd)
                     elif recovered_pr_status == "ready-for-review":
                         print(

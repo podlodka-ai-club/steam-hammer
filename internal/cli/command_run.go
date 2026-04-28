@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -379,8 +380,29 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 	lastCode := 0
 	launchedStates := make([]detachedWorkerState, 0, len(ids.ids))
 	for _, id := range ids.ids {
+		issueOpts := opts
+		workerPaths := detachedWorkerPaths{}
+		clonePath := strings.TrimSpace(*opts.dir)
+		if *detach {
+			var err error
+			workerPaths, err = resolveDetachedWorkerPaths(*workerDir, *opts.dir, "issue", strconv.Itoa(id))
+			if err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
+				return 1
+			}
+			clonePath, err = a.prepareDetachedBatchClone(*opts.dir, workerPaths)
+			if err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to prepare detached worker clone for issue %d: %v\n", id, err)
+				if *stopOnError {
+					return 1
+				}
+				lastCode = 1
+				continue
+			}
+			issueOpts = withCommonOptionsDir(issueOpts, clonePath)
+		}
 		pythonArgs := buildIssuePythonArgs(
-			opts,
+			issueOpts,
 			id,
 			base,
 			*includeEmpty,
@@ -399,20 +421,17 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 			flags,
 		)
 		if *detach {
-			workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "issue", strconv.Itoa(id))
-			if err != nil {
-				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
-				return 1
-			}
-			startedState, code := a.startDetachedWorkerState(detachedWorkerStateFromOptions(
+			state := detachedWorkerStateFromOptions(
 				workerName("issue", strconv.Itoa(id)),
 				"run batch",
 				"issue",
 				strconv.Itoa(id),
-				opts,
+				issueOpts,
 				append([]string{"python3"}, pythonArgs...),
 				workerPaths,
-			))
+			)
+			state.WorkDir = clonePath
+			startedState, code := a.startDetachedWorkerState(state)
 			if code != 0 {
 				if *stopOnError {
 					return code
@@ -527,6 +546,28 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 		))
 	}
 	return a.runPython(ctx, pythonArgs)
+}
+
+func withCommonOptionsDir(opts commonOptions, dir string) commonOptions {
+	updated := opts
+	updated.dir = stringPtr(dir)
+	return updated
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func (a *App) prepareDetachedBatchClone(configuredDir string, workerPaths detachedWorkerPaths) (string, error) {
+	if a.clone == nil {
+		return "", fmt.Errorf("detached batch clone preparer is not configured")
+	}
+	sourceDir := "."
+	if strings.TrimSpace(configuredDir) != "" {
+		sourceDir = configuredDir
+	}
+	clonePath := filepath.Join(filepath.Dir(workerPaths.StatePath), "repo")
+	return a.clone.Prepare(sourceDir, clonePath)
 }
 
 func (a *App) runPR(ctx context.Context, args []string) int {

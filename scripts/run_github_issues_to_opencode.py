@@ -158,6 +158,17 @@ AUTONOMOUS_CLAIM_TTL_SECONDS = 3600
 AUTONOMOUS_BATCH_SINGLE_PASS_STATUSES = frozenset(
     {"ready-for-review", "waiting-for-ci", "ready-to-merge"}
 )
+AUTONOMOUS_QUEUE_STATUS_RANKS = {
+    "ready-to-merge": 0,
+    "waiting-for-ci": 1,
+    "ready-for-review": 2,
+    "in-progress": 3,
+    "pr-review": 3,
+    "issue-flow": 4,
+    "waiting-for-author": 5,
+    "blocked": 6,
+    "failed": 7,
+}
 ORCHESTRATION_DEPENDENCIES_MARKER = "<!-- orchestration-dependencies:v1 -->"
 DECOMPOSITION_CHILD_STATUSES = ("planned", "created", "in-progress", "done", "blocked")
 KNOWN_NO_EXTENSION_REQUIRED_FILES = frozenset(
@@ -917,18 +928,80 @@ def evaluate_issue_scope(issue: dict, scope_defaults: dict) -> dict:
     }
 
 
-def sort_autonomous_issues(issues: list[dict], scope_defaults: dict) -> list[dict]:
+def _autonomous_queue_sort_metadata(repo: str, issue: dict) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "status": "issue-flow",
+        "status_rank": AUTONOMOUS_QUEUE_STATUS_RANKS["issue-flow"],
+        "merge_risk_rank": 3,
+    }
+
+    try:
+        linked_open_pr = find_open_pr_for_issue(repo=repo, issue=issue)
+    except Exception:
+        return metadata
+
+    if not isinstance(linked_open_pr, dict):
+        return metadata
+
+    metadata["status"] = "pr-review"
+    metadata["status_rank"] = AUTONOMOUS_QUEUE_STATUS_RANKS["pr-review"]
+    metadata["merge_risk_rank"] = 2
+
+    pr_number = _as_positive_int(linked_open_pr.get("number"))
+    if pr_number is None:
+        return metadata
+
+    try:
+        pull_request = fetch_pull_request(repo=repo, number=pr_number)
+    except Exception:
+        return metadata
+
+    merge_readiness_state = classify_pr_merge_readiness_state(
+        merge_state=str(pull_request.get("mergeStateStatus") or ""),
+        mergeable=str(pull_request.get("mergeable") or ""),
+    )
+    review_decision = derive_pr_review_decision(pull_request)
+    is_draft = bool(pull_request.get("isDraft"))
+    if not is_draft and merge_readiness_state == "clean" and review_decision == "APPROVED":
+        metadata["status"] = "ready-to-merge"
+        metadata["status_rank"] = AUTONOMOUS_QUEUE_STATUS_RANKS["ready-to-merge"]
+    elif merge_readiness_state in {"stale", "conflicting"}:
+        metadata["status"] = merge_readiness_state
+        metadata["status_rank"] = AUTONOMOUS_QUEUE_STATUS_RANKS["pr-review"]
+
+    changed_paths = extract_pull_request_changed_file_paths(pull_request)
+    if _touches_central_runner_files(changed_paths):
+        metadata["merge_risk_rank"] = 0
+    elif changed_paths:
+        metadata["merge_risk_rank"] = 1
+    return metadata
+
+
+def sort_autonomous_issues(
+    issues: list[dict],
+    scope_defaults: dict,
+    repo: str | None = None,
+) -> list[dict]:
     priority_config = scope_defaults.get("priority") if isinstance(scope_defaults, dict) else None
     priority_order = _normalize_match_list(
         priority_config.get("order") if isinstance(priority_config, dict) else None
     )
+    queue_metadata: dict[int, dict[str, object]] = {}
+    if repo:
+        for issue in issues:
+            queue_metadata[id(issue)] = _autonomous_queue_sort_metadata(repo=repo, issue=issue)
 
-    def sort_key(issue: dict) -> tuple[int, float, int]:
+    def sort_key(issue: dict) -> tuple[int, int, int, float, int]:
+        metadata = queue_metadata.get(id(issue), {})
         updated_at = _parse_iso_timestamp(issue.get("updatedAt"))
         updated_ts = updated_at.timestamp() if updated_at is not None else 0.0
         issue_number = issue.get("number")
         numeric_issue = issue_number if type(issue_number) is int else 0
+        status_rank = metadata.get("status_rank")
+        merge_risk_rank = metadata.get("merge_risk_rank")
         return (
+            int(status_rank) if isinstance(status_rank, int) else AUTONOMOUS_QUEUE_STATUS_RANKS["issue-flow"],
+            int(merge_risk_rank) if isinstance(merge_risk_rank, int) else 3,
             _issue_priority_rank(issue, priority_order),
             -updated_ts,
             -numeric_issue,
@@ -9886,7 +9959,7 @@ def main() -> int:
         return _finish_main(0, original_process_cwd)
 
     if autonomous_mode and not pr_mode_requested and issue_number_arg is None:
-        issues = sort_autonomous_issues(issues=issues, scope_defaults=scope_defaults)
+        issues = sort_autonomous_issues(issues=issues, scope_defaults=scope_defaults, repo=repo)
 
     autonomous_session_state = load_autonomous_session_state(autonomous_session_file)
     blocked_dependency_entries: list[dict] = []

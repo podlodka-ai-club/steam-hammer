@@ -218,6 +218,22 @@ class PrReviewModeTests(unittest.TestCase):
 
         self.assertEqual(readiness["status"], "blocked")
         self.assertEqual(readiness["next_action"], "resolve_merge_conflicts")
+        self.assertEqual(readiness["merge_readiness_state"], "conflicting")
+
+    def test_evaluate_pr_merge_readiness_marks_behind_pr_as_stale(self) -> None:
+        readiness = self.mod.evaluate_pr_merge_readiness(
+            pull_request={
+                "mergeStateStatus": "BEHIND",
+                "mergeable": "UNKNOWN",
+                "reviewDecision": "APPROVED",
+                "isDraft": False,
+            },
+            merge_policy={"auto": False, "method": "squash"},
+        )
+
+        self.assertEqual(readiness["status"], "blocked")
+        self.assertEqual(readiness["next_action"], "sync_pr_with_base")
+        self.assertEqual(readiness["merge_readiness_state"], "stale")
 
     def test_evaluate_pr_merge_readiness_reports_ready_to_merge_when_gate_passes(self) -> None:
         readiness = self.mod.evaluate_pr_merge_readiness(
@@ -232,6 +248,7 @@ class PrReviewModeTests(unittest.TestCase):
 
         self.assertEqual(readiness["status"], "ready-to-merge")
         self.assertEqual(readiness["next_action"], "ready_for_merge")
+        self.assertEqual(readiness["merge_readiness_state"], "clean")
 
     def test_evaluate_pr_merge_readiness_blocks_unknown_mergeability(self) -> None:
         readiness = self.mod.evaluate_pr_merge_readiness(
@@ -246,6 +263,7 @@ class PrReviewModeTests(unittest.TestCase):
 
         self.assertEqual(readiness["status"], "blocked")
         self.assertEqual(readiness["next_action"], "inspect_merge_requirements")
+        self.assertEqual(readiness["merge_readiness_state"], "unknown")
 
     def test_evaluate_pr_merge_readiness_blocks_failed_merge_result_verification(self) -> None:
         readiness = self.mod.evaluate_pr_merge_readiness(

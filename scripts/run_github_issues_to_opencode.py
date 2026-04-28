@@ -2906,6 +2906,10 @@ def evaluate_pr_merge_readiness(
 ) -> dict:
     merge_state = str(pull_request.get("mergeStateStatus") or "").strip().upper() or "UNKNOWN"
     mergeable = str(pull_request.get("mergeable") or "").strip().upper() or "UNKNOWN"
+    merge_readiness_state = classify_pr_merge_readiness_state(
+        merge_state=merge_state,
+        mergeable=mergeable,
+    )
     is_draft = bool(pull_request.get("isDraft")) or merge_state == "DRAFT"
     review_decision = derive_pr_review_decision(pull_request)
     auto_merge_enabled = bool(merge_policy.get("auto", False))
@@ -2914,6 +2918,7 @@ def evaluate_pr_merge_readiness(
     readiness = {
         "merge_state_status": merge_state,
         "mergeable": mergeable,
+        "merge_readiness_state": merge_readiness_state,
         "review_decision": review_decision,
         "is_draft": is_draft,
         "auto_merge_enabled": auto_merge_enabled,
@@ -2936,12 +2941,22 @@ def evaluate_pr_merge_readiness(
         )
         return readiness
 
-    if mergeable == "CONFLICTING" or merge_state in {"DIRTY", "CONFLICTING"}:
+    if merge_readiness_state == "conflicting":
         readiness.update(
             {
                 "status": "blocked",
                 "next_action": "resolve_merge_conflicts",
                 "error": f"PR is not mergeable yet (mergeStateStatus={merge_state})",
+            }
+        )
+        return readiness
+
+    if merge_readiness_state == "stale":
+        readiness.update(
+            {
+                "status": "blocked",
+                "next_action": "sync_pr_with_base",
+                "error": f"PR branch is stale and must be synced with base (mergeStateStatus={merge_state})",
             }
         )
         return readiness
@@ -2966,7 +2981,7 @@ def evaluate_pr_merge_readiness(
         )
         return readiness
 
-    if merge_state in {"BLOCKED", "BEHIND", "UNKNOWN"} and mergeable != "MERGEABLE":
+    if merge_readiness_state == "unknown":
         readiness.update(
             {
                 "status": "blocked",
@@ -2989,6 +3004,18 @@ def evaluate_pr_merge_readiness(
         return readiness
 
     return readiness
+
+
+def classify_pr_merge_readiness_state(*, merge_state: str, mergeable: str) -> str:
+    normalized_merge_state = merge_state.strip().upper() or "UNKNOWN"
+    normalized_mergeable = mergeable.strip().upper() or "UNKNOWN"
+    if normalized_mergeable == "CONFLICTING" or normalized_merge_state in {"DIRTY", "CONFLICTING"}:
+        return "conflicting"
+    if normalized_merge_state == "BEHIND":
+        return "stale"
+    if normalized_mergeable == "MERGEABLE":
+        return "clean"
+    return "unknown"
 
 
 def run_merge_for_pull_request(repo: str, pr_number: int, merge_policy: dict, dry_run: bool) -> None:
@@ -4147,7 +4174,8 @@ def _summarize_current_status(
         if not ci_status.get("has_checks"):
             return f"{status} at {stage or 'unknown stage'}; waiting for CI checks to start"
 
-    if isinstance(merge_readiness, dict) and status == "ready-to-merge":
+    if isinstance(merge_readiness, dict) and status in {"ready-to-merge", "blocked"}:
+        merge_readiness_state = _as_optional_string(merge_readiness.get("merge_readiness_state"))
         merge_state = str(merge_readiness.get("merge_state_status") or "").strip()
         verification = (
             merge_readiness.get("merge_result_verification")
@@ -4160,8 +4188,13 @@ def _summarize_current_status(
             if verification_status in {"passed", "skipped", "dry-run"}
             else ""
         )
+        detail_parts: list[str] = []
+        if merge_readiness_state:
+            detail_parts.append(f"merge readiness {merge_readiness_state}")
         if merge_state:
-            return f"{status} at {stage or 'unknown stage'}; merge state {merge_state}{verification_text}"
+            detail_parts.append(f"merge state {merge_state}")
+        if detail_parts:
+            return f"{status} at {stage or 'unknown stage'}; {'; '.join(detail_parts)}{verification_text}"
 
     if stage:
         return f"{status} at {stage}"
@@ -4297,15 +4330,25 @@ def format_orchestration_status_summary(snapshot: dict) -> str:
         verification_summary = _as_optional_string(verification.get("summary")) or verification_status
         verification_text = f"; merge-result verification={verification_summary}"
 
+    merge_readiness_text = ""
+    if isinstance(merge_readiness, dict):
+        merge_readiness_state = _as_optional_string(merge_readiness.get("merge_readiness_state"))
+        if merge_readiness_state:
+            merge_readiness_text = f"merge={merge_readiness_state}, "
+
     if isinstance(ci_status, dict):
         ci_overall = str(ci_status.get("overall") or "unknown").strip() or "unknown"
         pending = ci_status.get("pending_checks") if isinstance(ci_status.get("pending_checks"), list) else []
         failing = ci_status.get("failing_checks") if isinstance(ci_status.get("failing_checks"), list) else []
         lines.append(
-            f"PR readiness: ci={ci_overall}, pending={len(pending)}, failing={len(failing)}{verification_text}"
+            f"PR readiness: {merge_readiness_text}ci={ci_overall}, pending={len(pending)}, failing={len(failing)}{verification_text}"
         )
     elif isinstance(merge_readiness, dict):
-        readiness_line = f"PR readiness: {str(merge_readiness.get('status') or 'unknown')}"
+        merge_readiness_state = _as_optional_string(merge_readiness.get("merge_readiness_state"))
+        readiness_line = "PR readiness: "
+        if merge_readiness_state:
+            readiness_line += f"merge={merge_readiness_state}, "
+        readiness_line += f"status={str(merge_readiness.get('status') or 'unknown')}"
         if verification_text:
             readiness_line += verification_text
         lines.append(readiness_line)
@@ -10609,10 +10652,20 @@ def main() -> int:
                     )
                     pull_request = current_codehost_provider().fetch_pull_request(repo=repo, number=pr_number)
                     merge_state = str(pull_request.get("mergeStateStatus") or "").strip().upper()
-                    should_force_sync_rerun = merge_state in {"DIRTY", "CONFLICTING"}
+                    mergeable_state = str(pull_request.get("mergeable") or "").strip().upper()
+                    merge_readiness_state = classify_pr_merge_readiness_state(
+                        merge_state=merge_state,
+                        mergeable=mergeable_state,
+                    )
+                    should_force_sync_rerun = merge_readiness_state in {"stale", "conflicting"}
                     if should_force_sync_rerun:
+                        recovery_reason = (
+                            "is stale against the base branch"
+                            if merge_readiness_state == "stale"
+                            else "is not mergeable with base yet"
+                        )
                         print(
-                            f"Linked PR #{pr_number} is not mergeable with base yet "
+                            f"Linked PR #{pr_number} {recovery_reason} "
                             f"(mergeStateStatus={merge_state}); rerun will auto-sync and resolve routine conflicts"
                         )
                     pull_request, review_items, _review_stats = fetch_actionable_pr_review_feedback(

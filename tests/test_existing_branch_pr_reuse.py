@@ -811,6 +811,125 @@ class ExistingBranchAndPrReuseTests(unittest.TestCase):
             output,
         )
 
+    def test_main_pr_review_mode_stale_pr_without_actionable_comments_still_syncs(self) -> None:
+        args = type("Args", (), {
+            "repo": "owner/repo",
+            "issue": 35,
+            "state": "open",
+            "limit": 10,
+            "runner": "opencode",
+            "agent": "build",
+            "model": None,
+            "agent_timeout_seconds": 900,
+            "agent_idle_timeout_seconds": None,
+            "opencode_auto_approve": False,
+            "branch_prefix": "issue-fix",
+            "include_empty": False,
+            "stop_on_error": False,
+            "fail_on_existing": False,
+            "force_issue_flow": False,
+            "sync_reused_branch": True,
+            "sync_strategy": "rebase",
+            "dir": ".",
+            "local_config": "local-config.json",
+            "dry_run": False,
+        })()
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_issue",
+                    return_value={
+                        "number": 35,
+                        "title": "Auto-sync stale PR in pr-review mode",
+                        "body": "Fix stale branch handling",
+                        "url": "https://github.com/owner/repo/issues/35",
+                    },
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.find_open_pr_for_issue",
+                    return_value={
+                        "number": 77,
+                        "headRefName": "issue-fix/35-auto-sync-stale-pr",
+                        "baseRefName": "main",
+                    },
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_pull_request",
+                    return_value={
+                        "number": 77,
+                        "title": "Sync stale branch",
+                        "url": "https://github.com/owner/repo/pull/77",
+                        "state": "OPEN",
+                        "mergeStateStatus": "BEHIND",
+                        "mergeable": "UNKNOWN",
+                        "body": "PR body",
+                        "reviews": [],
+                        "author": {"login": "pr-owner"},
+                    },
+                )
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=[]))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]))
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[])
+            )
+            stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.normalize_review_items", return_value=([], {}))
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.prepare_issue_branch", return_value="reused"))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.sync_reused_branch_with_base",
+                    return_value={
+                        "status": "synced-cleanly",
+                        "changed": True,
+                        "applied_strategy": "rebase",
+                    },
+                )
+            )
+            run_agent_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_agent"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.has_changes", return_value=False))
+            push_branch_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.push_branch"))
+            ensure_pr_mock = stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.ensure_pr",
+                    return_value=("reused", "https://github.com/owner/repo/pull/77"),
+                )
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_command"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"))
+            stdout_mock = stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        run_agent_mock.assert_not_called()
+        self.assertIn(
+            unittest.mock.call(
+                branch_name="issue-fix/35-auto-sync-stale-pr",
+                dry_run=False,
+                force_with_lease=True,
+            ),
+            push_branch_mock.call_args_list,
+        )
+        ensure_pr_mock.assert_called_once()
+
+        output = stdout_mock.getvalue()
+        self.assertIn("Selected mode: pr-review", output)
+        self.assertIn("mergeStateStatus=BEHIND", output)
+        self.assertIn("is stale against the base branch", output)
+        self.assertIn("No actionable review comments for linked PR #77", output)
+        self.assertIn("Skipping agent run for issue #35 in pr-review mode", output)
+        self.assertIn("PR #77 rerun sync pushed", output)
+
     @patch("scripts.run_github_issues_to_opencode.open_pr")
     @patch(
         "scripts.run_github_issues_to_opencode.find_existing_pr",

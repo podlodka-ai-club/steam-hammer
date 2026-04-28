@@ -503,6 +503,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
                 },
                 "merge_readiness": {
                     "status": "ready-to-merge",
+                    "merge_readiness_state": "clean",
                     "merge_state_status": "CLEAN",
                     "merge_result_verification": {
                         "status": "passed",
@@ -513,13 +514,47 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "Current: ready-to-merge at merge_gate; merge state CLEAN; merge-result verification passed",
+            "Current: ready-to-merge at merge_gate; merge readiness clean; merge state CLEAN; merge-result verification passed",
             summary,
         )
         self.assertIn(
-            "PR readiness: ci=success, pending=0, failing=0; merge-result verification=passed (2/2 commands)",
+            "PR readiness: merge=clean, ci=success, pending=0, failing=0; merge-result verification=passed (2/2 commands)",
             summary,
         )
+
+    def test_format_status_summary_shows_stale_merge_readiness(self) -> None:
+        summary = format_orchestration_status_summary(
+            {
+                "target_type": "pr",
+                "target_number": 12,
+                "latest_state": {
+                    "status": "blocked",
+                    "payload": {
+                        "status": "blocked",
+                        "stage": "merge_gate",
+                        "next_action": "sync_pr_with_base",
+                    },
+                },
+                "latest_status": "blocked",
+                "pr_number": 12,
+                "branch": "issue-fix/12-status",
+                "base_branch": "main",
+                "ci_status": {
+                    "overall": "success",
+                    "pending_checks": [],
+                    "failing_checks": [],
+                },
+                "merge_readiness": {
+                    "status": "blocked",
+                    "merge_readiness_state": "stale",
+                    "merge_state_status": "BEHIND",
+                    "error": "PR branch is stale and must be synced with base (mergeStateStatus=BEHIND)",
+                },
+            }
+        )
+
+        self.assertIn("Current: blocked at merge_gate; merge readiness stale; merge state BEHIND", summary)
+        self.assertIn("PR readiness: merge=stale, ci=success, pending=0, failing=0", summary)
 
     def test_build_clarification_context_note_includes_question_and_answer(self) -> None:
         note = build_clarification_context_note(

@@ -177,6 +177,82 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(stats["reviews_used"], 1)
         self.assertEqual(stats["reviews_superseded"], 1)
 
+    def test_evaluate_pr_merge_readiness_requires_approval_when_review_decision_demands_it(self) -> None:
+        readiness = self.mod.evaluate_pr_merge_readiness(
+            pull_request={
+                "mergeStateStatus": "CLEAN",
+                "mergeable": "MERGEABLE",
+                "reviewDecision": "REVIEW_REQUIRED",
+                "isDraft": False,
+            },
+            merge_policy={"auto": True, "method": "squash"},
+        )
+
+        self.assertEqual(readiness["status"], "waiting-for-author")
+        self.assertEqual(readiness["next_action"], "await_required_approval")
+
+    def test_evaluate_pr_merge_readiness_blocks_conflicts(self) -> None:
+        readiness = self.mod.evaluate_pr_merge_readiness(
+            pull_request={
+                "mergeStateStatus": "DIRTY",
+                "mergeable": "CONFLICTING",
+                "reviewDecision": "APPROVED",
+                "isDraft": False,
+            },
+            merge_policy={"auto": False, "method": "merge"},
+        )
+
+        self.assertEqual(readiness["status"], "blocked")
+        self.assertEqual(readiness["next_action"], "resolve_merge_conflicts")
+
+    def test_evaluate_pr_merge_readiness_reports_ready_to_merge_when_gate_passes(self) -> None:
+        readiness = self.mod.evaluate_pr_merge_readiness(
+            pull_request={
+                "mergeStateStatus": "CLEAN",
+                "mergeable": "MERGEABLE",
+                "reviewDecision": "APPROVED",
+                "isDraft": False,
+            },
+            merge_policy={"auto": False, "method": "squash"},
+        )
+
+        self.assertEqual(readiness["status"], "ready-to-merge")
+        self.assertEqual(readiness["next_action"], "ready_for_merge")
+
+    def test_evaluate_pr_merge_readiness_blocks_unknown_mergeability(self) -> None:
+        readiness = self.mod.evaluate_pr_merge_readiness(
+            pull_request={
+                "mergeStateStatus": "UNKNOWN",
+                "mergeable": "UNKNOWN",
+                "reviewDecision": "APPROVED",
+                "isDraft": False,
+            },
+            merge_policy={"auto": True, "method": "squash"},
+        )
+
+        self.assertEqual(readiness["status"], "blocked")
+        self.assertEqual(readiness["next_action"], "inspect_merge_requirements")
+
+    def test_run_merge_for_pull_request_reports_manual_merge_when_auto_merge_disabled(self) -> None:
+        completed = self.mod.subprocess.CompletedProcess(
+            args=["gh", "pr", "merge"],
+            returncode=1,
+            stdout="",
+            stderr="GraphQL: Auto-merge is not enabled for this repository",
+        )
+
+        with mock.patch.object(self.mod.subprocess, "run", return_value=completed):
+            with self.assertRaises(self.mod.MergeRequestNotAcceptedError) as context:
+                self.mod.run_merge_for_pull_request(
+                    repo="owner/repo",
+                    pr_number=42,
+                    merge_policy={"auto": True, "method": "squash"},
+                    dry_run=False,
+                )
+
+        self.assertEqual(context.exception.status, "ready-to-merge")
+        self.assertEqual(context.exception.next_action, "merge_manually_or_enable_auto_merge")
+
     def test_normalize_review_items_includes_actionable_approved_review_summary(self) -> None:
         reviews = [
             {
@@ -455,6 +531,47 @@ class PrReviewModeTests(unittest.TestCase):
         fetch_issue_mock.assert_called_once_with(repo="owner/repo", number=17)
         self.assertEqual(linked[0]["number"], 17)
         self.assertEqual(linked[0]["body"], "Issue body context")
+
+    def test_fetch_actionable_pr_review_feedback_uses_active_codehost_provider(self) -> None:
+        pull_request = {
+            "number": 23,
+            "reviews": [],
+            "author": {"login": "alice"},
+        }
+        provider = mock.Mock()
+        provider.fetch_pull_request.return_value = pull_request
+        provider.fetch_pr_review_threads.return_value = []
+        provider.fetch_pr_conversation_comments.return_value = []
+
+        with (
+            mock.patch.object(self.mod, "current_codehost_provider", return_value=provider),
+            mock.patch.object(
+                self.mod,
+                "fetch_pull_request",
+                side_effect=AssertionError("should use codehost provider"),
+            ),
+            mock.patch.object(
+                self.mod,
+                "fetch_pr_review_threads",
+                side_effect=AssertionError("should use codehost provider"),
+            ),
+            mock.patch.object(
+                self.mod,
+                "fetch_pr_conversation_comments",
+                side_effect=AssertionError("should use codehost provider"),
+            ),
+        ):
+            returned_pr, review_items, review_stats = self.mod.fetch_actionable_pr_review_feedback(
+                repo="owner/repo",
+                pr_number=23,
+            )
+
+        provider.fetch_pull_request.assert_called_once_with(repo="owner/repo", number=23)
+        provider.fetch_pr_review_threads.assert_called_once_with(repo="owner/repo", number=23)
+        provider.fetch_pr_conversation_comments.assert_called_once_with(repo="owner/repo", pr_number=23)
+        self.assertEqual(returned_pr, pull_request)
+        self.assertEqual(review_items, [])
+        self.assertEqual(review_stats["threads_total"], 0)
 
     def test_fetch_pr_review_threads_raises_when_pr_missing(self) -> None:
         graphql_response = {

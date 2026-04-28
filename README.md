@@ -1,9 +1,9 @@
-# GitHub Issue/PR -> AI Agent Runner
+# Multi-Provider Issue/PR -> AI Agent Runner
 
 Script can run in two modes:
 
-- Issue mode: fetches GitHub issues via `gh`, runs an AI agent on each issue body, and automates git workflow for a fix branch.
-- PR review mode: fetches unresolved PR review feedback, builds a focused prompt for the agent, and prepares a follow-up commit.
+- Issue mode: fetches tracker issues, runs an AI agent on each issue body, and automates git workflow for a fix branch.
+- PR review mode: fetches unresolved code-host review feedback, builds a focused prompt for the agent, and prepares a follow-up commit.
 
 Memo link: https://www.notion.so/Hacker-Sprint-1-33f2db4c860e8064a657e199b4578f66
 
@@ -69,6 +69,7 @@ export JIRA_API_TOKEN=your_token
 
 python scripts/run_github_issues_to_opencode.py \
   --tracker jira \
+  --codehost github \
   --issue PROJ-42 \
   --repo owner/repo
 ```
@@ -520,8 +521,9 @@ PR mode notes:
 - If there are no actionable unresolved comments, script exits successfully without running the agent.
 - If recovered state is `waiting-for-ci`, script reads GitHub check-runs and commit statuses for PR `headRefOid`:
   - pending checks -> emits `waiting-for-ci` (stage `ci_checks`);
-  - successful checks or no checks -> emits `ready-to-merge`;
+  - successful checks or no checks -> validates mergeability, approval state, and project merge policy before emitting `ready-to-merge` or requesting GitHub auto-merge;
   - failing checks -> emits `blocked` and includes failing check names with URLs in state error/details.
+- Project config can define `workflow.merge.auto` and `workflow.merge.method` (`merge`, `squash`, `rebase`) to let orchestration request `gh pr merge --auto` once CI, approvals, and mergeability all allow it.
 - Prompt input priority is deterministic: unresolved inline comments first, then review summaries, then conversation comments.
 - Review summaries are taken from the latest review per author to avoid reprocessing superseded feedback.
 - Filtering rules are deterministic and backward-compatible:

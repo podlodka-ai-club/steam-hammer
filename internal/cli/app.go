@@ -21,6 +21,8 @@ const defaultLocalConfigName = "local-config.json"
 const projectConfigScaffold = `{
   "defaults": {
     "preset": "default",
+    "tracker": "github",
+    "codehost": "github",
     "runner": "opencode",
     "agent": "build",
     "model": "openai/gpt-4o",
@@ -60,6 +62,25 @@ const projectConfigScaffold = `{
     "max_attempts": 2,
     "escalate_to_preset": "hard"
   },
+  "scope": {
+    "defaults": {
+      "labels": {
+        "allow": ["autonomous", "bug"],
+        "deny": ["manual-only"]
+      },
+      "assignees": {
+        "deny": ["human-only"]
+      },
+      "priority": {
+        "allow": ["priority:high", "priority:medium"],
+        "order": ["priority:high", "priority:medium", "priority:low"]
+      },
+      "freshness": {
+        "max_age_days": 30,
+        "max_idle_days": 14
+      }
+    }
+  },
   "presets": {
     "cheap": {
       "runner": "opencode",
@@ -94,6 +115,8 @@ const projectConfigScaffold = `{
 
 const localConfigScaffold = `{
   "preset": "default",
+  "tracker": "github",
+  "codehost": "github",
   "runner": "opencode",
   "agent": "build",
   "model": "openai/gpt-4o",
@@ -562,7 +585,6 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	}
 	return a.runPython(ctx, pythonArgs)
 }
-
 
 func (a *App) runPython(ctx context.Context, args []string) int {
 	if err := a.runner.Run(ctx, "python3", args...); err != nil {

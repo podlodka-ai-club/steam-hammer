@@ -1610,6 +1610,7 @@ def run_configured_workflow_hooks(
     configured_hooks: dict[str, list[str]],
     dry_run: bool,
     cwd: str | None = None,
+    env: dict[str, str] | None = None,
     context: dict[str, str] | None = None,
 ) -> list[dict]:
     hook_name = WORKFLOW_HOOK_ALIASES.get(hook_name, hook_name)
@@ -1617,9 +1618,11 @@ def run_configured_workflow_hooks(
     if not commands:
         return []
 
-    env = os.environ.copy()
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update({key: str(value) for key, value in env.items() if value is not None})
     if context:
-        env.update({key: str(value) for key, value in context.items() if value is not None})
+        merged_env.update({key: str(value) for key, value in context.items() if value is not None})
 
     results: list[dict] = []
     for index, command_text in enumerate(commands, start=1):
@@ -1629,7 +1632,7 @@ def run_configured_workflow_hooks(
             command_text=command_text,
             dry_run=dry_run,
             cwd=cwd,
-            env=env,
+            env=merged_env,
         )
         result["hook"] = hook_name
         results.append(result)
@@ -9172,9 +9175,9 @@ def main() -> int:
                     base_branch=str(pr_state_context["base_branch"] or "") or None,
                 )
                 failure_stage = "workflow_hooks"
-                run_workflow_hook(
-                    hooks=configured_hooks,
+                run_configured_workflow_hooks(
                     hook_name="pre_agent",
+                    configured_hooks=configured_hooks,
                     dry_run=args.dry_run,
                     cwd=os.getcwd(),
                     env=pr_hook_env,
@@ -9211,9 +9214,9 @@ def main() -> int:
                     raise RuntimeError(message)
 
                 failure_stage = "workflow_hooks"
-                run_workflow_hook(
-                    hooks=configured_hooks,
+                run_configured_workflow_hooks(
                     hook_name="post_agent",
+                    configured_hooks=configured_hooks,
                     dry_run=args.dry_run,
                     cwd=os.getcwd(),
                     env=pr_hook_env,
@@ -9301,9 +9304,9 @@ def main() -> int:
                 )
 
                 failure_stage = "workflow_hooks"
-                run_workflow_hook(
-                    hooks=configured_hooks,
+                run_configured_workflow_hooks(
                     hook_name="pre_pr_update",
+                    configured_hooks=configured_hooks,
                     dry_run=args.dry_run,
                     cwd=os.getcwd(),
                     env=pr_hook_env,
@@ -9339,9 +9342,9 @@ def main() -> int:
                 )
 
                 failure_stage = "workflow_hooks"
-                run_workflow_hook(
-                    hooks=configured_hooks,
+                run_configured_workflow_hooks(
                     hook_name="post_pr_update",
+                    configured_hooks=configured_hooks,
                     dry_run=args.dry_run,
                     cwd=os.getcwd(),
                     env=pr_hook_env,
@@ -10647,12 +10650,13 @@ def main() -> int:
                     )
                 else:
                     failure_stage = "workflow_hooks"
-                    run_workflow_hook(
-                        hooks=configured_hooks,
+                    run_configured_workflow_hooks(
                         hook_name="pre_agent",
+                        configured_hooks=configured_hooks,
                         dry_run=args.dry_run,
                         cwd=os.getcwd(),
                         env=issue_hook_env,
+                        context=issue_hook_context,
                     )
                     failure_stage = "agent_run"
                     if configured_hooks:
@@ -10690,6 +10694,7 @@ def main() -> int:
                             configured_hooks=configured_hooks,
                             dry_run=args.dry_run,
                             cwd=os.getcwd(),
+                            env=issue_hook_env,
                             context=issue_hook_context,
                         )
                         failure_stage = "agent_run"
@@ -10704,14 +10709,6 @@ def main() -> int:
                             + (f" ({diagnosis})" if diagnosis else "")
                         )
                         raise RuntimeError(message)
-                    failure_stage = "workflow_hooks"
-                    run_workflow_hook(
-                        hooks=configured_hooks,
-                        hook_name="post_agent",
-                        dry_run=args.dry_run,
-                        cwd=os.getcwd(),
-                        env=issue_hook_env,
-                    )
                     clarification_request = agent_result.get("clarification_request")
                     if isinstance(clarification_request, dict):
                         question = str(clarification_request.get("question") or "").strip()
@@ -10778,12 +10775,13 @@ def main() -> int:
                         )
                         used_force_with_lease = args.sync_strategy == "rebase"
                         failure_stage = "workflow_hooks"
-                        run_workflow_hook(
-                            hooks=configured_hooks,
+                        run_configured_workflow_hooks(
                             hook_name="pre_pr_update",
+                            configured_hooks=configured_hooks,
                             dry_run=False,
                             cwd=os.getcwd(),
                             env=issue_hook_env,
+                            context=issue_hook_context,
                         )
                         failure_stage = "commit_push"
                         push_branch(
@@ -10856,12 +10854,13 @@ def main() -> int:
                                 ),
                             )
                         failure_stage = "workflow_hooks"
-                        run_workflow_hook(
-                            hooks=configured_hooks,
+                        run_configured_workflow_hooks(
                             hook_name="post_pr_update",
+                            configured_hooks=configured_hooks,
                             dry_run=False,
                             cwd=os.getcwd(),
                             env=issue_hook_env,
+                            context=issue_hook_context,
                         )
                         if (
                             decomposition_parent_issue is not None
@@ -10903,15 +10902,6 @@ def main() -> int:
                     cwd=os.getcwd(),
                 )
 
-                failure_stage = "workflow_hooks"
-                run_workflow_hook(
-                    hooks=configured_hooks,
-                    hook_name="pre_pr_update",
-                    dry_run=args.dry_run,
-                    cwd=os.getcwd(),
-                    env=issue_hook_env,
-                )
-
                 failure_stage = "commit_push"
                 if configured_hooks:
                     failure_stage = "workflow_hooks"
@@ -10920,6 +10910,7 @@ def main() -> int:
                         configured_hooks=configured_hooks,
                         dry_run=args.dry_run,
                         cwd=os.getcwd(),
+                        env=issue_hook_env,
                         context=issue_hook_context,
                     )
                     failure_stage = "commit_push"
@@ -11017,16 +11008,17 @@ def main() -> int:
                         issue_number=issue["number"],
                         dry_run=args.dry_run,
                     )
-                break
 
                 failure_stage = "workflow_hooks"
-                run_workflow_hook(
-                    hooks=configured_hooks,
+                run_configured_workflow_hooks(
                     hook_name="post_pr_update",
+                    configured_hooks=configured_hooks,
                     dry_run=args.dry_run,
                     cwd=os.getcwd(),
                     env=issue_hook_env,
+                    context=issue_hook_context,
                 )
+                break
 
                 if (
                     decomposition_parent_issue is not None

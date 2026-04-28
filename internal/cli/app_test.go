@@ -104,6 +104,24 @@ func TestInitCreatesConfigScaffolds(t *testing.T) {
 	}
 }
 
+func TestScaffoldsMatchExampleConfigs(t *testing.T) {
+	projectExample, err := os.ReadFile(filepath.Join("..", "..", "project-config.example.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(project example) error = %v", err)
+	}
+	if got := strings.TrimSpace(projectConfigScaffold); got != strings.TrimSpace(string(projectExample)) {
+		t.Fatalf("project scaffold drifted from example config")
+	}
+
+	localExample, err := os.ReadFile(filepath.Join("..", "..", "local-config.example.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(local example) error = %v", err)
+	}
+	if got := strings.TrimSpace(localConfigScaffold); got != strings.TrimSpace(string(localExample)) {
+		t.Fatalf("local scaffold drifted from example config")
+	}
+}
+
 func TestInitRefusesToOverwriteWithoutForce(t *testing.T) {
 	targetDir := t.TempDir()
 	projectPath := filepath.Join(targetDir, defaultProjectConfigName)

@@ -11,6 +11,7 @@ from scripts.run_github_issues_to_opencode import (
     configured_workflow_commands,
     evaluate_pr_readiness,
     parse_args,
+    run_configured_workflow_hooks,
     run_doctor,
     validate_project_config,
     workflow_hooks,
@@ -167,6 +168,42 @@ class ProjectWorkflowConfigTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("[PASS] Project config:", stdout.getvalue())
         self.assertIn("commands=setup, test, e2e", stdout.getvalue())
+
+    def test_run_configured_workflow_hooks_runs_all_commands_with_merged_env(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def fake_run(*, kind: str, name: str, command_text: str, dry_run: bool, cwd: str | None = None, env: dict[str, str] | None = None) -> dict[str, object]:
+            calls.append(
+                {
+                    "kind": kind,
+                    "name": name,
+                    "command_text": command_text,
+                    "dry_run": dry_run,
+                    "cwd": cwd,
+                    "env": env,
+                }
+            )
+            return {"name": name, "command": command_text, "status": "passed", "exit_code": 0}
+
+        with patch("scripts.run_github_issues_to_opencode._run_workflow_shell_command", side_effect=fake_run):
+            results = run_configured_workflow_hooks(
+                hook_name="pre_pr_update",
+                configured_hooks={"pre_pr_update": ["./hooks/one.sh", "./hooks/two.sh"]},
+                dry_run=False,
+                cwd="/repo",
+                env={"ORCHESTRATOR_MODE": "issue-flow"},
+                context={"hook_target": "issue", "repo_dir": "/repo"},
+            )
+
+        self.assertEqual([call["name"] for call in calls], ["pre_pr_update[1]", "pre_pr_update[2]"])
+        self.assertEqual([call["command_text"] for call in calls], ["./hooks/one.sh", "./hooks/two.sh"])
+        self.assertEqual(results[0]["hook"], "pre_pr_update")
+        self.assertEqual(results[1]["hook"], "pre_pr_update")
+        first_env = calls[0]["env"]
+        self.assertIsInstance(first_env, dict)
+        self.assertEqual(first_env["ORCHESTRATOR_MODE"], "issue-flow")
+        self.assertEqual(first_env["hook_target"], "issue")
+        self.assertEqual(first_env["repo_dir"], "/repo")
 
 
 if __name__ == "__main__":

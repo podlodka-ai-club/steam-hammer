@@ -99,6 +99,31 @@ Exit codes:
 - `0` when there are no failed checks.
 - non-zero when one or more checks fail.
 
+## Verification paths
+
+Use a fast path while iterating on orchestration logic, then a full path before release or after a larger batch of changes.
+
+Fast smoke check:
+
+```bash
+python3 -m unittest \
+  tests.test_pr_review_comments_mode \
+  tests.test_existing_branch_pr_reuse \
+  tests.test_orchestration_state_recovery \
+  tests.test_project_workflow_config -q
+```
+
+Full confidence run:
+
+```bash
+python3 -m unittest discover -s tests -q
+```
+
+Guidance:
+
+- use the fast path for small runner/test-harness changes and local smoke checks;
+- use the full path before release, after post-batch hardening, or whenever provider/routing behavior changed.
+
 ## Go orchestrator CLI
 
 Phase 1 includes a Go CLI wrapper around the existing Python runner. Install the binary once, or run it directly with Go:

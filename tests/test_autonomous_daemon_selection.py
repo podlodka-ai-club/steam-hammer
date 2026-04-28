@@ -156,6 +156,7 @@ class AutonomousDaemonSelectionTests(unittest.TestCase):
             patch("scripts.run_github_issues_to_opencode.fetch_pull_request", return_value=linked_pr),
             patch("scripts.run_github_issues_to_opencode.fetch_pr_review_threads", return_value=[]),
             patch("scripts.run_github_issues_to_opencode.fetch_pr_conversation_comments", return_value=[]),
+            patch("scripts.run_github_issues_to_opencode.remove_agent_failure_label_from_issue"),
             patch(
                 "scripts.run_github_issues_to_opencode.read_pr_ci_status_for_pull_request",
                 return_value={"overall": "pending", "pending_checks": [{"name": "ci"}], "checks": []},

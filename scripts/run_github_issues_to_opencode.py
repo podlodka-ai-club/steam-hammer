@@ -4971,6 +4971,12 @@ def remove_agent_failure_label_from_issue(repo: str, issue_number: int, dry_run:
         tracker_provider = current_tracker_provider()
         if not tracker_provider.supports_issue_labels:
             return
+        if dry_run:
+            print(
+                f"[dry-run] Would remove label '{AGENT_FAILURE_LABEL_NAME}' from issue "
+                f"{format_issue_ref(issue_number, tracker=tracker_provider.name)} if present"
+            )
+            return
         if not tracker_provider.issue_has_label(
             repo=repo,
             issue_id=issue_number,

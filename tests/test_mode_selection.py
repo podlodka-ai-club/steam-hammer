@@ -79,6 +79,17 @@ class ModeSelectionTests(unittest.TestCase):
         self.assertEqual(mode, "pr-review")
         self.assertIn("waiting-for-ci", reason)
 
+    def test_ready_to_merge_state_prefers_pr_review_when_open_pr_exists(self) -> None:
+        mode, reason = choose_execution_mode(
+            issue_number=45,
+            linked_open_pr={"number": 144},
+            force_issue_flow=False,
+            recovered_state={"status": "ready-to-merge"},
+        )
+
+        self.assertEqual(mode, "pr-review")
+        self.assertIn("ready-to-merge", reason)
+
 
 if __name__ == "__main__":
     unittest.main()

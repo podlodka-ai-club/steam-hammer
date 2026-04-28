@@ -7,52 +7,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/workers"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-type detachedWorkerState struct {
-	Name        string                 `json:"name"`
-	Mode        string                 `json:"mode"`
-	TargetKind  string                 `json:"target_kind"`
-	TargetID    string                 `json:"target_id,omitempty"`
-	Repo        string                 `json:"repo,omitempty"`
-	Tracker     string                 `json:"tracker,omitempty"`
-	CodeHost    string                 `json:"codehost,omitempty"`
-	Runner      string                 `json:"runner,omitempty"`
-	Agent       string                 `json:"agent,omitempty"`
-	Model       string                 `json:"model,omitempty"`
-	Command     []string               `json:"command"`
-	StartedAt   string                 `json:"started_at"`
-	PID         int                    `json:"pid"`
-	LogPath     string                 `json:"log_path"`
-	SessionPath string                 `json:"session_path,omitempty"`
-	StatePath   string                 `json:"state_path"`
-	ClonePath   string                 `json:"clone_path,omitempty"`
-	WorkDir     string                 `json:"work_dir"`
-	Batch       *detachedBatchMetadata `json:"batch,omitempty"`
-}
+type detachedWorkerState = workers.State
 
-type detachedBatchMetadata struct {
-	ChildIssueIDs []string                  `json:"child_issue_ids,omitempty"`
-	ChildWorkers  []detachedBatchWorkerLink `json:"child_workers,omitempty"`
-}
+type detachedBatchMetadata = workers.BatchMetadata
 
-type detachedBatchWorkerLink struct {
-	IssueID       string `json:"issue_id,omitempty"`
-	WorkerName    string `json:"worker_name,omitempty"`
-	LogPath       string `json:"log_path,omitempty"`
-	ClonePath     string `json:"clone_path,omitempty"`
-	StartedAt     string `json:"started_at,omitempty"`
-	StatePath     string `json:"state_path,omitempty"`
-	StatusCommand string `json:"status_command,omitempty"`
-}
+type detachedBatchWorkerLink = workers.BatchWorkerLink
 
 type detachedWorkerLogReport struct {
 	Lines int `json:"lines"`
@@ -120,48 +88,14 @@ type detachedBatchChildReport struct {
 	NextCommand   string                      `json:"next_command,omitempty"`
 }
 
-type detachedWorkerPaths struct {
-	statePath   string
-	logPath     string
-	sessionPath string
-	workDir     string
-}
+type detachedWorkerPaths = workers.Paths
 
 func resolveDetachedWorkerPaths(configuredRoot, configuredWorkDir, targetKind, targetID string) (detachedWorkerPaths, error) {
-	workDir := "."
-	if strings.TrimSpace(configuredWorkDir) != "" {
-		workDir = configuredWorkDir
-	}
-	absWorkDir, err := filepath.Abs(workDir)
-	if err != nil {
-		return detachedWorkerPaths{}, err
-	}
-
-	root := strings.TrimSpace(configuredRoot)
-	if root == "" {
-		root = filepath.Join(absWorkDir, ".orchestrator", "workers")
-	} else if !filepath.IsAbs(root) {
-		root = filepath.Join(absWorkDir, root)
-	}
-
-	name := workerName(targetKind, targetID)
-	workerBase := filepath.Join(root, name)
-	paths := detachedWorkerPaths{
-		statePath: filepath.Join(workerBase, "worker.json"),
-		logPath:   filepath.Join(workerBase, "worker.log"),
-		workDir:   absWorkDir,
-	}
-	if targetKind == "daemon" {
-		paths.sessionPath = filepath.Join(workerBase, "session.json")
-	}
-	return paths, nil
+	return workers.ResolvePaths(configuredRoot, configuredWorkDir, targetKind, targetID)
 }
 
 func workerName(targetKind, targetID string) string {
-	if targetID == "" {
-		return targetKind
-	}
-	return targetKind + "-" + targetID
+	return workers.WorkerName(targetKind, targetID)
 }
 
 func (a *App) startDetachedWorker(state detachedWorkerState) int {
@@ -216,82 +150,25 @@ func (a *App) startDetachedWorkerState(state detachedWorkerState) (detachedWorke
 }
 
 func withDetachedBatchMetadata(states []detachedWorkerState, requestedIssueIDs []int) []detachedWorkerState {
-	if len(states) == 0 {
-		return nil
-	}
-	childIssueIDs := make([]string, 0, len(requestedIssueIDs))
-	for _, id := range requestedIssueIDs {
-		childIssueIDs = append(childIssueIDs, strconv.Itoa(id))
-	}
-	childWorkers := make([]detachedBatchWorkerLink, 0, len(states))
-	for _, state := range states {
-		childWorkers = append(childWorkers, detachedBatchWorkerLink{
-			IssueID:       state.TargetID,
-			WorkerName:    state.Name,
-			LogPath:       state.LogPath,
-			ClonePath:     state.ClonePath,
-			StartedAt:     state.StartedAt,
-			StatePath:     state.StatePath,
-			StatusCommand: detachedTargetStatusCommand(state),
-		})
-	}
-	updated := make([]detachedWorkerState, len(states))
-	copy(updated, states)
-	batch := &detachedBatchMetadata{
-		ChildIssueIDs: childIssueIDs,
-		ChildWorkers:  childWorkers,
-	}
-	for i := range updated {
-		updated[i].Batch = batch
-	}
-	return updated
+	return workers.WithBatchMetadata(states, requestedIssueIDs, func(state workers.State) string {
+		return detachedTargetStatusCommand(state)
+	})
 }
 
 func writeDetachedBatchStates(states []detachedWorkerState) error {
-	for _, state := range states {
-		if err := writeDetachedWorkerState(state); err != nil {
-			return err
-		}
-	}
-	return nil
+	return workers.WriteBatchStates(states)
 }
 
 func ensureDetachedWorkerWritable(statePath string) error {
-	state, err := readDetachedWorkerState(statePath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("failed to inspect detached worker state: %w", err)
-	}
-	if state.PID > 0 {
-		running, _ := processRunning(state.PID)
-		if running {
-			return fmt.Errorf("detached worker %s is already running with pid %d (see %s)", state.Name, state.PID, state.LogPath)
-		}
-	}
-	return nil
+	return workers.EnsureWritable(statePath, processRunning)
 }
 
 func writeDetachedWorkerState(state detachedWorkerState) error {
-	payload, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	payload = append(payload, '\n')
-	return os.WriteFile(state.StatePath, payload, 0o644)
+	return workers.WriteState(state)
 }
 
 func readDetachedWorkerState(path string) (detachedWorkerState, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return detachedWorkerState{}, err
-	}
-	var state detachedWorkerState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return detachedWorkerState{}, err
-	}
-	return state, nil
+	return workers.ReadState(path)
 }
 
 func (a *App) runDetachedStatus(configuredRoot, name string, asJSON bool) int {
@@ -300,10 +177,10 @@ func (a *App) runDetachedStatus(configuredRoot, name string, asJSON bool) int {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
 		return 1
 	}
-	report, err := detachedWorkerReportFromStateFile(workerPaths.statePath)
+	report, err := detachedWorkerReportFromStateFile(workerPaths.StatePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			_, _ = fmt.Fprintf(a.err, "orchestrator: detached worker state not found: %s\n", workerPaths.statePath)
+			_, _ = fmt.Fprintf(a.err, "orchestrator: detached worker state not found: %s\n", workerPaths.StatePath)
 			return 1
 		}
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect detached worker state: %v\n", err)
@@ -426,35 +303,18 @@ func processRunning(pid int) (bool, error) {
 }
 
 func detachedWorkerReports(configuredRoot string) ([]detachedWorkerReport, error) {
-	workerPaths, err := resolveDetachedWorkerPaths(configuredRoot, ".", "", "")
+	states, err := workers.ListStates(configuredRoot, ".")
 	if err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(filepath.Dir(workerPaths.statePath))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return []detachedWorkerReport{}, nil
-		}
-		return nil, err
-	}
-	reports := make([]detachedWorkerReport, 0, len(entries))
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		statePath := filepath.Join(filepath.Dir(workerPaths.statePath), entry.Name(), "worker.json")
-		report, err := detachedWorkerReportFromStateFile(statePath)
+	reports := make([]detachedWorkerReport, 0, len(states))
+	for _, state := range states {
+		report, err := detachedWorkerReportFromState(state, true)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
 			return nil, err
 		}
 		reports = append(reports, report)
 	}
-	sort.Slice(reports, func(i, j int) bool {
-		return reports[i].Worker.Name < reports[j].Worker.Name
-	})
 	return reports, nil
 }
 
@@ -679,11 +539,11 @@ func detachedWorkerStateFromOptions(name, mode, targetKind, targetID string, opt
 		Agent:       strings.TrimSpace(*opts.agent),
 		Model:       strings.TrimSpace(*opts.model),
 		Command:     append([]string(nil), command...),
-		LogPath:     paths.logPath,
-		SessionPath: paths.sessionPath,
-		StatePath:   paths.statePath,
+		LogPath:     paths.LogPath,
+		SessionPath: paths.SessionPath,
+		StatePath:   paths.StatePath,
 		ClonePath:   strings.TrimSpace(*opts.dir),
-		WorkDir:     paths.workDir,
+		WorkDir:     paths.WorkDir,
 	}
 }
 

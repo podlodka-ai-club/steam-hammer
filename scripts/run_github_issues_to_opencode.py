@@ -1547,6 +1547,14 @@ class MergeRequestNotAcceptedError(RuntimeError):
         super().__init__(message)
 
 
+class RecoveryVerificationFailure(RuntimeError):
+    def __init__(self, *, scope: str, verification: dict[str, object]):
+        self.scope = scope
+        self.verification = verification
+        detail = _as_optional_string(verification.get("error")) or _as_optional_string(verification.get("summary"))
+        super().__init__(detail or f"{scope.capitalize()} recovery verification failed")
+
+
 def _run_workflow_shell_command(
     *,
     kind: str,
@@ -2296,7 +2304,16 @@ def run_forced_recovery_verification(
                 dry_run=dry_run,
             )
         except WorkflowCheckFailure as exc:
-            raise RuntimeError(f"Focused recovery verification failed: {exc}") from exc
+            failed_results = exc.checks if isinstance(exc.checks, list) else [exc.failed_check]
+            raise RecoveryVerificationFailure(
+                scope="focused",
+                verification={
+                    "status": "failed",
+                    "summary": _summarize_recovery_verification_results(failed_results),
+                    "error": f"Focused recovery verification failed: {exc}",
+                    "commands": failed_results,
+                },
+            ) from exc
         results.extend(focused_results)
 
     print(f"Running full-repo recovery verification for branch '{branch_name}'")
@@ -2307,7 +2324,16 @@ def run_forced_recovery_verification(
             cwd=repo_dir,
         )
     except WorkflowCheckFailure as exc:
-        raise RuntimeError(f"Full-repo recovery verification failed: {exc}") from exc
+        failed_results = results + (exc.checks if isinstance(exc.checks, list) else [exc.failed_check])
+        raise RecoveryVerificationFailure(
+            scope="full-repo",
+            verification={
+                "status": "failed",
+                "summary": _summarize_recovery_verification_results(failed_results),
+                "error": f"Full-repo recovery verification failed: {exc}",
+                "commands": failed_results,
+            },
+        ) from exc
     results.extend(full_repo_results)
 
     summary = _summarize_recovery_verification_results(results)
@@ -7465,6 +7491,145 @@ def leave_pr_summary_comment(
     )
 
 
+def _first_failed_workflow_result(results: list[dict[str, object]] | object) -> dict[str, object] | None:
+    if not isinstance(results, list):
+        return None
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        if str(result.get("status") or "").strip().lower() == "failed":
+            return result
+    return None
+
+
+def derive_recovery_verification_next_hypothesis(
+    *,
+    verification: dict[str, object],
+    recovery_result: dict[str, object] | None,
+) -> str:
+    failed = _first_failed_workflow_result(verification.get("commands"))
+    failed_name = str(failed.get("name") or "verification command") if isinstance(failed, dict) else "verification command"
+    auto_resolved = bool(recovery_result and recovery_result.get("auto_resolved"))
+    if auto_resolved:
+        return (
+            f"The auto-resolved recovery likely preserved mergeability but left '{failed_name}' failing; "
+            "the branch needs a follow-up code fix before PR review can continue."
+        )
+    return (
+        f"The sync fixed mergeability, but '{failed_name}' still fails on the recovered branch; "
+        "the branch likely needs a focused follow-up fix before PR review can continue."
+    )
+
+
+def format_recovery_verification_follow_up_comment(
+    *,
+    branch_name: str,
+    verification: dict[str, object],
+    recovery_result: dict[str, object] | None,
+    next_action: str,
+) -> str:
+    summary = _as_optional_string(verification.get("summary")) or "failed"
+    error = _as_optional_string(verification.get("error")) or summary
+    commands = verification.get("commands") if isinstance(verification.get("commands"), list) else []
+    failed = _first_failed_workflow_result(commands)
+    next_hypothesis = derive_recovery_verification_next_hypothesis(
+        verification=verification,
+        recovery_result=recovery_result,
+    )
+    recovery_status = str((recovery_result or {}).get("status") or "synced")
+    applied_strategy = _as_optional_string((recovery_result or {}).get("applied_strategy")) or "unknown"
+
+    lines = [
+        "Recovery follow-up: mergeability sync passed, but verification still failed.",
+        "",
+        f"- Branch: `{branch_name}`",
+        f"- Recovery result: `{recovery_status}` via `{applied_strategy}`",
+        f"- Verification summary: `{summary}`",
+        f"- Error: `{error}`",
+    ]
+
+    if isinstance(failed, dict):
+        failed_name = str(failed.get("name") or "verification")
+        exit_code = failed.get("exit_code")
+        evidence = (
+            _as_optional_string(failed.get("stderr_excerpt"))
+            or _as_optional_string(failed.get("stdout_excerpt"))
+            or _as_optional_string(failed.get("error"))
+        )
+        detail = f"- Failed check: `{failed_name}`"
+        if exit_code is not None:
+            detail += f" (exit code `{exit_code}`)"
+        lines.append(detail)
+        if evidence:
+            lines.append(f"- Evidence: `{evidence}`")
+
+    lines.extend(
+        [
+            "",
+            f"Next hypothesis: {next_hypothesis}",
+            f"Next action: {_humanize_status_token(next_action)}.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def post_recovery_verification_follow_up_comment(
+    *,
+    repo: str,
+    pr_number: int,
+    branch_name: str,
+    verification: dict[str, object],
+    recovery_result: dict[str, object] | None,
+    next_action: str,
+    dry_run: bool,
+) -> None:
+    body = format_recovery_verification_follow_up_comment(
+        branch_name=branch_name,
+        verification=verification,
+        recovery_result=recovery_result,
+        next_action=next_action,
+    )
+    if dry_run:
+        print(
+            f"[dry-run] Would post recovery follow-up comment to PR #{pr_number}: "
+            f"status={verification.get('status')}"
+        )
+        return
+
+    current_codehost_provider().post_pr_comment(
+        repo=repo,
+        pr_number=pr_number,
+        body=body,
+    )
+
+
+def safe_post_recovery_verification_follow_up_comment(
+    *,
+    repo: str,
+    pr_number: int,
+    branch_name: str,
+    verification: dict[str, object],
+    recovery_result: dict[str, object] | None,
+    next_action: str,
+    dry_run: bool,
+) -> None:
+    try:
+        post_recovery_verification_follow_up_comment(
+            repo=repo,
+            pr_number=pr_number,
+            branch_name=branch_name,
+            verification=verification,
+            recovery_result=recovery_result,
+            next_action=next_action,
+            dry_run=dry_run,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Warning: failed to post recovery follow-up comment to PR #{pr_number}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def open_pr(
     repo: str,
     base_branch: str,
@@ -11501,12 +11666,86 @@ def main() -> int:
                             "pushing sync-only branch updates"
                         )
                         failure_stage = "workflow_checks"
-                        run_forced_recovery_verification(
-                            branch_name=issue_branch,
-                            project_config=project_config,
-                            repo_dir=os.getcwd(),
-                            dry_run=False,
-                        )
+                        try:
+                            run_forced_recovery_verification(
+                                branch_name=issue_branch,
+                                project_config=project_config,
+                                repo_dir=os.getcwd(),
+                                dry_run=False,
+                            )
+                        except RecoveryVerificationFailure as exc:
+                            recovery_next_action = "inspect_recovery_verification"
+                            linked_pr_number = linked_open_pr.get("number") if isinstance(linked_open_pr, dict) else None
+                            if mode == "pr-review" and type(linked_pr_number) is int:
+                                safe_post_recovery_verification_follow_up_comment(
+                                    repo=repo,
+                                    pr_number=linked_pr_number,
+                                    branch_name=issue_branch,
+                                    verification=exc.verification,
+                                    recovery_result=reused_branch_sync_result,
+                                    next_action=recovery_next_action,
+                                    dry_run=args.dry_run,
+                                )
+                            safe_post_orchestration_state_comment(
+                                repo=repo,
+                                target_type=state_target_type,
+                                target_number=state_target_number,
+                                dry_run=args.dry_run,
+                                state=build_orchestration_state(
+                                    status="blocked",
+                                    task_type="issue" if mode == "issue-flow" else "pr",
+                                    issue_number=issue["number"],
+                                    pr_number=state_pr_number,
+                                    branch=issue_branch,
+                                    base_branch=target_base_branch,
+                                    runner=active_runner,
+                                    agent=active_agent,
+                                    model=active_model,
+                                    attempt=state_attempt,
+                                    stage="workflow_checks",
+                                    next_action=recovery_next_action,
+                                    error=short_error_text(str(exc)),
+                                    workflow_checks=(
+                                        exc.verification.get("commands")
+                                        if isinstance(exc.verification.get("commands"), list)
+                                        else None
+                                    ),
+                                    stats=issue_agent_run_stats,
+                                    decomposition=decomposition_rollup,
+                                ),
+                            )
+                            print(
+                                f"Recovery verification failed for {issue_label} after sync-only rerun: {exc}. "
+                                "Recorded blocked state with follow-up evidence."
+                            )
+                            if supports_issue_tracker_ops:
+                                remove_agent_failure_label_from_issue(
+                                    repo=repo,
+                                    issue_number=issue["number"],
+                                    dry_run=args.dry_run,
+                                )
+                            if not args.dry_run:
+                                run_command(["git", "checkout", base_branch])
+                            batch_done_summary = f"Blocked {issue_label} on recovery verification follow-up"
+                            batch_current_summary = (
+                                f"Batch {batch_index}/{len(issues)} blocked after sync-only recovery for {issue_label}"
+                            )
+                            batch_action_items = [
+                                f"Posted recovery verification evidence for PR #{linked_pr_number}"
+                                if type(linked_pr_number) is int
+                                else f"Recorded recovery verification failure for {issue_label}"
+                            ]
+                            batch_blockers = [short_error_text(str(exc))]
+                            mark_autonomous_session_issue_processed(
+                                autonomous_session_state,
+                                issue_number=batch_issue_number,
+                                status="blocked",
+                            )
+                            save_autonomous_session_state(
+                                autonomous_session_file,
+                                autonomous_session_state,
+                            )
+                            continue
                         used_force_with_lease = (
                             str(reused_branch_sync_result.get("applied_strategy") or "") == "rebase"
                         )

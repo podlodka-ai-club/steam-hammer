@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/workers"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -277,9 +278,9 @@ func TestRunIssueDetachStartsBackgroundWorkerWithPredictablePaths(t *testing.T) 
 	if _, err := os.Stat(wantStatePath); err != nil {
 		t.Fatalf("Stat(%q) error = %v", wantStatePath, err)
 	}
-	state, err := readDetachedWorkerState(wantStatePath)
+	state, err := workers.ReadState(wantStatePath)
 	if err != nil {
-		t.Fatalf("readDetachedWorkerState() error = %v", err)
+		t.Fatalf("workers.ReadState() error = %v", err)
 	}
 	if state.ClonePath != targetDir {
 		t.Fatalf("clone path = %q, want %q", state.ClonePath, targetDir)
@@ -462,9 +463,9 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 		if _, err := os.Stat(statePath); err != nil {
 			t.Fatalf("Stat(%q) error = %v", statePath, err)
 		}
-		state, err := readDetachedWorkerState(statePath)
+		state, err := workers.ReadState(statePath)
 		if err != nil {
-			t.Fatalf("readDetachedWorkerState(%q) error = %v", statePath, err)
+			t.Fatalf("workers.ReadState(%q) error = %v", statePath, err)
 		}
 		if state.Mode != "run batch" {
 			t.Fatalf("worker mode = %q, want run batch", state.Mode)
@@ -494,9 +495,9 @@ func TestRunBatchDetachPersistsBatchMetadataForChildWorkers(t *testing.T) {
 
 	for _, issueID := range []string{"71", "72"} {
 		statePath := filepath.Join(targetDir, ".orchestrator", "workers", "issue-"+issueID, "worker.json")
-		state, err := readDetachedWorkerState(statePath)
+		state, err := workers.ReadState(statePath)
 		if err != nil {
-			t.Fatalf("readDetachedWorkerState(%q) error = %v", statePath, err)
+			t.Fatalf("workers.ReadState(%q) error = %v", statePath, err)
 		}
 		if state.Batch == nil {
 			t.Fatalf("worker batch metadata = nil for %s", issueID)
@@ -870,8 +871,8 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 	if err := os.WriteFile(logPath, []byte("line 1\nline 2\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile(log) error = %v", err)
 	}
-	if err := writeDetachedWorkerState(state); err != nil {
-		t.Fatalf("writeDetachedWorkerState() error = %v", err)
+	if err := workers.WriteState(state); err != nil {
+		t.Fatalf("workers.WriteState() error = %v", err)
 	}
 
 	var out strings.Builder
@@ -955,8 +956,8 @@ func TestStatusWorkerShowsBatchSummary(t *testing.T) {
 			t.Fatalf("WriteFile(log) error = %v", err)
 		}
 	}
-	if err := writeDetachedBatchStates(states); err != nil {
-		t.Fatalf("writeDetachedBatchStates() error = %v", err)
+	if err := workers.WriteBatchStates(states); err != nil {
+		t.Fatalf("workers.WriteBatchStates() error = %v", err)
 	}
 
 	var out strings.Builder
@@ -1039,8 +1040,8 @@ func TestStatusWorkerJSONIncludesBatchSummary(t *testing.T) {
 			t.Fatalf("WriteFile(log) error = %v", err)
 		}
 	}
-	if err := writeDetachedBatchStates(states); err != nil {
-		t.Fatalf("writeDetachedBatchStates() error = %v", err)
+	if err := workers.WriteBatchStates(states); err != nil {
+		t.Fatalf("workers.WriteBatchStates() error = %v", err)
 	}
 
 	var out strings.Builder
@@ -1093,9 +1094,9 @@ func TestReadDetachedWorkerStateSupportsLegacyMetadataWithoutBatch(t *testing.T)
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	state, err := readDetachedWorkerState(statePath)
+	state, err := workers.ReadState(statePath)
 	if err != nil {
-		t.Fatalf("readDetachedWorkerState() error = %v", err)
+		t.Fatalf("workers.ReadState() error = %v", err)
 	}
 	if state.Name != "issue-71" || state.TargetID != "71" {
 		t.Fatalf("state = %#v", state)
@@ -1120,7 +1121,7 @@ func TestStatusWorkersJSONListsRegistryEntries(t *testing.T) {
 	if err := os.WriteFile(sessionPath, []byte("{\n  \"processed_issues\": {\"71\": {\"status\": \"ready-for-review\"}},\n  \"checkpoint\": {\n    \"phase\": \"running\",\n    \"current\": \"issue #71\",\n    \"next\": [\"issue #72\"],\n    \"counts\": {\"processed\": 1, \"failures\": 0},\n    \"updated_at\": \"2026-04-28T12:10:00Z\"\n  }\n}\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile(session) error = %v", err)
 	}
-	if err := writeDetachedWorkerState(detachedWorkerState{
+	if err := workers.WriteState(detachedWorkerState{
 		Name:        "daemon",
 		Mode:        "run daemon",
 		TargetKind:  "daemon",
@@ -1133,7 +1134,7 @@ func TestStatusWorkersJSONListsRegistryEntries(t *testing.T) {
 		ClonePath:   targetDir,
 		WorkDir:     targetDir,
 	}); err != nil {
-		t.Fatalf("writeDetachedWorkerState() error = %v", err)
+		t.Fatalf("workers.WriteState() error = %v", err)
 	}
 
 	var out strings.Builder

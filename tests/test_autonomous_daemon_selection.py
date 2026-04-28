@@ -26,6 +26,107 @@ from scripts.run_github_issues_to_opencode import (
 
 
 class AutonomousDaemonSelectionTests(unittest.TestCase):
+    def test_sort_autonomous_issues_prioritizes_recovered_ready_prs(self) -> None:
+        ready_issue = {
+            "number": 101,
+            "title": "Ready PR",
+            "labels": [{"name": "bug"}],
+            "updatedAt": "2026-04-27T10:00:00Z",
+        }
+        waiting_issue = {
+            "number": 102,
+            "title": "Waiting PR",
+            "labels": [{"name": "bug"}],
+            "updatedAt": "2026-04-28T10:00:00Z",
+        }
+        new_issue = {
+            "number": 103,
+            "title": "New issue",
+            "labels": [{"name": "bug"}],
+            "updatedAt": "2026-04-29T10:00:00Z",
+        }
+        with (
+            patch(
+                "scripts.run_github_issues_to_opencode.find_open_pr_for_issue",
+                side_effect=[
+                    None,
+                    {"number": 202, "headRefName": "issue-fix/102-waiting", "baseRefName": "main"},
+                    {"number": 201, "headRefName": "issue-fix/101-ready", "baseRefName": "main"},
+                ],
+            ),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_pull_request",
+                side_effect=[
+                    {
+                        "mergeStateStatus": "UNKNOWN",
+                        "mergeable": "UNKNOWN",
+                        "reviewDecision": "REVIEW_REQUIRED",
+                        "files": [{"path": "docs/waiting.md"}],
+                    },
+                    {
+                        "mergeStateStatus": "CLEAN",
+                        "mergeable": "MERGEABLE",
+                        "reviewDecision": "APPROVED",
+                        "files": [{"path": "docs/queue.md"}],
+                    },
+                ],
+            ),
+        ):
+            ordered = sort_autonomous_issues(
+                issues=[new_issue, waiting_issue, ready_issue],
+                scope_defaults={},
+                repo="owner/repo",
+            )
+
+        self.assertEqual([issue["number"] for issue in ordered], [101, 102, 103])
+
+    def test_sort_autonomous_issues_prioritizes_central_runner_prs_with_same_status(self) -> None:
+        central_issue = {
+            "number": 201,
+            "title": "Runner change",
+            "labels": [{"name": "bug"}],
+            "updatedAt": "2026-04-27T10:00:00Z",
+        }
+        regular_issue = {
+            "number": 202,
+            "title": "Regular change",
+            "labels": [{"name": "bug"}],
+            "updatedAt": "2026-04-28T10:00:00Z",
+        }
+        with (
+            patch(
+                "scripts.run_github_issues_to_opencode.find_open_pr_for_issue",
+                side_effect=[
+                    {"number": 302, "headRefName": "issue-fix/202-regular", "baseRefName": "main"},
+                    {"number": 301, "headRefName": "issue-fix/201-runner", "baseRefName": "main"},
+                ],
+            ),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_pull_request",
+                side_effect=[
+                    {
+                        "mergeStateStatus": "CLEAN",
+                        "mergeable": "MERGEABLE",
+                        "reviewDecision": "APPROVED",
+                        "files": [{"path": "docs/queue.md"}],
+                    },
+                    {
+                        "mergeStateStatus": "CLEAN",
+                        "mergeable": "MERGEABLE",
+                        "reviewDecision": "APPROVED",
+                        "files": [{"path": "internal/cli/app.go"}],
+                    },
+                ],
+            ),
+        ):
+            ordered = sort_autonomous_issues(
+                issues=[regular_issue, central_issue],
+                scope_defaults={},
+                repo="owner/repo",
+            )
+
+        self.assertEqual([issue["number"] for issue in ordered], [201, 202])
+
     def test_scope_evaluation_supports_assignee_priority_and_freshness(self) -> None:
         issue = {
             "number": 93,

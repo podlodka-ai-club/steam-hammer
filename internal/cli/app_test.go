@@ -38,6 +38,26 @@ func (contextRunner) Run(ctx context.Context, _ string, _ ...string) error {
 	return ctx.Err()
 }
 
+type recordingDetachedStarter struct {
+	req   DetachedRequest
+	pid   int
+	calls int
+	err   error
+}
+
+func (r *recordingDetachedStarter) Start(req DetachedRequest) (DetachedProcess, error) {
+	r.req = req
+	r.calls++
+	if r.err != nil {
+		return DetachedProcess{}, r.err
+	}
+	pid := r.pid
+	if pid == 0 {
+		pid = 4242
+	}
+	return DetachedProcess{PID: pid}, nil
+}
+
 type exitCodeError int
 
 func (e exitCodeError) Error() string { return "exit" }
@@ -115,6 +135,23 @@ func TestStatusPRCommandWiresPythonRunner(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--status", "--pr", "72", "--repo", "owner/repo"})
+}
+
+func TestStatusAutonomousSessionCommandWiresPythonRunner(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"status", "--autonomous-session-file", ".orchestrator/workers/daemon/session.json"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if !reflect.DeepEqual(runner.args, []string{runnerScript, "--status", "--autonomous-session-file", ".orchestrator/workers/daemon/session.json"}) {
+		t.Fatalf("runner args = %#v", runner.args)
+	}
 }
 
 func TestInitCreatesConfigScaffolds(t *testing.T) {
@@ -197,6 +234,42 @@ func TestRunIssueCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run", "--base", "current"})
 }
 
+func TestRunIssueDetachStartsBackgroundWorkerWithPredictablePaths(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	targetDir := t.TempDir()
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", targetDir, "--detach"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if starter.calls != 1 {
+		t.Fatalf("starter calls = %d, want 1", starter.calls)
+	}
+	wantLogPath := filepath.Join(targetDir, ".orchestrator", "workers", "issue-71", "worker.log")
+	wantStatePath := filepath.Join(targetDir, ".orchestrator", "workers", "issue-71", "worker.json")
+	if starter.req.Name != "python3" {
+		t.Fatalf("starter name = %q, want python3", starter.req.Name)
+	}
+	if !reflect.DeepEqual(starter.req.Args, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dir", targetDir}) {
+		t.Fatalf("starter args = %#v", starter.req.Args)
+	}
+	if starter.req.LogPath != wantLogPath {
+		t.Fatalf("starter log path = %q, want %q", starter.req.LogPath, wantLogPath)
+	}
+	if starter.req.Dir != targetDir {
+		t.Fatalf("starter dir = %q, want %q", starter.req.Dir, targetDir)
+	}
+	if _, err := os.Stat(wantStatePath); err != nil {
+		t.Fatalf("Stat(%q) error = %v", wantStatePath, err)
+	}
+	if !strings.Contains(out.String(), "orchestrator status --worker issue-71") {
+		t.Fatalf("stdout = %q, want detached status hint", out.String())
+	}
+}
+
 func TestRunDaemonCommandForwardsPostBatchVerificationFlags(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -222,6 +295,32 @@ func TestRunDaemonCommandForwardsPostBatchVerificationFlags(t *testing.T) {
 	}
 	if !strings.Contains(joined, "--autonomous-session-file") {
 		t.Fatalf("runner args = %q, want daemon session file", joined)
+	}
+}
+
+func TestRunDaemonDetachUsesStableSessionFile(t *testing.T) {
+	starter := &recordingDetachedStarter{}
+	targetDir := t.TempDir()
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--post-batch-verify", "--create-followup-issue"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if starter.calls != 1 {
+		t.Fatalf("starter calls = %d, want 1", starter.calls)
+	}
+	wantSessionPath := filepath.Join(targetDir, ".orchestrator", "workers", "daemon", "session.json")
+	if got := flagValue(starter.req.Args, "--autonomous-session-file"); got != wantSessionPath {
+		t.Fatalf("session path = %q, want %q", got, wantSessionPath)
+	}
+	joined := strings.Join(starter.req.Args, " ")
+	if !strings.Contains(joined, "--post-batch-verify") {
+		t.Fatalf("starter args = %q, want --post-batch-verify", joined)
+	}
+	if !strings.Contains(joined, "--create-followup-issue") {
+		t.Fatalf("starter args = %q, want --create-followup-issue", joined)
 	}
 }
 
@@ -598,6 +697,51 @@ func TestPythonRunnerContextCancellation(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "python runner canceled") {
 		t.Fatalf("stderr = %q, want cancellation message", errOut.String())
+	}
+}
+
+func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
+	targetDir := t.TempDir()
+	workerRoot := filepath.Join(targetDir, ".orchestrator", "workers")
+	workerDir := filepath.Join(workerRoot, "issue-71")
+	if err := os.MkdirAll(workerDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	statePath := filepath.Join(workerDir, "worker.json")
+	logPath := filepath.Join(workerDir, "worker.log")
+	state := detachedWorkerState{
+		Name:       "issue-71",
+		Mode:       "run issue",
+		TargetKind: "issue",
+		TargetID:   "71",
+		Repo:       "owner/repo",
+		PID:        os.Getpid(),
+		StartedAt:  "2026-04-28T12:00:00Z",
+		LogPath:    logPath,
+		StatePath:  statePath,
+		WorkDir:    targetDir,
+	}
+	if err := writeDetachedWorkerState(state); err != nil {
+		t.Fatalf("writeDetachedWorkerState() error = %v", err)
+	}
+
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	code := app.Run([]string{"status", "--worker", "issue-71", "--worker-dir", workerRoot})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	printed := out.String()
+	for _, want := range []string{
+		"worker: issue-71",
+		"target: issue #71",
+		"process: running",
+		"log: " + logPath,
+		"orchestrator status --issue 71 --repo owner/repo",
+	} {
+		if !strings.Contains(printed, want) {
+			t.Fatalf("stdout = %q, want %q", printed, want)
+		}
 	}
 }
 

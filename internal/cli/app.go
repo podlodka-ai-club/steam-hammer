@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -141,6 +144,21 @@ type Runner interface {
 	Run(ctx context.Context, name string, args ...string) error
 }
 
+type DetachedStarter interface {
+	Start(req DetachedRequest) (DetachedProcess, error)
+}
+
+type DetachedRequest struct {
+	Name    string
+	Args    []string
+	Dir     string
+	LogPath string
+}
+
+type DetachedProcess struct {
+	PID int
+}
+
 type ExecRunner struct {
 	Stdout io.Writer
 	Stderr io.Writer
@@ -154,10 +172,37 @@ func (r ExecRunner) Run(ctx context.Context, name string, args ...string) error 
 	return cmd.Run()
 }
 
+type ExecDetachedStarter struct{}
+
+func (ExecDetachedStarter) Start(req DetachedRequest) (DetachedProcess, error) {
+	if err := os.MkdirAll(filepath.Dir(req.LogPath), 0o755); err != nil {
+		return DetachedProcess{}, fmt.Errorf("failed to create log directory: %w", err)
+	}
+	logFile, err := os.OpenFile(req.LogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return DetachedProcess{}, fmt.Errorf("failed to open log file: %w", err)
+	}
+
+	cmd := exec.Command(req.Name, req.Args...)
+	cmd.Dir = req.Dir
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Stdin = nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return DetachedProcess{}, err
+	}
+	_ = logFile.Close()
+	return DetachedProcess{PID: cmd.Process.Pid}, nil
+}
+
 type App struct {
 	out    io.Writer
 	err    io.Writer
 	runner Runner
+	start  DetachedStarter
 }
 
 func NewApp(out, err io.Writer) *App {
@@ -165,11 +210,31 @@ func NewApp(out, err io.Writer) *App {
 		out:    out,
 		err:    err,
 		runner: ExecRunner{Stdout: out, Stderr: err},
+		start:  ExecDetachedStarter{},
 	}
 }
 
 func (a *App) SetRunner(r Runner) {
 	a.runner = r
+}
+
+func (a *App) SetDetachedStarter(starter DetachedStarter) {
+	a.start = starter
+}
+
+type detachedWorkerState struct {
+	Name        string   `json:"name"`
+	Mode        string   `json:"mode"`
+	TargetKind  string   `json:"target_kind"`
+	TargetID    string   `json:"target_id,omitempty"`
+	Repo        string   `json:"repo,omitempty"`
+	Command     []string `json:"command"`
+	StartedAt   string   `json:"started_at"`
+	PID         int      `json:"pid"`
+	LogPath     string   `json:"log_path"`
+	SessionPath string   `json:"session_path,omitempty"`
+	StatePath   string   `json:"state_path"`
+	WorkDir     string   `json:"work_dir"`
 }
 
 func (a *App) Run(args []string) int {
@@ -313,6 +378,9 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 	addCommonFlags(fs, &opts)
 	issue := fs.Int("issue", 0, "GitHub issue number")
 	pr := fs.Int("pr", 0, "GitHub pull request number")
+	worker := fs.String("worker", "", "detached worker name: issue-N, pr-N, or daemon")
+	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
+	autonomousSessionFile := fs.String("autonomous-session-file", "", "read daemon batch status from a session checkpoint file")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -321,16 +389,34 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintf(a.err, "unexpected status argument: %s\n", fs.Arg(0))
 		return 2
 	}
-	if (*issue > 0 && *pr > 0) || (*issue <= 0 && *pr <= 0) {
-		_, _ = fmt.Fprintln(a.err, "status requires exactly one of --issue N or --pr N")
+	targets := 0
+	if *issue > 0 {
+		targets++
+	}
+	if *pr > 0 {
+		targets++
+	}
+	if strings.TrimSpace(*worker) != "" {
+		targets++
+	}
+	if strings.TrimSpace(*autonomousSessionFile) != "" {
+		targets++
+	}
+	if targets != 1 {
+		_, _ = fmt.Fprintln(a.err, "status requires exactly one of --issue N, --pr N, --worker NAME, or --autonomous-session-file PATH")
 		return 2
+	}
+	if strings.TrimSpace(*worker) != "" {
+		return a.runDetachedStatus(*workerDir, *worker)
 	}
 
 	pythonArgs := []string{runnerScript, "--status"}
 	if *issue > 0 {
 		pythonArgs = append(pythonArgs, "--issue", strconv.Itoa(*issue))
-	} else {
+	} else if *pr > 0 {
 		pythonArgs = append(pythonArgs, "--pr", strconv.Itoa(*pr))
+	} else {
+		pythonArgs = append(pythonArgs, "--autonomous-session-file", *autonomousSessionFile)
 	}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
 	return a.runPython(ctx, pythonArgs)
@@ -389,6 +475,8 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	fs.StringVar(&base, "base-branch", "", "base branch mode: default or current")
 	postBatchVerify := fs.Bool("post-batch-verify", false, "run post-batch verification after the daemon cycle completes")
 	createFollowupIssue := fs.Bool("create-followup-issue", false, "create a GitHub follow-up issue automatically when post-batch verification fails")
+	detach := fs.Bool("detach", false, "start the worker in the background and write logs/state to a predictable path")
+	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -466,6 +554,35 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	if *opts.dryRun && effectiveMaxCycles == 0 {
 		effectiveMaxCycles = 1
 	}
+	if *detach && effectiveMaxCycles == 0 {
+		effectiveMaxCycles = 1
+	}
+
+	if *detach {
+		workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "daemon", "")
+		if err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
+			return 1
+		}
+		pythonArgs = append(pythonArgs, "--autonomous-session-file", workerPaths.sessionPath)
+		if *postBatchVerify {
+			pythonArgs = append(pythonArgs, "--post-batch-verify")
+		}
+		if *createFollowupIssue {
+			pythonArgs = append(pythonArgs, "--create-followup-issue")
+		}
+		return a.startDetachedWorker(detachedWorkerState{
+			Name:        "daemon",
+			Mode:        "run daemon",
+			TargetKind:  "daemon",
+			Repo:        strings.TrimSpace(*opts.repo),
+			Command:     append([]string{"python3"}, pythonArgs...),
+			LogPath:     workerPaths.logPath,
+			SessionPath: workerPaths.sessionPath,
+			StatePath:   workerPaths.statePath,
+			WorkDir:     workerPaths.workDir,
+		})
+	}
 
 	sessionFile, err := os.CreateTemp("", "orchestrator-daemon-session-*.json")
 	if err != nil {
@@ -540,6 +657,8 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 	syncReusedBranch := fs.Bool("sync-reused-branch", true, "sync reused issue branches before running the agent")
 	noSyncReusedBranch := fs.Bool("no-sync-reused-branch", false, "disable sync for reused issue branches before the agent step")
 	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
+	detach := fs.Bool("detach", false, "start the worker in the background and write logs/state to a predictable path")
+	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -607,6 +726,24 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 	if *syncStrategy != "" {
 		pythonArgs = append(pythonArgs, "--sync-strategy", *syncStrategy)
 	}
+	if *detach {
+		workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "issue", strconv.Itoa(*id))
+		if err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
+			return 1
+		}
+		return a.startDetachedWorker(detachedWorkerState{
+			Name:       workerName("issue", strconv.Itoa(*id)),
+			Mode:       "run issue",
+			TargetKind: "issue",
+			TargetID:   strconv.Itoa(*id),
+			Repo:       strings.TrimSpace(*opts.repo),
+			Command:    append([]string{"python3"}, pythonArgs...),
+			LogPath:    workerPaths.logPath,
+			StatePath:  workerPaths.statePath,
+			WorkDir:    workerPaths.workDir,
+		})
+	}
 	return a.runPython(ctx, pythonArgs)
 }
 
@@ -628,6 +765,8 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	followupPrefix := fs.String("pr-followup-branch-prefix", "", "optional follow-up branch prefix")
 	conflictRecoveryOnly := fs.Bool("conflict-recovery-only", false, "sync the current PR branch with base and stop before any agent work")
 	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
+	detach := fs.Bool("detach", false, "start the worker in the background and write logs/state to a predictable path")
+	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -668,7 +807,257 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	if *conflictRecoveryOnly {
 		pythonArgs = append(pythonArgs, "--conflict-recovery-only")
 	}
+	if *detach {
+		workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "pr", strconv.Itoa(*id))
+		if err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
+			return 1
+		}
+		return a.startDetachedWorker(detachedWorkerState{
+			Name:       workerName("pr", strconv.Itoa(*id)),
+			Mode:       "run pr",
+			TargetKind: "pr",
+			TargetID:   strconv.Itoa(*id),
+			Repo:       strings.TrimSpace(*opts.repo),
+			Command:    append([]string{"python3"}, pythonArgs...),
+			LogPath:    workerPaths.logPath,
+			StatePath:  workerPaths.statePath,
+			WorkDir:    workerPaths.workDir,
+		})
+	}
 	return a.runPython(ctx, pythonArgs)
+}
+
+type detachedWorkerPaths struct {
+	statePath   string
+	logPath     string
+	sessionPath string
+	workDir     string
+}
+
+func resolveDetachedWorkerPaths(configuredRoot, configuredWorkDir, targetKind, targetID string) (detachedWorkerPaths, error) {
+	workDir := "."
+	if strings.TrimSpace(configuredWorkDir) != "" {
+		workDir = configuredWorkDir
+	}
+	absWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return detachedWorkerPaths{}, err
+	}
+
+	root := strings.TrimSpace(configuredRoot)
+	if root == "" {
+		root = filepath.Join(absWorkDir, ".orchestrator", "workers")
+	} else if !filepath.IsAbs(root) {
+		root = filepath.Join(absWorkDir, root)
+	}
+
+	name := workerName(targetKind, targetID)
+	workerBase := filepath.Join(root, name)
+	paths := detachedWorkerPaths{
+		statePath: filepath.Join(workerBase, "worker.json"),
+		logPath:   filepath.Join(workerBase, "worker.log"),
+		workDir:   absWorkDir,
+	}
+	if targetKind == "daemon" {
+		paths.sessionPath = filepath.Join(workerBase, "session.json")
+	}
+	return paths, nil
+}
+
+func workerName(targetKind, targetID string) string {
+	if targetID == "" {
+		return targetKind
+	}
+	return targetKind + "-" + targetID
+}
+
+func (a *App) startDetachedWorker(state detachedWorkerState) int {
+	if a.start == nil {
+		_, _ = fmt.Fprintln(a.err, "orchestrator: detached worker starter is not configured")
+		return 1
+	}
+	if err := ensureDetachedWorkerWritable(state.StatePath); err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+		return 1
+	}
+	if err := os.MkdirAll(filepath.Dir(state.StatePath), 0o755); err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to create worker directory: %v\n", err)
+		return 1
+	}
+	if state.SessionPath != "" {
+		if err := os.MkdirAll(filepath.Dir(state.SessionPath), 0o755); err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to create session directory: %v\n", err)
+			return 1
+		}
+	}
+	process, err := a.start.Start(DetachedRequest{
+		Name:    state.Command[0],
+		Args:    state.Command[1:],
+		Dir:     state.WorkDir,
+		LogPath: state.LogPath,
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to start detached worker: %v\n", err)
+		return 1
+	}
+	state.PID = process.PID
+	state.StartedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := writeDetachedWorkerState(state); err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to write detached worker state: %v\n", err)
+		return 1
+	}
+	_, _ = fmt.Fprintf(a.out, "started detached worker %s\n", state.Name)
+	_, _ = fmt.Fprintf(a.out, "pid: %d\n", state.PID)
+	_, _ = fmt.Fprintf(a.out, "log: %s\n", state.LogPath)
+	_, _ = fmt.Fprintf(a.out, "state: %s\n", state.StatePath)
+	if state.SessionPath != "" {
+		_, _ = fmt.Fprintf(a.out, "session: %s\n", state.SessionPath)
+	}
+	_, _ = fmt.Fprintf(a.out, "next: orchestrator status --worker %s\n", state.Name)
+	return 0
+}
+
+func ensureDetachedWorkerWritable(statePath string) error {
+	state, err := readDetachedWorkerState(statePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("failed to inspect detached worker state: %w", err)
+	}
+	if state.PID > 0 {
+		running, _ := processRunning(state.PID)
+		if running {
+			return fmt.Errorf("detached worker %s is already running with pid %d (see %s)", state.Name, state.PID, state.LogPath)
+		}
+	}
+	return nil
+}
+
+func writeDetachedWorkerState(state detachedWorkerState) error {
+	payload, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	return os.WriteFile(state.StatePath, payload, 0o644)
+}
+
+func readDetachedWorkerState(path string) (detachedWorkerState, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return detachedWorkerState{}, err
+	}
+	var state detachedWorkerState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return detachedWorkerState{}, err
+	}
+	return state, nil
+}
+
+func (a *App) runDetachedStatus(configuredRoot, name string) int {
+	workerPaths, err := resolveDetachedWorkerPaths(configuredRoot, ".", normalizeWorkerLookupName(name), workerLookupID(name))
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
+		return 1
+	}
+	state, err := readDetachedWorkerState(workerPaths.statePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: detached worker state not found: %s\n", workerPaths.statePath)
+			return 1
+		}
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to read detached worker state: %v\n", err)
+		return 1
+	}
+	running, runErr := processRunning(state.PID)
+	processStatus := "stopped"
+	if running {
+		processStatus = "running"
+	} else if runErr != nil {
+		processStatus = "unknown"
+	}
+	_, _ = fmt.Fprintf(a.out, "worker: %s\n", state.Name)
+	if state.TargetKind == "daemon" {
+		_, _ = fmt.Fprintln(a.out, "target: daemon")
+	} else {
+		_, _ = fmt.Fprintf(a.out, "target: %s #%s\n", state.TargetKind, state.TargetID)
+	}
+	if state.Repo != "" {
+		_, _ = fmt.Fprintf(a.out, "repo: %s\n", state.Repo)
+	}
+	_, _ = fmt.Fprintf(a.out, "process: %s\n", processStatus)
+	_, _ = fmt.Fprintf(a.out, "pid: %d\n", state.PID)
+	_, _ = fmt.Fprintf(a.out, "started: %s\n", state.StartedAt)
+	_, _ = fmt.Fprintf(a.out, "log: %s\n", state.LogPath)
+	_, _ = fmt.Fprintf(a.out, "state: %s\n", state.StatePath)
+	if state.SessionPath != "" {
+		_, _ = fmt.Fprintf(a.out, "session: %s\n", state.SessionPath)
+	}
+	_, _ = fmt.Fprintf(a.out, "next: %s\n", detachedWorkerNextAction(state, processStatus))
+	return 0
+}
+
+func normalizeWorkerLookupName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return ""
+	}
+	parts := strings.SplitN(trimmed, "-", 2)
+	return parts[0]
+}
+
+func workerLookupID(name string) string {
+	trimmed := strings.TrimSpace(name)
+	parts := strings.SplitN(trimmed, "-", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	return parts[1]
+}
+
+func processRunning(pid int) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+	err := syscall.Kill(pid, 0)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		return false, nil
+	}
+	return false, err
+}
+
+func detachedWorkerNextAction(state detachedWorkerState, processStatus string) string {
+	if processStatus == "running" {
+		if state.TargetKind == "daemon" && state.SessionPath != "" {
+			return fmt.Sprintf("tail -f %s or run orchestrator status --autonomous-session-file %s", state.LogPath, state.SessionPath)
+		}
+		return fmt.Sprintf("tail -f %s or run %s", state.LogPath, detachedTargetStatusCommand(state))
+	}
+	if state.TargetKind == "daemon" && state.SessionPath != "" {
+		return fmt.Sprintf("inspect %s and, if needed, run orchestrator status --autonomous-session-file %s", state.LogPath, state.SessionPath)
+	}
+	return fmt.Sprintf("inspect %s and, if needed, run %s", state.LogPath, detachedTargetStatusCommand(state))
+}
+
+func detachedTargetStatusCommand(state detachedWorkerState) string {
+	if state.TargetKind == "issue" {
+		if state.Repo != "" {
+			return fmt.Sprintf("orchestrator status --issue %s --repo %s", state.TargetID, state.Repo)
+		}
+		return fmt.Sprintf("orchestrator status --issue %s", state.TargetID)
+	}
+	if state.TargetKind == "pr" {
+		if state.Repo != "" {
+			return fmt.Sprintf("orchestrator status --pr %s --repo %s", state.TargetID, state.Repo)
+		}
+		return fmt.Sprintf("orchestrator status --pr %s", state.TargetID)
+	}
+	return fmt.Sprintf("orchestrator status --worker %s", state.Name)
 }
 
 func (a *App) runPython(ctx context.Context, args []string) int {
@@ -939,7 +1328,7 @@ func usage() string {
 	  orchestrator doctor [flags]
 	  orchestrator autodoctor [flags]
 	  orchestrator verify [flags]
-	  orchestrator status (--issue N | --pr N) [flags]
+	  orchestrator status (--issue N | --pr N | --worker NAME | --autonomous-session-file PATH) [flags]
 	  orchestrator run issue --id N [flags]
 	  orchestrator run pr --id N [flags]
 	  orchestrator run daemon [flags]

@@ -409,7 +409,7 @@ func detachedWorkerLinkedStatus(state detachedWorkerState) (*detachedWorkerLinke
 	if state.TargetKind != "issue" && state.TargetKind != "pr" {
 		return nil, nil
 	}
-	args := []string{runnerScript, "--status"}
+	args := []string{defaultRuntimeProvider().RunnerScript(), "--status"}
 	if state.TargetKind == "issue" {
 		args = append(args, "--issue", state.TargetID)
 	} else {

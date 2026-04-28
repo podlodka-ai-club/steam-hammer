@@ -26,10 +26,10 @@ type commonOptions struct {
 	idleTime *int
 }
 
-func addCommonFlags(fs *flag.FlagSet, opts *commonOptions) {
-	opts.repo = fs.String("repo", "", "GitHub repo in owner/name format")
+func addCommonFlags(fs *flag.FlagSet, opts *commonOptions, runtime runtimeProvider) {
+	opts.repo = fs.String("repo", "", runtime.RepoFlagDescription())
 	opts.tracker = fs.String("tracker", "", "tracker provider: github or jira")
-	opts.codehost = fs.String("codehost", "", "code host provider: github, bitbucket, or custom-proxy")
+	opts.codehost = fs.String("codehost", "", "code host provider override passed through to the current runtime")
 	opts.dir = fs.String("dir", "", "local git repository path")
 	opts.runner = fs.String("runner", "", "AI runner: claude or opencode")
 	opts.agent = fs.String("agent", "", "OpenCode agent name")

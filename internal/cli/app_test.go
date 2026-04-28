@@ -123,6 +123,40 @@ func TestAutoDoctorCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--doctor", "--repo", "owner/repo", "--dry-run"})
 }
 
+func TestStatusHelpUsesProviderNeutralTargetDescriptions(t *testing.T) {
+	var out strings.Builder
+	app := NewApp(&out, &out)
+
+	if code := app.Run([]string{"status", "--help"}); code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	help := out.String()
+	for _, want := range []string{"tracker issue number", "code host pull request number", "repository in owner/name format for the current runtime"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("status help missing %q\n%s", want, help)
+		}
+	}
+	if strings.Contains(help, "GitHub issue number") || strings.Contains(help, "GitHub pull request number") {
+		t.Fatalf("status help should not use GitHub-only target descriptions\n%s", help)
+	}
+}
+
+func TestVerifyHelpUsesProviderNeutralFollowUpDescription(t *testing.T) {
+	var out strings.Builder
+	app := NewApp(&out, &out)
+
+	if code := app.Run([]string{"verify", "--help"}); code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	help := out.String()
+	if !strings.Contains(help, "create a tracker follow-up issue automatically when verification fails") {
+		t.Fatalf("verify help missing provider-neutral follow-up wording\n%s", help)
+	}
+	if strings.Contains(help, "GitHub follow-up issue") {
+		t.Fatalf("verify help should not advertise a GitHub-only follow-up issue\n%s", help)
+	}
+}
+
 func TestVerifyCommandWiresPythonRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})

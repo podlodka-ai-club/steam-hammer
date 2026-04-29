@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -126,7 +127,34 @@ func buildIssuePythonArgs(script string, opts commonOptions, id int, base string
 	return pythonArgs
 }
 
-func buildDaemonPythonArgs(script string, opts commonOptions, state string, limit int, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, syncReusedBranch, noSyncReusedBranch bool, syncStrategy, base string, postBatchVerify, createFollowupIssue bool, fs flagState) []string {
+type flagState interface {
+	wasPassed(name string) bool
+}
+
+type flagStateAdapter struct {
+	fs interface{ Visit(func(*flag.Flag)) }
+}
+
+func (f flagStateAdapter) wasPassed(name string) bool {
+	passed := false
+	f.fs.Visit(func(current *flag.Flag) {
+		if current.Name == name {
+			passed = true
+		}
+	})
+	return passed
+}
+
+func buildVerifyPythonArgs(script string, opts commonOptions, createFollowupIssue bool) []string {
+	pythonArgs := []string{script, "--post-batch-verify"}
+	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
+	if createFollowupIssue {
+		pythonArgs = append(pythonArgs, "--create-followup-issue")
+	}
+	return pythonArgs
+}
+
+func buildDaemonPythonArgs(script string, opts commonOptions, state string, limit int, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, syncReusedBranch, noSyncReusedBranch bool, syncStrategy, sessionPath string, postBatchVerify, createFollowupIssue bool, fs flagState) []string {
 	pythonArgs := []string{script, "--autonomous", "--state", state, "--limit", strconv.Itoa(limit)}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
 	if base != "" {
@@ -171,6 +199,9 @@ func buildDaemonPythonArgs(script string, opts commonOptions, state string, limi
 	if syncStrategy != "" {
 		pythonArgs = append(pythonArgs, "--sync-strategy", syncStrategy)
 	}
+	if sessionPath != "" {
+		pythonArgs = append(pythonArgs, "--autonomous-session-file", sessionPath)
+	}
 	if postBatchVerify {
 		pythonArgs = append(pythonArgs, "--post-batch-verify")
 	}
@@ -180,22 +211,269 @@ func buildDaemonPythonArgs(script string, opts commonOptions, state string, limi
 	return pythonArgs
 }
 
-type flagState interface {
-	wasPassed(name string) bool
+func defaultSourceDir(configuredDir string) string {
+	if strings.TrimSpace(configuredDir) != "" {
+		return configuredDir
+	}
+	return "."
 }
 
-type flagStateAdapter struct {
-	fs interface{ Visit(func(*flag.Flag)) }
+type daemonParallelConfig struct {
+	opts                 commonOptions
+	flags                flagState
+	state                string
+	limit                int
+	maxParallelTasks     int
+	base                 string
+	includeEmpty         bool
+	stopOnError          bool
+	failOnExisting       bool
+	forceIssueFlow       bool
+	skipIfPRExists       bool
+	noSkipIfPRExists     bool
+	skipIfBranchExists   bool
+	noSkipIfBranchExists bool
+	forceReprocess       bool
+	syncReusedBranch     bool
+	noSyncReusedBranch   bool
+	syncStrategy         string
+	postBatchVerify      bool
+	createFollowupIssue  bool
+	detach               bool
+	workerDir            string
+	effectiveMaxCycles   int
+	pollIntervalSeconds  int
 }
 
-func (f flagStateAdapter) wasPassed(name string) bool {
-	passed := false
-	f.fs.Visit(func(current *flag.Flag) {
-		if current.Name == name {
-			passed = true
+type daemonParallelPreparedWorker struct {
+	name       string
+	opts       commonOptions
+	pythonArgs []string
+	workerPath detachedWorkerPaths
+	cleanup    func()
+}
+
+func (a *App) prepareParallelDaemonWorker(config daemonParallelConfig, slot int) (daemonParallelPreparedWorker, error) {
+	workerOpts := config.opts
+	if config.detach {
+		workerPaths, err := resolveDetachedWorkerPaths(config.workerDir, *config.opts.dir, "daemon", strconv.Itoa(slot))
+		if err != nil {
+			return daemonParallelPreparedWorker{}, fmt.Errorf("failed to resolve detached worker paths: %w", err)
 		}
-	})
-	return passed
+		clonePath, err := a.prepareDetachedWorkerClone(*config.opts.dir, workerPaths)
+		if err != nil {
+			return daemonParallelPreparedWorker{}, fmt.Errorf("failed to prepare detached worker clone: %w", err)
+		}
+		workerOpts = withCommonOptionsDir(workerOpts, clonePath)
+		return daemonParallelPreparedWorker{
+			name: workerName("daemon", strconv.Itoa(slot)),
+			opts: workerOpts,
+			pythonArgs: buildDaemonPythonArgs(
+				a.runtime.RunnerScript(),
+				workerOpts,
+				config.state,
+				1,
+				config.base,
+				config.includeEmpty,
+				config.stopOnError,
+				config.failOnExisting,
+				config.forceIssueFlow,
+				config.skipIfPRExists,
+				config.noSkipIfPRExists,
+				config.skipIfBranchExists,
+				config.noSkipIfBranchExists,
+				config.forceReprocess,
+				config.syncReusedBranch,
+				config.noSyncReusedBranch,
+				config.syncStrategy,
+				workerPaths.SessionPath,
+				false,
+				false,
+				config.flags,
+			),
+			workerPath: workerPaths,
+		}, nil
+	}
+
+	tempRoot, err := os.MkdirTemp("", "orchestrator-daemon-worker-*")
+	if err != nil {
+		return daemonParallelPreparedWorker{}, fmt.Errorf("failed to create daemon worker temp directory: %w", err)
+	}
+	cleanup := func() {
+		_ = os.RemoveAll(tempRoot)
+	}
+	clonePath := filepath.Join(tempRoot, "repo")
+	if _, err := a.clone.Prepare(defaultSourceDir(*config.opts.dir), clonePath); err != nil {
+		cleanup()
+		return daemonParallelPreparedWorker{}, fmt.Errorf("failed to prepare daemon worker clone: %w", err)
+	}
+	sessionFile, err := os.CreateTemp(tempRoot, "autonomous-session-*.json")
+	if err != nil {
+		cleanup()
+		return daemonParallelPreparedWorker{}, fmt.Errorf("failed to create daemon worker session file: %w", err)
+	}
+	sessionPath := sessionFile.Name()
+	_ = sessionFile.Close()
+	workerOpts = withCommonOptionsDir(workerOpts, clonePath)
+	return daemonParallelPreparedWorker{
+		name: workerName("daemon", strconv.Itoa(slot)),
+		opts: workerOpts,
+		pythonArgs: buildDaemonPythonArgs(
+			a.runtime.RunnerScript(),
+			workerOpts,
+			config.state,
+			1,
+			config.base,
+			config.includeEmpty,
+			config.stopOnError,
+			config.failOnExisting,
+			config.forceIssueFlow,
+			config.skipIfPRExists,
+			config.noSkipIfPRExists,
+			config.skipIfBranchExists,
+			config.noSkipIfBranchExists,
+			config.forceReprocess,
+			config.syncReusedBranch,
+			config.noSyncReusedBranch,
+			config.syncStrategy,
+			sessionPath,
+			false,
+			false,
+			config.flags,
+		),
+		cleanup: cleanup,
+	}, nil
+}
+
+func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig) int {
+	workersToLaunch := config.maxParallelTasks
+	if config.limit < workersToLaunch {
+		workersToLaunch = config.limit
+	}
+	if workersToLaunch <= 0 {
+		return 0
+	}
+	if config.detach && config.postBatchVerify {
+		_, _ = fmt.Fprintln(a.err, "run daemon with --detach and --max-parallel-tasks > 1 does not support --post-batch-verify")
+		return 2
+	}
+	if !config.detach && a.clone == nil {
+		_, _ = fmt.Fprintln(a.err, "orchestrator: detached batch clone preparer is not configured")
+		return 1
+	}
+
+	cycles := 0
+	lastCode := 0
+	for {
+		cycles++
+		preparedWorkers := make([]daemonParallelPreparedWorker, 0, workersToLaunch)
+		for slot := 1; slot <= workersToLaunch; slot++ {
+			worker, err := a.prepareParallelDaemonWorker(config, slot)
+			if err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+				lastCode = 1
+				if config.stopOnError {
+					for _, prepared := range preparedWorkers {
+						if prepared.cleanup != nil {
+							prepared.cleanup()
+						}
+					}
+					return lastCode
+				}
+				continue
+			}
+			preparedWorkers = append(preparedWorkers, worker)
+		}
+
+		cycleCode := 0
+		if config.detach {
+			for _, worker := range preparedWorkers {
+				state := detachedWorkerStateFromOptions(
+					worker.name,
+					"run daemon",
+					"daemon",
+					strings.TrimPrefix(worker.name, "daemon-"),
+					worker.opts,
+					append([]string{"python3"}, worker.pythonArgs...),
+					worker.workerPath,
+				)
+				state.WorkDir = strings.TrimSpace(*worker.opts.dir)
+				state.ClonePath = strings.TrimSpace(*worker.opts.dir)
+				if _, code := a.startDetachedWorkerState(state); code != 0 {
+					cycleCode = code
+					if config.stopOnError {
+						return code
+					}
+				}
+			}
+		} else {
+			cycleCtx := ctx
+			cancel := func() {}
+			if config.stopOnError {
+				cycleCtx, cancel = context.WithCancel(ctx)
+			}
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			for _, worker := range preparedWorkers {
+				worker := worker
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					code := a.runPython(cycleCtx, worker.pythonArgs)
+					if worker.cleanup != nil {
+						worker.cleanup()
+					}
+					if code == 0 {
+						return
+					}
+					mu.Lock()
+					if cycleCode == 0 {
+						cycleCode = code
+					}
+					mu.Unlock()
+					if config.stopOnError {
+						cancel()
+					}
+				}()
+			}
+			wg.Wait()
+			cancel()
+		}
+
+		if cycleCode == 0 && config.postBatchVerify && !config.detach {
+			verifyCode := a.runPython(ctx, buildVerifyPythonArgs(a.runtime.RunnerScript(), config.opts, config.createFollowupIssue))
+			if verifyCode != 0 {
+				cycleCode = verifyCode
+			}
+		}
+		if cycleCode != 0 {
+			lastCode = cycleCode
+			if config.stopOnError {
+				return cycleCode
+			}
+			_, _ = fmt.Fprintf(a.err, "orchestrator: daemon poll cycle %d exited with code %d\n", cycles, cycleCode)
+		}
+		if config.effectiveMaxCycles > 0 && cycles >= config.effectiveMaxCycles {
+			return lastCode
+		}
+		if config.detach {
+			return lastCode
+		}
+
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.Canceled) {
+				_, _ = fmt.Fprintln(a.err, "orchestrator: daemon canceled")
+				return 130
+			}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				_, _ = fmt.Fprintln(a.err, "orchestrator: daemon timed out")
+				return 124
+			}
+			return 1
+		case <-time.After(time.Duration(config.pollIntervalSeconds) * time.Second):
+		}
+	}
 }
 
 func (a *App) runDaemon(ctx context.Context, args []string) int {
@@ -210,7 +488,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	state := fs.String("state", "open", "issue state to poll: open, closed, or all")
 	limit := fs.Int("limit", 10, "maximum number of issues to scan per poll")
 	pollIntervalSeconds := fs.Int("poll-interval-seconds", 120, "delay between autonomous polls")
-	maxParallelTasks := fs.Int("max-parallel-tasks", 1, "maximum parallel tasks; detached daemon mode launches one isolated worker per task")
+	maxParallelTasks := fs.Int("max-parallel-tasks", 1, "maximum parallel autonomous workers to run per poll cycle")
 	maxCycles := fs.Int("max-cycles", 0, "optional test/debug bound on daemon polling cycles")
 	includeEmpty := fs.Bool("include-empty", false, "process issues even if body is empty")
 	stopOnError := fs.Bool("stop-on-error", false, "stop after the first failed poll cycle")
@@ -255,43 +533,46 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintln(a.err, "run daemon requires --max-parallel-tasks > 0")
 		return 2
 	}
-	if *maxParallelTasks != 1 && !*detach {
-		_, _ = fmt.Fprintln(a.err, "run daemon currently supports --max-parallel-tasks > 1 only with --detach")
-		return 2
-	}
 	if *state != "open" && *state != "closed" && *state != "all" {
 		_, _ = fmt.Fprintln(a.err, "run daemon requires --state to be one of: open, closed, all")
 		return 2
 	}
 
-	pythonArgs := buildDaemonPythonArgs(
-		a.runtime.RunnerScript(),
-		opts,
-		*state,
-		*limit,
-		*includeEmpty,
-		*stopOnError,
-		*failOnExisting,
-		*forceIssueFlow,
-		*skipIfPRExists,
-		*noSkipIfPRExists,
-		*skipIfBranchExists,
-		*noSkipIfBranchExists,
-		*forceReprocess,
-		*syncReusedBranch,
-		*noSyncReusedBranch,
-		*syncStrategy,
-		base,
-		*postBatchVerify,
-		*createFollowupIssue,
-		flagStateAdapter{fs: fs},
-	)
+	flags := flagStateAdapter{fs: fs}
 	effectiveMaxCycles := *maxCycles
 	if *opts.dryRun && effectiveMaxCycles == 0 {
 		effectiveMaxCycles = 1
 	}
 	if *detach && effectiveMaxCycles == 0 {
 		effectiveMaxCycles = 1
+	}
+	if *maxParallelTasks > 1 {
+		return a.runParallelDaemon(ctx, daemonParallelConfig{
+			opts:                 opts,
+			flags:                flags,
+			state:                *state,
+			limit:                *limit,
+			maxParallelTasks:     *maxParallelTasks,
+			base:                 base,
+			includeEmpty:         *includeEmpty,
+			stopOnError:          *stopOnError,
+			failOnExisting:       *failOnExisting,
+			forceIssueFlow:       *forceIssueFlow,
+			skipIfPRExists:       *skipIfPRExists,
+			noSkipIfPRExists:     *noSkipIfPRExists,
+			skipIfBranchExists:   *skipIfBranchExists,
+			noSkipIfBranchExists: *noSkipIfBranchExists,
+			forceReprocess:       *forceReprocess,
+			syncReusedBranch:     *syncReusedBranch,
+			noSyncReusedBranch:   *noSyncReusedBranch,
+			syncStrategy:         *syncStrategy,
+			postBatchVerify:      *postBatchVerify,
+			createFollowupIssue:  *createFollowupIssue,
+			detach:               *detach,
+			workerDir:            *workerDir,
+			effectiveMaxCycles:   effectiveMaxCycles,
+			pollIntervalSeconds:  *pollIntervalSeconds,
+		})
 	}
 
 	if *detach {
@@ -323,6 +604,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 				daemonOpts,
 				*state,
 				*limit,
+				base,
 				*includeEmpty,
 				*stopOnError,
 				*failOnExisting,
@@ -335,12 +617,11 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 				*syncReusedBranch,
 				*noSyncReusedBranch,
 				*syncStrategy,
-				base,
+				workerPaths.SessionPath,
 				*postBatchVerify,
 				*createFollowupIssue,
-				flagStateAdapter{fs: fs},
+				flags,
 			)
-			workerArgs = append(workerArgs, "--autonomous-session-file", workerPaths.SessionPath)
 			state := detachedWorkerStateFromOptions(
 				workerLabel,
 				"run daemon",
@@ -369,7 +650,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	sessionPath := sessionFile.Name()
 	_ = sessionFile.Close()
 	defer os.Remove(sessionPath)
-	pythonArgs = append(pythonArgs, "--autonomous-session-file", sessionPath)
+	pythonArgs := buildDaemonPythonArgs(a.runtime.RunnerScript(), opts, *state, *limit, base, *includeEmpty, *stopOnError, *failOnExisting, *forceIssueFlow, *skipIfPRExists, *noSkipIfPRExists, *skipIfBranchExists, *noSkipIfBranchExists, *forceReprocess, *syncReusedBranch, *noSyncReusedBranch, *syncStrategy, sessionPath, *postBatchVerify, *createFollowupIssue, flags)
 
 	cycles := 0
 	for {

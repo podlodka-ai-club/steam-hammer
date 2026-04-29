@@ -390,9 +390,11 @@ func TestRunDaemonCommandForwardsPostBatchVerificationFlags(t *testing.T) {
 
 func TestRunDaemonDetachUsesStableSessionFile(t *testing.T) {
 	starter := &recordingDetachedStarter{}
+	cloner := &recordingBatchClonePreparer{}
 	targetDir := t.TempDir()
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
 
 	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--post-batch-verify", "--create-followup-issue"})
 	if code != 0 {
@@ -404,6 +406,13 @@ func TestRunDaemonDetachUsesStableSessionFile(t *testing.T) {
 	wantSessionPath := filepath.Join(targetDir, ".orchestrator", "workers", "daemon", "session.json")
 	if got := flagValue(starter.req.Args, "--autonomous-session-file"); got != wantSessionPath {
 		t.Fatalf("session path = %q, want %q", got, wantSessionPath)
+	}
+	wantClonePath := filepath.Join(targetDir, ".orchestrator", "workers", "daemon", "repo")
+	if starter.req.Dir != wantClonePath {
+		t.Fatalf("starter dir = %q, want %q", starter.req.Dir, wantClonePath)
+	}
+	if len(cloner.targetDirs) != 1 || cloner.targetDirs[0] != wantClonePath {
+		t.Fatalf("clone target dirs = %#v, want %q", cloner.targetDirs, wantClonePath)
 	}
 	joined := strings.Join(starter.req.Args, " ")
 	if !strings.Contains(joined, "--post-batch-verify") {
@@ -689,7 +698,7 @@ func TestRunDaemonReusesAutonomousSessionFileAcrossCycles(t *testing.T) {
 	}
 }
 
-func TestRunDaemonRejectsParallelismAboveOne(t *testing.T) {
+func TestRunDaemonRejectsParallelismAboveOneWithoutDetach(t *testing.T) {
 	runner := &recordingRunner{}
 	var errOut strings.Builder
 	app := NewApp(&strings.Builder{}, &errOut)
@@ -701,8 +710,69 @@ func TestRunDaemonRejectsParallelismAboveOne(t *testing.T) {
 	if runner.calls != 0 {
 		t.Fatalf("runner calls = %d, want 0", runner.calls)
 	}
-	if !strings.Contains(errOut.String(), "--max-parallel-tasks=1") {
+	if !strings.Contains(errOut.String(), "only with --detach") {
 		t.Fatalf("stderr = %q, want concurrency validation", errOut.String())
+	}
+}
+
+func TestRunDaemonDetachStartsOneWorkerPerParallelTask(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	cloner := &recordingBatchClonePreparer{}
+	targetDir := t.TempDir()
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--max-parallel-tasks", "2"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if starter.calls != 2 {
+		t.Fatalf("starter calls = %d, want 2", starter.calls)
+	}
+	if len(cloner.targetDirs) != 2 {
+		t.Fatalf("clone preparations = %d, want 2", len(cloner.targetDirs))
+	}
+	if len(starter.reqs) != 2 {
+		t.Fatalf("starter requests = %d, want 2", len(starter.reqs))
+	}
+	if starter.reqs[0].Dir == starter.reqs[1].Dir {
+		t.Fatalf("daemon worker dirs should differ, got %q", starter.reqs[0].Dir)
+	}
+	for _, workerID := range []string{"1", "2"} {
+		workerDir := filepath.Join(targetDir, ".orchestrator", "workers", "daemon-"+workerID)
+		statePath := filepath.Join(workerDir, "worker.json")
+		if _, err := os.Stat(statePath); err != nil {
+			t.Fatalf("Stat(%q) error = %v", statePath, err)
+		}
+		state, err := workers.ReadState(statePath)
+		if err != nil {
+			t.Fatalf("workers.ReadState(%q) error = %v", statePath, err)
+		}
+		if state.Name != "daemon-"+workerID {
+			t.Fatalf("worker name = %q, want daemon-%s", state.Name, workerID)
+		}
+		if state.TargetKind != "daemon" || state.TargetID != workerID {
+			t.Fatalf("worker target = %#v", state)
+		}
+		wantClonePath := filepath.Join(workerDir, "repo")
+		if state.ClonePath != wantClonePath {
+			t.Fatalf("clone path = %q, want %q", state.ClonePath, wantClonePath)
+		}
+		if state.WorkDir != wantClonePath {
+			t.Fatalf("work dir = %q, want %q", state.WorkDir, wantClonePath)
+		}
+		wantSessionPath := filepath.Join(workerDir, "session.json")
+		if got := flagValue(state.Command[1:], "--autonomous-session-file"); got != wantSessionPath {
+			t.Fatalf("session path = %q, want %q", got, wantSessionPath)
+		}
+	}
+	printed := out.String()
+	for _, want := range []string{"started detached worker daemon-1", "started detached worker daemon-2"} {
+		if !strings.Contains(printed, want) {
+			t.Fatalf("stdout = %q, want %q", printed, want)
+		}
 	}
 }
 

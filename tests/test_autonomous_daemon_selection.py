@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.run_github_issues_to_opencode import (
+    autonomous_session_issue_status,
     autonomous_session_processed_issue_numbers,
     build_orchestration_claim,
     evaluate_issue_scope,
@@ -243,6 +244,26 @@ class AutonomousDaemonSelectionTests(unittest.TestCase):
         self.assertEqual(skipped, [153])
         self.assertEqual(autonomous_session_processed_issue_numbers(session_state), {153})
 
+    def test_autonomous_session_requeues_waiting_ci_and_ready_to_merge_followups(self) -> None:
+        issues = [
+            {"number": 153, "title": "Waiting CI"},
+            {"number": 152, "title": "Ready merge"},
+            {"number": 151, "title": "Fresh issue"},
+        ]
+        session_state = {
+            "processed_issues": {
+                "153": {"status": "waiting-for-ci", "updated_at": "2026-04-28T10:00:00Z"},
+                "152": {"status": "ready-to-merge", "updated_at": "2026-04-28T10:01:00Z"},
+            }
+        }
+
+        filtered, skipped = filter_autonomous_issues_for_single_pass(issues, session_state)
+
+        self.assertEqual([issue["number"] for issue in filtered], [153, 152, 151])
+        self.assertEqual(skipped, [])
+        self.assertEqual(autonomous_session_issue_status(session_state, 153), "waiting-for-ci")
+        self.assertEqual(autonomous_session_issue_status(session_state, 152), "ready-to-merge")
+
     def test_parse_issue_dependency_references_supports_body_comments_and_marker(self) -> None:
         issue = {
             "number": 158,
@@ -368,6 +389,35 @@ class AutonomousDaemonSelectionTests(unittest.TestCase):
 
         self.assertEqual([issue["number"] for issue in filtered], [152])
         self.assertEqual(skipped, [153])
+
+    def test_autonomous_session_requeues_merge_followups_between_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_path = os.path.join(temp_dir, "daemon-session.json")
+
+            first_cycle_state = load_autonomous_session_state(session_path)
+            mark_autonomous_session_issue_processed(
+                first_cycle_state,
+                issue_number=153,
+                status="waiting-for-ci",
+            )
+            mark_autonomous_session_issue_processed(
+                first_cycle_state,
+                issue_number=152,
+                status="ready-to-merge",
+            )
+            save_autonomous_session_state(session_path, first_cycle_state)
+
+            second_cycle_state = load_autonomous_session_state(session_path)
+            filtered, skipped = filter_autonomous_issues_for_single_pass(
+                issues=[
+                    {"number": 153, "title": "Waiting CI"},
+                    {"number": 152, "title": "Ready merge"},
+                ],
+                session_state=second_cycle_state,
+            )
+
+        self.assertEqual([issue["number"] for issue in filtered], [153, 152])
+        self.assertEqual(skipped, [])
 
     def test_autonomous_session_status_summary_formats_checkpoint(self) -> None:
         session_state = {

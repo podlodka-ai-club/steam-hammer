@@ -159,6 +159,7 @@ AUTONOMOUS_CLAIM_TTL_SECONDS = 3600
 AUTONOMOUS_BATCH_SINGLE_PASS_STATUSES = frozenset(
     {"ready-for-review", "waiting-for-ci", "ready-to-merge"}
 )
+AUTONOMOUS_SESSION_SKIP_STATUSES = frozenset({"ready-for-review"})
 AUTONOMOUS_QUEUE_STATUS_RANKS = {
     "ready-to-merge": 0,
     "waiting-for-ci": 1,
@@ -1184,6 +1185,17 @@ def autonomous_session_processed_issue_numbers(state: dict) -> set[int]:
     return issue_numbers
 
 
+def autonomous_session_issue_status(state: dict, issue_number: int) -> str | None:
+    processed = state.get("processed_issues") if isinstance(state, dict) else None
+    if not isinstance(processed, dict):
+        return None
+    issue_entry = processed.get(str(issue_number))
+    if not isinstance(issue_entry, dict):
+        return None
+    status = _as_optional_string(issue_entry.get("status"))
+    return status if status else None
+
+
 def mark_autonomous_session_issue_processed(state: dict, issue_number: int, status: str) -> dict:
     if status not in AUTONOMOUS_BATCH_SINGLE_PASS_STATUSES:
         return state
@@ -1201,14 +1213,17 @@ def mark_autonomous_session_issue_processed(state: dict, issue_number: int, stat
 def filter_autonomous_issues_for_single_pass(
     issues: list[dict], session_state: dict
 ) -> tuple[list[dict], list[int]]:
-    processed_issue_numbers = autonomous_session_processed_issue_numbers(session_state)
-    if not processed_issue_numbers:
+    if not autonomous_session_processed_issue_numbers(session_state):
         return list(issues), []
     filtered: list[dict] = []
     skipped: list[int] = []
     for issue in issues:
         issue_number = _as_positive_int(issue.get("number"))
-        if issue_number is not None and issue_number in processed_issue_numbers:
+        if issue_number is None:
+            filtered.append(issue)
+            continue
+        processed_status = autonomous_session_issue_status(session_state, issue_number)
+        if processed_status in AUTONOMOUS_SESSION_SKIP_STATUSES:
             skipped.append(issue_number)
             continue
         filtered.append(issue)

@@ -94,7 +94,9 @@ func TestStateSummaryMatchesPythonCheckpointFormat(t *testing.T) {
 		"Done: Autonomous batch loop finished across 2 issue(s)",
 		"Current: Idle between autonomous runs",
 		"Next: no queued batches",
+		"Next actions: Touched 1 PR(s); Recommended a verification follow-up issue",
 		"Issue/PR actions: Touched 1 PR(s); Recommended a verification follow-up issue",
+		"Active workers: 0",
 		"In progress: none",
 		"Blockers: failed (1/2 passed; failed: go-test)",
 		"Next checkpoint: when the next autonomous invocation starts",
@@ -105,6 +107,33 @@ func TestStateSummaryMatchesPythonCheckpointFormat(t *testing.T) {
 		if !strings.Contains(summary, want) {
 			t.Fatalf("Summary() missing %q\n%s", want, summary)
 		}
+	}
+}
+
+func TestStateSummaryIncludesVerificationNextActionAndActiveWorkers(t *testing.T) {
+	state := State{
+		ProcessedIssues: map[string]json.RawMessage{},
+		Checkpoint: &Checkpoint{
+			Phase:          "running",
+			BatchIndex:     1,
+			TotalBatches:   3,
+			Current:        "Batch 1/3 running for issue #71",
+			IssuePRActions: []string{"Inspect issue #71 and choose issue-flow or PR-review path"},
+			InProgress:     []string{"worker issue-71", "", "worker issue-72"},
+			Verification: &VerificationResult{
+				Status:     "failed",
+				NextAction: "create_follow_up_issue_and_fix_regression",
+			},
+		},
+	}
+
+	summary := state.Summary()
+
+	if !strings.Contains(summary, "Next actions: Inspect issue #71 and choose issue-flow or PR-review path; verification: create follow up issue and fix regression") {
+		t.Fatalf("Summary() = %q", summary)
+	}
+	if !strings.Contains(summary, "Active workers: 2") {
+		t.Fatalf("Summary() = %q", summary)
 	}
 }
 

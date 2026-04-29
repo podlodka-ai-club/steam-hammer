@@ -13,20 +13,20 @@ type State struct {
 }
 
 type Checkpoint struct {
-	RunID          string              `json:"run_id,omitempty"`
-	Phase          string              `json:"phase,omitempty"`
-	BatchIndex     int                 `json:"batch_index,omitempty"`
-	TotalBatches   int                 `json:"total_batches,omitempty"`
-	Counts         Counts              `json:"counts,omitempty"`
-	Done           []string            `json:"done,omitempty"`
-	Current        string              `json:"current,omitempty"`
-	Next           []string            `json:"next,omitempty"`
-	IssuePRActions []string            `json:"issue_pr_actions,omitempty"`
-	InProgress     []string            `json:"in_progress,omitempty"`
-	Blockers       []string            `json:"blockers,omitempty"`
-	NextCheckpoint string              `json:"next_checkpoint,omitempty"`
-	UpdatedAt      string              `json:"updated_at,omitempty"`
-	Verification   *VerificationResult `json:"verification,omitempty"`
+	RunID          string               `json:"run_id,omitempty"`
+	Phase          string               `json:"phase,omitempty"`
+	BatchIndex     int                  `json:"batch_index,omitempty"`
+	TotalBatches   int                  `json:"total_batches,omitempty"`
+	Counts         Counts               `json:"counts,omitempty"`
+	Done           []string             `json:"done,omitempty"`
+	Current        string               `json:"current,omitempty"`
+	Next           []string             `json:"next,omitempty"`
+	IssuePRActions []string             `json:"issue_pr_actions,omitempty"`
+	InProgress     []string             `json:"in_progress,omitempty"`
+	Blockers       []string             `json:"blockers,omitempty"`
+	NextCheckpoint string               `json:"next_checkpoint,omitempty"`
+	UpdatedAt      string               `json:"updated_at,omitempty"`
+	Verification   *VerificationVerdict `json:"verification,omitempty"`
 }
 
 type Counts struct {
@@ -36,31 +36,6 @@ type Counts struct {
 	SkippedExistingBranch      int `json:"skipped_existing_branch,omitempty"`
 	SkippedBlockedDependencies int `json:"skipped_blocked_dependencies,omitempty"`
 	SkippedOutOfScope          int `json:"skipped_out_of_scope,omitempty"`
-}
-
-type VerificationResult struct {
-	Status        string                `json:"status,omitempty"`
-	Summary       string                `json:"summary,omitempty"`
-	NextAction    string                `json:"next_action,omitempty"`
-	Commands      []VerificationCommand `json:"commands,omitempty"`
-	FollowUpIssue *FollowUpIssue        `json:"follow_up_issue,omitempty"`
-}
-
-type VerificationCommand struct {
-	Name          string `json:"name,omitempty"`
-	Command       string `json:"command,omitempty"`
-	Status        string `json:"status,omitempty"`
-	ExitCode      *int   `json:"exit_code,omitempty"`
-	StdoutExcerpt string `json:"stdout_excerpt,omitempty"`
-	StderrExcerpt string `json:"stderr_excerpt,omitempty"`
-}
-
-type FollowUpIssue struct {
-	Status      string `json:"status,omitempty"`
-	Title       string `json:"title,omitempty"`
-	Body        string `json:"body,omitempty"`
-	IssueNumber *int   `json:"issue_number,omitempty"`
-	IssueURL    string `json:"issue_url,omitempty"`
 }
 
 func LoadState(path string) (State, error) {
@@ -158,28 +133,6 @@ func (c Counts) compactSummary() string {
 		parts = append(parts, "out-of-scope="+itoa(c.SkippedOutOfScope))
 	}
 	return strings.Join(parts, ", ")
-}
-
-func (v VerificationResult) summaryLine() string {
-	summary := optionalString(v.Summary)
-	if summary == "" {
-		summary = optionalString(v.Status)
-		if summary == "" {
-			summary = "unknown"
-		}
-	}
-	line := "Verification: " + summary
-	if v.FollowUpIssue == nil {
-		return line
-	}
-	status := optionalString(v.FollowUpIssue.Status)
-	if status == "created" && v.FollowUpIssue.IssueNumber != nil {
-		return line + "; follow-up issue #" + itoa(*v.FollowUpIssue.IssueNumber) + " created"
-	}
-	if status != "" {
-		return line + "; follow-up=" + status
-	}
-	return line
 }
 
 func optionalString(value string) string {

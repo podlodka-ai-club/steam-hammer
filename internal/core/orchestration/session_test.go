@@ -61,7 +61,6 @@ func TestParseStatePreservesCheckpointVerification(t *testing.T) {
 }
 
 func TestStateSummaryMatchesPythonCheckpointFormat(t *testing.T) {
-	issueNumber := 164
 	state := State{
 		ProcessedIssues: map[string]json.RawMessage{"71": json.RawMessage(`{"status":"ready-for-review"}`)},
 		Checkpoint: &Checkpoint{
@@ -79,8 +78,8 @@ func TestStateSummaryMatchesPythonCheckpointFormat(t *testing.T) {
 				Status:  "failed",
 				Summary: "failed (1/2 passed; failed: go-test)",
 				FollowUpIssue: &FollowUpIssue{
-					Status:      "created",
-					IssueNumber: &issueNumber,
+					Status:   "created",
+					IssueRef: "#164",
 				},
 			},
 		},
@@ -172,5 +171,33 @@ func TestParseStateInitializesProcessedIssuesMap(t *testing.T) {
 	}
 	if !reflect.DeepEqual(state.ProcessedIssues, map[string]json.RawMessage{}) {
 		t.Fatalf("ProcessedIssues = %#v", state.ProcessedIssues)
+	}
+}
+
+func TestParseStatePreservesNonNumericFollowUpIssueRefs(t *testing.T) {
+	state, err := ParseState([]byte(`{
+		"processed_issues": {},
+		"checkpoint": {
+			"verification": {
+				"status": "failed",
+				"summary": "failed",
+				"follow_up_issue": {
+					"status": "created",
+					"issue_number": "PROJ-164"
+				}
+			}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("ParseState() error = %v", err)
+	}
+	if state.Checkpoint == nil || state.Checkpoint.Verification == nil || state.Checkpoint.Verification.FollowUpIssue == nil {
+		t.Fatal("verification follow-up issue = nil")
+	}
+	if got := state.Checkpoint.Verification.FollowUpIssue.IssueRef; got != "PROJ-164" {
+		t.Fatalf("IssueRef = %q, want PROJ-164", got)
+	}
+	if !strings.Contains(state.Summary(), "follow-up issue PROJ-164 created") {
+		t.Fatalf("Summary() = %q", state.Summary())
 	}
 }

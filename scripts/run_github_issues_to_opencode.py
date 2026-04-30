@@ -440,6 +440,16 @@ def format_issue_label(issue_number: object, tracker: str = TRACKER_GITHUB) -> s
     return f"issue {format_issue_ref(issue_number, tracker=tracker)}"
 
 
+def _format_stored_issue_ref(issue_number: object) -> str | None:
+    if isinstance(issue_number, int):
+        return format_issue_ref(issue_number, tracker=TRACKER_GITHUB)
+    if isinstance(issue_number, str):
+        normalized = issue_number.strip()
+        if normalized:
+            return normalized
+    return None
+
+
 def format_issue_ref_from_issue(issue: dict) -> str:
     return format_issue_ref(issue.get("number"), tracker=issue_tracker(issue))
 
@@ -935,9 +945,10 @@ def _autonomous_queue_sort_metadata(repo: str, issue: dict) -> dict[str, object]
         "status_rank": AUTONOMOUS_QUEUE_STATUS_RANKS["issue-flow"],
         "merge_risk_rank": 3,
     }
+    codehost_provider = current_codehost_provider()
 
     try:
-        linked_open_pr = find_open_pr_for_issue(repo=repo, issue=issue)
+        linked_open_pr = codehost_provider.find_open_pr_for_issue(repo=repo, issue=issue)
     except Exception:
         return metadata
 
@@ -953,7 +964,7 @@ def _autonomous_queue_sort_metadata(repo: str, issue: dict) -> dict[str, object]
         return metadata
 
     try:
-        pull_request = fetch_pull_request(repo=repo, number=pr_number)
+        pull_request = codehost_provider.fetch_pull_request(repo=repo, number=pr_number)
     except Exception:
         return metadata
 
@@ -1012,15 +1023,10 @@ def sort_autonomous_issues(
 
 
 def _fetch_issue_comments_for_dependency_resolution(repo: str, issue: dict) -> list[dict]:
-    tracker = issue_tracker(issue)
     issue_ref = issue.get("number")
-    if tracker == TRACKER_JIRA:
-        return fetch_jira_issue_comments(str(issue_ref))
-
-    issue_number = _as_positive_int(issue_ref)
-    if issue_number is None:
+    if issue_ref is None:
         return []
-    return fetch_issue_comments(repo=repo, issue_number=issue_number)
+    return current_tracker_provider().list_issue_comments(repo=repo, issue_id=issue_ref)
 
 
 def _fetch_dependency_issue(repo: str, issue_ref: int | str, tracker: str) -> dict | None:
@@ -1028,11 +1034,7 @@ def _fetch_dependency_issue(repo: str, issue_ref: int | str, tracker: str) -> di
         normalized_ref = normalize_issue_number(issue_ref, tracker)
     except RuntimeError:
         return None
-    if tracker == TRACKER_JIRA:
-        return fetch_jira_issue(str(normalized_ref))
-    if not isinstance(normalized_ref, int):
-        return None
-    return fetch_issue(repo=repo, number=normalized_ref)
+    return current_tracker_provider().get_issue(repo=repo, issue_id=normalized_ref)
 
 
 def split_autonomous_issues_by_dependency_state(
@@ -1339,9 +1341,9 @@ def format_autonomous_session_status_summary(state: dict) -> str:
         verification_line = f"Verification: {verification_summary}"
         if follow_up_issue is not None:
             follow_up_status = _as_optional_string(follow_up_issue.get("status"))
-            issue_number = follow_up_issue.get("issue_number")
-            if follow_up_status == "created" and type(issue_number) is int:
-                verification_line += f"; follow-up issue #{issue_number} created"
+            issue_ref = _format_stored_issue_ref(follow_up_issue.get("issue_number"))
+            if follow_up_status == "created" and issue_ref is not None:
+                verification_line += f"; follow-up issue {issue_ref} created"
             elif follow_up_status:
                 verification_line += f"; follow-up={follow_up_status}"
         lines.append(verification_line)
@@ -3097,7 +3099,7 @@ def finalize_pr_after_ci_success(
     repo_dir: str,
     dry_run: bool,
 ) -> dict:
-    pull_request = fetch_pull_request(repo=repo, number=pr_number)
+    pull_request = current_codehost_provider().fetch_pull_request(repo=repo, number=pr_number)
     required_file_validation = validate_required_files_in_pr(
         pull_request=pull_request,
         linked_issues=linked_issues,
@@ -4974,7 +4976,7 @@ def load_linked_issue_context(repo: str, pull_request: dict) -> list[dict]:
         body = str(reference.get("body") or "").strip()
         url = str(reference.get("url") or "").strip()
         if not title or not body or not url:
-            issue = fetch_issue(repo=repo, number=number)
+            issue = current_tracker_provider().get_issue(repo=repo, issue_id=number)
             if isinstance(issue, dict):
                 title = str(issue.get("title") or title)
                 body = str(issue.get("body") or body)
@@ -9094,9 +9096,10 @@ def main() -> int:
                 if isinstance(follow_up_issue, dict) and str(follow_up_issue.get("status") or "") == "recommended":
                     print(f"Recommended follow-up issue: {follow_up_issue.get('title')}")
                 if isinstance(follow_up_issue, dict) and str(follow_up_issue.get("status") or "") == "created":
+                    issue_ref = _format_stored_issue_ref(follow_up_issue.get("issue_number")) or "issue"
                     print(
                         "Created follow-up issue: "
-                        f"#{follow_up_issue.get('issue_number')} {follow_up_issue.get('issue_url') or ''}".rstrip()
+                        f"{issue_ref} {follow_up_issue.get('issue_url') or ''}".rstrip()
                     )
                 exit_code = 1 if str(verification.get("status") or "") == "failed" else 0
                 return _finish_main(exit_code, original_process_cwd)
@@ -10019,9 +10022,10 @@ def main() -> int:
         if isinstance(follow_up_issue, dict) and str(follow_up_issue.get("status") or "") == "recommended":
             print(f"Recommended follow-up issue: {follow_up_issue.get('title')}")
         if isinstance(follow_up_issue, dict) and str(follow_up_issue.get("status") or "") == "created":
+            issue_ref = _format_stored_issue_ref(follow_up_issue.get("issue_number")) or "issue"
             print(
                 "Created follow-up issue: "
-                f"#{follow_up_issue.get('issue_number')} {follow_up_issue.get('issue_url') or ''}".rstrip()
+                f"{issue_ref} {follow_up_issue.get('issue_url') or ''}".rstrip()
             )
 
     if autonomous_mode and issue_number_arg is None:

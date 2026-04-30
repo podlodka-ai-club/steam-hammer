@@ -125,6 +125,33 @@ class PostBatchVerificationTests(unittest.TestCase):
 
         self.assertIn("Verification: failed (1/2 passed; failed: go-test); follow-up=recommended", summary)
 
+    def test_autonomous_session_summary_formats_non_numeric_follow_up_issue_refs(self) -> None:
+        state = {}
+        update_autonomous_session_checkpoint(
+            state,
+            run_id="run-1",
+            phase="completed",
+            batch_index=1,
+            total_batches=1,
+            counts={"processed": 1, "failures": 1},
+            done=["Autonomous batch loop finished across 1 issue(s)"],
+            current="Idle between autonomous runs",
+            next_items=[],
+            issue_pr_actions=[],
+            in_progress=[],
+            blockers=["failed (1/1 passed; failed: verify)"],
+            next_checkpoint="when the next autonomous invocation starts",
+            verification={
+                "status": "failed",
+                "summary": "failed (1/1 passed; failed: verify)",
+                "follow_up_issue": {"status": "created", "issue_number": "PROJ-164"},
+            },
+        )
+
+        summary = format_autonomous_session_status_summary(state)
+
+        self.assertIn("Verification: failed (1/1 passed; failed: verify); follow-up issue PROJ-164 created", summary)
+
 
 if __name__ == "__main__":
     unittest.main()

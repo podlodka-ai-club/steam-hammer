@@ -1,6 +1,9 @@
 package orchestration
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+)
 
 const (
 	StatusInProgress       = "in-progress"
@@ -78,7 +81,37 @@ type FollowUpIssue struct {
 	Title       string `json:"title,omitempty"`
 	Body        string `json:"body,omitempty"`
 	IssueNumber *int   `json:"issue_number,omitempty"`
+	IssueRef    string `json:"-"`
 	IssueURL    string `json:"issue_url,omitempty"`
+}
+
+func (f *FollowUpIssue) UnmarshalJSON(data []byte) error {
+	type alias struct {
+		Status      string      `json:"status,omitempty"`
+		Title       string      `json:"title,omitempty"`
+		Body        string      `json:"body,omitempty"`
+		IssueNumber interface{} `json:"issue_number,omitempty"`
+		IssueURL    string      `json:"issue_url,omitempty"`
+	}
+	var payload alias
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+	f.Status = payload.Status
+	f.Title = payload.Title
+	f.Body = payload.Body
+	f.IssueURL = payload.IssueURL
+	switch number := payload.IssueNumber.(type) {
+	case float64:
+		if number > 0 && number == float64(int(number)) {
+			value := int(number)
+			f.IssueNumber = &value
+			f.IssueRef = "#" + itoa(value)
+		}
+	case string:
+		f.IssueRef = strings.TrimSpace(number)
+	}
+	return nil
 }
 
 // Compatibility aliases keep the current session checkpoint consumer stable
@@ -235,8 +268,12 @@ func (v VerificationVerdict) summaryLine() string {
 		return line
 	}
 	status := optionalString(v.FollowUpIssue.Status)
-	if status == "created" && v.FollowUpIssue.IssueNumber != nil {
-		return line + "; follow-up issue #" + itoa(*v.FollowUpIssue.IssueNumber) + " created"
+	issueRef := optionalString(v.FollowUpIssue.IssueRef)
+	if issueRef == "" && v.FollowUpIssue.IssueNumber != nil {
+		issueRef = "#" + itoa(*v.FollowUpIssue.IssueNumber)
+	}
+	if status == "created" && issueRef != "" {
+		return line + "; follow-up issue " + issueRef + " created"
 	}
 	if status != "" {
 		return line + "; follow-up=" + status

@@ -127,6 +127,47 @@ class AutonomousDaemonSelectionTests(unittest.TestCase):
 
         self.assertEqual([issue["number"] for issue in ordered], [201, 202])
 
+    def test_sort_autonomous_issues_uses_active_codehost_provider(self) -> None:
+        ready_issue = {
+            "number": 101,
+            "title": "Ready PR",
+            "labels": [{"name": "bug"}],
+            "updatedAt": "2026-04-27T10:00:00Z",
+        }
+        new_issue = {
+            "number": 103,
+            "title": "New issue",
+            "labels": [{"name": "bug"}],
+            "updatedAt": "2026-04-29T10:00:00Z",
+        }
+        provider = unittest.mock.Mock()
+        provider.find_open_pr_for_issue.side_effect = [None, {"number": 201}]
+        provider.fetch_pull_request.return_value = {
+            "mergeStateStatus": "CLEAN",
+            "mergeable": "MERGEABLE",
+            "reviewDecision": "APPROVED",
+            "files": [{"path": "docs/queue.md"}],
+        }
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.current_codehost_provider", return_value=provider),
+            patch(
+                "scripts.run_github_issues_to_opencode.find_open_pr_for_issue",
+                side_effect=AssertionError("should use codehost provider"),
+            ),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_pull_request",
+                side_effect=AssertionError("should use codehost provider"),
+            ),
+        ):
+            ordered = sort_autonomous_issues(
+                issues=[new_issue, ready_issue],
+                scope_defaults={},
+                repo="owner/repo",
+            )
+
+        self.assertEqual([issue["number"] for issue in ordered], [101, 103])
+
     def test_scope_evaluation_supports_assignee_priority_and_freshness(self) -> None:
         issue = {
             "number": 93,
@@ -265,6 +306,44 @@ class AutonomousDaemonSelectionTests(unittest.TestCase):
             format_autonomous_dependency_blocker(blocked[0]),
             "issue #158 skipped: open dependencies #156",
         )
+
+    def test_split_autonomous_issues_by_dependency_state_uses_active_tracker_provider(self) -> None:
+        dependent = {
+            "number": "PROJ-158",
+            "title": "Dependent",
+            "body": "Blocked by PROJ-156",
+            "state": "open",
+            "tracker": "jira",
+        }
+        provider = unittest.mock.Mock()
+        provider.list_issue_comments.return_value = []
+        provider.get_issue.return_value = {
+            "number": "PROJ-156",
+            "title": "Prerequisite",
+            "body": "",
+            "state": "open",
+            "tracker": "jira",
+        }
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.current_tracker_provider", return_value=provider),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_jira_issue",
+                side_effect=AssertionError("should use tracker provider"),
+            ),
+            patch(
+                "scripts.run_github_issues_to_opencode.fetch_jira_issue_comments",
+                side_effect=AssertionError("should use tracker provider"),
+            ),
+        ):
+            runnable, blocked = split_autonomous_issues_by_dependency_state(
+                repo="owner/repo",
+                issues=[dependent],
+            )
+
+        self.assertEqual(runnable, [])
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["open_dependencies"], ["PROJ-156"])
 
     def test_autonomous_session_persists_processed_issue_between_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

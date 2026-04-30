@@ -704,23 +704,29 @@ class PrReviewModeTests(unittest.TestCase):
                 }
             ]
         }
+        provider = mock.Mock()
+        provider.get_issue.return_value = {
+            "number": 17,
+            "title": "Improve docs",
+            "body": "Issue body context",
+            "url": "https://example/issues/17",
+        }
 
         with mock.patch.object(
             self.mod,
+            "current_tracker_provider",
+            return_value=provider,
+        ), mock.patch.object(
+            self.mod,
             "fetch_issue",
-            return_value={
-                "number": 17,
-                "title": "Improve docs",
-                "body": "Issue body context",
-                "url": "https://example/issues/17",
-            },
-        ) as fetch_issue_mock:
+            side_effect=AssertionError("should use tracker provider"),
+        ):
             linked = self.mod.load_linked_issue_context(
                 repo="owner/repo",
                 pull_request=pull_request,
             )
 
-        fetch_issue_mock.assert_called_once_with(repo="owner/repo", number=17)
+        provider.get_issue.assert_called_once_with(repo="owner/repo", issue_id=17)
         self.assertEqual(linked[0]["number"], 17)
         self.assertEqual(linked[0]["body"], "Issue body context")
 

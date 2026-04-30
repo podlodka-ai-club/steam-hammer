@@ -716,12 +716,7 @@ func isBatchDoneState(linked *detachedWorkerLinkedReport) bool {
 	if linked == nil {
 		return false
 	}
-	switch strings.TrimSpace(strings.ToLower(linked.LatestState)) {
-	case "ready-for-review", "waiting-for-ci", "ready-to-merge":
-		return true
-	default:
-		return false
-	}
+	return orchestration.IsAutonomousReadyStatus(linked.LatestState)
 }
 
 func containsBatchConflict(raw string) bool {

@@ -976,9 +976,14 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 		"clone: " + targetDir,
 		"agent: runner=opencode agent=build model=openai/gpt-4o",
 		"log-progress: lines=2",
+		"log-freshness: updated ",
 		"log: " + logPath,
 		"linked-latest-state: waiting-for-ci",
+		"linked-current: waiting on 1 pending CI check(s)",
+		"linked-next: wait for ci",
+		"linked-blockers: pending ci",
 		"linked-pr: #101",
+		"linked-updated: 2026-04-28T12:05:00Z",
 		"orchestrator status --issue 71 --repo owner/repo",
 	} {
 		if !strings.Contains(printed, want) {
@@ -1056,6 +1061,7 @@ func TestStatusWorkerShowsBatchSummary(t *testing.T) {
 	printed := out.String()
 	for _, want := range []string{
 		"batch-child-workers: 2",
+		"batch-active-workers: 1",
 		"batch-done: issue #71: waiting-for-ci (#101)",
 		"batch-current: issue #72: merge conflict while rebasing (#102)",
 		"batch-next: issue #71: wait for ci; issue #72: resolve merge conflicts",
@@ -1156,6 +1162,9 @@ func TestStatusWorkerJSONIncludesBatchSummary(t *testing.T) {
 	if len(payload.Batch.Verification) != 2 {
 		t.Fatalf("verification len = %d, want 2", len(payload.Batch.Verification))
 	}
+	if payload.Batch.ActiveWorkers != 1 {
+		t.Fatalf("active workers = %d, want 1", payload.Batch.ActiveWorkers)
+	}
 	if len(payload.Batch.Failures) == 0 {
 		t.Fatalf("failures = %#v, want non-empty", payload.Batch.Failures)
 	}
@@ -1255,8 +1264,14 @@ func TestStatusWorkersJSONListsRegistryEntries(t *testing.T) {
 	if worker.Log.Lines != 2 {
 		t.Fatalf("log lines = %d, want 2", worker.Log.Lines)
 	}
+	if worker.Log.UpdatedAt == "" {
+		t.Fatalf("log updated_at = %q, want non-empty", worker.Log.UpdatedAt)
+	}
 	if worker.Session == nil || worker.Session.Current != "issue #71" || worker.Session.Processed != 1 {
 		t.Fatalf("session = %#v", worker.Session)
+	}
+	if worker.Session.ActiveWorkers != 0 {
+		t.Fatalf("session active workers = %d, want 0", worker.Session.ActiveWorkers)
 	}
 }
 

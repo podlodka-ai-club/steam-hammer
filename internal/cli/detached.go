@@ -24,7 +24,8 @@ type detachedBatchMetadata = workers.BatchMetadata
 type detachedBatchWorkerLink = workers.BatchWorkerLink
 
 type detachedWorkerLogReport struct {
-	Lines int `json:"lines"`
+	Lines     int    `json:"lines"`
+	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
 type detachedWorkerLinkedReport struct {
@@ -39,12 +40,13 @@ type detachedWorkerLinkedReport struct {
 }
 
 type detachedWorkerSessionReport struct {
-	Phase     string   `json:"phase,omitempty"`
-	Current   string   `json:"current,omitempty"`
-	Next      []string `json:"next,omitempty"`
-	Processed int      `json:"processed,omitempty"`
-	Failures  int      `json:"failures,omitempty"`
-	UpdatedAt string   `json:"updated_at,omitempty"`
+	Phase         string   `json:"phase,omitempty"`
+	Current       string   `json:"current,omitempty"`
+	Next          []string `json:"next,omitempty"`
+	Processed     int      `json:"processed,omitempty"`
+	Failures      int      `json:"failures,omitempty"`
+	ActiveWorkers int      `json:"active_workers,omitempty"`
+	UpdatedAt     string   `json:"updated_at,omitempty"`
 }
 
 type detachedWorkerReport struct {
@@ -59,6 +61,7 @@ type detachedWorkerReport struct {
 
 type detachedBatchStatusReport struct {
 	RequestedIssueIDs []string                   `json:"requested_issue_ids,omitempty"`
+	ActiveWorkers     int                        `json:"active_workers,omitempty"`
 	Done              []string                   `json:"done,omitempty"`
 	Current           []string                   `json:"current,omitempty"`
 	Next              []string                   `json:"next,omitempty"`
@@ -216,6 +219,7 @@ func (a *App) runDetachedStatus(configuredRoot, name string, asJSON bool) int {
 		_, _ = fmt.Fprintf(a.out, "agent: runner=%s agent=%s model=%s\n", state.Runner, state.Agent, state.Model)
 	}
 	_, _ = fmt.Fprintf(a.out, "log-progress: lines=%d\n", report.Log.Lines)
+	_, _ = fmt.Fprintf(a.out, "log-freshness: %s\n", detachedWorkerLogFreshness(report.Log))
 	_, _ = fmt.Fprintf(a.out, "log: %s\n", state.LogPath)
 	_, _ = fmt.Fprintf(a.out, "state: %s\n", state.StatePath)
 	if state.SessionPath != "" {
@@ -225,17 +229,34 @@ func (a *App) runDetachedStatus(configuredRoot, name string, asJSON bool) int {
 		if report.Linked.LatestState != "" {
 			_, _ = fmt.Fprintf(a.out, "linked-latest-state: %s\n", report.Linked.LatestState)
 		}
+		if report.Linked.Current != "" {
+			_, _ = fmt.Fprintf(a.out, "linked-current: %s\n", report.Linked.Current)
+		}
+		if report.Linked.Next != "" {
+			_, _ = fmt.Fprintf(a.out, "linked-next: %s\n", report.Linked.Next)
+		}
+		if report.Linked.Blockers != "" {
+			_, _ = fmt.Fprintf(a.out, "linked-blockers: %s\n", report.Linked.Blockers)
+		}
 		if report.Linked.PR != "" {
 			_, _ = fmt.Fprintf(a.out, "linked-pr: %s\n", report.Linked.PR)
+		}
+		if report.Linked.PRReadiness != "" {
+			_, _ = fmt.Fprintf(a.out, "linked-pr-readiness: %s\n", report.Linked.PRReadiness)
+		}
+		if report.Linked.Updated != "" {
+			_, _ = fmt.Fprintf(a.out, "linked-updated: %s\n", report.Linked.Updated)
 		}
 	}
 	if report.Session != nil {
 		_, _ = fmt.Fprintf(a.out, "session-phase: %s\n", report.Session.Phase)
 		_, _ = fmt.Fprintf(a.out, "session-current: %s\n", report.Session.Current)
 		_, _ = fmt.Fprintf(a.out, "session-counts: processed=%d failures=%d\n", report.Session.Processed, report.Session.Failures)
+		_, _ = fmt.Fprintf(a.out, "session-active-workers: %d\n", report.Session.ActiveWorkers)
 	}
 	if report.Batch != nil {
 		_, _ = fmt.Fprintf(a.out, "batch-child-workers: %d\n", len(report.Batch.ChildWorkers))
+		_, _ = fmt.Fprintf(a.out, "batch-active-workers: %d\n", report.Batch.ActiveWorkers)
 		_, _ = fmt.Fprintf(a.out, "batch-done: %s\n", joinOrNone(report.Batch.Done))
 		_, _ = fmt.Fprintf(a.out, "batch-current: %s\n", joinOrNone(report.Batch.Current))
 		_, _ = fmt.Fprintf(a.out, "batch-next: %s\n", joinOrNone(report.Batch.Next))
@@ -289,7 +310,7 @@ func (a *App) runDetachedStatusList(configuredRoot string, asJSON bool) int {
 		return 0
 	}
 	for _, report := range reports {
-		_, _ = fmt.Fprintf(a.out, "%s\t%s\tlines=%d\t%s\n", report.Worker.Name, report.ProcessStatus, report.Log.Lines, report.Next)
+		_, _ = fmt.Fprintf(a.out, "%s\t%s\tlines=%d\tlog=%s\t%s\n", report.Worker.Name, report.ProcessStatus, report.Log.Lines, detachedWorkerLogFreshness(report.Log), report.Next)
 	}
 	return 0
 }
@@ -392,17 +413,30 @@ func detachedProcessStatus(pid int) string {
 }
 
 func detachedWorkerLogSummary(path string) (detachedWorkerLogReport, error) {
-	data, err := os.ReadFile(path)
+	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return detachedWorkerLogReport{}, nil
 		}
 		return detachedWorkerLogReport{}, err
 	}
-	if len(data) == 0 {
-		return detachedWorkerLogReport{}, nil
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return detachedWorkerLogReport{}, err
 	}
-	return detachedWorkerLogReport{Lines: bytes.Count(data, []byte("\n"))}, nil
+	report := detachedWorkerLogReport{UpdatedAt: info.ModTime().UTC().Format(time.RFC3339)}
+	if len(data) == 0 {
+		return report, nil
+	}
+	report.Lines = bytes.Count(data, []byte("\n"))
+	return report, nil
+}
+
+func detachedWorkerLogFreshness(report detachedWorkerLogReport) string {
+	if strings.TrimSpace(report.UpdatedAt) == "" {
+		return "no log updates recorded"
+	}
+	return "updated " + report.UpdatedAt
 }
 
 func detachedWorkerLinkedStatus(state detachedWorkerState) (*detachedWorkerLinkedReport, error) {
@@ -496,12 +530,13 @@ func detachedWorkerSessionStatus(path string) (*detachedWorkerSessionReport, err
 	}
 	checkpoint := state.Checkpoint
 	report := &detachedWorkerSessionReport{
-		Phase:     checkpoint.Phase,
-		Current:   checkpoint.Current,
-		Next:      checkpoint.Next,
-		Processed: checkpoint.Counts.Processed,
-		Failures:  checkpoint.Counts.Failures,
-		UpdatedAt: checkpoint.UpdatedAt,
+		Phase:         checkpoint.Phase,
+		Current:       checkpoint.Current,
+		Next:          checkpoint.Next,
+		Processed:     checkpoint.Counts.Processed,
+		Failures:      checkpoint.Counts.Failures,
+		ActiveWorkers: len(checkpoint.InProgress),
+		UpdatedAt:     checkpoint.UpdatedAt,
 	}
 	if report.Processed == 0 && len(state.ProcessedIssues) > 0 {
 		report.Processed = len(state.ProcessedIssues)
@@ -565,6 +600,7 @@ func detachedWorkerStateFromOptions(name, mode, targetKind, targetID string, opt
 func detachedBatchStatus(batch detachedBatchMetadata) (*detachedBatchStatusReport, error) {
 	report := &detachedBatchStatusReport{
 		RequestedIssueIDs: append([]string(nil), batch.ChildIssueIDs...),
+		ActiveWorkers:     0,
 		Done:              []string{},
 		Current:           []string{},
 		Next:              []string{},
@@ -603,6 +639,9 @@ func detachedBatchStatus(batch detachedBatchMetadata) (*detachedBatchStatusRepor
 			childReport.Blockers = workerReport.Linked.Blockers
 			childReport.PR = workerReport.Linked.PR
 			childReport.PRReadiness = workerReport.Linked.PRReadiness
+		}
+		if workerReport.ProcessStatus == "running" {
+			report.ActiveWorkers++
 		}
 		report.ChildWorkers = append(report.ChildWorkers, childReport)
 

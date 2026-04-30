@@ -95,7 +95,9 @@ func (s State) Summary() string {
 		"Done: " + joinOrFallback(checkpoint.Done, "none yet"),
 		"Current: " + current,
 		"Next: " + joinOrFallback(checkpoint.Next, "no queued batches"),
+		"Next actions: " + checkpoint.nextActionsSummary(),
 		"Issue/PR actions: " + joinOrFallback(checkpoint.IssuePRActions, "none"),
+		"Active workers: " + itoa(checkpoint.activeWorkers()),
 		"In progress: " + joinOrFallback(checkpoint.InProgress, "none"),
 		"Blockers: " + joinOrFallback(checkpoint.Blockers, "none"),
 		"Next checkpoint: " + nextCheckpoint,
@@ -113,6 +115,33 @@ func (c Checkpoint) batchLine() string {
 		return "Batch: " + itoa(c.BatchIndex) + "/" + itoa(c.TotalBatches)
 	}
 	return "Batch: not started"
+}
+
+func (c Checkpoint) activeWorkers() int {
+	count := 0
+	for _, value := range c.InProgress {
+		if strings.TrimSpace(value) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func (c Checkpoint) nextActionsSummary() string {
+	actions := make([]string, 0, len(c.IssuePRActions)+1)
+	for _, value := range c.IssuePRActions {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			actions = append(actions, value)
+		}
+	}
+	if c.Verification != nil {
+		nextAction := humanizeToken(c.Verification.NextAction)
+		if nextAction != "unknown" {
+			actions = append(actions, "verification: "+nextAction)
+		}
+	}
+	return joinOrFallback(dedupeStrings(actions), "none")
 }
 
 func (c Counts) compactSummary() string {
@@ -139,6 +168,14 @@ func optionalString(value string) string {
 	return strings.TrimSpace(value)
 }
 
+func humanizeToken(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "unknown"
+	}
+	return strings.ReplaceAll(strings.ReplaceAll(trimmed, "_", " "), "-", " ")
+}
+
 func joinOrFallback(values []string, fallback string) string {
 	trimmed := make([]string, 0, len(values))
 	for _, value := range values {
@@ -152,6 +189,26 @@ func joinOrFallback(values []string, fallback string) string {
 		return fallback
 	}
 	return strings.Join(trimmed, "; ")
+}
+
+func dedupeStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
 }
 
 func itoa(value int) string {

@@ -38,17 +38,17 @@ const (
 )
 
 const (
-	RecoveryActionFixWorkflowSetup       = "fix_workflow_setup_and_retry"
-	RecoveryActionFixWorkflowHook        = "fix_workflow_hook_and_retry"
-	RecoveryActionFixWorkflowChecks      = "fix_workflow_checks_and_retry"
-	RecoveryActionInspectMergeExecution  = "inspect_merge_requirements_and_retry"
-	RecoveryActionStageResidualFiles     = "stage_or-remove-residual-untracked-files"
-	RecoveryActionRaiseTokenBudget       = "raise_token_budget_or_split_issue"
-	RecoveryActionRaiseCostBudget        = "raise_cost_budget_or_split_issue"
-	RecoveryActionRestoreBranchContext   = "restore_worker_branch_context_and_retry"
-	RecoveryActionInspectErrorAndRetry   = "inspect_error_and_retry"
-	RecoveryActionInspectVerification    = "inspect_recovery_verification"
-	RecoverySummaryPassedZeroCommands    = "passed (0 commands)"
+	RecoveryActionFixWorkflowSetup      = "fix_workflow_setup_and_retry"
+	RecoveryActionFixWorkflowHook       = "fix_workflow_hook_and_retry"
+	RecoveryActionFixWorkflowChecks     = "fix_workflow_checks_and_retry"
+	RecoveryActionInspectMergeExecution = "inspect_merge_requirements_and_retry"
+	RecoveryActionStageResidualFiles    = "stage_or-remove-residual-untracked-files"
+	RecoveryActionRaiseTokenBudget      = "raise_token_budget_or_split_issue"
+	RecoveryActionRaiseCostBudget       = "raise_cost_budget_or_split_issue"
+	RecoveryActionRestoreBranchContext  = "restore_worker_branch_context_and_retry"
+	RecoveryActionInspectErrorAndRetry  = "inspect_error_and_retry"
+	RecoveryActionInspectVerification   = "inspect_recovery_verification"
+	RecoverySummaryPassedZeroCommands   = "passed (0 commands)"
 	SanitizedBranchPathFallback         = "pr-branch"
 	IssueBranchSlugFallback             = "issue"
 )
@@ -222,21 +222,7 @@ func SummarizeRecoveryVerificationResults(results []VerificationStep) string {
 	if len(results) == 0 {
 		return RecoverySummaryPassedZeroCommands
 	}
-	failedNames := make([]string, 0)
-	for _, result := range results {
-		if strings.TrimSpace(result.Status) == StatusFailed {
-			name := strings.TrimSpace(result.Name)
-			if name == "" {
-				name = "command"
-			}
-			failedNames = append(failedNames, name)
-		}
-	}
-	if len(failedNames) > 0 {
-		passedCount := len(results) - len(failedNames)
-		return fmt.Sprintf("failed (%d/%d passed; failed: %s)", passedCount, len(results), strings.Join(failedNames, ", "))
-	}
-	return fmt.Sprintf("passed (%d/%d commands)", len(results), len(results))
+	return SummarizeVerificationResults(results)
 }
 
 func FailureStateForStage(failureStage string) string {

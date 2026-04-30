@@ -105,7 +105,7 @@ func (s State) Summary() string {
 		"Updated: " + updatedAt,
 	}
 	if checkpoint.Verification != nil {
-		lines = append(lines, checkpoint.Verification.summaryLine())
+		lines = append(lines, checkpoint.Verification.SummaryLine())
 	}
 	return strings.Join(lines, "\n")
 }

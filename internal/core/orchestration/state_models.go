@@ -1,9 +1,6 @@
 package orchestration
 
-import (
-	"encoding/json"
-	"strings"
-)
+import "strings"
 
 const (
 	StatusInProgress       = "in-progress"
@@ -58,67 +55,6 @@ type TrackedState struct {
 	Stats                  map[string]any     `json:"stats,omitempty"`
 	Decomposition          map[string]any     `json:"decomposition,omitempty"`
 }
-
-type VerificationVerdict struct {
-	Status        string             `json:"status,omitempty"`
-	Summary       string             `json:"summary,omitempty"`
-	Error         string             `json:"error,omitempty"`
-	NextAction    string             `json:"next_action,omitempty"`
-	Commands      []VerificationStep `json:"commands,omitempty"`
-	FollowUpIssue *FollowUpIssue     `json:"follow_up_issue,omitempty"`
-}
-
-type VerificationStep struct {
-	Name          string `json:"name,omitempty"`
-	Command       string `json:"command,omitempty"`
-	Status        string `json:"status,omitempty"`
-	ExitCode      *int   `json:"exit_code,omitempty"`
-	StdoutExcerpt string `json:"stdout_excerpt,omitempty"`
-	StderrExcerpt string `json:"stderr_excerpt,omitempty"`
-}
-
-type FollowUpIssue struct {
-	Status      string `json:"status,omitempty"`
-	Title       string `json:"title,omitempty"`
-	Body        string `json:"body,omitempty"`
-	IssueNumber *int   `json:"issue_number,omitempty"`
-	IssueRef    string `json:"-"`
-	IssueURL    string `json:"issue_url,omitempty"`
-}
-
-func (f *FollowUpIssue) UnmarshalJSON(data []byte) error {
-	type alias struct {
-		Status      string      `json:"status,omitempty"`
-		Title       string      `json:"title,omitempty"`
-		Body        string      `json:"body,omitempty"`
-		IssueNumber interface{} `json:"issue_number,omitempty"`
-		IssueURL    string      `json:"issue_url,omitempty"`
-	}
-	var payload alias
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return err
-	}
-	f.Status = payload.Status
-	f.Title = payload.Title
-	f.Body = payload.Body
-	f.IssueURL = payload.IssueURL
-	switch number := payload.IssueNumber.(type) {
-	case float64:
-		if number > 0 && number == float64(int(number)) {
-			value := int(number)
-			f.IssueNumber = &value
-			f.IssueRef = "#" + itoa(value)
-		}
-	case string:
-		f.IssueRef = strings.TrimSpace(number)
-	}
-	return nil
-}
-
-// Compatibility aliases keep the current session checkpoint consumer stable
-// while the reusable verification verdict model moves into the shared domain.
-type VerificationResult = VerificationVerdict
-type VerificationCommand = VerificationStep
 
 type PullRequestFacts struct {
 	MergeStateStatus string
@@ -254,30 +190,4 @@ func ClassifyPRMergeReadinessState(mergeState, mergeable string) string {
 		return MergeReadinessClean
 	}
 	return MergeReadinessUnknown
-}
-
-func (v VerificationVerdict) summaryLine() string {
-	summary := optionalString(v.Summary)
-	if summary == "" {
-		summary = optionalString(v.Status)
-		if summary == "" {
-			summary = "unknown"
-		}
-	}
-	line := "Verification: " + summary
-	if v.FollowUpIssue == nil {
-		return line
-	}
-	status := optionalString(v.FollowUpIssue.Status)
-	issueRef := optionalString(v.FollowUpIssue.IssueRef)
-	if issueRef == "" && v.FollowUpIssue.IssueNumber != nil {
-		issueRef = "#" + itoa(*v.FollowUpIssue.IssueNumber)
-	}
-	if status == "created" && issueRef != "" {
-		return line + "; follow-up issue " + issueRef + " created"
-	}
-	if status != "" {
-		return line + "; follow-up=" + status
-	}
-	return line
 }

@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
 type recordingRunner struct {
+	mu    sync.Mutex
 	name  string
 	args  []string
 	calls int
@@ -19,6 +21,8 @@ type recordingRunner struct {
 }
 
 func (r *recordingRunner) Run(_ context.Context, name string, args ...string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.name = name
 	r.args = append([]string(nil), args...)
 	r.calls++
@@ -698,19 +702,19 @@ func TestRunDaemonReusesAutonomousSessionFileAcrossCycles(t *testing.T) {
 	}
 }
 
-func TestRunDaemonRejectsParallelismAboveOneWithoutDetach(t *testing.T) {
+func TestRunDaemonRejectsNonPositiveParallelism(t *testing.T) {
 	runner := &recordingRunner{}
 	var errOut strings.Builder
 	app := NewApp(&strings.Builder{}, &errOut)
 	app.SetRunner(runner)
 
-	if code := app.Run([]string{"run", "daemon", "--max-parallel-tasks", "2", "--poll-interval-seconds", "1", "--max-cycles", "1"}); code != 2 {
+	if code := app.Run([]string{"run", "daemon", "--max-parallel-tasks", "0", "--poll-interval-seconds", "1", "--max-cycles", "1"}); code != 2 {
 		t.Fatalf("Run() code = %d, want 2", code)
 	}
 	if runner.calls != 0 {
 		t.Fatalf("runner calls = %d, want 0", runner.calls)
 	}
-	if !strings.Contains(errOut.String(), "only with --detach") {
+	if !strings.Contains(errOut.String(), "--max-parallel-tasks > 0") {
 		t.Fatalf("stderr = %q, want concurrency validation", errOut.String())
 	}
 }
@@ -773,6 +777,86 @@ func TestRunDaemonDetachStartsOneWorkerPerParallelTask(t *testing.T) {
 		if !strings.Contains(printed, want) {
 			t.Fatalf("stdout = %q, want %q", printed, want)
 		}
+	}
+}
+
+func TestRunDaemonParallelUsesIsolatedClonesPerWorker(t *testing.T) {
+	runner := &recordingRunner{}
+	cloner := &recordingBatchClonePreparer{}
+	targetDir := t.TempDir()
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetBatchClonePreparer(cloner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--limit", "3", "--max-parallel-tasks", "2", "--poll-interval-seconds", "1", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 2 {
+		t.Fatalf("runner calls = %d, want 2", runner.calls)
+	}
+	if len(cloner.targetDirs) != 2 {
+		t.Fatalf("clone preparations = %d, want 2", len(cloner.targetDirs))
+	}
+	seenDirs := map[string]bool{}
+	for _, cmd := range runner.cmds {
+		if got := flagValue(cmd[1:], "--limit"); got != "1" {
+			t.Fatalf("daemon worker limit = %q, want 1 in %#v", got, cmd)
+		}
+		workerDir := flagValue(cmd[1:], "--dir")
+		if workerDir == "" {
+			t.Fatalf("daemon worker missing --dir in %#v", cmd)
+		}
+		if workerDir == targetDir {
+			t.Fatalf("daemon worker dir = %q, want isolated clone", workerDir)
+		}
+		seenDirs[workerDir] = true
+		if sessionPath := flagValue(cmd[1:], "--autonomous-session-file"); sessionPath == "" {
+			t.Fatalf("daemon worker missing session file in %#v", cmd)
+		} else if _, err := os.Stat(sessionPath); !os.IsNotExist(err) {
+			t.Fatalf("session file %q still exists after daemon run, err=%v", sessionPath, err)
+		}
+	}
+	if len(seenDirs) != 2 {
+		t.Fatalf("isolated worker dirs = %d, want 2 (%#v)", len(seenDirs), seenDirs)
+	}
+}
+
+func TestRunDaemonParallelRunsVerificationOnceAfterWorkers(t *testing.T) {
+	runner := &recordingRunner{}
+	cloner := &recordingBatchClonePreparer{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetBatchClonePreparer(cloner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--max-parallel-tasks", "2", "--poll-interval-seconds", "1", "--max-cycles", "1", "--dry-run", "--post-batch-verify", "--create-followup-issue"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 3 {
+		t.Fatalf("runner calls = %d, want 3", runner.calls)
+	}
+	verifyCalls := 0
+	workerCalls := 0
+	for _, cmd := range runner.cmds {
+		joined := strings.Join(cmd, " ")
+		if strings.Contains(joined, "--post-batch-verify") {
+			verifyCalls++
+			if flagValue(cmd[1:], "--limit") != "" {
+				t.Fatalf("verification call should not include daemon batch limit: %#v", cmd)
+			}
+			continue
+		}
+		workerCalls++
+		if got := flagValue(cmd[1:], "--limit"); got != "1" {
+			t.Fatalf("daemon worker limit = %q, want 1 in %#v", got, cmd)
+		}
+	}
+	if workerCalls != 2 {
+		t.Fatalf("worker calls = %d, want 2", workerCalls)
+	}
+	if verifyCalls != 1 {
+		t.Fatalf("verify calls = %d, want 1", verifyCalls)
 	}
 }
 

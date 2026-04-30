@@ -126,6 +126,60 @@ func buildIssuePythonArgs(script string, opts commonOptions, id int, base string
 	return pythonArgs
 }
 
+func buildDaemonPythonArgs(script string, opts commonOptions, state string, limit int, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, syncReusedBranch, noSyncReusedBranch bool, syncStrategy, base string, postBatchVerify, createFollowupIssue bool, fs flagState) []string {
+	pythonArgs := []string{script, "--autonomous", "--state", state, "--limit", strconv.Itoa(limit)}
+	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
+	if base != "" {
+		pythonArgs = append(pythonArgs, "--base", base)
+	}
+	if includeEmpty {
+		pythonArgs = append(pythonArgs, "--include-empty")
+	}
+	if stopOnError {
+		pythonArgs = append(pythonArgs, "--stop-on-error")
+	}
+	if failOnExisting {
+		pythonArgs = append(pythonArgs, "--fail-on-existing")
+	}
+	if forceIssueFlow {
+		pythonArgs = append(pythonArgs, "--force-issue-flow")
+	}
+	if noSkipIfPRExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
+	} else if fs.wasPassed("skip-if-pr-exists") && skipIfPRExists {
+		pythonArgs = append(pythonArgs, "--skip-if-pr-exists")
+	} else if !skipIfPRExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
+	}
+	if noSkipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
+	} else if fs.wasPassed("skip-if-branch-exists") && skipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--skip-if-branch-exists")
+	} else if !skipIfBranchExists {
+		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
+	}
+	if forceReprocess {
+		pythonArgs = append(pythonArgs, "--force-reprocess")
+	}
+	if noSyncReusedBranch {
+		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
+	} else if fs.wasPassed("sync-reused-branch") && syncReusedBranch {
+		pythonArgs = append(pythonArgs, "--sync-reused-branch")
+	} else if !syncReusedBranch {
+		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
+	}
+	if syncStrategy != "" {
+		pythonArgs = append(pythonArgs, "--sync-strategy", syncStrategy)
+	}
+	if postBatchVerify {
+		pythonArgs = append(pythonArgs, "--post-batch-verify")
+	}
+	if createFollowupIssue {
+		pythonArgs = append(pythonArgs, "--create-followup-issue")
+	}
+	return pythonArgs
+}
+
 type flagState interface {
 	wasPassed(name string) bool
 }
@@ -156,7 +210,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	state := fs.String("state", "open", "issue state to poll: open, closed, or all")
 	limit := fs.Int("limit", 10, "maximum number of issues to scan per poll")
 	pollIntervalSeconds := fs.Int("poll-interval-seconds", 120, "delay between autonomous polls")
-	maxParallelTasks := fs.Int("max-parallel-tasks", 1, "maximum parallel tasks; only 1 is supported currently")
+	maxParallelTasks := fs.Int("max-parallel-tasks", 1, "maximum parallel tasks; detached daemon mode launches one isolated worker per task")
 	maxCycles := fs.Int("max-cycles", 0, "optional test/debug bound on daemon polling cycles")
 	includeEmpty := fs.Bool("include-empty", false, "process issues even if body is empty")
 	stopOnError := fs.Bool("stop-on-error", false, "stop after the first failed poll cycle")
@@ -197,8 +251,12 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintln(a.err, "run daemon requires --limit > 0")
 		return 2
 	}
-	if *maxParallelTasks != 1 {
-		_, _ = fmt.Fprintln(a.err, "run daemon currently supports only --max-parallel-tasks=1")
+	if *maxParallelTasks <= 0 {
+		_, _ = fmt.Fprintln(a.err, "run daemon requires --max-parallel-tasks > 0")
+		return 2
+	}
+	if *maxParallelTasks != 1 && !*detach {
+		_, _ = fmt.Fprintln(a.err, "run daemon currently supports --max-parallel-tasks > 1 only with --detach")
 		return 2
 	}
 	if *state != "open" && *state != "closed" && *state != "all" {
@@ -206,50 +264,28 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		return 2
 	}
 
-	pythonArgs := []string{a.runtime.RunnerScript(), "--autonomous", "--state", *state, "--limit", strconv.Itoa(*limit)}
-	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
-	if base != "" {
-		pythonArgs = append(pythonArgs, "--base", base)
-	}
-	if *includeEmpty {
-		pythonArgs = append(pythonArgs, "--include-empty")
-	}
-	if *stopOnError {
-		pythonArgs = append(pythonArgs, "--stop-on-error")
-	}
-	if *failOnExisting {
-		pythonArgs = append(pythonArgs, "--fail-on-existing")
-	}
-	if *forceIssueFlow {
-		pythonArgs = append(pythonArgs, "--force-issue-flow")
-	}
-	if *noSkipIfPRExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
-	} else if flagWasPassed(fs, "skip-if-pr-exists") && *skipIfPRExists {
-		pythonArgs = append(pythonArgs, "--skip-if-pr-exists")
-	} else if !*skipIfPRExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
-	}
-	if *noSkipIfBranchExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
-	} else if flagWasPassed(fs, "skip-if-branch-exists") && *skipIfBranchExists {
-		pythonArgs = append(pythonArgs, "--skip-if-branch-exists")
-	} else if !*skipIfBranchExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
-	}
-	if *forceReprocess {
-		pythonArgs = append(pythonArgs, "--force-reprocess")
-	}
-	if *noSyncReusedBranch {
-		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
-	} else if flagWasPassed(fs, "sync-reused-branch") && *syncReusedBranch {
-		pythonArgs = append(pythonArgs, "--sync-reused-branch")
-	} else if !*syncReusedBranch {
-		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
-	}
-	if *syncStrategy != "" {
-		pythonArgs = append(pythonArgs, "--sync-strategy", *syncStrategy)
-	}
+	pythonArgs := buildDaemonPythonArgs(
+		a.runtime.RunnerScript(),
+		opts,
+		*state,
+		*limit,
+		*includeEmpty,
+		*stopOnError,
+		*failOnExisting,
+		*forceIssueFlow,
+		*skipIfPRExists,
+		*noSkipIfPRExists,
+		*skipIfBranchExists,
+		*noSkipIfBranchExists,
+		*forceReprocess,
+		*syncReusedBranch,
+		*noSyncReusedBranch,
+		*syncStrategy,
+		base,
+		*postBatchVerify,
+		*createFollowupIssue,
+		flagStateAdapter{fs: fs},
+	)
 	effectiveMaxCycles := *maxCycles
 	if *opts.dryRun && effectiveMaxCycles == 0 {
 		effectiveMaxCycles = 1
@@ -259,27 +295,70 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	}
 
 	if *detach {
-		workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "daemon", "")
-		if err != nil {
-			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
-			return 1
+		lastCode := 0
+		for workerIndex := 1; workerIndex <= *maxParallelTasks; workerIndex++ {
+			workerID := ""
+			workerLabel := "daemon"
+			if *maxParallelTasks > 1 {
+				workerID = strconv.Itoa(workerIndex)
+				workerLabel = workerName("daemon", workerID)
+			}
+			workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "daemon", workerID)
+			if err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
+				return 1
+			}
+			clonePath, err := a.prepareDetachedWorkerClone(*opts.dir, workerPaths)
+			if err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to prepare detached worker clone for %s: %v\n", workerLabel, err)
+				if *stopOnError {
+					return 1
+				}
+				lastCode = 1
+				continue
+			}
+			daemonOpts := withCommonOptionsDir(opts, clonePath)
+			workerArgs := buildDaemonPythonArgs(
+				a.runtime.RunnerScript(),
+				daemonOpts,
+				*state,
+				*limit,
+				*includeEmpty,
+				*stopOnError,
+				*failOnExisting,
+				*forceIssueFlow,
+				*skipIfPRExists,
+				*noSkipIfPRExists,
+				*skipIfBranchExists,
+				*noSkipIfBranchExists,
+				*forceReprocess,
+				*syncReusedBranch,
+				*noSyncReusedBranch,
+				*syncStrategy,
+				base,
+				*postBatchVerify,
+				*createFollowupIssue,
+				flagStateAdapter{fs: fs},
+			)
+			workerArgs = append(workerArgs, "--autonomous-session-file", workerPaths.SessionPath)
+			state := detachedWorkerStateFromOptions(
+				workerLabel,
+				"run daemon",
+				"daemon",
+				workerID,
+				daemonOpts,
+				append([]string{"python3"}, workerArgs...),
+				workerPaths,
+			)
+			state.WorkDir = clonePath
+			if _, code := a.startDetachedWorkerState(state); code != 0 {
+				if *stopOnError {
+					return code
+				}
+				lastCode = code
+			}
 		}
-		pythonArgs = append(pythonArgs, "--autonomous-session-file", workerPaths.SessionPath)
-		if *postBatchVerify {
-			pythonArgs = append(pythonArgs, "--post-batch-verify")
-		}
-		if *createFollowupIssue {
-			pythonArgs = append(pythonArgs, "--create-followup-issue")
-		}
-		return a.startDetachedWorker(detachedWorkerStateFromOptions(
-			"daemon",
-			"run daemon",
-			"daemon",
-			"",
-			opts,
-			append([]string{"python3"}, pythonArgs...),
-			workerPaths,
-		))
+		return lastCode
 	}
 
 	sessionFile, err := os.CreateTemp("", "orchestrator-daemon-session-*.json")
@@ -291,12 +370,6 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	_ = sessionFile.Close()
 	defer os.Remove(sessionPath)
 	pythonArgs = append(pythonArgs, "--autonomous-session-file", sessionPath)
-	if *postBatchVerify {
-		pythonArgs = append(pythonArgs, "--post-batch-verify")
-	}
-	if *createFollowupIssue {
-		pythonArgs = append(pythonArgs, "--create-followup-issue")
-	}
 
 	cycles := 0
 	for {
@@ -390,7 +463,7 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
 				return 1
 			}
-			clonePath, err = a.prepareDetachedBatchClone(*opts.dir, workerPaths)
+			clonePath, err = a.prepareDetachedWorkerClone(*opts.dir, workerPaths)
 			if err != nil {
 				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to prepare detached worker clone for issue %d: %v\n", id, err)
 				if *stopOnError {
@@ -560,9 +633,9 @@ func stringPtr(value string) *string {
 	return &value
 }
 
-func (a *App) prepareDetachedBatchClone(configuredDir string, workerPaths detachedWorkerPaths) (string, error) {
+func (a *App) prepareDetachedWorkerClone(configuredDir string, workerPaths detachedWorkerPaths) (string, error) {
 	if a.clone == nil {
-		return "", fmt.Errorf("detached batch clone preparer is not configured")
+		return "", fmt.Errorf("detached worker clone preparer is not configured")
 	}
 	sourceDir := "."
 	if strings.TrimSpace(configuredDir) != "" {

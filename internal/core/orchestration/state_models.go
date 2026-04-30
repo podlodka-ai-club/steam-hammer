@@ -62,6 +62,7 @@ type TrackedState struct {
 type VerificationVerdict struct {
 	Status        string             `json:"status,omitempty"`
 	Summary       string             `json:"summary,omitempty"`
+	Error         string             `json:"error,omitempty"`
 	NextAction    string             `json:"next_action,omitempty"`
 	Commands      []VerificationStep `json:"commands,omitempty"`
 	FollowUpIssue *FollowUpIssue     `json:"follow_up_issue,omitempty"`

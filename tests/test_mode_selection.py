@@ -34,6 +34,18 @@ class ModeSelectionTests(unittest.TestCase):
         self.assertEqual(mode, "issue-flow")
         self.assertIn("--force-issue-flow", reason)
 
+    def test_force_issue_flow_does_not_resume_waiting_for_author_state(self) -> None:
+        mode, reason = choose_execution_mode(
+            issue_number=45,
+            linked_open_pr={"number": 144},
+            force_issue_flow=True,
+            recovered_state={"status": "waiting-for-author"},
+        )
+
+        self.assertEqual(mode, "skip")
+        self.assertIn("waiting-for-author", reason)
+        self.assertIn("explicitly resumed", reason)
+
     def test_ready_for_review_state_prefers_pr_review_when_open_pr_exists(self) -> None:
         mode, reason = choose_execution_mode(
             issue_number=45,

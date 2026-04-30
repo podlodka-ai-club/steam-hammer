@@ -697,6 +697,75 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertIn("waiting-for-author", output)
         self.assertIn("Skipping issue #45: recovered orchestration state is waiting-for-author", output)
 
+    def test_main_issue_flow_force_flag_still_skips_waiting_for_author(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=45,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=True,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            isolate_worktree=True,
+        )
+        issue = {
+            "number": 45,
+            "title": "Recover orchestration context",
+            "body": "Implement state recovery",
+            "url": "https://example/issues/45",
+        }
+
+        issue_comments = [
+            {
+                "id": 1,
+                "created_at": "2026-04-26T12:00:00Z",
+                "html_url": "https://example/issues/45#issuecomment-1",
+                "body": (
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"waiting-for-author","reason":"awaiting user answer"}\n'
+                    "```"
+                ),
+            }
+        ]
+
+        with (
+            patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args),
+            patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"),
+            patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue),
+            patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=None),
+            patch("scripts.run_github_issues_to_opencode.fetch_issue_comments", return_value=issue_comments),
+            patch("scripts.run_github_issues_to_opencode.run_agent") as run_agent_mock,
+            patch("scripts.run_github_issues_to_opencode.prepare_issue_branch") as prepare_issue_branch_mock,
+            patch("sys.stdout", new_callable=io.StringIO) as stdout_mock,
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        run_agent_mock.assert_not_called()
+        prepare_issue_branch_mock.assert_not_called()
+        output = stdout_mock.getvalue()
+        self.assertIn("Skipping issue #45: recovered orchestration state is waiting-for-author", output)
+        self.assertNotIn("Proceeding despite waiting-for-author state", output)
+
     def test_main_issue_flow_failed_state_passes_context_to_prompt(self) -> None:
         args = argparse.Namespace(
             repo="owner/repo",

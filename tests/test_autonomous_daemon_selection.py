@@ -1,9 +1,10 @@
 import argparse
 import io
+import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 from scripts.run_github_issues_to_opencode import (
     autonomous_session_issue_status,
@@ -418,6 +419,20 @@ class AutonomousDaemonSelectionTests(unittest.TestCase):
 
         self.assertEqual([issue["number"] for issue in filtered], [153, 152])
         self.assertEqual(skipped, [])
+
+    def test_autonomous_session_load_retries_partial_json(self) -> None:
+        state_body = json.dumps({"processed_issues": {"153": {"status": "ready-for-review"}}, "checkpoint": {}})
+        with patch(
+            "builtins.open",
+            side_effect=[
+                mock_open(read_data="").return_value,
+                mock_open(read_data=state_body).return_value,
+            ],
+        ) as open_mock:
+            state = load_autonomous_session_state("/tmp/daemon-session.json")
+
+        self.assertEqual(open_mock.call_count, 2)
+        self.assertEqual(state["processed_issues"]["153"]["status"], "ready-for-review")
 
     def test_autonomous_session_status_summary_formats_checkpoint(self) -> None:
         session_state = {

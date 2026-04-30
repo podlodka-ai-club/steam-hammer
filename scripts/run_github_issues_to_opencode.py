@@ -1135,13 +1135,22 @@ def format_autonomous_dependency_blocker(blocked_entry: dict) -> str:
 def load_autonomous_session_state(path: str | None) -> dict:
     if not path:
         return {"processed_issues": {}, "checkpoint": {}}
-    try:
-        with open(path, encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except FileNotFoundError:
-        return {"processed_issues": {}, "checkpoint": {}}
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"Warning: unable to load autonomous session state from {path}: {exc}", file=sys.stderr)
+    load_error: OSError | json.JSONDecodeError | None = None
+    payload: object | None = None
+    for attempt in range(3):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            load_error = None
+            break
+        except FileNotFoundError:
+            return {"processed_issues": {}, "checkpoint": {}}
+        except (OSError, json.JSONDecodeError) as exc:
+            load_error = exc
+            if attempt < 2:
+                time.sleep(0.05)
+    if load_error is not None:
+        print(f"Warning: unable to load autonomous session state from {path}: {load_error}", file=sys.stderr)
         return {"processed_issues": {}, "checkpoint": {}}
     if not isinstance(payload, dict):
         return {"processed_issues": {}, "checkpoint": {}}
@@ -1164,6 +1173,8 @@ def save_autonomous_session_state(path: str | None, state: dict) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(state, handle, indent=2, sort_keys=True)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temp_path, path)
     except OSError as exc:
         print(f"Warning: unable to save autonomous session state to {path}: {exc}", file=sys.stderr)
@@ -6654,9 +6665,6 @@ def choose_execution_mode(
     recovered_state: dict | None = None,
     clarification_answer: dict | None = None,
 ) -> tuple[str, str]:
-    if force_issue_flow:
-        return "issue-flow", "--force-issue-flow is set"
-
     recovered_status = ""
     if isinstance(recovered_state, dict):
         recovered_status = str(recovered_state.get("status") or "")
@@ -6674,8 +6682,11 @@ def choose_execution_mode(
     if recovered_status in {"waiting-for-author", "blocked"}:
         return (
             "skip",
-            f"recovered orchestration state is {recovered_status}; skipping until explicitly forced",
+            f"recovered orchestration state is {recovered_status}; skipping until explicitly resumed",
         )
+
+    if force_issue_flow:
+        return "issue-flow", "--force-issue-flow is set"
 
     if recovered_status in {"waiting-for-ci", "ready-to-merge"} and linked_open_pr is not None:
         pr_number = linked_open_pr.get("number")

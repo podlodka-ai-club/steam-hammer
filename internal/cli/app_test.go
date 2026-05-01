@@ -869,7 +869,7 @@ func TestRunIssueUsesGoNativeHappyPath(t *testing.T) {
 	}
 }
 
-func TestRunIssueFallsBackToPythonAfterGoSelectsPRReview(t *testing.T) {
+func TestRunIssueRoutesLinkedPRToPRCompatibilityAdapter(t *testing.T) {
 	runner := &recordingRunner{}
 	lifecycle := &fakeDaemonLifecycle{
 		issue:    githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
@@ -884,9 +884,42 @@ func TestRunIssueFallsBackToPythonAfterGoSelectsPRReview(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo"})
-	if !strings.Contains(errOut.String(), "falling back to python issue runner") || !strings.Contains(errOut.String(), "linked open PR #101") {
-		t.Fatalf("stderr = %q, want native selection fallback reason", errOut.String())
+	assertCommand(t, runner, []string{runnerScript, "--pr", "101", "--from-review-comments", "--repo", "owner/repo"})
+	if !strings.Contains(errOut.String(), "routing issue #71 to pr review compatibility adapter") || !strings.Contains(errOut.String(), "linked open PR #101") {
+		t.Fatalf("stderr = %q, want explicit adapter routing reason", errOut.String())
+	}
+}
+
+func TestRunIssueRoutesReadyToMergeRecoveryToPRCompatibilityAdapter(t *testing.T) {
+	runner := &recordingRunner{}
+	stateBody, err := orchestration.BuildOrchestrationStateComment(orchestration.TrackedState{
+		Status:   orchestration.StatusReadyToMerge,
+		TaskType: orchestration.TaskTypePR,
+		Issue:    intPtr(71),
+		PR:       intPtr(101),
+	})
+	if err != nil {
+		t.Fatalf("BuildOrchestrationStateComment() error = %v", err)
+	}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:    githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		linkedPR: &githublifecycle.PullRequest{Number: 101, Title: "Existing fix", HeadRefName: "issue-fix/71-fix-runner"},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{
+			71: {{ID: 1, Body: stateBody, CreatedAt: "2026-05-01T12:00:00Z"}},
+		},
+	}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetIssueLifecycle(lifecycle)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--pr", "101", "--from-review-comments", "--repo", "owner/repo"})
+	if !strings.Contains(errOut.String(), "ready-to-merge") {
+		t.Fatalf("stderr = %q, want recovered ready-to-merge reason", errOut.String())
 	}
 }
 
@@ -1199,6 +1232,44 @@ func TestRunDaemonDetachStartsOneWorkerPerParallelTask(t *testing.T) {
 	}
 	printed := out.String()
 	for _, want := range []string{"started detached worker daemon-1", "started detached worker daemon-2"} {
+		if !strings.Contains(printed, want) {
+			t.Fatalf("stdout = %q, want %q", printed, want)
+		}
+	}
+}
+
+func TestRunDaemonDetachStartsThreeWorkersWhenRequested(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	cloner := &recordingBatchClonePreparer{}
+	targetDir := t.TempDir()
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--max-parallel-tasks", "3"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if starter.calls != 3 {
+		t.Fatalf("starter calls = %d, want 3", starter.calls)
+	}
+	if len(cloner.targetDirs) != 3 {
+		t.Fatalf("clone preparations = %d, want 3", len(cloner.targetDirs))
+	}
+	for _, workerID := range []string{"1", "2", "3"} {
+		workerDir := filepath.Join(targetDir, ".orchestrator", "workers", "daemon-"+workerID)
+		statePath := filepath.Join(workerDir, "worker.json")
+		state, err := workers.ReadState(statePath)
+		if err != nil {
+			t.Fatalf("workers.ReadState(%q) error = %v", statePath, err)
+		}
+		if state.Name != "daemon-"+workerID {
+			t.Fatalf("worker name = %q, want daemon-%s", state.Name, workerID)
+		}
+	}
+	printed := out.String()
+	for _, want := range []string{"started detached worker daemon-1", "started detached worker daemon-2", "started detached worker daemon-3"} {
 		if !strings.Contains(printed, want) {
 			t.Fatalf("stdout = %q, want %q", printed, want)
 		}

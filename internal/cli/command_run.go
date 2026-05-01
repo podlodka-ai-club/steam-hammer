@@ -129,6 +129,30 @@ func buildIssuePythonArgs(script string, opts commonOptions, id int, base string
 	return pythonArgs
 }
 
+func buildPRPythonArgs(script string, opts commonOptions, id int, allowBranchSwitch, isolateWorktree, postSummary bool, followupPrefix string, conflictRecoveryOnly bool, syncStrategy string) []string {
+	pythonArgs := []string{script, "--pr", strconv.Itoa(id), "--from-review-comments"}
+	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
+	if allowBranchSwitch {
+		pythonArgs = append(pythonArgs, "--allow-pr-branch-switch")
+	}
+	if isolateWorktree {
+		pythonArgs = append(pythonArgs, "--isolate-worktree")
+	}
+	if postSummary {
+		pythonArgs = append(pythonArgs, "--post-pr-summary")
+	}
+	if followupPrefix != "" {
+		pythonArgs = append(pythonArgs, "--pr-followup-branch-prefix", followupPrefix)
+	}
+	if syncStrategy != "" {
+		pythonArgs = append(pythonArgs, "--sync-strategy", syncStrategy)
+	}
+	if conflictRecoveryOnly {
+		pythonArgs = append(pythonArgs, "--conflict-recovery-only")
+	}
+	return pythonArgs
+}
+
 func appendAutonomousSessionFile(args []string, sessionPath string) []string {
 	if strings.TrimSpace(sessionPath) == "" {
 		return args
@@ -1326,26 +1350,7 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 		return 2
 	}
 
-	pythonArgs := []string{a.runtime.RunnerScript(), "--pr", strconv.Itoa(*id), "--from-review-comments"}
-	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
-	if *allowBranchSwitch {
-		pythonArgs = append(pythonArgs, "--allow-pr-branch-switch")
-	}
-	if *isolateWorktree {
-		pythonArgs = append(pythonArgs, "--isolate-worktree")
-	}
-	if *postSummary {
-		pythonArgs = append(pythonArgs, "--post-pr-summary")
-	}
-	if *followupPrefix != "" {
-		pythonArgs = append(pythonArgs, "--pr-followup-branch-prefix", *followupPrefix)
-	}
-	if *syncStrategy != "" {
-		pythonArgs = append(pythonArgs, "--sync-strategy", *syncStrategy)
-	}
-	if *conflictRecoveryOnly {
-		pythonArgs = append(pythonArgs, "--conflict-recovery-only")
-	}
+	pythonArgs := buildPRPythonArgs(a.runtime.RunnerScript(), opts, *id, *allowBranchSwitch, *isolateWorktree, *postSummary, *followupPrefix, *conflictRecoveryOnly, *syncStrategy)
 	if *detach {
 		workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "pr", strconv.Itoa(*id))
 		if err != nil {

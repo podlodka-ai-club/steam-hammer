@@ -5,7 +5,8 @@
 ## Кратко
 
 - Пользовательская точка входа уже есть в Go CLI: `orchestrator init`, `doctor`, `autodoctor`, `run issue`, `run pr`, `run daemon`.
-- Основной execution core пока остается в `scripts/run_github_issues_to_opencode.py`; Go-слой в основном отвечает за CLI-форму, совместимость и bootstrap.
+- Go уже владеет execution-mode/router решениями для one-shot issue flow, daemon selection/claim logic, detached worker surfaces и post-batch verification; Python runner больше не должен заново принимать эти orchestration decisions за Go.
+- `scripts/run_github_issues_to_opencode.py` остается compatibility adapter'ом для еще не перенесенных runtime paths, а не единственным execution core для всех сценариев.
 - MVP для GitHub largely implemented: one-shot issue flow, PR review flow, state comments, recovery, базовый daemon polling, project config, scope guards, workflow checks и PR readiness.
 - Auto-merge, multi-provider execution core, полноценная conflict recovery orchestration и richer operator UX еще не завершены.
 
@@ -16,14 +17,15 @@
 - Есть Go entrypoint `cmd/orchestrator`.
 - `init` создает scaffold для `project-config.json` и `local-config.json`.
 - `doctor` и `autodoctor` проверяют окружение, конфиг и могут делать runner smoke check.
-- `run issue` запускает one-shot issue orchestration.
+- `run issue` запускает Go-first one-shot issue orchestration для fresh-branch GitHub path.
 - `run batch` запускает явный список issue ID как batch entrypoint: в `--dry-run` режиме показывает per-issue запуск, а в `--detach` стартует отдельный worker на каждый issue.
 - `run pr` запускает review-comments flow для существующего PR.
-- `run daemon` запускает polling loop поверх текущего GitHub/Python runner'а.
+- `run daemon` запускает Go-owned polling/claim loop и затем dispatch'ит совместимый worker path для каждого выбранного таска.
 
 ### Issue flow
 
 - Поддерживаются одиночный запуск по `--issue` / `run issue --id` и batch/polling обработка списка issue.
+- Для нового GitHub issue без существующего branch/PR Go сам выбирает mode, готовит branch, запускает agent, коммитит, пушит и создает PR без вызова Python runner'а.
 - Скрипт создает или переиспользует deterministic issue branch и PR.
 - Для reused branch есть sync с base branch, стратегии `rebase` и `merge`, fallback с `rebase` на `merge` и conservative auto-resolution части merge conflicts.
 - Для image-only или image-backed issue attachments могут попадать в prompt.
@@ -32,6 +34,7 @@
 
 - Есть `pr-review` режим по unresolved review feedback.
 - Одинарный запуск по issue умеет автоматически переключаться в PR/review or CI progression path, если у issue уже есть связанный открытый PR.
+- Это переключение теперь принимается в Go: `run issue` при linked PR маршрутизирует выполнение в явный PR compatibility adapter (`run pr` semantics), а не передает issue-level decision обратно в Python.
 - После push orchestrator может ждать CI status, оценивать readiness и публиковать состояния `waiting-for-ci`, `ready-for-review`, `blocked`, `ready-to-merge`.
 - Auto-merge policy в config уже описывается, но полный merge loop еще не является основным завершенным сценарием.
 
@@ -61,12 +64,26 @@
 ### Daemon mode
 
 - `run daemon` уже существует и повторно вызывает batch issue flow по polling interval.
-- Текущий daemon режим остается осторожным: GitHub-only, с ограниченной concurrency и опорой на существующий Python runner.
+- Текущий daemon режим остается осторожным: GitHub-only, с ограниченной concurrency; selection/claim policy выполняется в Go, а per-task execution для совместимых worker paths пока еще может идти через Python adapter.
 - Для `run issue`, `run pr` и `run daemon` появился first-class `--detach` path: worker стартует в фоне и пишет `worker.json`/`worker.log` в `.orchestrator/workers/<issue-N|pr-N|daemon>/`.
 - Во время autonomous batch loop сохраняется session-level checkpoint в `--autonomous-session-file`: done/current/next, issue/PR actions, blockers, счетчики и next checkpoint.
 - `status` теперь умеет читать не только issue/PR state comments, но и session-level checkpoint из `--autonomous-session-file`, а также detached worker metadata через `--worker` и `--workers`, чтобы оператор мог проверить pid/process state, log progress, clone path, linked branch, linked issue/PR state и session checkpoint без ручных `ps`/`wc -l`/path lookup. Для worker surfaces доступен `--json`, а `status --worker issue-N` для detached batch child дополнительно сводит batch-level done/current/next, child workers, linked PRs, conflicts, verification и failures.
 - Safe bounded smoke path для текущего entrypoint задокументирован в `docs/daemon-smoke-test.md`, включая post-#204 checklist для маленького detached batch.
+- Финальный North Star smoke checklist с recorded commands/results хранится в `docs/final-smoke-checklist.md`.
 - Это рабочий автономный entrypoint ранней стадии, а не финальный service-grade orchestrator.
+
+### Граница Go/Python после #268
+
+- Go-owned paths:
+- `run issue` fresh-branch one-shot flow без linked PR/reused branch;
+- execution-mode selection (`issue-flow` / `pr-review` / `skip`) и recovery-based routing;
+- daemon issue selection, claim/release comments, session checkpoint wiring и detached worker preparation;
+- detached worker registry/status surfaces и post-batch verification.
+- Python compatibility adapter:
+- `run pr` runtime и review-comments execution loop;
+- `doctor`, `autodoctor`, `status` и другие еще не перенесенные CLI compatibility surfaces;
+- batch/daemon worker execution paths, которые все еще запускаются через script adapter;
+- issue-path blockers, еще не реализованные в Go: reused branch handling, linked PR reuse internals beyond adapter routing, dedicated conflict-recovery-only runtime.
 
 ### Post-#204 safety invariants
 
@@ -78,7 +95,7 @@
 
 ## Что еще не доведено до North Star
 
-- Основной execution core пока не перенесен в Go и остается крупным Python runner'ом.
+- PR review runtime, reused-branch issue runtime и часть autonomous worker execution все еще не перенесены из Python compatibility adapter в Go.
 - Нет еще полноценной interactive `resume` поверхности и richer operator UX поверх сохраненного session checkpoint.
 - Нет dedicated conflict-recovery mode, который чинит только branch divergence без полного повторного issue run.
 - Нет обязательного post-batch verification workflow, который сам создает follow-up issue/checklist после крупных merge batches.
@@ -92,4 +109,4 @@
 3. Уменьшить шум и длительность full Python verification.
 4. Добавить dedicated conflict-recovery path для reused branches и stacked batches.
 5. Автоматизировать post-batch verification и follow-up issue creation.
-6. Разделить крупный Python runner на более мелкие модули, чтобы снизить conflict pressure и упростить перенос в Go.
+6. Продолжить сужать Python compatibility adapter до PR/reuse-only responsibilities и переносить оставшиеся runtime loops в Go.

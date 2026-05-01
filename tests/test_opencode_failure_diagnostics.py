@@ -8,8 +8,11 @@ from scripts.run_github_issues_to_opencode import (
     AGENT_FAILURE_LABEL_NAME,
     RECOMMENDED_OPENCODE_MODEL,
     classify_opencode_failure,
+    command_succeeds,
     describe_exit_code,
     ensure_agent_failure_label,
+    run_capture,
+    run_check_command,
     validate_opencode_model_backend,
 )
 
@@ -111,6 +114,45 @@ class ValidateOpenCodeModelBackendTests(unittest.TestCase):
 
         self.assertIn("Timed out after 30s", str(ctx.exception))
         self.assertIn("qwen3.5:2b", str(ctx.exception))
+
+    @patch("scripts.run_github_issues_to_opencode.shutil.which", return_value="/usr/local/bin/ollama")
+    @patch("scripts.run_github_issues_to_opencode.subprocess.run")
+    def test_ollama_show_uses_explicit_utf8_text_encoding(self, run_mock, _which) -> None:
+        run_mock.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        validate_opencode_model_backend(runner="opencode", model="ollama/qwen3.5:2b")
+
+        self.assertEqual(run_mock.call_args.kwargs["encoding"], "utf-8")
+        self.assertTrue(run_mock.call_args.kwargs["text"])
+
+
+class SubprocessUtf8Tests(unittest.TestCase):
+    @patch("scripts.run_github_issues_to_opencode.subprocess.run")
+    def test_run_capture_uses_explicit_utf8_text_encoding(self, run_mock) -> None:
+        run_mock.return_value = SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        self.assertEqual(run_capture(["gh", "status"]), "ok")
+
+        self.assertEqual(run_mock.call_args.kwargs["encoding"], "utf-8")
+        self.assertTrue(run_mock.call_args.kwargs["text"])
+
+    @patch("scripts.run_github_issues_to_opencode.subprocess.run")
+    def test_command_succeeds_uses_explicit_utf8_text_encoding(self, run_mock) -> None:
+        run_mock.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        self.assertTrue(command_succeeds(["gh", "status"]))
+
+        self.assertEqual(run_mock.call_args.kwargs["encoding"], "utf-8")
+        self.assertTrue(run_mock.call_args.kwargs["text"])
+
+    @patch("scripts.run_github_issues_to_opencode.subprocess.run")
+    def test_run_check_command_uses_explicit_utf8_text_encoding(self, run_mock) -> None:
+        run_mock.return_value = SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+        self.assertEqual(run_check_command(["gh", "status"]), (True, "ok", "", 0))
+
+        self.assertEqual(run_mock.call_args.kwargs["encoding"], "utf-8")
+        self.assertTrue(run_mock.call_args.kwargs["text"])
 
 
 if __name__ == "__main__":

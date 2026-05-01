@@ -1396,7 +1396,7 @@ def preview_autonomous_issue_queue(issues: list[dict], start_index: int, limit: 
 
 
 def run_capture(command: list[str]) -> str:
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = subprocess.run(command, capture_output=True, **_subprocess_text_kwargs())
     if result.returncode != 0:
         stderr = result.stderr.strip()
         raise RuntimeError(f"Command failed: {' '.join(command)}\n{stderr}")
@@ -1410,7 +1410,7 @@ def run_command(command: list[str]) -> None:
 
 
 def command_succeeds(command: list[str]) -> bool:
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = subprocess.run(command, capture_output=True, **_subprocess_text_kwargs())
     return result.returncode == 0
 
 
@@ -1420,7 +1420,13 @@ def run_check_command(
     env: dict[str, str] | None = None,
 ) -> tuple[bool, str, str, int]:
     try:
-        result = subprocess.run(command, capture_output=True, text=True, cwd=cwd, env=env)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            cwd=cwd,
+            env=env,
+            **_subprocess_text_kwargs(),
+        )
     except FileNotFoundError as exc:
         return False, "", str(exc), 127
     return (
@@ -1442,6 +1448,10 @@ def describe_exit_code(return_code: int) -> str:
         return f"terminated by signal {signal_number}"
 
     return f"terminated by {signal_name} ({signal_number})"
+
+
+def _subprocess_text_kwargs() -> dict[str, str | bool]:
+    return {"text": True, "encoding": "utf-8"}
 
 
 def classify_opencode_failure(return_code: int, model: str | None) -> str | None:
@@ -1492,8 +1502,8 @@ def validate_opencode_model_backend(runner: str, model: str | None) -> None:
         result = subprocess.run(
             [ollama_path, "show", local_model],
             capture_output=True,
-            text=True,
             timeout=OLLAMA_PREFLIGHT_TIMEOUT_SECONDS,
+            **_subprocess_text_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
@@ -1706,9 +1716,9 @@ def _run_workflow_shell_command(
         result = subprocess.run(
             ["bash", "-lc", command_text],
             capture_output=True,
-            text=True,
             cwd=cwd,
             env=env,
+            **_subprocess_text_kwargs(),
         )
     except FileNotFoundError as exc:
         raise RuntimeError(
@@ -3144,7 +3154,7 @@ def run_merge_for_pull_request(repo: str, pr_number: int, merge_policy: dict, dr
         )
         return
 
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = subprocess.run(command, capture_output=True, **_subprocess_text_kwargs())
     if result.returncode == 0:
         return
 
@@ -7322,9 +7332,9 @@ def run_agent_with_prompt(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
         bufsize=1,
         cwd=cwd,
+        **_subprocess_text_kwargs(),
     )
 
     line_queue: _queue.Queue[tuple[str, str]] = _queue.Queue()

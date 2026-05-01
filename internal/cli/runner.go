@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 )
 
 type Runner interface {
@@ -66,7 +65,7 @@ func (ExecDetachedStarter) Start(req DetachedRequest) (DetachedProcess, error) {
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	configureDetachedProcess(cmd)
 
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()

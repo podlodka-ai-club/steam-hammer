@@ -1107,6 +1107,217 @@ func TestRunIssueUsesGoNativeReusedBranchSyncPreflight(t *testing.T) {
 	}
 }
 
+func TestRunIssueConflictRecoveryOnlySyncsAndPushesWithoutAgent(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 0},
+		{ExitCode: 0},
+		{},
+		{},
+		{},
+		{Stdout: "abc123\n"},
+		{},
+		{Stdout: "def456\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+		{},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+	}
+	agent := &fakeIssueAgentRunner{}
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo", "--conflict-recovery-only"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("python runner calls = %d, want 0", runner.calls)
+	}
+	if agent.callCount != 0 {
+		t.Fatalf("agent call count = %d, want 0", agent.callCount)
+	}
+	if len(lifecycle.commentBodies[71]) != 1 {
+		t.Fatalf("comment bodies = %d, want 1", len(lifecycle.commentBodies[71]))
+	}
+	state, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][0])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody() error = %v", err)
+	}
+	if state.Status != orchestration.StatusWaitingForAuthor || state.Stage != "sync_branch" || state.NextAction != "inspect_conflict_recovery_result" {
+		t.Fatalf("state = %#v", state)
+	}
+	if state.BranchLifecycle != orchestration.BranchLifecycleReused {
+		t.Fatalf("branch lifecycle = %q, want reused", state.BranchLifecycle)
+	}
+	if state.ReusedBranchSync == nil || state.ReusedBranchSync.Status != orchestration.BranchSyncStatusSyncedCleanly || !state.ReusedBranchSync.Changed {
+		t.Fatalf("sync verdict = %#v", state.ReusedBranchSync)
+	}
+	if len(lifecycle.createdPRs) != 0 {
+		t.Fatalf("created PRs = %d, want 0", len(lifecycle.createdPRs))
+	}
+	wantCommands := []string{
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("status", "--porcelain"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("show-ref", "--verify", "--quiet", "refs/heads/issue-fix/71-fix-runner"),
+		gitCommand("ls-remote", "--exit-code", "--heads", "origin", "issue-fix/71-fix-runner"),
+		gitCommand("checkout", "main"),
+		gitCommand("checkout", "issue-fix/71-fix-runner"),
+		gitCommand("fetch", "origin", "main"),
+		gitCommand("rev-parse", "HEAD"),
+		gitCommand("rebase", "origin/main"),
+		gitCommand("rev-parse", "HEAD"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("push", "-u", "--force-with-lease", "origin", "issue-fix/71-fix-runner"),
+	}
+	if !reflect.DeepEqual(shell.cmds, wantCommands) {
+		t.Fatalf("shell commands = %#v, want %#v", shell.cmds, wantCommands)
+	}
+	printed := out.String()
+	if !strings.Contains(printed, "Conflict recovery push result for branch 'issue-fix/71-fix-runner': pushed") || !strings.Contains(printed, "Conflict recovery result for branch 'issue-fix/71-fix-runner': synced cleanly") {
+		t.Fatalf("stdout = %q, want recovery summaries", printed)
+	}
+}
+
+func TestRunIssueConflictRecoveryOnlyNoopSkipsPush(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 0},
+		{ExitCode: 0},
+		{},
+		{},
+		{},
+		{Stdout: "abc123\n"},
+		{},
+		{Stdout: "abc123\n"},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+	}
+	agent := &fakeIssueAgentRunner{}
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo", "--conflict-recovery-only"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("python runner calls = %d, want 0", runner.calls)
+	}
+	if agent.callCount != 0 {
+		t.Fatalf("agent call count = %d, want 0", agent.callCount)
+	}
+	if len(lifecycle.commentBodies[71]) != 1 {
+		t.Fatalf("comment bodies = %d, want 1", len(lifecycle.commentBodies[71]))
+	}
+	state, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][0])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody() error = %v", err)
+	}
+	if state.ReusedBranchSync == nil || state.ReusedBranchSync.Status != orchestration.BranchSyncStatusAlreadyCurrent || state.ReusedBranchSync.Changed {
+		t.Fatalf("sync verdict = %#v", state.ReusedBranchSync)
+	}
+	wantCommands := []string{
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("status", "--porcelain"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("show-ref", "--verify", "--quiet", "refs/heads/issue-fix/71-fix-runner"),
+		gitCommand("ls-remote", "--exit-code", "--heads", "origin", "issue-fix/71-fix-runner"),
+		gitCommand("checkout", "main"),
+		gitCommand("checkout", "issue-fix/71-fix-runner"),
+		gitCommand("fetch", "origin", "main"),
+		gitCommand("rev-parse", "HEAD"),
+		gitCommand("rebase", "origin/main"),
+		gitCommand("rev-parse", "HEAD"),
+	}
+	if !reflect.DeepEqual(shell.cmds, wantCommands) {
+		t.Fatalf("shell commands = %#v, want %#v", shell.cmds, wantCommands)
+	}
+	if strings.Contains(out.String(), "Conflict recovery push result") {
+		t.Fatalf("stdout = %q, want no push summary", out.String())
+	}
+}
+
+func TestRunIssueConflictRecoveryOnlyBlocksWhenDeterministicBranchMissing(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 1},
+		{ExitCode: 2},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+	}
+	agent := &fakeIssueAgentRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo", "--conflict-recovery-only"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("python runner calls = %d, want 0", runner.calls)
+	}
+	if agent.callCount != 0 {
+		t.Fatalf("agent call count = %d, want 0", agent.callCount)
+	}
+	if len(lifecycle.commentBodies[71]) != 1 {
+		t.Fatalf("comment bodies = %d, want 1", len(lifecycle.commentBodies[71]))
+	}
+	state, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][0])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody() error = %v", err)
+	}
+	if state.Status != orchestration.StatusBlocked || state.Stage != "sync_branch" || state.NextAction != "run_normal_issue_flow_first" {
+		t.Fatalf("state = %#v", state)
+	}
+	if !strings.Contains(state.Error, "requires an existing deterministic issue branch") {
+		t.Fatalf("blocked error = %q, want missing-branch guidance", state.Error)
+	}
+	wantCommands := []string{
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("status", "--porcelain"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("show-ref", "--verify", "--quiet", "refs/heads/issue-fix/71-fix-runner"),
+		gitCommand("ls-remote", "--exit-code", "--heads", "origin", "issue-fix/71-fix-runner"),
+	}
+	if !reflect.DeepEqual(shell.cmds, wantCommands) {
+		t.Fatalf("shell commands = %#v, want %#v", shell.cmds, wantCommands)
+	}
+	if !strings.Contains(errOut.String(), "run the normal issue flow first") {
+		t.Fatalf("stderr = %q, want explicit recovery guidance", errOut.String())
+	}
+}
+
 func TestRunIssueBlocksWhenReusedBranchSyncCannotBeRecovered(t *testing.T) {
 	runner := &recordingRunner{}
 	shell := &fakeShellExecutor{results: []shellExecutionResult{

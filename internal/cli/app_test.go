@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/githublifecycle"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/workers"
 	"os"
 	"path/filepath"
@@ -70,6 +71,42 @@ type recordingBatchClonePreparer struct {
 	sourceDirs []string
 	targetDirs []string
 	err        error
+}
+
+type fakeDaemonLifecycle struct {
+	issues          []githublifecycle.Issue
+	commentsByIssue map[int][]githublifecycle.IssueComment
+	commentBodies   map[int][]string
+	listErr         error
+	commentErr      error
+}
+
+func (f *fakeDaemonLifecycle) ListIssues(_ context.Context, _ string, _ string, _ int) ([]githublifecycle.Issue, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return append([]githublifecycle.Issue(nil), f.issues...), nil
+}
+
+func (f *fakeDaemonLifecycle) ListIssueComments(_ context.Context, _ string, number int) ([]githublifecycle.IssueComment, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return append([]githublifecycle.IssueComment(nil), f.commentsByIssue[number]...), nil
+}
+
+func (f *fakeDaemonLifecycle) CommentOnIssue(_ context.Context, _ string, number int, body string) error {
+	if f.commentErr != nil {
+		return f.commentErr
+	}
+	if f.commentBodies == nil {
+		f.commentBodies = map[int][]string{}
+	}
+	f.commentBodies[number] = append(f.commentBodies[number], body)
+	comments := f.commentsByIssue[number]
+	comments = append(comments, githublifecycle.IssueComment{ID: int64(len(comments) + 1), Body: body, CreatedAt: "2026-05-01T12:00:00Z"})
+	f.commentsByIssue[number] = comments
+	return nil
 }
 
 func (r *recordingBatchClonePreparer) Prepare(sourceDir, targetDir string) (string, error) {
@@ -368,6 +405,7 @@ func TestRunDaemonCommandForwardsPostBatchVerificationFlags(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
+	app.SetDaemonLifecycle(nil)
 
 	code := app.Run([]string{
 		"run", "daemon",
@@ -680,12 +718,13 @@ func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{issues: []githublifecycle.Issue{{Number: 71}}, commentsByIssue: map[int][]githublifecycle.IssueComment{}})
 
 	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--poll-interval-seconds", "1", "--max-cycles", "1", "--dry-run"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--autonomous", "--state", "open", "--limit", "3", "--repo", "owner/repo", "--dry-run"})
+	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run"})
 	assertCommandContainsFlag(t, runner.args, "--autonomous-session-file")
 }
 
@@ -693,6 +732,7 @@ func TestRunDaemonReusesAutonomousSessionFileAcrossCycles(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
+	app.SetDaemonLifecycle(nil)
 
 	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--poll-interval-seconds", "0", "--max-cycles", "2", "--dry-run"})
 	if code != 0 {
@@ -711,6 +751,30 @@ func TestRunDaemonReusesAutonomousSessionFileAcrossCycles(t *testing.T) {
 	}
 	if _, err := os.Stat(firstSessionPath); !os.IsNotExist(err) {
 		t.Fatalf("session file %q still exists after daemon run, err=%v", firstSessionPath, err)
+	}
+}
+
+func TestRunDaemonGoPolicyProcessesDistinctIssuesAcrossCycles(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues:          []githublifecycle.Issue{{Number: 71}, {Number: 72}},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "2", "--poll-interval-seconds", "0", "--max-cycles", "2", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 2 {
+		t.Fatalf("runner calls = %d, want 2", runner.calls)
+	}
+	if got := flagValue(runner.cmds[0][1:], "--issue"); got != "71" {
+		t.Fatalf("first issue = %q, want 71", got)
+	}
+	if got := flagValue(runner.cmds[1][1:], "--issue"); got != "72" {
+		t.Fatalf("second issue = %q, want 72", got)
 	}
 }
 
@@ -799,6 +863,7 @@ func TestRunDaemonParallelUsesIsolatedClonesPerWorker(t *testing.T) {
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
 	app.SetBatchClonePreparer(cloner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{issues: []githublifecycle.Issue{{Number: 71}, {Number: 72}}, commentsByIssue: map[int][]githublifecycle.IssueComment{}})
 
 	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--limit", "3", "--max-parallel-tasks", "2", "--poll-interval-seconds", "1", "--max-cycles", "1", "--dry-run"})
 	if code != 0 {
@@ -810,10 +875,13 @@ func TestRunDaemonParallelUsesIsolatedClonesPerWorker(t *testing.T) {
 	if len(cloner.targetDirs) != 2 {
 		t.Fatalf("clone preparations = %d, want 2", len(cloner.targetDirs))
 	}
+	seenIssues := map[string]bool{}
 	seenDirs := map[string]bool{}
 	for _, cmd := range runner.cmds {
-		if got := flagValue(cmd[1:], "--limit"); got != "3" {
-			t.Fatalf("daemon worker limit = %q, want 3 in %#v", got, cmd)
+		if got := flagValue(cmd[1:], "--issue"); got == "" {
+			t.Fatalf("daemon worker missing --issue in %#v", cmd)
+		} else {
+			seenIssues[got] = true
 		}
 		workerDir := flagValue(cmd[1:], "--dir")
 		if workerDir == "" {
@@ -832,6 +900,9 @@ func TestRunDaemonParallelUsesIsolatedClonesPerWorker(t *testing.T) {
 	if len(seenDirs) != 2 {
 		t.Fatalf("isolated worker dirs = %d, want 2 (%#v)", len(seenDirs), seenDirs)
 	}
+	if !seenIssues["71"] || !seenIssues["72"] {
+		t.Fatalf("seen issues = %#v, want 71 and 72", seenIssues)
+	}
 }
 
 func TestRunDaemonParallelRunsVerificationOnceAfterWorkers(t *testing.T) {
@@ -840,6 +911,7 @@ func TestRunDaemonParallelRunsVerificationOnceAfterWorkers(t *testing.T) {
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
 	app.SetBatchClonePreparer(cloner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{issues: []githublifecycle.Issue{{Number: 71}, {Number: 72}}, commentsByIssue: map[int][]githublifecycle.IssueComment{}})
 
 	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--max-parallel-tasks", "2", "--poll-interval-seconds", "1", "--max-cycles", "1", "--dry-run", "--post-batch-verify", "--create-followup-issue"})
 	if code != 0 {
@@ -860,8 +932,8 @@ func TestRunDaemonParallelRunsVerificationOnceAfterWorkers(t *testing.T) {
 			continue
 		}
 		workerCalls++
-		if got := flagValue(cmd[1:], "--limit"); got != "3" {
-			t.Fatalf("daemon worker limit = %q, want 3 in %#v", got, cmd)
+		if got := flagValue(cmd[1:], "--issue"); got == "" {
+			t.Fatalf("daemon worker missing --issue in %#v", cmd)
 		}
 	}
 	if workerCalls != 2 {
@@ -947,12 +1019,13 @@ func TestRunDaemonCommandSupportsAllState(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{issues: []githublifecycle.Issue{{Number: 71}}, commentsByIssue: map[int][]githublifecycle.IssueComment{}})
 
 	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "3", "--state", "all", "--dry-run", "--poll-interval-seconds", "1"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--autonomous", "--state", "all", "--limit", "3", "--repo", "owner/repo", "--dry-run"})
+	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run"})
 }
 
 func TestRunDaemonCommandMapsIssueFlowFlags(t *testing.T) {

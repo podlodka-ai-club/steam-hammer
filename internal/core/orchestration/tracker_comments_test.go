@@ -122,3 +122,37 @@ func TestSelectLatestParseableDecompositionPlanParsesLatestPlan(t *testing.T) {
 		t.Fatalf("comment id = %d, want 13", latest.CommentID)
 	}
 }
+
+func TestParseClarificationRequestText(t *testing.T) {
+	body := strings.Join([]string{
+		"Need answer before continuing",
+		ClarificationRequestMarker,
+		"```json",
+		`{"question":"Should this pause on unsafe writes?","reason":"Needs product decision"}`,
+		"```",
+	}, "\n")
+
+	payload, err := ParseClarificationRequestText(body)
+	if err != nil {
+		t.Fatalf("ParseClarificationRequestText() error = %v", err)
+	}
+	if payload["question"] != "Should this pause on unsafe writes?" {
+		t.Fatalf("question = %#v, want normalized value", payload["question"])
+	}
+	if payload["reason"] != "Needs product decision" {
+		t.Fatalf("reason = %#v, want normalized value", payload["reason"])
+	}
+}
+
+func TestLatestClarificationRequestFromAgentOutputIgnoresMalformedPayload(t *testing.T) {
+	body := strings.Join([]string{
+		ClarificationRequestMarker,
+		"```json",
+		`{"question":"   "}`,
+		"```",
+	}, "\n")
+
+	if payload := LatestClarificationRequestFromAgentOutput(body); payload != nil {
+		t.Fatalf("LatestClarificationRequestFromAgentOutput() = %#v, want nil", payload)
+	}
+}

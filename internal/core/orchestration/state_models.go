@@ -30,30 +30,30 @@ const (
 // that is persisted in tracker comments today. Optional nested payloads stay
 // additive so Go can consume the Python-produced state without changing it.
 type TrackedState struct {
-	Status                 string             `json:"status,omitempty"`
-	TaskType               string             `json:"task_type,omitempty"`
-	Issue                  *int               `json:"issue,omitempty"`
-	PR                     *int               `json:"pr,omitempty"`
-	Branch                 string             `json:"branch,omitempty"`
-	BaseBranch             string             `json:"base_branch,omitempty"`
-	Runner                 string             `json:"runner,omitempty"`
-	Agent                  string             `json:"agent,omitempty"`
-	Model                  string             `json:"model,omitempty"`
-	Attempt                int                `json:"attempt,omitempty"`
-	Stage                  string             `json:"stage,omitempty"`
-	NextAction             string             `json:"next_action,omitempty"`
-	Error                  string             `json:"error,omitempty"`
-	Timestamp              string             `json:"timestamp,omitempty"`
-	WorkflowChecks         []VerificationStep `json:"workflow_checks,omitempty"`
-	MergeReadiness         *PRMergeReadiness  `json:"merge_readiness,omitempty"`
-	RequiredFileValidation map[string]any     `json:"required_file_validation,omitempty"`
-	MergePolicy            map[string]any     `json:"merge_policy,omitempty"`
-	CIChecks               []map[string]any   `json:"ci_checks,omitempty"`
-	CIDiagnostics          map[string]any     `json:"ci_diagnostics,omitempty"`
-	ResidualUntrackedFiles []string           `json:"residual_untracked_files,omitempty"`
-	ResidualUntrackedCount int                `json:"residual_untracked_count,omitempty"`
-	Stats                  map[string]any     `json:"stats,omitempty"`
-	Decomposition          map[string]any     `json:"decomposition,omitempty"`
+	Status                 string                    `json:"status,omitempty"`
+	TaskType               string                    `json:"task_type,omitempty"`
+	Issue                  *int                      `json:"issue,omitempty"`
+	PR                     *int                      `json:"pr,omitempty"`
+	Branch                 string                    `json:"branch,omitempty"`
+	BaseBranch             string                    `json:"base_branch,omitempty"`
+	Runner                 string                    `json:"runner,omitempty"`
+	Agent                  string                    `json:"agent,omitempty"`
+	Model                  string                    `json:"model,omitempty"`
+	Attempt                int                       `json:"attempt,omitempty"`
+	Stage                  string                    `json:"stage,omitempty"`
+	NextAction             string                    `json:"next_action,omitempty"`
+	Error                  string                    `json:"error,omitempty"`
+	Timestamp              string                    `json:"timestamp,omitempty"`
+	WorkflowChecks         []VerificationStep        `json:"workflow_checks,omitempty"`
+	MergeReadiness         *PRMergeReadiness         `json:"merge_readiness,omitempty"`
+	RequiredFileValidation *PRRequiredFileValidation `json:"required_file_validation,omitempty"`
+	MergePolicy            *MergePolicy              `json:"merge_policy,omitempty"`
+	CIChecks               []PRCICheck               `json:"ci_checks,omitempty"`
+	CIDiagnostics          *CIDiagnostics            `json:"ci_diagnostics,omitempty"`
+	ResidualUntrackedFiles []string                  `json:"residual_untracked_files,omitempty"`
+	ResidualUntrackedCount int                       `json:"residual_untracked_count,omitempty"`
+	Stats                  map[string]any            `json:"stats,omitempty"`
+	Decomposition          map[string]any            `json:"decomposition,omitempty"`
 }
 
 type PullRequestFacts struct {

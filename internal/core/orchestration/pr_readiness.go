@@ -37,14 +37,19 @@ type PRReadinessFacts struct {
 }
 
 type PRCICheck struct {
-	Name  string `json:"name,omitempty"`
-	State string `json:"state,omitempty"`
-	URL   string `json:"url,omitempty"`
+	Name       string `json:"name,omitempty"`
+	State      string `json:"state,omitempty"`
+	URL        string `json:"url,omitempty"`
+	Conclusion string `json:"conclusion,omitempty"`
 }
 
 type PRRequiredFileValidation struct {
-	Status       string
-	MissingFiles []string
+	Status            string   `json:"status,omitempty"`
+	RequiredFileCount int      `json:"required_file_count,omitempty"`
+	RequiredFiles     []string `json:"required_files,omitempty"`
+	MatchedFiles      []string `json:"matched_files,omitempty"`
+	MissingFiles      []string `json:"missing_files,omitempty"`
+	ChangedFileCount  int      `json:"changed_file_count,omitempty"`
 }
 
 type PRReadiness struct {

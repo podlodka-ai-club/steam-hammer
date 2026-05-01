@@ -636,9 +636,12 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 		}
 
 		if cycleCode == 0 && config.postBatchVerify {
-			verifyCode := a.runPython(ctx, buildVerifyPythonArgs(a.runtime.RunnerScript(), config.opts, config.createFollowupIssue))
-			if verifyCode != 0 {
-				cycleCode = verifyCode
+			verification, err := a.runPostBatchVerification(ctx, config.opts, config.createFollowupIssue, config.sessionPath)
+			if err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: post-batch verification failed: %v\n", err)
+				cycleCode = 1
+			} else if strings.EqualFold(strings.TrimSpace(verification.Status), orchestration.StatusFailed) {
+				cycleCode = 1
 			}
 		}
 		if cycleCode != 0 {
@@ -730,9 +733,12 @@ func (a *App) runSerialDaemon(ctx context.Context, config daemonParallelConfig) 
 				}
 			}
 			if cycleCode == 0 && config.postBatchVerify {
-				verifyCode := a.runPython(ctx, buildVerifyPythonArgs(a.runtime.RunnerScript(), config.opts, config.createFollowupIssue))
-				if verifyCode != 0 {
-					cycleCode = verifyCode
+				verification, err := a.runPostBatchVerification(ctx, config.opts, config.createFollowupIssue, config.sessionPath)
+				if err != nil {
+					_, _ = fmt.Fprintf(a.err, "orchestrator: post-batch verification failed: %v\n", err)
+					cycleCode = 1
+				} else if strings.EqualFold(strings.TrimSpace(verification.Status), orchestration.StatusFailed) {
+					cycleCode = 1
 				}
 			}
 			if cycleCode != 0 {

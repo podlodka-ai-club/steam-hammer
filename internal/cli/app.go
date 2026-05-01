@@ -12,6 +12,7 @@ type App struct {
 	out     io.Writer
 	err     io.Writer
 	runner  Runner
+	shell   shellExecutor
 	start   DetachedStarter
 	clone   BatchClonePreparer
 	daemon  daemonLifecycle
@@ -23,6 +24,7 @@ func NewApp(out, err io.Writer) *App {
 		out:     out,
 		err:     err,
 		runner:  ExecRunner{Stdout: out, Stderr: err},
+		shell:   execShellExecutor{},
 		start:   ExecDetachedStarter{},
 		clone:   ExecBatchClonePreparer{},
 		daemon:  githublifecycle.NewAdapter(nil),

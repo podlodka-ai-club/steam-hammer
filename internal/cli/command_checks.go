@@ -2,11 +2,14 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
+
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 )
 
 func (a *App) runDoctor(ctx context.Context, args []string) int {
@@ -55,12 +58,23 @@ func (a *App) runVerify(ctx context.Context, args []string) int {
 		return 2
 	}
 
-	pythonArgs := []string{a.runtime.RunnerScript(), "--post-batch-verify"}
-	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
-	if *createFollowupIssue {
-		pythonArgs = append(pythonArgs, "--create-followup-issue")
+	verification, err := a.runPostBatchVerification(ctx, opts, *createFollowupIssue, "")
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			_, _ = fmt.Fprintln(a.err, "orchestrator: verification timed out")
+			return 124
+		}
+		if errors.Is(err, context.Canceled) {
+			_, _ = fmt.Fprintln(a.err, "orchestrator: verification canceled")
+			return 130
+		}
+		_, _ = fmt.Fprintf(a.err, "orchestrator: verification failed: %v\n", err)
+		return 1
 	}
-	return a.runPython(ctx, pythonArgs)
+	if strings.EqualFold(strings.TrimSpace(verification.Status), orchestration.StatusFailed) {
+		return 1
+	}
+	return 0
 }
 
 func (a *App) runStatus(ctx context.Context, args []string) int {

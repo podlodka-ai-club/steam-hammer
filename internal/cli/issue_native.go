@@ -240,32 +240,13 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 			_, _ = fmt.Fprintf(a.out, "Skipping issue #%d: branch %q already exists\n", issue.Number, issueBranch)
 			return 0
 		}
-		_, _ = fmt.Fprintln(a.err, "orchestrator: falling back to python issue runner: branch reuse is not supported by the Go-native issue path yet")
-		return a.runPython(ctx, buildIssuePythonArgs(
-			a.runtime.RunnerScript(),
-			opts.common,
-			issue.Number,
-			opts.base,
-			opts.includeEmpty,
-			false,
-			opts.failOnExisting,
-			opts.forceIssueFlow,
-			opts.skipIfPRExists,
-			opts.noSkipIfPRExists,
-			opts.skipIfBranchExists,
-			opts.noSkipIfBranchExists,
-			opts.forceReprocess,
-			opts.conflictRecoveryOnly,
-			opts.syncReusedBranch,
-			opts.noSyncReusedBranch,
-			opts.syncStrategy,
-			nilFlagState{},
-		))
 	}
 
 	runnerName := fallbackString(strings.TrimSpace(*opts.common.runner), nativeIssueDefaultRunner)
 	agentName := fallbackString(strings.TrimSpace(*opts.common.agent), nativeIssueDefaultAgent)
 	modelName := fallbackString(strings.TrimSpace(*opts.common.model), nativeIssueDefaultModel)
+	branchLifecycle := orchestration.BranchLifecycleCreated
+	var reusedBranchSync *orchestration.ReusedBranchSyncVerdict
 	postState := func(state orchestration.TrackedState) {
 		if err := a.safePostIssueState(ctx, repo, issue.Number, state); err != nil {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: warning: failed to post state for issue #%d: %v\n", issue.Number, err)
@@ -273,40 +254,48 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 	}
 	failedState := func(stage, nextAction, message string) orchestration.TrackedState {
 		return orchestration.TrackedState{
-			Status:     orchestration.StatusFailed,
-			TaskType:   "issue",
-			Issue:      intPtr(issue.Number),
-			Branch:     issueBranch,
-			BaseBranch: baseBranch,
-			Runner:     runnerName,
-			Agent:      agentName,
-			Model:      modelName,
-			Attempt:    1,
-			Stage:      stage,
-			NextAction: nextAction,
-			Error:      message,
-			Timestamp:  time.Now().UTC().Format(time.RFC3339),
+			Status:           orchestration.StatusFailed,
+			TaskType:         "issue",
+			Issue:            intPtr(issue.Number),
+			Branch:           issueBranch,
+			BranchLifecycle:  branchLifecycle,
+			BaseBranch:       baseBranch,
+			Runner:           runnerName,
+			Agent:            agentName,
+			Model:            modelName,
+			Attempt:          1,
+			Stage:            stage,
+			NextAction:       nextAction,
+			Error:            message,
+			Timestamp:        time.Now().UTC().Format(time.RFC3339),
+			ReusedBranchSync: reusedBranchSync,
 		}
 	}
-	postState(orchestration.TrackedState{
-		Status:     orchestration.StatusInProgress,
-		TaskType:   "issue",
-		Issue:      intPtr(issue.Number),
-		Branch:     issueBranch,
-		BaseBranch: baseBranch,
-		Runner:     runnerName,
-		Agent:      agentName,
-		Model:      modelName,
-		Attempt:    1,
-		Stage:      "agent_run",
-		NextAction: "wait_for_agent_result",
-		Timestamp:  time.Now().UTC().Format(time.RFC3339),
-	})
-	if err := a.checkoutFreshIssueBranch(ctx, repoRoot, baseBranch, issueBranch); err != nil {
-		postState(failedState("prepare_branch", "inspect_branch_setup", err.Error()))
+	pushAfterAgentWithLease := false
+	branchLifecycle, reusedBranchSync, pushAfterAgentWithLease, err = a.prepareIssueBranchPreflight(ctx, repoRoot, baseBranch, issueBranch, localBranchExists, remoteBranchExists, opts.syncReusedBranch, opts.syncStrategy)
+	if err != nil {
+		state := failedState("sync_branch", "resolve_branch_sync_conflict", err.Error())
+		state.Status = orchestration.StatusBlocked
+		postState(state)
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to prepare issue branch %q: %v\n", issueBranch, err)
 		return 1
 	}
+	postState(orchestration.TrackedState{
+		Status:           orchestration.StatusInProgress,
+		TaskType:         "issue",
+		Issue:            intPtr(issue.Number),
+		Branch:           issueBranch,
+		BranchLifecycle:  branchLifecycle,
+		BaseBranch:       baseBranch,
+		Runner:           runnerName,
+		Agent:            agentName,
+		Model:            modelName,
+		Attempt:          1,
+		Stage:            "agent_run",
+		NextAction:       "wait_for_agent_result",
+		Timestamp:        time.Now().UTC().Format(time.RFC3339),
+		ReusedBranchSync: reusedBranchSync,
+	})
 	preRunUntracked, err := a.gitUntrackedFiles(ctx, repoRoot)
 	if err != nil {
 		postState(failedState("agent_run", "inspect_git_status", err.Error()))
@@ -343,20 +332,22 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 				_, _ = fmt.Fprintf(a.err, "orchestrator: warning: failed to post clarification request for issue #%d: %v\n", issue.Number, err)
 			}
 			postState(orchestration.TrackedState{
-				Status:     orchestration.StatusWaitingForAuthor,
-				TaskType:   "issue",
-				Issue:      intPtr(issue.Number),
-				Branch:     issueBranch,
-				BaseBranch: baseBranch,
-				Runner:     runnerName,
-				Agent:      agentName,
-				Model:      modelName,
-				Attempt:    1,
-				Stage:      "agent_run",
-				NextAction: "await_author_reply",
-				Error:      reason,
-				Timestamp:  time.Now().UTC().Format(time.RFC3339),
-				Stats:      statsMap(result.Stats),
+				Status:           orchestration.StatusWaitingForAuthor,
+				TaskType:         "issue",
+				Issue:            intPtr(issue.Number),
+				Branch:           issueBranch,
+				BranchLifecycle:  branchLifecycle,
+				BaseBranch:       baseBranch,
+				Runner:           runnerName,
+				Agent:            agentName,
+				Model:            modelName,
+				Attempt:          1,
+				Stage:            "agent_run",
+				NextAction:       "await_author_reply",
+				Error:            reason,
+				Timestamp:        time.Now().UTC().Format(time.RFC3339),
+				ReusedBranchSync: reusedBranchSync,
+				Stats:            statsMap(result.Stats),
 			})
 			_, _ = fmt.Fprintf(a.out, "Paused issue #%d for clarification: %s\n", issue.Number, question)
 			return 0
@@ -370,20 +361,22 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 	}
 	if !hasChanges {
 		postState(orchestration.TrackedState{
-			Status:     orchestration.StatusWaitingForAuthor,
-			TaskType:   "issue",
-			Issue:      intPtr(issue.Number),
-			Branch:     issueBranch,
-			BaseBranch: baseBranch,
-			Runner:     runnerName,
-			Agent:      agentName,
-			Model:      modelName,
-			Attempt:    1,
-			Stage:      "agent_run",
-			NextAction: "inspect_noop_result",
-			Error:      "Agent finished without changing the worktree",
-			Timestamp:  time.Now().UTC().Format(time.RFC3339),
-			Stats:      statsMap(result.Stats),
+			Status:           orchestration.StatusWaitingForAuthor,
+			TaskType:         "issue",
+			Issue:            intPtr(issue.Number),
+			Branch:           issueBranch,
+			BranchLifecycle:  branchLifecycle,
+			BaseBranch:       baseBranch,
+			Runner:           runnerName,
+			Agent:            agentName,
+			Model:            modelName,
+			Attempt:          1,
+			Stage:            "agent_run",
+			NextAction:       "inspect_noop_result",
+			Error:            "Agent finished without changing the worktree",
+			Timestamp:        time.Now().UTC().Format(time.RFC3339),
+			ReusedBranchSync: reusedBranchSync,
+			Stats:            statsMap(result.Stats),
 		})
 		_, _ = fmt.Fprintf(a.out, "No changes detected for issue #%d; skipping commit and PR\n", issue.Number)
 		return 0
@@ -404,7 +397,7 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to commit issue changes: %v\n", err)
 		return 1
 	}
-	if err := a.gitPushBranch(ctx, repoRoot, issueBranch); err != nil {
+	if err := a.gitPushBranch(ctx, repoRoot, issueBranch, pushAfterAgentWithLease); err != nil {
 		postState(failedState("commit_push", "inspect_push_failure", err.Error()))
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to push issue branch %q: %v\n", issueBranch, err)
 		return 1
@@ -426,20 +419,22 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 	}
 	prNumber := parsePullRequestNumber(prURL)
 	postState(orchestration.TrackedState{
-		Status:     orchestration.StatusReadyForReview,
-		TaskType:   "issue",
-		Issue:      intPtr(issue.Number),
-		PR:         prNumber,
-		Branch:     issueBranch,
-		BaseBranch: baseBranch,
-		Runner:     runnerName,
-		Agent:      agentName,
-		Model:      modelName,
-		Attempt:    1,
-		Stage:      "pr_ready",
-		NextAction: "wait_for_review",
-		Timestamp:  time.Now().UTC().Format(time.RFC3339),
-		Stats:      statsMap(result.Stats),
+		Status:           orchestration.StatusReadyForReview,
+		TaskType:         "issue",
+		Issue:            intPtr(issue.Number),
+		PR:               prNumber,
+		Branch:           issueBranch,
+		BranchLifecycle:  branchLifecycle,
+		BaseBranch:       baseBranch,
+		Runner:           runnerName,
+		Agent:            agentName,
+		Model:            modelName,
+		Attempt:          1,
+		Stage:            "pr_ready",
+		NextAction:       "wait_for_review",
+		Timestamp:        time.Now().UTC().Format(time.RFC3339),
+		ReusedBranchSync: reusedBranchSync,
+		Stats:            statsMap(result.Stats),
 	})
 	if prURL != "" {
 		_, _ = fmt.Fprintf(a.out, "Prepared issue #%d for review: %s\n", issue.Number, prURL)
@@ -598,6 +593,154 @@ func (a *App) checkoutFreshIssueBranch(ctx context.Context, repoRoot, baseBranch
 	return nil
 }
 
+func (a *App) prepareIssueBranchPreflight(ctx context.Context, repoRoot, baseBranch, branchName string, localExists, remoteExists, syncReusedBranch bool, strategy string) (string, *orchestration.ReusedBranchSyncVerdict, bool, error) {
+	if !localExists && !remoteExists {
+		if err := a.checkoutFreshIssueBranch(ctx, repoRoot, baseBranch, branchName); err != nil {
+			return orchestration.BranchLifecycleCreated, nil, false, err
+		}
+		return orchestration.BranchLifecycleCreated, nil, false, nil
+	}
+
+	if _, err := a.runGit(ctx, repoRoot, "checkout", baseBranch); err != nil {
+		return orchestration.BranchLifecycleReused, nil, false, err
+	}
+	if localExists {
+		if _, err := a.runGit(ctx, repoRoot, "checkout", branchName); err != nil {
+			return orchestration.BranchLifecycleReused, nil, false, err
+		}
+	} else {
+		if _, err := a.runGit(ctx, repoRoot, "checkout", "-b", branchName, "--track", "origin/"+branchName); err != nil {
+			return orchestration.BranchLifecycleReused, nil, false, err
+		}
+	}
+
+	if !syncReusedBranch {
+		return orchestration.BranchLifecycleReused, nil, false, nil
+	}
+
+	verdict, err := a.syncReusedIssueBranchWithBase(ctx, repoRoot, baseBranch, branchName, strategy)
+	if err != nil {
+		return orchestration.BranchLifecycleReused, nil, false, err
+	}
+	useForceWithLease := verdict.Changed && strings.TrimSpace(verdict.AppliedStrategy) == "rebase"
+	return orchestration.BranchLifecycleReused, &verdict, useForceWithLease, nil
+}
+
+func normalizeSyncStrategy(strategy string) (string, error) {
+	normalized := strings.TrimSpace(strategy)
+	if normalized == "" {
+		return "rebase", nil
+	}
+	switch normalized {
+	case "rebase", "merge":
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("unsupported sync strategy %q (want rebase or merge)", strategy)
+	}
+}
+
+func (a *App) syncReusedIssueBranchWithBase(ctx context.Context, repoRoot, baseBranch, branchName, strategy string) (orchestration.ReusedBranchSyncVerdict, error) {
+	normalizedStrategy, err := normalizeSyncStrategy(strategy)
+	if err != nil {
+		return orchestration.ReusedBranchSyncVerdict{}, err
+	}
+	remoteBaseRef := "origin/" + strings.TrimSpace(baseBranch)
+	if _, err := a.runGit(ctx, repoRoot, "fetch", "origin", baseBranch); err != nil {
+		return orchestration.ReusedBranchSyncVerdict{}, err
+	}
+	if normalizedStrategy == "merge" {
+		return a.mergeSyncWithAutoResolution(ctx, repoRoot, remoteBaseRef, branchName, normalizedStrategy)
+	}
+
+	beforeSyncSHA, err := a.gitCurrentHeadSHA(ctx, repoRoot)
+	if err != nil {
+		return orchestration.ReusedBranchSyncVerdict{}, err
+	}
+	if _, err := a.runGit(ctx, repoRoot, "rebase", remoteBaseRef); err != nil {
+		_, _ = a.gitCommandSucceeds(ctx, repoRoot, "rebase", "--abort")
+		return a.mergeSyncWithAutoResolution(ctx, repoRoot, remoteBaseRef, branchName, normalizedStrategy)
+	}
+	afterSyncSHA, err := a.gitCurrentHeadSHA(ctx, repoRoot)
+	if err != nil {
+		return orchestration.ReusedBranchSyncVerdict{}, err
+	}
+	changed := beforeSyncSHA != afterSyncSHA
+	return orchestration.ReusedBranchSyncVerdict{
+		BranchName:        branchName,
+		RemoteBaseRef:     remoteBaseRef,
+		RequestedStrategy: normalizedStrategy,
+		AppliedStrategy:   "rebase",
+		Status:            branchSyncStatus(changed, false),
+		Changed:           changed,
+		AutoResolved:      false,
+	}, nil
+}
+
+func (a *App) mergeSyncWithAutoResolution(ctx context.Context, repoRoot, remoteBaseRef, branchName, requestedStrategy string) (orchestration.ReusedBranchSyncVerdict, error) {
+	beforeSyncSHA, err := a.gitCurrentHeadSHA(ctx, repoRoot)
+	if err != nil {
+		return orchestration.ReusedBranchSyncVerdict{}, err
+	}
+	autoResolved := false
+	if _, err := a.runGit(ctx, repoRoot, "merge", "--no-edit", "-X", "theirs", remoteBaseRef); err != nil {
+		autoResolved = true
+		if err := a.autoResolveMergeConflictsWithBase(ctx, repoRoot, remoteBaseRef); err != nil {
+			_, _ = a.gitCommandSucceeds(ctx, repoRoot, "merge", "--abort")
+			return orchestration.ReusedBranchSyncVerdict{}, fmt.Errorf(
+				"failed to auto-resolve merge conflicts while syncing reused branch %q with %q: resolve conflicts manually or rerun with --no-sync-reused-branch",
+				branchName,
+				remoteBaseRef,
+			)
+		}
+	}
+	afterSyncSHA, err := a.gitCurrentHeadSHA(ctx, repoRoot)
+	if err != nil {
+		return orchestration.ReusedBranchSyncVerdict{}, err
+	}
+	changed := beforeSyncSHA != afterSyncSHA
+	return orchestration.ReusedBranchSyncVerdict{
+		BranchName:        branchName,
+		RemoteBaseRef:     remoteBaseRef,
+		RequestedStrategy: requestedStrategy,
+		AppliedStrategy:   "merge",
+		Status:            branchSyncStatus(changed, autoResolved),
+		Changed:           changed,
+		AutoResolved:      autoResolved && changed,
+	}, nil
+}
+
+func branchSyncStatus(changed, autoResolved bool) string {
+	if !changed {
+		return orchestration.BranchSyncStatusAlreadyCurrent
+	}
+	if autoResolved {
+		return orchestration.BranchSyncStatusAutoResolved
+	}
+	return orchestration.BranchSyncStatusSyncedCleanly
+}
+
+func (a *App) autoResolveMergeConflictsWithBase(ctx context.Context, repoRoot, remoteBaseRef string) error {
+	conflictedPaths, err := a.gitConflictedPaths(ctx, repoRoot)
+	if err != nil {
+		return err
+	}
+	if len(conflictedPaths) == 0 {
+		return fmt.Errorf("merge with %q reported conflicts, but no conflicted files were detected", remoteBaseRef)
+	}
+	for _, path := range conflictedPaths {
+		if _, err := a.runGit(ctx, repoRoot, "checkout", "--theirs", "--", path); err != nil {
+			return err
+		}
+	}
+	if _, err := a.runGit(ctx, repoRoot, "add", "-A"); err != nil {
+		return err
+	}
+	if _, err := a.runGit(ctx, repoRoot, "commit", "--no-edit"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (a *App) gitStageIssueChanges(ctx context.Context, repoRoot string, baseline []string) error {
 	if _, err := a.runGit(ctx, repoRoot, "add", "-u"); err != nil {
 		return err
@@ -630,11 +773,16 @@ func (a *App) gitCommit(ctx context.Context, repoRoot, message string) error {
 	return err
 }
 
-func (a *App) gitPushBranch(ctx context.Context, repoRoot, branchName string) error {
+func (a *App) gitPushBranch(ctx context.Context, repoRoot, branchName string, forceWithLease bool) error {
 	if err := a.assertNativeGitContext(ctx, repoRoot, branchName, "push branch"); err != nil {
 		return err
 	}
-	_, err := a.runGit(ctx, repoRoot, "push", "-u", "origin", branchName)
+	args := []string{"push", "-u"}
+	if forceWithLease {
+		args = append(args, "--force-with-lease")
+	}
+	args = append(args, "origin", branchName)
+	_, err := a.runGit(ctx, repoRoot, args...)
 	return err
 }
 
@@ -666,6 +814,14 @@ func (a *App) gitRepoRoot(ctx context.Context, cwd string) (string, error) {
 
 func (a *App) gitCurrentBranch(ctx context.Context, cwd string) (string, error) {
 	stdout, err := a.runGit(ctx, cwd, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(stdout), nil
+}
+
+func (a *App) gitCurrentHeadSHA(ctx context.Context, cwd string) (string, error) {
+	stdout, err := a.runGit(ctx, cwd, "rev-parse", "HEAD")
 	if err != nil {
 		return "", err
 	}
@@ -726,6 +882,34 @@ func (a *App) gitUntrackedFiles(ctx context.Context, cwd string) ([]string, erro
 	}
 	sort.Strings(files)
 	return files, nil
+}
+
+func (a *App) gitConflictedPaths(ctx context.Context, cwd string) ([]string, error) {
+	stdout, err := a.runGit(ctx, cwd, "diff", "--name-only", "--diff-filter=U")
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(stdout) == "" {
+		return nil, nil
+	}
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	paths := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			paths = append(paths, line)
+		}
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func (a *App) gitCommandSucceeds(ctx context.Context, cwd string, args ...string) (bool, error) {
+	result, err := a.runShell(ctx, cwd, gitCommand(args...))
+	if err != nil {
+		return false, err
+	}
+	return result.ExitCode == 0, nil
 }
 
 func (a *App) runGit(ctx context.Context, cwd string, args ...string) (string, error) {

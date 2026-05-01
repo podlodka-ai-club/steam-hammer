@@ -655,6 +655,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - If merge-based auto-resolution still cannot finish, the run stops before agent execution with a clear error and hints to resolve conflicts.
 - If sync updates branch history and agent produces no new file changes, the script first runs forced recovery verification and only then pushes sync-only branch updates so existing PR conflict status can be refreshed safely.
 - For rebase-based sync that rewrites branch history, push uses `--force-with-lease` automatically.
+- The Go-native `run issue` path now performs the normal reused-branch sync preflight itself; dedicated sync-only recovery mode (`--conflict-recovery-only`) still goes through the compatibility path.
 - Use `--sync-strategy merge` if you prefer merge-based sync instead of rebase.
 - Use `--no-sync-reused-branch` only when you intentionally want to skip auto-sync.
 - Recovery verification always runs full-repo checks (`workflow.commands` when configured, otherwise detected repo defaults). You can add `workflow.verification.focused_commands` to also run extra uncached checks in a fresh clone before the branch is considered safely recovered.

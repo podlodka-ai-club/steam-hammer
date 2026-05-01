@@ -35,6 +35,7 @@ type TrackedState struct {
 	Issue                  *int                      `json:"issue,omitempty"`
 	PR                     *int                      `json:"pr,omitempty"`
 	Branch                 string                    `json:"branch,omitempty"`
+	BranchLifecycle        string                    `json:"branch_lifecycle,omitempty"`
 	BaseBranch             string                    `json:"base_branch,omitempty"`
 	Runner                 string                    `json:"runner,omitempty"`
 	Agent                  string                    `json:"agent,omitempty"`
@@ -52,6 +53,7 @@ type TrackedState struct {
 	CIDiagnostics          *CIDiagnostics            `json:"ci_diagnostics,omitempty"`
 	ResidualUntrackedFiles []string                  `json:"residual_untracked_files,omitempty"`
 	ResidualUntrackedCount int                       `json:"residual_untracked_count,omitempty"`
+	ReusedBranchSync       *ReusedBranchSyncVerdict  `json:"reused_branch_sync,omitempty"`
 	Stats                  map[string]any            `json:"stats,omitempty"`
 	Decomposition          map[string]any            `json:"decomposition,omitempty"`
 }

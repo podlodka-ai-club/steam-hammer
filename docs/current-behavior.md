@@ -17,7 +17,7 @@
 - Есть Go entrypoint `cmd/orchestrator`.
 - `init` создает scaffold для `project-config.json` и `local-config.json`.
 - `doctor` и `autodoctor` проверяют окружение, конфиг и могут делать runner smoke check.
-- `run issue` запускает Go-first one-shot issue orchestration для fresh-branch GitHub path.
+- `run issue` запускает Go-first one-shot issue orchestration для fresh-branch и reused-branch GitHub path.
 - `run batch` запускает явный список issue ID как batch entrypoint: в `--dry-run` режиме показывает per-issue запуск, а в `--detach` стартует отдельный worker на каждый issue.
 - `run pr` запускает review-comments flow для существующего PR.
 - `run daemon` запускает Go-owned polling/claim loop и затем dispatch'ит совместимый worker path для каждого выбранного таска.
@@ -25,7 +25,7 @@
 ### Issue flow
 
 - Поддерживаются одиночный запуск по `--issue` / `run issue --id` и batch/polling обработка списка issue.
-- Для нового GitHub issue без существующего branch/PR Go сам выбирает mode, готовит branch, запускает agent, коммитит, пушит и создает PR без вызова Python runner'а.
+- Для нового GitHub issue без существующего linked PR Go сам выбирает mode, готовит fresh/reused branch, при необходимости синхронизирует reused branch с base, запускает agent, коммитит, пушит и создает PR без вызова Python runner'а.
 - Скрипт создает или переиспользует deterministic issue branch и PR.
 - Для reused branch есть sync с base branch, стратегии `rebase` и `merge`, fallback с `rebase` на `merge` и conservative auto-resolution части merge conflicts.
 - Для image-only или image-backed issue attachments могут попадать в prompt.
@@ -83,7 +83,7 @@
 - `run pr` fallback paths, которые еще не перенесены в Go: `--dry-run`, `--isolate-worktree`, `--detach`, `--post-pr-summary`, follow-up branch mode и conflict-recovery/sync-only варианты;
 - `doctor`, `autodoctor`, `status` и другие еще не перенесенные CLI compatibility surfaces;
 - batch/daemon worker execution paths, которые все еще запускаются через script adapter;
-- issue-path blockers, еще не реализованные в Go: reused branch handling, linked PR reuse internals beyond adapter routing, dedicated conflict-recovery-only runtime.
+- issue-path blockers, еще не реализованные в Go: linked PR reuse internals beyond adapter routing и dedicated conflict-recovery-only runtime.
 
 ### Post-#204 safety invariants
 

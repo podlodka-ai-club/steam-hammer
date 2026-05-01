@@ -314,7 +314,7 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to commit PR changes: %v\n", err)
 			return 1
 		}
-		if err := a.gitPushBranch(ctx, repoRoot, activeBranch); err != nil {
+		if err := a.gitPushBranch(ctx, repoRoot, activeBranch, false); err != nil {
 			postState(failedState(attempt, "commit_push", "inspect_push_failure", err.Error()))
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to push PR branch %q: %v\n", activeBranch, err)
 			return 1

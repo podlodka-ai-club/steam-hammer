@@ -26,6 +26,7 @@ const (
 type nativeIssueOptions struct {
 	issueID              int
 	common               commonOptions
+	sessionPath          string
 	base                 string
 	includeEmpty         bool
 	failOnExisting       bool
@@ -89,7 +90,13 @@ func nativeIssueFallbackReason(opts nativeIssueOptions) string {
 	return ""
 }
 
-func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueOptions) int {
+func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueOptions) (exitCode int) {
+	tracker := startNativeSessionTracker(opts.sessionPath, fmt.Sprintf("issue #%d", opts.issueID), strconv.Itoa(opts.issueID))
+	var latestState *orchestration.TrackedState
+	defer func() {
+		tracker.finish(latestState, exitCode)
+	}()
+
 	issue, err := a.issueLifecycle.FetchIssue(ctx, repo, opts.issueID)
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to fetch issue #%d: %v\n", opts.issueID, err)
@@ -248,6 +255,8 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 	branchLifecycle := orchestration.BranchLifecycleCreated
 	var reusedBranchSync *orchestration.ReusedBranchSyncVerdict
 	postState := func(state orchestration.TrackedState) {
+		copy := state
+		latestState = &copy
 		if err := a.safePostIssueState(ctx, repo, issue.Number, state); err != nil {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: warning: failed to post state for issue #%d: %v\n", issue.Number, err)
 		}

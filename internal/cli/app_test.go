@@ -926,6 +926,86 @@ func TestRunIssueUsesGoNativeHappyPath(t *testing.T) {
 	}
 }
 
+func TestRunIssueNativePersistsAutonomousSessionCheckpoint(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 1},
+		{ExitCode: 2},
+		{},
+		{},
+		{Stdout: ""},
+		{Stdout: "M internal/cli/command_run.go\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+		{},
+		{Stdout: "new.txt\n"},
+		{},
+		{},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+		{},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+		createPRURL:   "https://github.com/owner/repo/pull/101",
+	}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{Stats: agentexec.Stats{ElapsedSeconds: 12}}}
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo", "--autonomous-session-file", sessionPath})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	state, err := orchestration.LoadState(sessionPath)
+	if err != nil {
+		t.Fatalf("LoadState() error = %v", err)
+	}
+	if state.Checkpoint == nil {
+		t.Fatal("checkpoint = nil")
+	}
+	if got := state.Checkpoint.Phase; got != "completed" {
+		t.Fatalf("checkpoint phase = %q, want completed", got)
+	}
+	if got := state.Checkpoint.Current; got != "Idle between autonomous runs" {
+		t.Fatalf("checkpoint current = %q", got)
+	}
+	if got := state.Checkpoint.Counts.Processed; got != 1 {
+		t.Fatalf("processed count = %d, want 1", got)
+	}
+	if got := state.Checkpoint.Counts.Failures; got != 0 {
+		t.Fatalf("failure count = %d, want 0", got)
+	}
+	if !reflect.DeepEqual(state.Checkpoint.Done, []string{"issue #71 (ready-for-review)"}) {
+		t.Fatalf("done = %#v", state.Checkpoint.Done)
+	}
+	if !reflect.DeepEqual(state.Checkpoint.Next, []string{"wait for review"}) {
+		t.Fatalf("next = %#v", state.Checkpoint.Next)
+	}
+	if !reflect.DeepEqual(state.Checkpoint.IssuePRActions, []string{"prepared PR #101 for review"}) {
+		t.Fatalf("issue/pr actions = %#v", state.Checkpoint.IssuePRActions)
+	}
+	raw := state.ProcessedIssues["71"]
+	if len(raw) == 0 {
+		t.Fatal("processed issue entry for 71 is missing")
+	}
+	var tracked orchestration.TrackedState
+	if err := json.Unmarshal(raw, &tracked); err != nil {
+		t.Fatalf("json.Unmarshal(processed issue) error = %v", err)
+	}
+	if tracked.Status != orchestration.StatusReadyForReview {
+		t.Fatalf("processed issue status = %q, want ready-for-review", tracked.Status)
+	}
+}
+
 func TestRunIssueUsesGoNativeReusedBranchSyncPreflight(t *testing.T) {
 	runner := &recordingRunner{}
 	shell := &fakeShellExecutor{results: []shellExecutionResult{
@@ -1181,10 +1261,13 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
 	cloner := &recordingBatchClonePreparer{}
 	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
 	var out strings.Builder
 	app := NewApp(&out, &strings.Builder{})
 	app.SetDetachedStarter(starter)
 	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(execPath)
+	app.SetIssueLifecycle(&fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{}})
 
 	code := app.Run([]string{"run", "batch", "--ids", "71,72", "--repo", "owner/repo", "--dir", targetDir, "--detach"})
 	if code != 0 {
@@ -1198,6 +1281,14 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 	}
 	if len(starter.reqs) != 2 {
 		t.Fatalf("starter requests = %d, want 2", len(starter.reqs))
+	}
+	for _, req := range starter.reqs {
+		if req.Name != execPath {
+			t.Fatalf("worker command = %q, want %q", req.Name, execPath)
+		}
+		if len(req.Args) < 4 || !reflect.DeepEqual(req.Args[:4], []string{"run", "issue", "--id", flagValue(req.Args, "--id")}) {
+			t.Fatalf("worker args = %#v, want run issue entrypoint", req.Args)
+		}
 	}
 	if starter.reqs[0].Dir == starter.reqs[1].Dir {
 		t.Fatalf("worker dirs should differ, got %q", starter.reqs[0].Dir)
@@ -1231,6 +1322,62 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 		if !strings.Contains(printed, want) {
 			t.Fatalf("stdout = %q, want %q", printed, want)
 		}
+	}
+}
+
+func TestRunBatchDetachRoutesLinkedPRToNativePRCommand(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	cloner := &recordingBatchClonePreparer{}
+	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(execPath)
+	app.SetIssueLifecycle(&fakeDaemonLifecycle{
+		issue:           githublifecycle.Issue{Number: 71, Title: "Fix runtime", Body: "Body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		linkedPR:        &githublifecycle.PullRequest{Number: 101, Title: "Existing fix", HeadRefName: "feature/pr-101", BaseRefName: "main"},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "batch", "--ids", "71", "--repo", "owner/repo", "--dir", targetDir, "--detach"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if starter.calls != 1 {
+		t.Fatalf("starter calls = %d, want 1", starter.calls)
+	}
+	if starter.req.Name != execPath {
+		t.Fatalf("worker command = %q, want %q", starter.req.Name, execPath)
+	}
+	if !reflect.DeepEqual(starter.req.Args[:4], []string{"run", "pr", "--id", "101"}) {
+		t.Fatalf("worker args = %#v, want native pr entrypoint", starter.req.Args)
+	}
+}
+
+func TestRunBatchDetachFallsBackToPythonWhenNativeIssueUnsupported(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	cloner := &recordingBatchClonePreparer{}
+	targetDir := t.TempDir()
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(filepath.Join(targetDir, "orchestrator"))
+	app.SetIssueLifecycle(&fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{}})
+
+	code := app.Run([]string{"run", "batch", "--ids", "71", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--project-config", "project.json"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if starter.req.Name != "python3" {
+		t.Fatalf("worker command = %q, want python3", starter.req.Name)
+	}
+	if len(starter.req.Args) < 3 || !reflect.DeepEqual(starter.req.Args[:3], []string{runnerScript, "--issue", "71"}) {
+		t.Fatalf("worker args = %#v, want python issue adapter", starter.req.Args)
+	}
+	if !strings.Contains(errOut.String(), "--project-config is not supported by the Go-native issue path yet") {
+		t.Fatalf("stderr = %q, want explicit native fallback reason", errOut.String())
 	}
 }
 
@@ -1415,10 +1562,12 @@ func TestRunDaemonDetachStartsOneWorkerPerParallelTask(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
 	cloner := &recordingBatchClonePreparer{}
 	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
 	var out strings.Builder
 	app := NewApp(&out, &strings.Builder{})
 	app.SetDetachedStarter(starter)
 	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(execPath)
 
 	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--max-parallel-tasks", "2"})
 	if code != 0 {
@@ -1432,6 +1581,14 @@ func TestRunDaemonDetachStartsOneWorkerPerParallelTask(t *testing.T) {
 	}
 	if len(starter.reqs) != 2 {
 		t.Fatalf("starter requests = %d, want 2", len(starter.reqs))
+	}
+	for _, req := range starter.reqs {
+		if req.Name != execPath {
+			t.Fatalf("worker command = %q, want %q", req.Name, execPath)
+		}
+		if len(req.Args) < 2 || !reflect.DeepEqual(req.Args[:2], []string{"run", "daemon"}) {
+			t.Fatalf("worker args = %#v, want run daemon entrypoint", req.Args)
+		}
 	}
 	if starter.reqs[0].Dir == starter.reqs[1].Dir {
 		t.Fatalf("daemon worker dirs should differ, got %q", starter.reqs[0].Dir)
@@ -1476,10 +1633,12 @@ func TestRunDaemonDetachStartsThreeWorkersWhenRequested(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
 	cloner := &recordingBatchClonePreparer{}
 	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
 	var out strings.Builder
 	app := NewApp(&out, &strings.Builder{})
 	app.SetDetachedStarter(starter)
 	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(execPath)
 
 	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--max-parallel-tasks", "3"})
 	if code != 0 {
@@ -1490,6 +1649,14 @@ func TestRunDaemonDetachStartsThreeWorkersWhenRequested(t *testing.T) {
 	}
 	if len(cloner.targetDirs) != 3 {
 		t.Fatalf("clone preparations = %d, want 3", len(cloner.targetDirs))
+	}
+	for _, req := range starter.reqs {
+		if req.Name != execPath {
+			t.Fatalf("worker command = %q, want %q", req.Name, execPath)
+		}
+		if len(req.Args) < 2 || !reflect.DeepEqual(req.Args[:2], []string{"run", "daemon"}) {
+			t.Fatalf("worker args = %#v, want run daemon entrypoint", req.Args)
+		}
 	}
 	for _, workerID := range []string{"1", "2", "3"} {
 		workerDir := filepath.Join(targetDir, ".orchestrator", "workers", "daemon-"+workerID)
@@ -1694,6 +1861,110 @@ func TestRunPRUsesNativeRuntimeLoopWhenRepoExplicit(t *testing.T) {
 	}
 	if !strings.Contains(joinedShell, "git 'push' '-u' 'origin' 'feature/pr-72'") {
 		t.Fatalf("shell commands missing PR push: %s", joinedShell)
+	}
+}
+
+func TestRunPRNativePersistsAutonomousSessionCheckpoint(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: ""},
+		{Stdout: " M internal/cli/pr_native.go\n"},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: ""},
+		{Stdout: "[feature/pr-72 abc123] Address review comments for PR #72\n"},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: "/repo\n"},
+		{Stdout: "pushed\n"},
+	}}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{ExitCode: 0, Stats: agentexec.Stats{ElapsedSeconds: 5}}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue: githublifecycle.Issue{Number: 243, Title: "Parent issue", Body: "Parent issue body", URL: "https://github.com/owner/repo/issues/243", Tracker: githublifecycle.TrackerGitHub},
+		pullRequests: []githublifecycle.PullRequest{
+			{
+				Number:                  72,
+				Title:                   "Move PR review runtime loop into Go",
+				Body:                    "PR description",
+				URL:                     "https://github.com/owner/repo/pull/72",
+				HeadRefName:             "feature/pr-72",
+				BaseRefName:             "main",
+				Author:                  &githublifecycle.Actor{Login: "author"},
+				ClosingIssuesReferences: []githublifecycle.IssueReference{{Number: 243}},
+			},
+			{
+				Number:                  72,
+				Title:                   "Move PR review runtime loop into Go",
+				Body:                    "PR description",
+				URL:                     "https://github.com/owner/repo/pull/72",
+				HeadRefName:             "feature/pr-72",
+				BaseRefName:             "main",
+				Author:                  &githublifecycle.Actor{Login: "author"},
+				ClosingIssuesReferences: []githublifecycle.IssueReference{{Number: 243}},
+			},
+		},
+		reviewThreadSeq: [][]githublifecycle.PullRequestReviewThread{
+			{{
+				Comments: []githublifecycle.PullRequestReviewComment{{
+					Body:   "Please add a regression test",
+					Path:   "internal/cli/pr_native.go",
+					Line:   12,
+					Author: &githublifecycle.Actor{Login: "reviewer"},
+				}},
+			}},
+			{},
+		},
+	}
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueAgentRunner(agent)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetPRLifecycle(lifecycle)
+
+	code := app.Run([]string{"run", "pr", "--id", "72", "--repo", "owner/repo", "--autonomous-session-file", sessionPath})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	state, err := orchestration.LoadState(sessionPath)
+	if err != nil {
+		t.Fatalf("LoadState() error = %v", err)
+	}
+	if state.Checkpoint == nil {
+		t.Fatal("checkpoint = nil")
+	}
+	if got := state.Checkpoint.Phase; got != "completed" {
+		t.Fatalf("checkpoint phase = %q, want completed", got)
+	}
+	if got := state.Checkpoint.Counts.Processed; got != 1 {
+		t.Fatalf("processed count = %d, want 1", got)
+	}
+	if got := state.Checkpoint.Counts.Failures; got != 0 {
+		t.Fatalf("failure count = %d, want 0", got)
+	}
+	if !reflect.DeepEqual(state.Checkpoint.Done, []string{"PR #72 (waiting-for-ci)"}) {
+		t.Fatalf("done = %#v", state.Checkpoint.Done)
+	}
+	if !reflect.DeepEqual(state.Checkpoint.Next, []string{"wait for ci"}) {
+		t.Fatalf("next = %#v", state.Checkpoint.Next)
+	}
+	if !reflect.DeepEqual(state.Checkpoint.IssuePRActions, []string{"pushed PR updates and waiting for CI"}) {
+		t.Fatalf("issue/pr actions = %#v", state.Checkpoint.IssuePRActions)
+	}
+	raw := state.ProcessedIssues["72"]
+	if len(raw) == 0 {
+		t.Fatal("processed PR entry for 72 is missing")
+	}
+	var tracked orchestration.TrackedState
+	if err := json.Unmarshal(raw, &tracked); err != nil {
+		t.Fatalf("json.Unmarshal(processed PR) error = %v", err)
+	}
+	if tracked.Status != orchestration.StatusWaitingForCI {
+		t.Fatalf("processed PR status = %q, want waiting-for-ci", tracked.Status)
 	}
 }
 

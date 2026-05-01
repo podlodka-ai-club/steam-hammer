@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/agentexec"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/githublifecycle"
@@ -21,6 +22,7 @@ type App struct {
 	prLifecycle    prReviewLifecycle
 	agentRunner    issueAgentRunner
 	runtime        runtimeProvider
+	executablePath func() (string, error)
 }
 
 func NewApp(out, err io.Writer) *App {
@@ -37,6 +39,7 @@ func NewApp(out, err io.Writer) *App {
 		prLifecycle:    adapter,
 		agentRunner:    nativeIssueAgentRunner{},
 		runtime:        defaultRuntimeProvider(),
+		executablePath: os.Executable,
 	}
 }
 
@@ -88,6 +91,16 @@ func (a *App) SetRuntimeProvider(provider runtimeProvider) {
 		return
 	}
 	a.runtime = provider
+}
+
+func (a *App) SetExecutablePath(path string) {
+	if path == "" {
+		a.executablePath = os.Executable
+		return
+	}
+	a.executablePath = func() (string, error) {
+		return path, nil
+	}
 }
 
 func (a *App) Run(args []string) int {

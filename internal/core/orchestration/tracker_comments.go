@@ -12,6 +12,7 @@ const (
 	OrchestrationStateMarker         = "<!-- orchestration-state:v1 -->"
 	OrchestrationClaimMarker         = "<!-- orchestration-claim:v1 -->"
 	OrchestrationDecompositionMarker = "<!-- orchestration-decomposition:v1 -->"
+	ClarificationRequestMarker       = "<!-- orchestration-clarification-request:v1 -->"
 )
 
 var fencedJSONObjectRE = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{.*?\\})\\s*```")
@@ -72,6 +73,38 @@ func SelectLatestParseableOrchestrationClaim(comments []TrackerComment, sourceLa
 
 func ParseDecompositionPlanCommentBody(body string) (map[string]any, error) {
 	return parseMarkedJSONObject(body, OrchestrationDecompositionMarker, "unable to parse decomposition payload")
+}
+
+func ParseClarificationRequestText(body string) (map[string]any, error) {
+	payload, err := parseMarkedJSONObject(body, ClarificationRequestMarker, "unable to parse clarification payload")
+	if err != nil || payload == nil {
+		return nil, err
+	}
+
+	question := strings.TrimSpace(stringValue(payload["question"]))
+	if question == "" {
+		return nil, errors.New("clarification payload must include a non-empty 'question'")
+	}
+
+	normalized := map[string]any{}
+	for key, value := range payload {
+		normalized[key] = value
+	}
+	normalized["question"] = question
+	reason := strings.TrimSpace(stringValue(payload["reason"]))
+	if reason == "" {
+		reason = question
+	}
+	normalized["reason"] = reason
+	return normalized, nil
+}
+
+func LatestClarificationRequestFromAgentOutput(output string) map[string]any {
+	payload, err := ParseClarificationRequestText(output)
+	if err != nil {
+		return nil
+	}
+	return payload
 }
 
 func SelectLatestParseableDecompositionPlan(comments []TrackerComment, sourceLabel string) (*ParsedTrackerComment[map[string]any], []string) {
@@ -167,6 +200,11 @@ func normalizePayloadStatus(payload map[string]any, key string) string {
 	}
 	value, _ := payload[key].(string)
 	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 func buildLatestParseableComment[T any](

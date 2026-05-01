@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/githublifecycle"
 )
 
 type App struct {
@@ -12,6 +14,7 @@ type App struct {
 	runner  Runner
 	start   DetachedStarter
 	clone   BatchClonePreparer
+	daemon  daemonLifecycle
 	runtime runtimeProvider
 }
 
@@ -22,6 +25,7 @@ func NewApp(out, err io.Writer) *App {
 		runner:  ExecRunner{Stdout: out, Stderr: err},
 		start:   ExecDetachedStarter{},
 		clone:   ExecBatchClonePreparer{},
+		daemon:  githublifecycle.NewAdapter(nil),
 		runtime: defaultRuntimeProvider(),
 	}
 }
@@ -36,6 +40,10 @@ func (a *App) SetDetachedStarter(starter DetachedStarter) {
 
 func (a *App) SetBatchClonePreparer(preparer BatchClonePreparer) {
 	a.clone = preparer
+}
+
+func (a *App) SetDaemonLifecycle(lifecycle daemonLifecycle) {
+	a.daemon = lifecycle
 }
 
 func (a *App) SetRuntimeProvider(provider runtimeProvider) {

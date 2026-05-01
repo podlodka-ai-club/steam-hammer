@@ -91,6 +91,26 @@ func TestCommentMethodsUseCurrentGitHubCommands(t *testing.T) {
 	}
 }
 
+func TestListIssueCommentsUsesCurrentGitHubAPI(t *testing.T) {
+	gh := &fakeGHCLI{outputs: []string{`[{"id":1,"body":"comment","html_url":"https://example.test/comment/1","created_at":"2026-05-01T10:00:00Z"}]`}}
+	adapter := NewAdapter(gh)
+
+	comments, err := adapter.ListIssueComments(context.Background(), "owner/repo", 71)
+	if err != nil {
+		t.Fatalf("ListIssueComments() error = %v", err)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("len(ListIssueComments()) = %d, want 1", len(comments))
+	}
+	if comments[0].ID != 1 || comments[0].Body != "comment" {
+		t.Fatalf("ListIssueComments() = %#v", comments)
+	}
+	want := []string{"api", "repos/owner/repo/issues/71/comments", "--method", "GET", "-H", "Accept: application/vnd.github+json", "-f", "per_page=100"}
+	if !reflect.DeepEqual(gh.captureCalls[0], want) {
+		t.Fatalf("ListIssueComments command = %#v, want %#v", gh.captureCalls[0], want)
+	}
+}
+
 func TestFetchPullRequestUsesCurrentGitHubFields(t *testing.T) {
 	gh := &fakeGHCLI{outputs: []string{`{"number":101,"title":"Fix runner","headRefOid":"abc123","mergeStateStatus":"CLEAN"}`}}
 	adapter := NewAdapter(gh)

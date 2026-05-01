@@ -35,6 +35,7 @@ type Lifecycle interface {
 type IssueLifecycle interface {
 	FetchIssue(ctx context.Context, repo string, number int) (Issue, error)
 	ListIssues(ctx context.Context, repo, state string, limit int) ([]Issue, error)
+	ListIssueComments(ctx context.Context, repo string, number int) ([]IssueComment, error)
 	CommentOnIssue(ctx context.Context, repo string, number int, body string) error
 }
 
@@ -101,6 +102,13 @@ type Issue struct {
 	Assignees []Actor `json:"assignees,omitempty"`
 	CreatedAt string  `json:"createdAt,omitempty"`
 	UpdatedAt string  `json:"updatedAt,omitempty"`
+}
+
+type IssueComment struct {
+	ID        int64  `json:"id,omitempty"`
+	Body      string `json:"body,omitempty"`
+	HTMLURL   string `json:"html_url,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
 }
 
 type PullRequest struct {
@@ -213,6 +221,23 @@ func (a *Adapter) CommentOnIssue(ctx context.Context, repo string, number int, b
 		"--repo", repo,
 		"--body", body,
 	)
+}
+
+func (a *Adapter) ListIssueComments(ctx context.Context, repo string, number int) ([]IssueComment, error) {
+	output, err := a.gh.Capture(ctx,
+		"api", fmt.Sprintf("repos/%s/issues/%d/comments", repo, number),
+		"--method", "GET",
+		"-H", "Accept: application/vnd.github+json",
+		"-f", "per_page=100",
+	)
+	if err != nil {
+		return nil, err
+	}
+	var comments []IssueComment
+	if err := decodeJSONArray(output, &comments); err != nil {
+		return nil, fmt.Errorf("unexpected response from gh issue comments: %w", err)
+	}
+	return comments, nil
 }
 
 func (a *Adapter) FetchPullRequest(ctx context.Context, repo string, number int) (PullRequest, error) {

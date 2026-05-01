@@ -1177,7 +1177,7 @@ func TestPythonRunnerContextCancellation(t *testing.T) {
 func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 	pythonDir := t.TempDir()
 	pythonPath := filepath.Join(pythonDir, "python3")
-	if err := os.WriteFile(pythonPath, []byte("#!/bin/sh\nprintf 'Target: issue #71\\nLatest state: waiting-for-ci\\nCurrent: waiting on 1 pending CI check(s)\\nNext: wait for ci\\nBlockers: pending ci\\nPR: #101\\nUpdated: 2026-04-28T12:05:00Z\\n'\n"), 0o755); err != nil {
+	if err := os.WriteFile(pythonPath, []byte("#!/bin/sh\nprintf 'Target: issue #71\\nLatest state: waiting-for-ci\\nBranch: issue-fix/71-linked-branch\\nCurrent: waiting on 1 pending CI check(s)\\nNext: wait for ci\\nBlockers: pending ci\\nPR: #101\\nUpdated: 2026-04-28T12:05:00Z\\n'\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile(fake python) error = %v", err)
 	}
 	t.Setenv("PATH", pythonDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1230,6 +1230,7 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 		"log-freshness: updated ",
 		"log: " + logPath,
 		"linked-latest-state: waiting-for-ci",
+		"linked-branch: issue-fix/71-linked-branch",
 		"linked-current: waiting on 1 pending CI check(s)",
 		"linked-next: wait for ci",
 		"linked-blockers: pending ci",
@@ -1249,10 +1250,10 @@ func TestStatusWorkerShowsBatchSummary(t *testing.T) {
 	raw := "#!/bin/sh\n" +
 		"case \"$*\" in\n" +
 		"  *\"--issue 71\"*)\n" +
-		"    printf 'Target: issue #71\\nLatest state: waiting-for-ci\\nCurrent: waiting on 1 pending CI check(s)\\nNext: wait for ci\\nBlockers: none\\nPR: #101\\nPR readiness: merge=clean, ci=pending, pending=1, failing=0; merge-result verification=passed (2/2 commands)\\nUpdated: 2026-04-28T12:05:00Z\\n'\n" +
+		"    printf 'Target: issue #71\\nLatest state: waiting-for-ci\\nBranch: issue-fix/71-linked-branch\\nCurrent: waiting on 1 pending CI check(s)\\nNext: wait for ci\\nBlockers: none\\nPR: #101\\nPR readiness: merge=clean, ci=pending, pending=1, failing=0; merge-result verification=passed (2/2 commands)\\nUpdated: 2026-04-28T12:05:00Z\\n'\n" +
 		"    ;;\n" +
 		"  *\"--issue 72\"*)\n" +
-		"    printf 'Target: issue #72\\nLatest state: failed\\nCurrent: merge conflict while rebasing\\nNext: resolve merge conflicts\\nBlockers: merge conflict while rebasing\\nPR: #102\\nPR readiness: merge=conflicting, ci=failure, pending=0, failing=1; merge-result verification=failed (1/2 commands)\\nUpdated: 2026-04-28T12:06:00Z\\n'\n" +
+		"    printf 'Target: issue #72\\nLatest state: failed\\nBranch: issue-fix/72-linked-branch\\nCurrent: merge conflict while rebasing\\nNext: resolve merge conflicts\\nBlockers: merge conflict while rebasing\\nPR: #102\\nPR readiness: merge=conflicting, ci=failure, pending=0, failing=1; merge-result verification=failed (1/2 commands)\\nUpdated: 2026-04-28T12:06:00Z\\n'\n" +
 		"    ;;\n" +
 		"esac\n"
 	if err := os.WriteFile(pythonPath, []byte(raw), 0o755); err != nil {
@@ -1334,10 +1335,10 @@ func TestStatusWorkerJSONIncludesBatchSummary(t *testing.T) {
 	raw := "#!/bin/sh\n" +
 		"case \"$*\" in\n" +
 		"  *\"--issue 71\"*)\n" +
-		"    printf 'Target: issue #71\\nLatest state: waiting-for-ci\\nCurrent: waiting on 1 pending CI check(s)\\nNext: wait for ci\\nBlockers: none\\nPR: #101\\nPR readiness: merge=clean, ci=pending, pending=1, failing=0; merge-result verification=passed (2/2 commands)\\nUpdated: 2026-04-28T12:05:00Z\\n'\n" +
+		"    printf 'Target: issue #71\\nLatest state: waiting-for-ci\\nBranch: issue-fix/71-linked-branch\\nCurrent: waiting on 1 pending CI check(s)\\nNext: wait for ci\\nBlockers: none\\nPR: #101\\nPR readiness: merge=clean, ci=pending, pending=1, failing=0; merge-result verification=passed (2/2 commands)\\nUpdated: 2026-04-28T12:05:00Z\\n'\n" +
 		"    ;;\n" +
 		"  *\"--issue 72\"*)\n" +
-		"    printf 'Target: issue #72\\nLatest state: failed\\nCurrent: merge conflict while rebasing\\nNext: resolve merge conflicts\\nBlockers: merge conflict while rebasing\\nPR: #102\\nPR readiness: merge=conflicting, ci=failure, pending=0, failing=1; merge-result verification=failed (1/2 commands)\\nUpdated: 2026-04-28T12:06:00Z\\n'\n" +
+		"    printf 'Target: issue #72\\nLatest state: failed\\nBranch: issue-fix/72-linked-branch\\nCurrent: merge conflict while rebasing\\nNext: resolve merge conflicts\\nBlockers: merge conflict while rebasing\\nPR: #102\\nPR readiness: merge=conflicting, ci=failure, pending=0, failing=1; merge-result verification=failed (1/2 commands)\\nUpdated: 2026-04-28T12:06:00Z\\n'\n" +
 		"    ;;\n" +
 		"esac\n"
 	if err := os.WriteFile(pythonPath, []byte(raw), 0o755); err != nil {
@@ -1403,6 +1404,9 @@ func TestStatusWorkerJSONIncludesBatchSummary(t *testing.T) {
 	}
 	if payload.Batch == nil {
 		t.Fatalf("batch = nil")
+	}
+	if payload.Linked == nil || payload.Linked.Branch != "issue-fix/71-linked-branch" {
+		t.Fatalf("linked branch = %#v, want issue-fix/71-linked-branch", payload.Linked)
 	}
 	if len(payload.Batch.ChildWorkers) != 2 {
 		t.Fatalf("child workers len = %d, want 2", len(payload.Batch.ChildWorkers))

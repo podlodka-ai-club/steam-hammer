@@ -652,6 +652,18 @@ func TestRunIssueCommandMapsCoreCompatibilityFlags(t *testing.T) {
 	})
 }
 
+func TestRunIssueCommandForwardsLightweightFlag(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "issue", "--id", "20", "--lightweight"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--issue", "20", "--lightweight"})
+}
+
 func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -917,6 +929,18 @@ func TestRunPRCommandMapsCoreCompatibilityFlags(t *testing.T) {
 		"--dry-run",
 		"--agent-timeout-seconds", "900",
 	})
+}
+
+func TestRunPRCommandForwardsModeLightweight(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "pr", "--id", "72", "--mode", "lightweight"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments", "--mode", "lightweight"})
 }
 
 func TestRunDaemonCommandSupportsAllState(t *testing.T) {

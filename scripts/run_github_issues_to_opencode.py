@@ -89,6 +89,7 @@ from scripts.project_config import (
 LOCAL_CONFIG_RELATIVE_PATH = "local-config.json"
 PROJECT_CONFIG_RELATIVE_PATH = "project-config.json"
 BUILTIN_DEFAULTS = {
+    "mode": "full",
     "tracker": "github",
     "codehost": "github",
     "state": "open",
@@ -239,6 +240,10 @@ def _safe_join_sorted(values: object) -> str:
         if item:
             normalized.append(item)
     return ", ".join(sorted(normalized))
+
+
+def _noop_comment_action(*args, **kwargs) -> None:
+    del args, kwargs
 
 
 def _normalize_match_list(values: list[str] | None) -> list[str]:
@@ -2812,6 +2817,69 @@ def _dedupe_preserve_order(values: list[str]) -> list[str]:
         seen.add(normalized)
         deduped.append(normalized)
     return deduped
+
+
+def _issue_markdown_sections(issue: dict) -> dict[str, list[str]]:
+    sections: dict[str, list[str]] = {}
+    current_heading = "overview"
+    sections[current_heading] = []
+    for raw_line in str(issue.get("body") or "").splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        heading = _normalize_heading(stripped)
+        if heading is not None:
+            current_heading = heading
+            sections.setdefault(current_heading, [])
+            continue
+        sections.setdefault(current_heading, []).append(stripped)
+    return sections
+
+
+def _compact_issue_line(text: str, max_len: int = 180) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 3].rstrip() + "..."
+
+
+def _compact_lightweight_issue_context(issue: dict) -> list[str]:
+    sections = _issue_markdown_sections(issue)
+    ordered_headings = ["problem", "proposed solution", "acceptance criteria", "overview"]
+    lines: list[str] = []
+    seen: set[str] = set()
+    for heading in ordered_headings:
+        entries = sections.get(heading) or []
+        if not entries or heading in seen:
+            continue
+        seen.add(heading)
+        lines.append(f"{heading.title()}:")
+        for entry in entries[:4]:
+            lines.append(f"- {_compact_issue_line(entry)}")
+    if lines:
+        return lines
+
+    fallback = [line.strip() for line in str(issue.get("body") or "").splitlines() if line.strip()]
+    return [f"- {_compact_issue_line(line)}" for line in fallback[:8]]
+
+
+def suggest_lightweight_focus_paths(issue: dict) -> list[str]:
+    body = str(issue.get("body") or "")
+    combined = f"{issue.get('title') or ''}\n{body}".lower()
+    candidates = extract_required_file_paths_from_text(body)
+
+    if any(token in combined for token in ("python runner", "orchestration state", "scope check", "decomposition preflight", "state comments")):
+        candidates.append("scripts/run_github_issues_to_opencode.py")
+    if any(token in combined for token in ("go cli wrapper", "go cli", "cli wrapper")):
+        candidates.extend([
+            "internal/cli/flags.go",
+            "internal/cli/command_run.go",
+            "internal/cli/app_test.go",
+        ])
+    if "lightweight" in combined:
+        candidates.append("tests/test_lightweight_mode.py")
+
+    return _dedupe_preserve_order(candidates)
 
 
 def extract_pull_request_changed_file_paths(pull_request: dict) -> list[str]:
@@ -6542,6 +6610,115 @@ def safe_post_orchestration_claim_comment(
         )
 
 
+def format_lightweight_completion_comment(
+    *,
+    issue: dict,
+    execution_status: str,
+    mode: str,
+    summary: str,
+    branch: str | None,
+    base_branch: str | None,
+    pr_url: str | None,
+    error: str | None = None,
+) -> str:
+    lines = [
+        "Lightweight orchestration summary",
+        "",
+        f"- issue: `{format_issue_ref_from_issue(issue)}`",
+        f"- result: `{execution_status}`",
+        f"- path: `{mode}`",
+        f"- branch: `{branch or 'n/a'}`",
+        f"- base branch: `{base_branch or 'n/a'}`",
+        f"- summary: {summary}",
+    ]
+    if pr_url:
+        lines.append(f"- PR: {pr_url}")
+    if error:
+        lines.append(f"- error: `{short_error_text(error)}`")
+    return "\n".join(lines)
+
+
+def post_lightweight_completion_comment(
+    *,
+    repo: str,
+    issue: dict,
+    execution_status: str,
+    mode: str,
+    summary: str,
+    branch: str | None,
+    base_branch: str | None,
+    pr_url: str | None,
+    error: str | None,
+    dry_run: bool,
+) -> None:
+    body = format_lightweight_completion_comment(
+        issue=issue,
+        execution_status=execution_status,
+        mode=mode,
+        summary=summary,
+        branch=branch,
+        base_branch=base_branch,
+        pr_url=pr_url,
+        error=error,
+    )
+    issue_number = issue.get("number")
+    if dry_run:
+        print(f"[dry-run] Would post lightweight completion summary to issue #{issue_number}: result={execution_status}")
+        return
+    current_tracker_provider().post_issue_comment(
+        repo=repo,
+        issue_id=issue_number,
+        body=body,
+    )
+
+
+def safe_post_lightweight_completion_comment(**kwargs) -> None:
+    try:
+        post_lightweight_completion_comment(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        issue = kwargs.get("issue") if isinstance(kwargs.get("issue"), dict) else {}
+        print(
+            f"Warning: failed to post lightweight completion summary for issue #{issue.get('number')}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def build_lightweight_prompt(issue: dict, image_paths: list[str] | None = None) -> str:
+    attached_images = image_paths if image_paths else []
+    image_section = ""
+    if attached_images:
+        image_filenames = ", ".join(
+            sorted(os.path.basename(path) for path in attached_images if isinstance(path, str) and path.strip())
+        )
+        if image_filenames:
+            image_section = f"\nImage attachments provided with this prompt: {image_filenames}\n"
+
+    focus_paths = suggest_lightweight_focus_paths(issue)
+    focus_section = "\n".join(f"- `{path}`" for path in focus_paths)
+    if not focus_section:
+        focus_section = "- No explicit file paths were derived from the issue body; keep exploration minimal and stay close to the first relevant entrypoints you find."
+
+    context_lines = _compact_lightweight_issue_context(issue)
+    compact_context = "\n".join(context_lines) if context_lines else "- No additional context provided."
+
+    return (
+        "You are working on a small, well-scoped issue in the current git branch.\n"
+        "Implement the fix in repository files using the smallest correct change.\n"
+        "Do not run git commands; git actions are handled by orchestration script.\n"
+        "Avoid broad repository exploration. Start with the focus paths below and only widen the search if they are clearly insufficient.\n\n"
+        "If the task is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. "
+        f"Instead, stop and print {CLARIFICATION_REQUEST_MARKER} followed by a JSON object like "
+        '{"question":"<focused question>","reason":"<why clarification is required>"}.\n\n'
+        f"Issue: {format_issue_ref_from_issue(issue)} - {issue['title']}\n"
+        f"URL: {issue['url']}\n\n"
+        "Focus paths:\n"
+        f"{focus_section}\n\n"
+        "Compact issue context:\n"
+        f"{compact_context}\n"
+        f"{image_section}"
+    )
+
+
 def build_prompt(issue: dict, image_paths: list[str] | None = None) -> str:
     attached_images = image_paths if image_paths else []
     image_section = ""
@@ -7716,6 +7893,7 @@ def resolve_project_config_path(raw_path: str | None, target_dir: str) -> str:
 
 def validate_local_config(config: dict, config_path: str) -> dict:
     supported_keys = {
+        "mode",
         "tracker",
         "codehost",
         "state",
@@ -7753,6 +7931,11 @@ def validate_local_config(config: dict, config_path: str) -> dict:
         )
 
     validated: dict = {}
+
+    if "mode" in config:
+        if config["mode"] not in {"full", "lightweight"}:
+            raise RuntimeError("Local config key 'mode' must be one of: full, lightweight")
+        validated["mode"] = config["mode"]
 
     if "tracker" in config:
         validated["tracker"] = _parse_tracker(config["tracker"])
@@ -8573,6 +8756,19 @@ def build_parser() -> argparse.ArgumentParser:
         description="Fetch tracker items, coordinate code-host operations, and run an AI agent for each task body."
     )
     parser.add_argument(
+        "--mode",
+        default=BUILTIN_DEFAULTS["mode"],
+        choices=["full", "lightweight"],
+        help="Execution mode: full orchestration or lightweight fast path.",
+    )
+    parser.add_argument(
+        "--lightweight",
+        dest="mode",
+        action="store_const",
+        const="lightweight",
+        help="Shortcut for --mode lightweight.",
+    )
+    parser.add_argument(
         "--repo", help="Repository slug for the active code host. Defaults to the current authenticated repo context."
     )
     parser.add_argument(
@@ -8979,6 +9175,8 @@ def main() -> int:
     post_pr_summary = bool(getattr(args, "post_pr_summary", False))
     track_tokens = bool(getattr(args, "track_tokens", False))
     autonomous_mode = bool(getattr(args, "autonomous", False))
+    execution_mode = str(getattr(args, "mode", BUILTIN_DEFAULTS["mode"]))
+    lightweight_mode = execution_mode == "lightweight"
     autonomous_session_file = _as_optional_string(getattr(args, "autonomous_session_file", None))
     token_budget = getattr(args, "token_budget", BUILTIN_DEFAULTS["token_budget"])
     if token_budget is not None and (type(token_budget) is not int or token_budget <= 0):
@@ -9027,6 +9225,18 @@ def main() -> int:
             configured_hooks = configured_workflow_hooks(project_config)
             readiness_policy = workflow_readiness_policy(project_config)
             merge_policy = workflow_merge_policy(project_config)
+            post_orchestration_state_comment_fn = (
+                safe_post_orchestration_state_comment if not lightweight_mode else _noop_comment_action
+            )
+            post_scope_skip_comment_fn = (
+                safe_post_issue_scope_skip_comment if not lightweight_mode else _noop_comment_action
+            )
+            remove_agent_failure_label_fn = (
+                remove_agent_failure_label_from_issue if not lightweight_mode else _noop_comment_action
+            )
+            report_issue_automation_failure_fn = (
+                safe_report_issue_automation_failure if not lightweight_mode else _noop_comment_action
+            )
 
             configured_command_names: list[str] = []
             if setup_command is not None:
@@ -9404,7 +9614,7 @@ def main() -> int:
                         )
 
                         if ci_overall == "pending":
-                            safe_post_orchestration_state_comment(
+                            post_orchestration_state_comment_fn(
                                 repo=repo,
                                 target_type="pr",
                                 target_number=pr_number_arg,
@@ -9441,7 +9651,7 @@ def main() -> int:
                             )
                             diagnostics_summary = format_ci_diagnostics_summary(ci_diagnostics)
                             if str(ci_diagnostics.get("overall_classification") or "") == "transient":
-                                safe_post_orchestration_state_comment(
+                                post_orchestration_state_comment_fn(
                                     repo=repo,
                                     target_type="pr",
                                     target_number=pr_number_arg,
@@ -9472,7 +9682,7 @@ def main() -> int:
                                 return _finish_main(0, original_process_cwd)
 
                             if current_attempt >= max_attempts:
-                                safe_post_orchestration_state_comment(
+                                post_orchestration_state_comment_fn(
                                     repo=repo,
                                     target_type="pr",
                                     target_number=pr_number_arg,
@@ -10139,6 +10349,9 @@ def main() -> int:
             selected_decomposition_child = False
             issue_agent_run_stats: dict[str, object] | None = None
             issue_repo_root: str | None = None
+            lightweight_completion_status: str | None = None
+            lightweight_completion_pr_url: str | None = None
+            lightweight_completion_error: str | None = None
             state_attempt = 1
             orchestration_attempt = 1
             active_attempt = state_attempt
@@ -10146,7 +10359,11 @@ def main() -> int:
             active_agent = str(args.agent)
             active_model = args.model
             supports_github_issue_ops = issue_tracker(issue) == TRACKER_GITHUB and type(issue["number"]) is int
-            decomposition_assessment = assess_issue_decomposition_need(issue)
+            decomposition_assessment = (
+                assess_issue_decomposition_need(issue)
+                if not lightweight_mode
+                else {"needs_decomposition": False, "reasons": [], "matched_keywords": []}
+            )
             batch_done_summary = f"Started batch {batch_index}/{len(issues)} for {issue_label}"
             batch_current_summary = f"Batch {batch_index}/{len(issues)} running for {issue_label}"
             batch_action_items = [f"Inspect {issue_label} and choose issue-flow or PR-review path"]
@@ -10178,14 +10395,17 @@ def main() -> int:
                 )
                 save_autonomous_session_state(autonomous_session_file, autonomous_session_state)
 
-            scope_decision = evaluate_issue_scope(issue=issue, scope_defaults=scope_defaults)
-            scope_eligible = bool(scope_decision.get("eligible", True))
-            scope_reason = str(scope_decision.get("reason") or "scope rules passed")
-            scope_prefix = "[dry-run] " if args.dry_run else ""
-            print(
-                f"{scope_prefix}Scope decision for {issue_label}: "
-                f"{'eligible' if scope_eligible else 'out-of-scope'} ({scope_reason})"
-            )
+            scope_eligible = True
+            scope_reason = "scope check skipped in lightweight mode"
+            if not lightweight_mode:
+                scope_decision = evaluate_issue_scope(issue=issue, scope_defaults=scope_defaults)
+                scope_eligible = bool(scope_decision.get("eligible", True))
+                scope_reason = str(scope_decision.get("reason") or "scope rules passed")
+                scope_prefix = "[dry-run] " if args.dry_run else ""
+                print(
+                    f"{scope_prefix}Scope decision for {issue_label}: "
+                    f"{'eligible' if scope_eligible else 'out-of-scope'} ({scope_reason})"
+                )
 
             if not scope_eligible:
                 if force_reprocess:
@@ -10194,7 +10414,7 @@ def main() -> int:
                         "because --force-reprocess is set."
                     )
                     if supports_issue_tracker_ops:
-                        safe_post_issue_scope_skip_comment(
+                        post_scope_skip_comment_fn(
                             repo=repo,
                             issue_number=issue["number"],
                             reason=scope_reason,
@@ -10208,7 +10428,7 @@ def main() -> int:
                     batch_action_items = [f"Posted blocked state and scope decision for {issue_label}"]
                     batch_blockers = [scope_reason]
                     if supports_issue_tracker_ops:
-                        safe_post_orchestration_state_comment(
+                        post_orchestration_state_comment_fn(
                             repo=repo,
                             target_type="issue",
                             target_number=issue["number"],
@@ -10229,7 +10449,7 @@ def main() -> int:
                                 error=short_error_text(scope_reason),
                             ),
                         )
-                        safe_post_issue_scope_skip_comment(
+                        post_scope_skip_comment_fn(
                             repo=repo,
                             issue_number=issue["number"],
                             reason=scope_reason,
@@ -10530,7 +10750,7 @@ def main() -> int:
             if body_image_reason:
                 print(f"{issue_label.capitalize()} {body_image_reason}")
 
-            if mode == "issue-flow" and decompose_mode != "never":
+            if mode == "issue-flow" and not lightweight_mode and decompose_mode != "never":
                 failure_stage = "decomposition_preflight"
                 should_plan, assessment = should_issue_decompose(issue, decompose_mode)
                 decomposition_assessment = assessment
@@ -10624,7 +10844,7 @@ def main() -> int:
                                     payload=latest_payload_dict,
                                     dry_run=args.dry_run,
                                 )
-                                safe_post_orchestration_state_comment(
+                                post_orchestration_state_comment_fn(
                                     repo=repo,
                                     target_type="issue",
                                     target_number=issue["number"],
@@ -10667,7 +10887,7 @@ def main() -> int:
                                 decomposition_rollup = build_decomposition_rollup_from_plan_payload(
                                     payload=latest_payload_dict,
                                 )
-                                safe_post_orchestration_state_comment(
+                                post_orchestration_state_comment_fn(
                                     repo=repo,
                                     target_type="issue",
                                     target_number=issue["number"],
@@ -10731,7 +10951,7 @@ def main() -> int:
                                     payload=latest_payload_dict,
                                     dry_run=args.dry_run,
                                 )
-                                safe_post_orchestration_state_comment(
+                                post_orchestration_state_comment_fn(
                                     repo=repo,
                                     target_type="issue",
                                     target_number=issue["number"],
@@ -10785,7 +11005,7 @@ def main() -> int:
                                 decomposition_rollup=decomposition_rollup,
                                 selected_child=selected_child,
                             )
-                            safe_post_orchestration_state_comment(
+                            post_orchestration_state_comment_fn(
                                 repo=repo,
                                 target_type="issue",
                                 target_number=decomposition_parent_issue["number"],
@@ -10857,7 +11077,7 @@ def main() -> int:
                             dry_run=args.dry_run,
                         )
                         decomposition_rollup = build_decomposition_rollup_from_plan_payload(payload=payload)
-                        safe_post_orchestration_state_comment(
+                        post_orchestration_state_comment_fn(
                             repo=repo,
                             target_type="issue",
                             target_number=issue["number"],
@@ -10907,6 +11127,7 @@ def main() -> int:
                     )
 
                 prompt_override: str | None = None
+                base_issue_prompt = build_lightweight_prompt if lightweight_mode else build_prompt
                 if (
                     recovered_state is not None
                     and str(recovered_state.get("status") or "") == "failed"
@@ -10916,7 +11137,7 @@ def main() -> int:
                         f"{format_recovered_state_context(recovered_state)}"
                     )
                     prompt_override = append_recovered_context_to_prompt(
-                        build_prompt(issue, image_paths=issue_image_paths),
+                        base_issue_prompt(issue, image_paths=issue_image_paths),
                         build_recovered_failure_context_note(recovered_state),
                     )
                 elif (
@@ -10925,12 +11146,12 @@ def main() -> int:
                     and clarification_answer is not None
                 ):
                     prompt_override = append_recovered_context_to_prompt(
-                        build_prompt(issue, image_paths=issue_image_paths),
+                        base_issue_prompt(issue, image_paths=issue_image_paths),
                         build_clarification_context_note(recovered_state, clarification_answer),
                     )
                 elif decomposition_child_note:
                     prompt_override = append_recovered_context_to_prompt(
-                        build_prompt(issue, image_paths=issue_image_paths),
+                        base_issue_prompt(issue, image_paths=issue_image_paths),
                         decomposition_child_note,
                     )
                 if mode == "pr-review":
@@ -11015,7 +11236,7 @@ def main() -> int:
                             )
 
                             if ci_overall == "pending":
-                                safe_post_orchestration_state_comment(
+                                post_orchestration_state_comment_fn(
                                     repo=repo,
                                     target_type="pr",
                                     target_number=state_target_number,
@@ -11043,7 +11264,7 @@ def main() -> int:
                                     f"CI checks are still pending ({pending_checks_count} pending), "
                                     "keeping waiting-for-ci state."
                                 )
-                                remove_agent_failure_label_from_issue(
+                                remove_agent_failure_label_fn(
                                     repo=repo,
                                     issue_number=issue["number"],
                                     dry_run=args.dry_run,
@@ -11070,7 +11291,7 @@ def main() -> int:
                                 )
                                 diagnostics_summary = format_ci_diagnostics_summary(ci_diagnostics)
                                 if str(ci_diagnostics.get("overall_classification") or "") == "transient":
-                                    safe_post_orchestration_state_comment(
+                                    post_orchestration_state_comment_fn(
                                         repo=repo,
                                         target_type="pr",
                                         target_number=state_target_number,
@@ -11098,7 +11319,7 @@ def main() -> int:
                                         f"No actionable review comments for linked PR #{pr_number}; "
                                         f"CI failure looks transient: {diagnostics_summary}."
                                     )
-                                    remove_agent_failure_label_from_issue(
+                                    remove_agent_failure_label_fn(
                                         repo=repo,
                                         issue_number=issue["number"],
                                         dry_run=args.dry_run,
@@ -11110,7 +11331,7 @@ def main() -> int:
                                     continue
 
                                 if current_attempt >= max_attempts:
-                                    safe_post_orchestration_state_comment(
+                                    post_orchestration_state_comment_fn(
                                         repo=repo,
                                         target_type="pr",
                                         target_number=state_target_number,
@@ -11141,7 +11362,7 @@ def main() -> int:
                                         f"retry limit reached after {current_attempt}/{max_attempts} attempts: "
                                         f"{diagnostics_summary}"
                                     )
-                                    remove_agent_failure_label_from_issue(
+                                    remove_agent_failure_label_fn(
                                         repo=repo,
                                         issue_number=issue["number"],
                                         dry_run=args.dry_run,
@@ -11161,7 +11382,7 @@ def main() -> int:
                                     ci_diagnostics=ci_diagnostics,
                                     linked_issues=[issue],
                                 )
-                                safe_post_orchestration_state_comment(
+                                post_orchestration_state_comment_fn(
                                     repo=repo,
                                     target_type="pr",
                                     target_number=state_target_number,
@@ -11213,7 +11434,7 @@ def main() -> int:
                                     repo_dir=os.getcwd(),
                                     dry_run=args.dry_run,
                                 )
-                                remove_agent_failure_label_from_issue(
+                                remove_agent_failure_label_fn(
                                     repo=repo,
                                     issue_number=issue["number"],
                                     dry_run=args.dry_run,
@@ -11236,7 +11457,7 @@ def main() -> int:
                                 f"No actionable review comments for linked PR #{pr_number}; "
                                 f"keeping recovered state '{recovered_status}' and skipping duplicate issue-flow."
                             )
-                            remove_agent_failure_label_from_issue(
+                            remove_agent_failure_label_fn(
                                 repo=repo,
                                 issue_number=issue["number"],
                                 dry_run=args.dry_run,
@@ -11255,7 +11476,7 @@ def main() -> int:
                             )
                             continue
                         else:
-                            safe_post_orchestration_state_comment(
+                            post_orchestration_state_comment_fn(
                                 repo=repo,
                                 target_type=state_target_type,
                                 target_number=state_target_number,
@@ -11281,7 +11502,7 @@ def main() -> int:
                                 f"No actionable review comments for linked PR #{pr_number}; "
                                 "skipping issue run."
                             )
-                            remove_agent_failure_label_from_issue(
+                            remove_agent_failure_label_fn(
                                 repo=repo,
                                 issue_number=issue["number"],
                                 dry_run=args.dry_run,
@@ -11291,7 +11512,7 @@ def main() -> int:
                             batch_action_items = [f"Posted waiting-for-author state for PR #{pr_number}"]
                             continue
 
-                    safe_post_orchestration_state_comment(
+                    post_orchestration_state_comment_fn(
                         repo=repo,
                         target_type=state_target_type,
                         target_number=state_target_number,
@@ -11427,7 +11648,7 @@ def main() -> int:
 
                 if mode == "issue-flow":
                     if supports_issue_tracker_ops:
-                        safe_post_orchestration_state_comment(
+                        post_orchestration_state_comment_fn(
                             repo=repo,
                             target_type=state_target_type,
                             target_number=state_target_number,
@@ -11507,6 +11728,9 @@ def main() -> int:
                     base_branch=target_base_branch,
                 )
 
+                if prompt_override is None and mode == "issue-flow" and lightweight_mode:
+                    prompt_override = build_lightweight_prompt(issue, image_paths=issue_image_paths)
+
                 if skip_agent_run:
                     print(
                         f"Skipping agent run for {issue_label} in pr-review mode: "
@@ -11546,7 +11770,7 @@ def main() -> int:
 
                         if active_attempt > 1:
                             print(f"Retrying {issue_label}: {_attempt_settings_summary(attempt_settings)}")
-                            safe_post_orchestration_state_comment(
+                            post_orchestration_state_comment_fn(
                                 repo=repo,
                                 target_type=state_target_type,
                                 target_number=state_target_number,
@@ -11635,7 +11859,7 @@ def main() -> int:
                                 reason=reason,
                                 dry_run=args.dry_run,
                             )
-                            safe_post_orchestration_state_comment(
+                            post_orchestration_state_comment_fn(
                                 repo=repo,
                                 target_type=state_target_type,
                                 target_number=state_target_number,
@@ -11749,7 +11973,7 @@ def main() -> int:
                                 "Recorded blocked state with follow-up evidence."
                             )
                             if supports_issue_tracker_ops:
-                                remove_agent_failure_label_from_issue(
+                                remove_agent_failure_label_fn(
                                     repo=repo,
                                     issue_number=issue["number"],
                                     dry_run=args.dry_run,
@@ -11812,7 +12036,7 @@ def main() -> int:
                             f"No changes detected for {issue_label}; skipping commit and PR"
                         )
                         if supports_github_issue_ops or mode == "pr-review":
-                            safe_post_orchestration_state_comment(
+                            post_orchestration_state_comment_fn(
                                 repo=repo,
                                 target_type=state_target_type,
                                 target_number=state_target_number,
@@ -11836,7 +12060,7 @@ def main() -> int:
                                 ),
                             )
                         elif mode == "issue-flow" and supports_issue_tracker_ops:
-                            safe_post_orchestration_state_comment(
+                            post_orchestration_state_comment_fn(
                                 repo=repo,
                                 target_type="issue",
                                 target_number=issue["number"],
@@ -11885,11 +12109,12 @@ def main() -> int:
                                 dry_run=args.dry_run,
                             )
                         if supports_issue_tracker_ops:
-                            remove_agent_failure_label_from_issue(
+                            remove_agent_failure_label_fn(
                                 repo=repo,
                                 issue_number=issue["number"],
                                 dry_run=args.dry_run,
                             )
+                        lightweight_completion_status = "success"
                         if not args.dry_run:
                             run_command(["git", "checkout", base_branch])
                         batch_done_summary = f"No code changes needed for {issue_label}"
@@ -11960,7 +12185,7 @@ def main() -> int:
                     print(f"PR status for {issue_label}: {pr_status} ({pr_url})")
                     batch_action_items = [f"Updated PR state for {issue_label}: {pr_status} ({pr_url})"]
                 if mode == "issue-flow" and supports_github_issue_ops:
-                    safe_post_orchestration_state_comment(
+                    post_orchestration_state_comment_fn(
                         repo=repo,
                         target_type="issue",
                         target_number=issue["number"],
@@ -11985,7 +12210,7 @@ def main() -> int:
                         ),
                     )
                 else:
-                    safe_post_orchestration_state_comment(
+                    post_orchestration_state_comment_fn(
                         repo=repo,
                         target_type="pr",
                         target_number=state_target_number,
@@ -12026,7 +12251,7 @@ def main() -> int:
                         dry_run=args.dry_run,
                     )
                 if supports_github_issue_ops:
-                    remove_agent_failure_label_from_issue(
+                    remove_agent_failure_label_fn(
                         repo=repo,
                         issue_number=issue["number"],
                         dry_run=args.dry_run,
@@ -12051,6 +12276,8 @@ def main() -> int:
                     if mode == "issue-flow"
                     else f"Advanced linked PR #{state_pr_number} to waiting-for-ci"
                 )
+                lightweight_completion_status = "success"
+                lightweight_completion_pr_url = pr_url or None
                 batch_current_summary = f"Batch {batch_index}/{len(issues)} finished for {issue_label}"
                 save_autonomous_session_state(
                     autonomous_session_file,
@@ -12078,7 +12305,7 @@ def main() -> int:
                 if not args.dry_run:
                     run_command(["git", "checkout", base_branch])
                 if supports_issue_tracker_ops:
-                    remove_agent_failure_label_from_issue(
+                    remove_agent_failure_label_fn(
                         repo=repo,
                         issue_number=issue["number"],
                         dry_run=args.dry_run,
@@ -12103,7 +12330,7 @@ def main() -> int:
                 exc.files if isinstance(exc, ResidualUntrackedFilesError) else None
             )
             if supports_issue_tracker_ops or mode == "pr-review":
-                safe_post_orchestration_state_comment(
+                post_orchestration_state_comment_fn(
                     repo=repo,
                     target_type=state_target_type,
                     target_number=state_target_number,
@@ -12152,7 +12379,7 @@ def main() -> int:
                         file=sys.stderr,
                     )
             if supports_issue_tracker_ops:
-                safe_report_issue_automation_failure(
+                report_issue_automation_failure_fn(
                     repo=repo,
                     issue_number=issue["number"],
                     run_id=run_id,
@@ -12169,6 +12396,8 @@ def main() -> int:
                     already_reported_issue_numbers=reported_issue_failures,
                 )
             batch_done_summary = f"Failed {issue_label} during {failure_stage}"
+            lightweight_completion_status = "failed"
+            lightweight_completion_error = str(exc)
             batch_current_summary = f"Batch {batch_index}/{len(issues)} failed for {issue_label}"
             batch_action_items = [f"Posted failure diagnostics for {issue_label}"]
             batch_blockers = [short_error_text(str(exc))]
@@ -12176,6 +12405,19 @@ def main() -> int:
             if args.stop_on_error:
                 break
         finally:
+            if lightweight_mode and lightweight_completion_status is not None:
+                safe_post_lightweight_completion_comment(
+                    repo=repo,
+                    issue=issue,
+                    execution_status=lightweight_completion_status,
+                    mode=mode,
+                    summary=batch_done_summary,
+                    branch=locals().get("issue_branch", None),
+                    base_branch=locals().get("target_base_branch", None),
+                    pr_url=lightweight_completion_pr_url,
+                    error=lightweight_completion_error,
+                    dry_run=args.dry_run,
+                )
             if autonomous_mode and claim_acquired and supports_github_issue_ops:
                 safe_post_orchestration_claim_comment(
                     repo=repo,

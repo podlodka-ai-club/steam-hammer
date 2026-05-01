@@ -8,25 +8,29 @@ import (
 )
 
 type commonOptions struct {
-	repo     *string
-	tracker  *string
-	codehost *string
-	dir      *string
-	runner   *string
-	agent    *string
-	model    *string
-	preset   *string
-	autoYes  *bool
-	branch   *string
-	dryRun   *bool
-	local    *string
-	project  *string
-	maxTry   *int
-	timeout  *int
-	idleTime *int
+	mode        *string
+	lightweight *bool
+	repo        *string
+	tracker     *string
+	codehost    *string
+	dir         *string
+	runner      *string
+	agent       *string
+	model       *string
+	preset      *string
+	autoYes     *bool
+	branch      *string
+	dryRun      *bool
+	local       *string
+	project     *string
+	maxTry      *int
+	timeout     *int
+	idleTime    *int
 }
 
 func addCommonFlags(fs *flag.FlagSet, opts *commonOptions, runtime runtimeProvider) {
+	opts.mode = fs.String("mode", "", "execution mode: full or lightweight")
+	opts.lightweight = fs.Bool("lightweight", false, "shortcut for --mode lightweight")
 	opts.repo = fs.String("repo", "", runtime.RepoFlagDescription())
 	opts.tracker = fs.String("tracker", "", "tracker provider: github or jira")
 	opts.codehost = fs.String("codehost", "", "code host provider override passed through to the current runtime")
@@ -46,6 +50,11 @@ func addCommonFlags(fs *flag.FlagSet, opts *commonOptions, runtime runtimeProvid
 }
 
 func appendCommonPythonArgs(args []string, opts commonOptions) []string {
+	if *opts.lightweight {
+		args = append(args, "--lightweight")
+	} else if *opts.mode != "" {
+		args = append(args, "--mode", *opts.mode)
+	}
 	if *opts.repo != "" {
 		args = append(args, "--repo", *opts.repo)
 	}

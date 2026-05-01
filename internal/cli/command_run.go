@@ -322,7 +322,7 @@ func (a *App) prepareParallelDaemonWorker(config daemonParallelConfig, slot int)
 			a.runtime.RunnerScript(),
 			workerOpts,
 			config.state,
-			1,
+			config.limit,
 			config.base,
 			config.includeEmpty,
 			config.stopOnError,

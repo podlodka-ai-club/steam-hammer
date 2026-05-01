@@ -812,8 +812,8 @@ func TestRunDaemonParallelUsesIsolatedClonesPerWorker(t *testing.T) {
 	}
 	seenDirs := map[string]bool{}
 	for _, cmd := range runner.cmds {
-		if got := flagValue(cmd[1:], "--limit"); got != "1" {
-			t.Fatalf("daemon worker limit = %q, want 1 in %#v", got, cmd)
+		if got := flagValue(cmd[1:], "--limit"); got != "3" {
+			t.Fatalf("daemon worker limit = %q, want 3 in %#v", got, cmd)
 		}
 		workerDir := flagValue(cmd[1:], "--dir")
 		if workerDir == "" {
@@ -860,8 +860,8 @@ func TestRunDaemonParallelRunsVerificationOnceAfterWorkers(t *testing.T) {
 			continue
 		}
 		workerCalls++
-		if got := flagValue(cmd[1:], "--limit"); got != "1" {
-			t.Fatalf("daemon worker limit = %q, want 1 in %#v", got, cmd)
+		if got := flagValue(cmd[1:], "--limit"); got != "3" {
+			t.Fatalf("daemon worker limit = %q, want 3 in %#v", got, cmd)
 		}
 	}
 	if workerCalls != 2 {

@@ -1257,6 +1257,7 @@ def _compact_autonomous_status_counts(counts: dict | None) -> str:
         ("skipped_existing_pr", "skipped_existing_pr"),
         ("skipped_existing_branch", "skipped_existing_branch"),
         ("skipped_blocked_dependencies", "skipped_blocked_dependencies"),
+        ("skipped_recovered_state", "skipped_recovered_state"),
         ("skipped_out_of_scope", "skipped_out_of_scope"),
     )
     for key, label in optional_fields:
@@ -1295,6 +1296,7 @@ def update_autonomous_session_checkpoint(
             "skipped_existing_pr": int(counts.get("skipped_existing_pr") or 0),
             "skipped_existing_branch": int(counts.get("skipped_existing_branch") or 0),
             "skipped_blocked_dependencies": int(counts.get("skipped_blocked_dependencies") or 0),
+            "skipped_recovered_state": int(counts.get("skipped_recovered_state") or 0),
             "skipped_out_of_scope": int(counts.get("skipped_out_of_scope") or 0),
         },
         "done": [item for item in done or [] if str(item).strip()],
@@ -10232,6 +10234,7 @@ def main() -> int:
     skipped_existing_pr = 0
     skipped_existing_branch = 0
     skipped_blocked_dependencies = len(blocked_dependency_entries)
+    skipped_recovered_state = 0
     skipped_out_of_scope = 0
     touched_prs: list[str] = []
     reported_issue_failures: set[int] = set()
@@ -10296,17 +10299,18 @@ def main() -> int:
             phase="running",
             batch_index=0,
             total_batches=len(issues),
-            counts={
-                "processed": processed,
-                "failures": failures,
-                "skipped_existing_pr": skipped_existing_pr,
-                "skipped_existing_branch": skipped_existing_branch,
-                "skipped_blocked_dependencies": skipped_blocked_dependencies,
-                "skipped_out_of_scope": skipped_out_of_scope,
-            },
-            done=[
-                f"Loaded autonomous queue with {len(issues)} runnable issue(s)",
-                *(
+                counts={
+                    "processed": processed,
+                    "failures": failures,
+                    "skipped_existing_pr": skipped_existing_pr,
+                    "skipped_existing_branch": skipped_existing_branch,
+                    "skipped_blocked_dependencies": skipped_blocked_dependencies,
+                    "skipped_recovered_state": skipped_recovered_state,
+                    "skipped_out_of_scope": skipped_out_of_scope,
+                },
+                done=[
+                    f"Loaded autonomous queue with {len(issues)} runnable issue(s)",
+                    *(
                     [f"Skipped {skipped_blocked_dependencies} dependency-blocked issue(s)"]
                     if skipped_blocked_dependencies > 0
                     else []
@@ -10377,14 +10381,15 @@ def main() -> int:
                     phase="running",
                     batch_index=batch_index,
                     total_batches=len(issues),
-                    counts={
-                        "processed": processed,
-                        "failures": failures,
-                        "skipped_existing_pr": skipped_existing_pr,
-                        "skipped_existing_branch": skipped_existing_branch,
-                        "skipped_blocked_dependencies": skipped_blocked_dependencies,
-                        "skipped_out_of_scope": skipped_out_of_scope,
-                    },
+                        counts={
+                            "processed": processed,
+                            "failures": failures,
+                            "skipped_existing_pr": skipped_existing_pr,
+                            "skipped_existing_branch": skipped_existing_branch,
+                            "skipped_blocked_dependencies": skipped_blocked_dependencies,
+                            "skipped_recovered_state": skipped_recovered_state,
+                            "skipped_out_of_scope": skipped_out_of_scope,
+                        },
                     done=[batch_done_summary],
                     current=batch_current_summary,
                     next_items=preview_autonomous_issue_queue(issues, start_index=batch_index),
@@ -10609,6 +10614,7 @@ def main() -> int:
                     clarification_answer=clarification_answer,
                 )
                 if mode == "skip":
+                    skipped_recovered_state += 1
                     batch_done_summary = f"Skipped {issue_label}: {mode_reason}"
                     batch_current_summary = f"Batch {batch_index}/{len(issues)} paused for {issue_label}"
                     batch_action_items = [f"Recovery state kept {issue_label} out of the autonomous batch"]
@@ -12443,6 +12449,7 @@ def main() -> int:
                         "skipped_existing_pr": skipped_existing_pr,
                         "skipped_existing_branch": skipped_existing_branch,
                         "skipped_blocked_dependencies": skipped_blocked_dependencies,
+                        "skipped_recovered_state": skipped_recovered_state,
                         "skipped_out_of_scope": skipped_out_of_scope,
                     },
                     done=[batch_done_summary],
@@ -12473,6 +12480,7 @@ def main() -> int:
                 "skipped_existing_pr": skipped_existing_pr,
                 "skipped_existing_branch": skipped_existing_branch,
                 "skipped_blocked_dependencies": skipped_blocked_dependencies,
+                "skipped_recovered_state": skipped_recovered_state,
                 "skipped_out_of_scope": skipped_out_of_scope,
             },
             done=[f"Autonomous batch loop finished across {len(issues)} runnable issue(s)"],
@@ -12492,6 +12500,7 @@ def main() -> int:
         f"Processed: {processed}, "
         f"skipped_existing_pr: {skipped_existing_pr}, "
         f"skipped_existing_branch: {skipped_existing_branch}, "
+        f"skipped_recovered_state: {skipped_recovered_state}, "
         f"skipped_out_of_scope: {skipped_out_of_scope}, "
         f"failures: {failures}"
     )

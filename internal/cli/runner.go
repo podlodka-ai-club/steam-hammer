@@ -115,14 +115,14 @@ func formatCommandOutput(output []byte) string {
 	return ": " + trimmed
 }
 
-func (a *App) runPython(ctx context.Context, args []string) int {
-	if err := a.runner.Run(ctx, "python3", args...); err != nil {
+func (a *App) runSubprocess(ctx context.Context, runtimeLabel, name string, args []string) int {
+	if err := a.runner.Run(ctx, name, args...); err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			_, _ = fmt.Fprintln(a.err, "orchestrator: python runner timed out")
+			_, _ = fmt.Fprintf(a.err, "orchestrator: %s timed out\n", runtimeLabel)
 			return 124
 		}
 		if errors.Is(ctx.Err(), context.Canceled) {
-			_, _ = fmt.Fprintln(a.err, "orchestrator: python runner canceled")
+			_, _ = fmt.Fprintf(a.err, "orchestrator: %s canceled\n", runtimeLabel)
 			return 130
 		}
 
@@ -130,13 +130,17 @@ func (a *App) runPython(ctx context.Context, args []string) int {
 		if errors.As(err, &exitErr) {
 			code := exitErr.ExitCode()
 			if code >= 0 {
-				_, _ = fmt.Fprintf(a.err, "orchestrator: python runner exited with code %d\n", code)
+				_, _ = fmt.Fprintf(a.err, "orchestrator: %s exited with code %d\n", runtimeLabel, code)
 				return code
 			}
 		}
 
-		_, _ = fmt.Fprintf(a.err, "orchestrator: python runner failed: %v\n", err)
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %s failed: %v\n", runtimeLabel, err)
 		return 1
 	}
 	return 0
+}
+
+func (a *App) runPython(ctx context.Context, args []string) int {
+	return a.runSubprocess(ctx, "python runner", "python3", args)
 }

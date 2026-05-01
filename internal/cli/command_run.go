@@ -81,76 +81,96 @@ func (a *App) runRun(ctx context.Context, args []string) int {
 func buildIssuePythonArgs(script string, opts commonOptions, id int, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch bool, syncStrategy string, fs flagState) []string {
 	pythonArgs := []string{script, "--issue", strconv.Itoa(id)}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
+	return appendIssueRunArgs(pythonArgs, base, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch, syncStrategy, fs)
+}
+
+func buildIssueCLIArgs(opts commonOptions, id int, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch bool, syncStrategy string, fs flagState) []string {
+	args := []string{"run", "issue", "--id", strconv.Itoa(id)}
+	args = appendCommonPythonArgs(args, opts)
+	return appendIssueRunArgs(args, base, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch, syncStrategy, fs)
+}
+
+func appendIssueRunArgs(args []string, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch bool, syncStrategy string, fs flagState) []string {
 	if base != "" {
-		pythonArgs = append(pythonArgs, "--base", base)
+		args = append(args, "--base", base)
 	}
 	if includeEmpty {
-		pythonArgs = append(pythonArgs, "--include-empty")
+		args = append(args, "--include-empty")
 	}
 	if stopOnError {
-		pythonArgs = append(pythonArgs, "--stop-on-error")
+		args = append(args, "--stop-on-error")
 	}
 	if failOnExisting {
-		pythonArgs = append(pythonArgs, "--fail-on-existing")
+		args = append(args, "--fail-on-existing")
 	}
 	if forceIssueFlow {
-		pythonArgs = append(pythonArgs, "--force-issue-flow")
+		args = append(args, "--force-issue-flow")
 	}
 	if noSkipIfPRExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
+		args = append(args, "--no-skip-if-pr-exists")
 	} else if fs.wasPassed("skip-if-pr-exists") && skipIfPRExists {
-		pythonArgs = append(pythonArgs, "--skip-if-pr-exists")
+		args = append(args, "--skip-if-pr-exists")
 	} else if !skipIfPRExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-pr-exists")
+		args = append(args, "--no-skip-if-pr-exists")
 	}
 	if noSkipIfBranchExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
+		args = append(args, "--no-skip-if-branch-exists")
 	} else if fs.wasPassed("skip-if-branch-exists") && skipIfBranchExists {
-		pythonArgs = append(pythonArgs, "--skip-if-branch-exists")
+		args = append(args, "--skip-if-branch-exists")
 	} else if !skipIfBranchExists {
-		pythonArgs = append(pythonArgs, "--no-skip-if-branch-exists")
+		args = append(args, "--no-skip-if-branch-exists")
 	}
 	if forceReprocess {
-		pythonArgs = append(pythonArgs, "--force-reprocess")
+		args = append(args, "--force-reprocess")
 	}
 	if conflictRecoveryOnly {
-		pythonArgs = append(pythonArgs, "--conflict-recovery-only")
+		args = append(args, "--conflict-recovery-only")
 	}
 	if noSyncReusedBranch {
-		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
+		args = append(args, "--no-sync-reused-branch")
 	} else if fs.wasPassed("sync-reused-branch") && syncReusedBranch {
-		pythonArgs = append(pythonArgs, "--sync-reused-branch")
+		args = append(args, "--sync-reused-branch")
 	} else if !syncReusedBranch {
-		pythonArgs = append(pythonArgs, "--no-sync-reused-branch")
+		args = append(args, "--no-sync-reused-branch")
 	}
 	if syncStrategy != "" {
-		pythonArgs = append(pythonArgs, "--sync-strategy", syncStrategy)
+		args = append(args, "--sync-strategy", syncStrategy)
 	}
-	return pythonArgs
+	return args
 }
 
 func buildPRPythonArgs(script string, opts commonOptions, id int, allowBranchSwitch, isolateWorktree, postSummary bool, followupPrefix string, conflictRecoveryOnly bool, syncStrategy string) []string {
 	pythonArgs := []string{script, "--pr", strconv.Itoa(id), "--from-review-comments"}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
+	return appendPRRunArgs(pythonArgs, allowBranchSwitch, isolateWorktree, postSummary, followupPrefix, conflictRecoveryOnly, syncStrategy)
+}
+
+func buildPRCLIArgs(opts commonOptions, id int, allowBranchSwitch, isolateWorktree, postSummary bool, followupPrefix string, conflictRecoveryOnly bool, syncStrategy string) []string {
+	args := []string{"run", "pr", "--id", strconv.Itoa(id)}
+	args = appendCommonPythonArgs(args, opts)
+	return appendPRRunArgs(args, allowBranchSwitch, isolateWorktree, postSummary, followupPrefix, conflictRecoveryOnly, syncStrategy)
+}
+
+func appendPRRunArgs(args []string, allowBranchSwitch, isolateWorktree, postSummary bool, followupPrefix string, conflictRecoveryOnly bool, syncStrategy string) []string {
 	if allowBranchSwitch {
-		pythonArgs = append(pythonArgs, "--allow-pr-branch-switch")
+		args = append(args, "--allow-pr-branch-switch")
 	}
 	if isolateWorktree {
-		pythonArgs = append(pythonArgs, "--isolate-worktree")
+		args = append(args, "--isolate-worktree")
 	}
 	if postSummary {
-		pythonArgs = append(pythonArgs, "--post-pr-summary")
+		args = append(args, "--post-pr-summary")
 	}
 	if followupPrefix != "" {
-		pythonArgs = append(pythonArgs, "--pr-followup-branch-prefix", followupPrefix)
+		args = append(args, "--pr-followup-branch-prefix", followupPrefix)
 	}
 	if syncStrategy != "" {
-		pythonArgs = append(pythonArgs, "--sync-strategy", syncStrategy)
+		args = append(args, "--sync-strategy", syncStrategy)
 	}
 	if conflictRecoveryOnly {
-		pythonArgs = append(pythonArgs, "--conflict-recovery-only")
+		args = append(args, "--conflict-recovery-only")
 	}
-	return pythonArgs
+	return args
 }
 
 func appendAutonomousSessionFile(args []string, sessionPath string) []string {
@@ -244,6 +264,63 @@ func buildDaemonPythonArgs(script string, opts commonOptions, state string, limi
 	return pythonArgs
 }
 
+func buildDaemonCLIArgs(opts commonOptions, state string, limit int, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, syncReusedBranch, noSyncReusedBranch bool, syncStrategy, sessionPath string, postBatchVerify, createFollowupIssue bool, fs flagState) []string {
+	args := []string{"run", "daemon", "--state", state, "--limit", strconv.Itoa(limit)}
+	args = appendCommonPythonArgs(args, opts)
+	if base != "" {
+		args = append(args, "--base", base)
+	}
+	if includeEmpty {
+		args = append(args, "--include-empty")
+	}
+	if stopOnError {
+		args = append(args, "--stop-on-error")
+	}
+	if failOnExisting {
+		args = append(args, "--fail-on-existing")
+	}
+	if forceIssueFlow {
+		args = append(args, "--force-issue-flow")
+	}
+	if noSkipIfPRExists {
+		args = append(args, "--no-skip-if-pr-exists")
+	} else if fs.wasPassed("skip-if-pr-exists") && skipIfPRExists {
+		args = append(args, "--skip-if-pr-exists")
+	} else if !skipIfPRExists {
+		args = append(args, "--no-skip-if-pr-exists")
+	}
+	if noSkipIfBranchExists {
+		args = append(args, "--no-skip-if-branch-exists")
+	} else if fs.wasPassed("skip-if-branch-exists") && skipIfBranchExists {
+		args = append(args, "--skip-if-branch-exists")
+	} else if !skipIfBranchExists {
+		args = append(args, "--no-skip-if-branch-exists")
+	}
+	if forceReprocess {
+		args = append(args, "--force-reprocess")
+	}
+	if noSyncReusedBranch {
+		args = append(args, "--no-sync-reused-branch")
+	} else if fs.wasPassed("sync-reused-branch") && syncReusedBranch {
+		args = append(args, "--sync-reused-branch")
+	} else if !syncReusedBranch {
+		args = append(args, "--no-sync-reused-branch")
+	}
+	if syncStrategy != "" {
+		args = append(args, "--sync-strategy", syncStrategy)
+	}
+	if sessionPath != "" {
+		args = append(args, "--autonomous-session-file", sessionPath)
+	}
+	if postBatchVerify {
+		args = append(args, "--post-batch-verify")
+	}
+	if createFollowupIssue {
+		args = append(args, "--create-followup-issue")
+	}
+	return args
+}
+
 func defaultSourceDir(configuredDir string) string {
 	if strings.TrimSpace(configuredDir) != "" {
 		return configuredDir
@@ -300,6 +377,13 @@ func daemonWorkerName(slot int) string {
 		return "daemon"
 	}
 	return workerName("daemon", strconv.Itoa(slot))
+}
+
+func workerRuntimeLabel(name string) string {
+	if name == "python3" {
+		return "python runner"
+	}
+	return "orchestrator worker"
 }
 
 func shouldUseGoDaemonPolicy(opts commonOptions, lifecycle daemonLifecycle) bool {
@@ -360,9 +444,104 @@ type daemonParallelPreparedWorker struct {
 	name       string
 	issueID    int
 	opts       commonOptions
+	command    workerLaunchCommand
 	pythonArgs []string
 	workerPath detachedWorkerPaths
 	cleanup    func()
+}
+
+type workerLaunchCommand struct {
+	name           string
+	args           []string
+	fallbackReason string
+}
+
+func (a *App) currentExecutable() (string, error) {
+	if a.executablePath == nil {
+		return "", fmt.Errorf("orchestrator executable path is not configured")
+	}
+	return a.executablePath()
+}
+
+func (a *App) buildBatchWorkerLaunchCommand(ctx context.Context, opts commonOptions, id int, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch bool, syncStrategy string, fs flagState) workerLaunchCommand {
+	pythonIssue := workerLaunchCommand{
+		name: "python3",
+		args: buildIssuePythonArgs(a.runtime.RunnerScript(), opts, id, base, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch, syncStrategy, fs),
+	}
+	if strings.TrimSpace(*opts.repo) == "" {
+		pythonIssue.fallbackReason = "native worker dispatch requires --repo"
+		return pythonIssue
+	}
+	if a.issueLifecycle == nil {
+		pythonIssue.fallbackReason = "native worker dispatch requires issue lifecycle dependencies"
+		return pythonIssue
+	}
+
+	issue, err := a.issueLifecycle.FetchIssue(ctx, strings.TrimSpace(*opts.repo), id)
+	if err != nil {
+		pythonIssue.fallbackReason = fmt.Sprintf("failed to inspect issue #%d for native dispatch: %v", id, err)
+		return pythonIssue
+	}
+	comments, err := a.issueLifecycle.ListIssueComments(ctx, strings.TrimSpace(*opts.repo), id)
+	if err != nil {
+		pythonIssue.fallbackReason = fmt.Sprintf("failed to inspect issue #%d comments for native dispatch: %v", id, err)
+		return pythonIssue
+	}
+	trackerComments := make([]orchestration.TrackerComment, 0, len(comments))
+	for _, comment := range comments {
+		trackerComments = append(trackerComments, orchestration.TrackerComment{ID: comment.ID, CreatedAt: comment.CreatedAt, HTMLURL: comment.HTMLURL, Body: comment.Body})
+	}
+	recoveredState, _ := orchestration.SelectLatestParseableOrchestrationState(trackerComments, fmt.Sprintf("issue #%d", id))
+	linkedPR, err := a.issueLifecycle.FindOpenPullRequestForIssue(ctx, strings.TrimSpace(*opts.repo), issue)
+	if err != nil {
+		pythonIssue.fallbackReason = fmt.Sprintf("failed to inspect linked PR for issue #%d: %v", id, err)
+		return pythonIssue
+	}
+	decision := orchestration.ChooseExecutionMode(id, linkedPRNumber(linkedPR), forceIssueFlow, parsedStatePayload(recoveredState), nil)
+
+	if decision.Mode == orchestration.ExecutionModePRReview && linkedPR != nil {
+		pythonPR := workerLaunchCommand{
+			name: "python3",
+			args: buildPRPythonArgs(a.runtime.RunnerScript(), opts, linkedPR.Number, false, false, false, "", false, ""),
+		}
+		if reason := nativePRFallbackReason(nativePROptions{prID: linkedPR.Number, common: opts}); reason != "" {
+			pythonPR.fallbackReason = reason
+			return pythonPR
+		}
+		execPath, err := a.currentExecutable()
+		if err != nil {
+			pythonPR.fallbackReason = fmt.Sprintf("failed to resolve orchestrator executable: %v", err)
+			return pythonPR
+		}
+		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, false, false, false, "", false, "")}
+	}
+
+	if reason := nativeIssueFallbackReason(nativeIssueOptions{
+		issueID:              id,
+		common:               opts,
+		base:                 base,
+		includeEmpty:         includeEmpty,
+		failOnExisting:       failOnExisting,
+		forceIssueFlow:       forceIssueFlow,
+		skipIfPRExists:       skipIfPRExists,
+		noSkipIfPRExists:     noSkipIfPRExists,
+		skipIfBranchExists:   skipIfBranchExists,
+		noSkipIfBranchExists: noSkipIfBranchExists,
+		forceReprocess:       forceReprocess,
+		conflictRecoveryOnly: conflictRecoveryOnly,
+		syncReusedBranch:     syncReusedBranch,
+		noSyncReusedBranch:   noSyncReusedBranch,
+		syncStrategy:         syncStrategy,
+	}); reason != "" {
+		pythonIssue.fallbackReason = reason
+		return pythonIssue
+	}
+	execPath, err := a.currentExecutable()
+	if err != nil {
+		pythonIssue.fallbackReason = fmt.Sprintf("failed to resolve orchestrator executable: %v", err)
+		return pythonIssue
+	}
+	return workerLaunchCommand{name: execPath, args: buildIssueCLIArgs(opts, id, base, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch, syncStrategy, fs)}
 }
 
 func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfig, handled daemonHandledState) ([]daemonSelectedIssue, error) {
@@ -481,7 +660,7 @@ func daemonPayloadString(payload map[string]any, key string) string {
 	return strings.TrimSpace(value)
 }
 
-func (a *App) prepareParallelDaemonWorker(config daemonParallelConfig, issue daemonSelectedIssue, sessionPath string) (daemonParallelPreparedWorker, error) {
+func (a *App) prepareParallelDaemonWorker(ctx context.Context, config daemonParallelConfig, issue daemonSelectedIssue, sessionPath string) (daemonParallelPreparedWorker, error) {
 	workerOpts := config.opts
 	if config.detach {
 		workerPaths, err := resolveDetachedWorkerPaths(config.workerDir, *config.opts.dir, "daemon", strings.TrimPrefix(issue.workerName, "daemon-"))
@@ -497,26 +676,11 @@ func (a *App) prepareParallelDaemonWorker(config daemonParallelConfig, issue dae
 			name:    issue.workerName,
 			issueID: issue.issueID,
 			opts:    workerOpts,
-			pythonArgs: appendAutonomousSessionFile(buildIssuePythonArgs(
-				a.runtime.RunnerScript(),
-				workerOpts,
-				issue.issueID,
-				config.base,
-				config.includeEmpty,
-				config.stopOnError,
-				config.failOnExisting,
-				config.forceIssueFlow,
-				config.skipIfPRExists,
-				config.noSkipIfPRExists,
-				config.skipIfBranchExists,
-				config.noSkipIfBranchExists,
-				config.forceReprocess,
-				false,
-				config.syncReusedBranch,
-				config.noSyncReusedBranch,
-				config.syncStrategy,
-				config.flags,
-			), workerPaths.SessionPath),
+			command: func() workerLaunchCommand {
+				command := a.buildBatchWorkerLaunchCommand(ctx, workerOpts, issue.issueID, config.base, config.includeEmpty, config.stopOnError, config.failOnExisting, config.forceIssueFlow, config.skipIfPRExists, config.noSkipIfPRExists, config.skipIfBranchExists, config.noSkipIfBranchExists, config.forceReprocess, false, config.syncReusedBranch, config.noSyncReusedBranch, config.syncStrategy, config.flags)
+				command.args = appendAutonomousSessionFile(command.args, workerPaths.SessionPath)
+				return command
+			}(),
 			workerPath: workerPaths,
 		}, nil
 	}
@@ -545,26 +709,11 @@ func (a *App) prepareParallelDaemonWorker(config daemonParallelConfig, issue dae
 		name:    issue.workerName,
 		issueID: issue.issueID,
 		opts:    workerOpts,
-		pythonArgs: appendAutonomousSessionFile(buildIssuePythonArgs(
-			a.runtime.RunnerScript(),
-			workerOpts,
-			issue.issueID,
-			config.base,
-			config.includeEmpty,
-			config.stopOnError,
-			config.failOnExisting,
-			config.forceIssueFlow,
-			config.skipIfPRExists,
-			config.noSkipIfPRExists,
-			config.skipIfBranchExists,
-			config.noSkipIfBranchExists,
-			config.forceReprocess,
-			false,
-			config.syncReusedBranch,
-			config.noSyncReusedBranch,
-			config.syncStrategy,
-			config.flags,
-		), workerSessionPath),
+		command: func() workerLaunchCommand {
+			command := a.buildBatchWorkerLaunchCommand(ctx, workerOpts, issue.issueID, config.base, config.includeEmpty, config.stopOnError, config.failOnExisting, config.forceIssueFlow, config.skipIfPRExists, config.noSkipIfPRExists, config.skipIfBranchExists, config.noSkipIfBranchExists, config.forceReprocess, false, config.syncReusedBranch, config.noSyncReusedBranch, config.syncStrategy, config.flags)
+			command.args = appendAutonomousSessionFile(command.args, workerSessionPath)
+			return command
+		}(),
 		cleanup: cleanup,
 	}, nil
 }
@@ -608,7 +757,7 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 		if !selectionFailed {
 			for _, issue := range selected {
 				handled.signatures[issue.issueID] = issue.signature
-				worker, err := a.prepareParallelDaemonWorker(config, issue, config.sessionPath)
+				worker, err := a.prepareParallelDaemonWorker(ctx, config, issue, config.sessionPath)
 				if err != nil {
 					_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
 					lastCode = 1
@@ -637,10 +786,13 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 			var mu sync.Mutex
 			for _, worker := range preparedWorkers {
 				worker := worker
+				if worker.command.fallbackReason != "" {
+					_, _ = fmt.Fprintf(a.err, "orchestrator: falling back to python worker for issue #%d: %s\n", worker.issueID, worker.command.fallbackReason)
+				}
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					code := a.runPython(cycleCtx, worker.pythonArgs)
+					code := a.runSubprocess(cycleCtx, workerRuntimeLabel(worker.command.name), worker.command.name, worker.command.args)
 					if worker.cleanup != nil {
 						worker.cleanup()
 					}
@@ -729,27 +881,12 @@ func (a *App) runSerialDaemon(ctx context.Context, config daemonParallelConfig) 
 			cycleCode := 0
 			for _, issue := range selected {
 				handled.signatures[issue.issueID] = issue.signature
-				pythonArgs := appendAutonomousSessionFile(buildIssuePythonArgs(
-					a.runtime.RunnerScript(),
-					config.opts,
-					issue.issueID,
-					config.base,
-					config.includeEmpty,
-					config.stopOnError,
-					config.failOnExisting,
-					config.forceIssueFlow,
-					config.skipIfPRExists,
-					config.noSkipIfPRExists,
-					config.skipIfBranchExists,
-					config.noSkipIfBranchExists,
-					config.forceReprocess,
-					false,
-					config.syncReusedBranch,
-					config.noSyncReusedBranch,
-					config.syncStrategy,
-					config.flags,
-				), config.sessionPath)
-				code := a.runPython(ctx, pythonArgs)
+				command := a.buildBatchWorkerLaunchCommand(ctx, config.opts, issue.issueID, config.base, config.includeEmpty, config.stopOnError, config.failOnExisting, config.forceIssueFlow, config.skipIfPRExists, config.noSkipIfPRExists, config.skipIfBranchExists, config.noSkipIfBranchExists, config.forceReprocess, false, config.syncReusedBranch, config.noSyncReusedBranch, config.syncStrategy, config.flags)
+				if command.fallbackReason != "" {
+					_, _ = fmt.Fprintf(a.err, "orchestrator: falling back to python worker for issue #%d: %s\n", issue.issueID, command.fallbackReason)
+				}
+				command.args = appendAutonomousSessionFile(command.args, config.sessionPath)
+				code := a.runSubprocess(ctx, workerRuntimeLabel(command.name), command.name, command.args)
 				if code != 0 && cycleCode == 0 {
 					cycleCode = code
 				}
@@ -834,6 +971,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	createFollowupIssue := fs.Bool("create-followup-issue", false, a.runtime.FollowUpIssueFlagDescription("post-batch verification"))
 	detach := fs.Bool("detach", false, "start the worker in the background and write logs/state to a predictable path")
 	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
+	autonomousSessionFile := fs.String("autonomous-session-file", "", "internal autonomous session checkpoint path")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -872,6 +1010,11 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		effectiveMaxCycles = 1
 	}
 	if *detach {
+		execPath, err := a.currentExecutable()
+		if err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve orchestrator executable: %v\n", err)
+			return 1
+		}
 		lastCode := 0
 		for workerIndex := 1; workerIndex <= *maxParallelTasks; workerIndex++ {
 			workerID := ""
@@ -895,8 +1038,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 				continue
 			}
 			daemonOpts := withCommonOptionsDir(opts, clonePath)
-			workerArgs := buildDaemonPythonArgs(
-				a.runtime.RunnerScript(),
+			workerArgs := buildDaemonCLIArgs(
 				daemonOpts,
 				*state,
 				*limit,
@@ -918,13 +1060,14 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 				*createFollowupIssue,
 				flags,
 			)
+			workerArgs = append(workerArgs, "--max-parallel-tasks", "1", "--max-cycles", "1")
 			state := detachedWorkerStateFromOptions(
 				workerLabel,
 				"run daemon",
 				"daemon",
 				workerID,
 				daemonOpts,
-				append([]string{"python3"}, workerArgs...),
+				append([]string{execPath}, workerArgs...),
 				workerPaths,
 			)
 			state.WorkDir = clonePath
@@ -938,15 +1081,21 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		return lastCode
 	}
 
-	if !shouldUseGoDaemonPolicy(opts, a.daemon) {
+	sessionPath := strings.TrimSpace(*autonomousSessionFile)
+	cleanupSession := func() {}
+	if sessionPath == "" {
 		sessionFile, err := os.CreateTemp("", "orchestrator-daemon-session-*.json")
 		if err != nil {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to create daemon session file: %v\n", err)
 			return 1
 		}
-		sessionPath := sessionFile.Name()
+		sessionPath = sessionFile.Name()
 		_ = sessionFile.Close()
-		defer os.Remove(sessionPath)
+		cleanupSession = func() { _ = os.Remove(sessionPath) }
+	}
+	defer cleanupSession()
+
+	if !shouldUseGoDaemonPolicy(opts, a.daemon) {
 		pythonArgs := buildDaemonPythonArgs(a.runtime.RunnerScript(), opts, *state, *limit, base, *includeEmpty, *stopOnError, *failOnExisting, *forceIssueFlow, *skipIfPRExists, *noSkipIfPRExists, *skipIfBranchExists, *noSkipIfBranchExists, *forceReprocess, *syncReusedBranch, *noSyncReusedBranch, *syncStrategy, sessionPath, *postBatchVerify, *createFollowupIssue, flags)
 
 		cycles := 0
@@ -978,15 +1127,6 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 			}
 		}
 	}
-
-	sessionFile, err := os.CreateTemp("", "orchestrator-daemon-session-*.json")
-	if err != nil {
-		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to create daemon session file: %v\n", err)
-		return 1
-	}
-	sessionPath := sessionFile.Name()
-	_ = sessionFile.Close()
-	defer os.Remove(sessionPath)
 
 	if *maxParallelTasks > 1 {
 		return a.runParallelDaemon(ctx, daemonParallelConfig{
@@ -1119,8 +1259,8 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 			}
 			issueOpts = withCommonOptionsDir(issueOpts, clonePath)
 		}
-		pythonArgs := buildIssuePythonArgs(
-			a.runtime.RunnerScript(),
+		command := a.buildBatchWorkerLaunchCommand(
+			ctx,
 			issueOpts,
 			id,
 			base,
@@ -1139,6 +1279,9 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 			*syncStrategy,
 			flags,
 		)
+		if command.fallbackReason != "" {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: falling back to python worker for issue #%d: %s\n", id, command.fallbackReason)
+		}
 		if *detach {
 			state := detachedWorkerStateFromOptions(
 				workerName("issue", strconv.Itoa(id)),
@@ -1146,7 +1289,7 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 				"issue",
 				strconv.Itoa(id),
 				issueOpts,
-				append([]string{"python3"}, pythonArgs...),
+				append([]string{command.name}, command.args...),
 				workerPaths,
 			)
 			state.WorkDir = clonePath
@@ -1169,7 +1312,7 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 			}
 			continue
 		}
-		code := a.runPython(ctx, pythonArgs)
+		code := a.runSubprocess(ctx, workerRuntimeLabel(command.name), command.name, command.args)
 		if code != 0 {
 			if *stopOnError {
 				return code
@@ -1209,6 +1352,7 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
 	detach := fs.Bool("detach", false, "start the worker in the background and write logs/state to a predictable path")
 	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
+	_ = fs.String("autonomous-session-file", "", "internal autonomous session checkpoint path")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -1330,6 +1474,7 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
 	detach := fs.Bool("detach", false, "start the worker in the background and write logs/state to a predictable path")
 	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
+	_ = fs.String("autonomous-session-file", "", "internal autonomous session checkpoint path")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)

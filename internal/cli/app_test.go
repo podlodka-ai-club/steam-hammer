@@ -1181,10 +1181,13 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
 	cloner := &recordingBatchClonePreparer{}
 	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
 	var out strings.Builder
 	app := NewApp(&out, &strings.Builder{})
 	app.SetDetachedStarter(starter)
 	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(execPath)
+	app.SetIssueLifecycle(&fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{}})
 
 	code := app.Run([]string{"run", "batch", "--ids", "71,72", "--repo", "owner/repo", "--dir", targetDir, "--detach"})
 	if code != 0 {
@@ -1198,6 +1201,14 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 	}
 	if len(starter.reqs) != 2 {
 		t.Fatalf("starter requests = %d, want 2", len(starter.reqs))
+	}
+	for _, req := range starter.reqs {
+		if req.Name != execPath {
+			t.Fatalf("worker command = %q, want %q", req.Name, execPath)
+		}
+		if len(req.Args) < 4 || !reflect.DeepEqual(req.Args[:4], []string{"run", "issue", "--id", flagValue(req.Args, "--id")}) {
+			t.Fatalf("worker args = %#v, want run issue entrypoint", req.Args)
+		}
 	}
 	if starter.reqs[0].Dir == starter.reqs[1].Dir {
 		t.Fatalf("worker dirs should differ, got %q", starter.reqs[0].Dir)
@@ -1231,6 +1242,62 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 		if !strings.Contains(printed, want) {
 			t.Fatalf("stdout = %q, want %q", printed, want)
 		}
+	}
+}
+
+func TestRunBatchDetachRoutesLinkedPRToNativePRCommand(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	cloner := &recordingBatchClonePreparer{}
+	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(execPath)
+	app.SetIssueLifecycle(&fakeDaemonLifecycle{
+		issue:           githublifecycle.Issue{Number: 71, Title: "Fix runtime", Body: "Body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		linkedPR:        &githublifecycle.PullRequest{Number: 101, Title: "Existing fix", HeadRefName: "feature/pr-101", BaseRefName: "main"},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "batch", "--ids", "71", "--repo", "owner/repo", "--dir", targetDir, "--detach"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if starter.calls != 1 {
+		t.Fatalf("starter calls = %d, want 1", starter.calls)
+	}
+	if starter.req.Name != execPath {
+		t.Fatalf("worker command = %q, want %q", starter.req.Name, execPath)
+	}
+	if !reflect.DeepEqual(starter.req.Args[:4], []string{"run", "pr", "--id", "101"}) {
+		t.Fatalf("worker args = %#v, want native pr entrypoint", starter.req.Args)
+	}
+}
+
+func TestRunBatchDetachFallsBackToPythonWhenNativeIssueUnsupported(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	cloner := &recordingBatchClonePreparer{}
+	targetDir := t.TempDir()
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(filepath.Join(targetDir, "orchestrator"))
+	app.SetIssueLifecycle(&fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{}})
+
+	code := app.Run([]string{"run", "batch", "--ids", "71", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--project-config", "project.json"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if starter.req.Name != "python3" {
+		t.Fatalf("worker command = %q, want python3", starter.req.Name)
+	}
+	if len(starter.req.Args) < 3 || !reflect.DeepEqual(starter.req.Args[:3], []string{runnerScript, "--issue", "71"}) {
+		t.Fatalf("worker args = %#v, want python issue adapter", starter.req.Args)
+	}
+	if !strings.Contains(errOut.String(), "--project-config is not supported by the Go-native issue path yet") {
+		t.Fatalf("stderr = %q, want explicit native fallback reason", errOut.String())
 	}
 }
 
@@ -1415,10 +1482,12 @@ func TestRunDaemonDetachStartsOneWorkerPerParallelTask(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
 	cloner := &recordingBatchClonePreparer{}
 	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
 	var out strings.Builder
 	app := NewApp(&out, &strings.Builder{})
 	app.SetDetachedStarter(starter)
 	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(execPath)
 
 	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--max-parallel-tasks", "2"})
 	if code != 0 {
@@ -1432,6 +1501,14 @@ func TestRunDaemonDetachStartsOneWorkerPerParallelTask(t *testing.T) {
 	}
 	if len(starter.reqs) != 2 {
 		t.Fatalf("starter requests = %d, want 2", len(starter.reqs))
+	}
+	for _, req := range starter.reqs {
+		if req.Name != execPath {
+			t.Fatalf("worker command = %q, want %q", req.Name, execPath)
+		}
+		if len(req.Args) < 2 || !reflect.DeepEqual(req.Args[:2], []string{"run", "daemon"}) {
+			t.Fatalf("worker args = %#v, want run daemon entrypoint", req.Args)
+		}
 	}
 	if starter.reqs[0].Dir == starter.reqs[1].Dir {
 		t.Fatalf("daemon worker dirs should differ, got %q", starter.reqs[0].Dir)
@@ -1476,10 +1553,12 @@ func TestRunDaemonDetachStartsThreeWorkersWhenRequested(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
 	cloner := &recordingBatchClonePreparer{}
 	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
 	var out strings.Builder
 	app := NewApp(&out, &strings.Builder{})
 	app.SetDetachedStarter(starter)
 	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(execPath)
 
 	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--max-parallel-tasks", "3"})
 	if code != 0 {
@@ -1490,6 +1569,14 @@ func TestRunDaemonDetachStartsThreeWorkersWhenRequested(t *testing.T) {
 	}
 	if len(cloner.targetDirs) != 3 {
 		t.Fatalf("clone preparations = %d, want 3", len(cloner.targetDirs))
+	}
+	for _, req := range starter.reqs {
+		if req.Name != execPath {
+			t.Fatalf("worker command = %q, want %q", req.Name, execPath)
+		}
+		if len(req.Args) < 2 || !reflect.DeepEqual(req.Args[:2], []string{"run", "daemon"}) {
+			t.Fatalf("worker args = %#v, want run daemon entrypoint", req.Args)
+		}
 	}
 	for _, workerID := range []string{"1", "2", "3"} {
 		workerDir := filepath.Join(targetDir, ".orchestrator", "workers", "daemon-"+workerID)

@@ -1204,6 +1204,26 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintln(a.err, "run issue requires --id N")
 		return 2
 	}
+	if code, handled := a.tryRunNativeIssue(ctx, nativeIssueOptions{
+		issueID:              *id,
+		common:               opts,
+		base:                 base,
+		includeEmpty:         *includeEmpty,
+		failOnExisting:       *failOnExisting,
+		forceIssueFlow:       *forceIssueFlow,
+		skipIfPRExists:       *skipIfPRExists,
+		noSkipIfPRExists:     *noSkipIfPRExists,
+		skipIfBranchExists:   *skipIfBranchExists,
+		noSkipIfBranchExists: *noSkipIfBranchExists,
+		forceReprocess:       *forceReprocess,
+		conflictRecoveryOnly: *conflictRecoveryOnly,
+		syncReusedBranch:     *syncReusedBranch,
+		noSyncReusedBranch:   *noSyncReusedBranch,
+		syncStrategy:         *syncStrategy,
+		detach:               *detach,
+	}); handled {
+		return code
+	}
 
 	pythonArgs := buildIssuePythonArgs(
 		a.runtime.RunnerScript(),

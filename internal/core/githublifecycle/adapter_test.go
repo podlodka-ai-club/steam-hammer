@@ -53,6 +53,23 @@ func TestFetchIssuePreservesGitHubTrackerBoundary(t *testing.T) {
 	}
 }
 
+func TestDefaultBranchUsesCurrentGitHubRepoView(t *testing.T) {
+	gh := &fakeGHCLI{outputs: []string{`{"defaultBranchRef":{"name":"main"}}`}}
+	adapter := NewAdapter(gh)
+
+	branch, err := adapter.DefaultBranch(context.Background(), "owner/repo")
+	if err != nil {
+		t.Fatalf("DefaultBranch() error = %v", err)
+	}
+	if branch != "main" {
+		t.Fatalf("DefaultBranch() = %q, want main", branch)
+	}
+	want := []string{"repo", "view", "owner/repo", "--json", "defaultBranchRef"}
+	if !reflect.DeepEqual(gh.captureCalls[0], want) {
+		t.Fatalf("DefaultBranch command = %#v, want %#v", gh.captureCalls[0], want)
+	}
+}
+
 func TestListIssuesPreservesGitHubTrackerBoundary(t *testing.T) {
 	gh := &fakeGHCLI{outputs: []string{`[{"number":71,"title":"Fix runner"},{"number":72,"title":"Fix CI"}]`}}
 	adapter := NewAdapter(gh)
@@ -186,6 +203,23 @@ func TestFetchPullRequestUsesCurrentGitHubFields(t *testing.T) {
 	want := []string{"pr", "view", "101", "--repo", "owner/repo", "--json", "number,title,body,url,state,mergeStateStatus,mergeable,isDraft,reviewDecision,headRefName,headRefOid,baseRefName,author,closingIssuesReferences,reviews,files"}
 	if !reflect.DeepEqual(gh.captureCalls[0], want) {
 		t.Fatalf("FetchPullRequest command = %#v, want %#v", gh.captureCalls[0], want)
+	}
+}
+
+func TestFindOpenPullRequestForIssueUsesCurrentGitHubFields(t *testing.T) {
+	gh := &fakeGHCLI{outputs: []string{`[{"number":101,"title":"Fix issue #71","url":"https://github.com/owner/repo/pull/101","headRefName":"issue-fix/71-fix-runner","closingIssuesReferences":[{"number":71}]}]`}}
+	adapter := NewAdapter(gh)
+
+	pr, err := adapter.FindOpenPullRequestForIssue(context.Background(), "owner/repo", Issue{Number: 71, Title: "Fix runner"})
+	if err != nil {
+		t.Fatalf("FindOpenPullRequestForIssue() error = %v", err)
+	}
+	if pr == nil || pr.Number != 101 {
+		t.Fatalf("FindOpenPullRequestForIssue() = %#v, want PR #101", pr)
+	}
+	want := []string{"pr", "list", "--repo", "owner/repo", "--state", "open", "--limit", "100", "--json", "number,title,url,body,headRefName,baseRefName,closingIssuesReferences"}
+	if !reflect.DeepEqual(gh.captureCalls[0], want) {
+		t.Fatalf("FindOpenPullRequestForIssue command = %#v, want %#v", gh.captureCalls[0], want)
 	}
 }
 

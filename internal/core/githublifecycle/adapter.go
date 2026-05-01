@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 )
 
@@ -28,8 +29,14 @@ var (
 // Lifecycle keeps the current GitHub-backed issue and PR operations behind an
 // explicit Go boundary so the orchestration core can depend on interfaces.
 type Lifecycle interface {
+	RepositoryLifecycle
 	IssueLifecycle
 	PullRequestLifecycle
+}
+
+type RepositoryLifecycle interface {
+	DefaultBranch(ctx context.Context, repo string) (string, error)
+	FindOpenPullRequestForIssue(ctx context.Context, repo string, issue Issue) (*PullRequest, error)
 }
 
 type IssueLifecycle interface {
@@ -227,6 +234,28 @@ func (a *Adapter) FetchIssue(ctx context.Context, repo string, number int) (Issu
 	return issue, nil
 }
 
+func (a *Adapter) DefaultBranch(ctx context.Context, repo string) (string, error) {
+	output, err := a.gh.Capture(ctx,
+		"repo", "view", repo,
+		"--json", "defaultBranchRef",
+	)
+	if err != nil {
+		return "", err
+	}
+	var payload struct {
+		DefaultBranchRef *struct {
+			Name string `json:"name,omitempty"`
+		} `json:"defaultBranchRef,omitempty"`
+	}
+	if err := decodeJSONObject(output, &payload); err != nil {
+		return "", fmt.Errorf("unexpected response fetching default branch for %s: %w", repo, err)
+	}
+	if payload.DefaultBranchRef == nil || strings.TrimSpace(payload.DefaultBranchRef.Name) == "" {
+		return "", fmt.Errorf("default branch is missing for %s", repo)
+	}
+	return strings.TrimSpace(payload.DefaultBranchRef.Name), nil
+}
+
 func (a *Adapter) ListIssues(ctx context.Context, repo, state string, limit int) ([]Issue, error) {
 	output, err := a.gh.Capture(ctx,
 		"issue", "list",
@@ -313,6 +342,30 @@ func (a *Adapter) FetchPullRequest(ctx context.Context, repo string, number int)
 		return PullRequest{}, fmt.Errorf("unexpected response fetching PR #%d: %w", number, err)
 	}
 	return pr, nil
+}
+
+func (a *Adapter) FindOpenPullRequestForIssue(ctx context.Context, repo string, issue Issue) (*PullRequest, error) {
+	output, err := a.gh.Capture(ctx,
+		"pr", "list",
+		"--repo", repo,
+		"--state", "open",
+		"--limit", "100",
+		"--json", "number,title,url,body,headRefName,baseRefName,closingIssuesReferences",
+	)
+	if err != nil {
+		return nil, err
+	}
+	var prs []PullRequest
+	if err := decodeJSONArray(output, &prs); err != nil {
+		return nil, fmt.Errorf("unexpected response from gh pr list while searching linked PR: %w", err)
+	}
+	for i := range prs {
+		if pullRequestLinksIssue(prs[i], issue) {
+			copy := prs[i]
+			return &copy, nil
+		}
+	}
+	return nil, nil
 }
 
 func (a *Adapter) CreatePullRequest(ctx context.Context, req CreatePullRequestRequest) (string, error) {
@@ -648,6 +701,30 @@ func buildPullRequestBody(req CreatePullRequestRequest) string {
 		body.WriteString("` (not repository default branch)\n")
 	}
 	return body.String()
+}
+
+func pullRequestLinksIssue(pr PullRequest, issue Issue) bool {
+	for _, reference := range pr.ClosingIssuesReferences {
+		if reference.Number == issue.Number {
+			return true
+		}
+	}
+
+	issueRef := fmt.Sprintf("#%d", issue.Number)
+	issueRefLower := strings.ToLower(issueRef)
+	if strings.Contains(strings.ToLower(pr.Title), issueRefLower) || strings.Contains(strings.ToLower(pr.Body), issueRefLower) {
+		return true
+	}
+
+	headRef := strings.TrimSpace(pr.HeadRefName)
+	if headRef == "" {
+		return false
+	}
+	return issueNumberPattern(issue.Number).MatchString(headRef)
+}
+
+func issueNumberPattern(issueNumber int) *regexp.Regexp {
+	return regexp.MustCompile(fmt.Sprintf(`(^|[^0-9])%d([^0-9]|$)`, issueNumber))
 }
 
 func decodeJSONObject(output string, target any) error {

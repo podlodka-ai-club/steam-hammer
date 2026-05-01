@@ -5,30 +5,36 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/agentexec"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/githublifecycle"
 )
 
 type App struct {
-	out     io.Writer
-	err     io.Writer
-	runner  Runner
-	shell   shellExecutor
-	start   DetachedStarter
-	clone   BatchClonePreparer
-	daemon  daemonLifecycle
-	runtime runtimeProvider
+	out            io.Writer
+	err            io.Writer
+	runner         Runner
+	shell          shellExecutor
+	start          DetachedStarter
+	clone          BatchClonePreparer
+	daemon         daemonLifecycle
+	issueLifecycle issueLifecycle
+	agentRunner    issueAgentRunner
+	runtime        runtimeProvider
 }
 
 func NewApp(out, err io.Writer) *App {
+	adapter := githublifecycle.NewAdapter(nil)
 	return &App{
-		out:     out,
-		err:     err,
-		runner:  ExecRunner{Stdout: out, Stderr: err},
-		shell:   execShellExecutor{},
-		start:   ExecDetachedStarter{},
-		clone:   ExecBatchClonePreparer{},
-		daemon:  githublifecycle.NewAdapter(nil),
-		runtime: defaultRuntimeProvider(),
+		out:            out,
+		err:            err,
+		runner:         ExecRunner{Stdout: out, Stderr: err},
+		shell:          execShellExecutor{},
+		start:          ExecDetachedStarter{},
+		clone:          ExecBatchClonePreparer{},
+		daemon:         adapter,
+		issueLifecycle: adapter,
+		agentRunner:    nativeIssueAgentRunner{},
+		runtime:        defaultRuntimeProvider(),
 	}
 }
 
@@ -46,6 +52,28 @@ func (a *App) SetBatchClonePreparer(preparer BatchClonePreparer) {
 
 func (a *App) SetDaemonLifecycle(lifecycle daemonLifecycle) {
 	a.daemon = lifecycle
+}
+
+func (a *App) SetIssueLifecycle(lifecycle issueLifecycle) {
+	a.issueLifecycle = lifecycle
+}
+
+func (a *App) SetIssueAgentRunner(runner issueAgentRunner) {
+	if runner == nil {
+		a.agentRunner = nativeIssueAgentRunner{}
+		return
+	}
+	a.agentRunner = runner
+}
+
+type issueAgentRunner interface {
+	Run(ctx context.Context, itemLabel string, req agentexec.Request) (*agentexec.Result, error)
+}
+
+type nativeIssueAgentRunner struct{}
+
+func (nativeIssueAgentRunner) Run(ctx context.Context, itemLabel string, req agentexec.Request) (*agentexec.Result, error) {
+	return agentexec.Run(ctx, itemLabel, req)
 }
 
 func (a *App) SetRuntimeProvider(provider runtimeProvider) {

@@ -3,15 +3,18 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"github.com/podlodka-ai-club/steam-hammer/internal/core/githublifecycle"
-	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
-	"github.com/podlodka-ai-club/steam-hammer/internal/core/workers"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/agentexec"
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/githublifecycle"
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/workers"
 )
 
 type recordingRunner struct {
@@ -81,15 +84,55 @@ type fakeShellExecutor struct {
 	cwds    []string
 }
 
+type fakeIssueAgentRunner struct {
+	result    *agentexec.Result
+	err       error
+	requests  []agentexec.Request
+	labels    []string
+	callCount int
+}
+
 type fakeDaemonLifecycle struct {
 	issues          []githublifecycle.Issue
+	issue           githublifecycle.Issue
+	defaultBranch   string
+	linkedPR        *githublifecycle.PullRequest
 	commentsByIssue map[int][]githublifecycle.IssueComment
 	commentBodies   map[int][]string
 	createdIssues   []githublifecycle.CreateIssueRequest
 	createIssue     githublifecycle.Issue
+	createdPRs      []githublifecycle.CreatePullRequestRequest
+	createPRURL     string
 	listErr         error
 	commentErr      error
 	createErr       error
+}
+
+func (f *fakeDaemonLifecycle) FetchIssue(_ context.Context, _ string, number int) (githublifecycle.Issue, error) {
+	if f.listErr != nil {
+		return githublifecycle.Issue{}, f.listErr
+	}
+	if f.issue.Number == 0 {
+		f.issue = githublifecycle.Issue{Number: number, Title: "Fix runner", Body: "Body", URL: "https://github.com/owner/repo/issues/" + strconv.Itoa(number), Tracker: githublifecycle.TrackerGitHub}
+	}
+	return f.issue, nil
+}
+
+func (f *fakeDaemonLifecycle) DefaultBranch(_ context.Context, _ string) (string, error) {
+	if f.listErr != nil {
+		return "", f.listErr
+	}
+	if f.defaultBranch == "" {
+		return "main", nil
+	}
+	return f.defaultBranch, nil
+}
+
+func (f *fakeDaemonLifecycle) FindOpenPullRequestForIssue(_ context.Context, _ string, _ githublifecycle.Issue) (*githublifecycle.PullRequest, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.linkedPR, nil
 }
 
 func (f *fakeDaemonLifecycle) ListIssues(_ context.Context, _ string, _ string, _ int) ([]githublifecycle.Issue, error) {
@@ -134,6 +177,17 @@ func (f *fakeDaemonLifecycle) CreateIssue(_ context.Context, req githublifecycle
 	return f.createIssue, nil
 }
 
+func (f *fakeDaemonLifecycle) CreatePullRequest(_ context.Context, req githublifecycle.CreatePullRequestRequest) (string, error) {
+	f.createdPRs = append(f.createdPRs, req)
+	if f.createErr != nil {
+		return "", f.createErr
+	}
+	if f.createPRURL == "" {
+		f.createPRURL = "https://github.com/owner/repo/pull/101"
+	}
+	return f.createPRURL, nil
+}
+
 func (r *recordingBatchClonePreparer) Prepare(sourceDir, targetDir string) (string, error) {
 	r.sourceDirs = append(r.sourceDirs, sourceDir)
 	r.targetDirs = append(r.targetDirs, targetDir)
@@ -158,6 +212,19 @@ func (f *fakeShellExecutor) Run(_ context.Context, cwd, command string) (shellEx
 	result := f.results[0]
 	f.results = f.results[1:]
 	return result, nil
+}
+
+func (f *fakeIssueAgentRunner) Run(_ context.Context, itemLabel string, req agentexec.Request) (*agentexec.Result, error) {
+	f.callCount++
+	f.labels = append(f.labels, itemLabel)
+	f.requests = append(f.requests, req)
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.result == nil {
+		return &agentexec.Result{}, nil
+	}
+	return f.result, nil
 }
 
 type exitCodeError int
@@ -690,6 +757,137 @@ func TestRunIssueCommandAcceptsIssueAlias(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--issue", "71"})
+}
+
+func TestRunIssueUsesGoNativeHappyPath(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 1},
+		{ExitCode: 2},
+		{},
+		{},
+		{Stdout: ""},
+		{Stdout: "M internal/cli/command_run.go\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+		{},
+		{Stdout: "new.txt\n"},
+		{},
+		{},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+		{},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+		createPRURL:   "https://github.com/owner/repo/pull/101",
+	}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{Stats: agentexec.Stats{ElapsedSeconds: 12}}}
+	var out strings.Builder
+	var errOut strings.Builder
+	app := NewApp(&out, &errOut)
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0; stderr=%q", code, errOut.String())
+	}
+	if runner.calls != 0 {
+		t.Fatalf("python runner calls = %d, want 0", runner.calls)
+	}
+	if agent.callCount != 1 {
+		t.Fatalf("agent call count = %d, want 1", agent.callCount)
+	}
+	if len(agent.requests) != 1 {
+		t.Fatalf("agent requests = %d, want 1", len(agent.requests))
+	}
+	if agent.requests[0].Runner != nativeIssueDefaultRunner || agent.requests[0].Agent != nativeIssueDefaultAgent || agent.requests[0].Model != nativeIssueDefaultModel {
+		t.Fatalf("agent request = %#v", agent.requests[0])
+	}
+	if agent.requests[0].Cwd != "/repo" {
+		t.Fatalf("agent cwd = %q, want /repo", agent.requests[0].Cwd)
+	}
+	if len(lifecycle.createdPRs) != 1 {
+		t.Fatalf("created PRs = %d, want 1", len(lifecycle.createdPRs))
+	}
+	createdPR := lifecycle.createdPRs[0]
+	if createdPR.BaseBranch != "main" || createdPR.HeadBranch != "issue-fix/71-fix-runner" || createdPR.IssueRef != "#71" {
+		t.Fatalf("created PR = %#v", createdPR)
+	}
+	if len(lifecycle.commentBodies[71]) != 2 {
+		t.Fatalf("comment bodies = %d, want 2", len(lifecycle.commentBodies[71]))
+	}
+	firstState, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][0])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody(first) error = %v", err)
+	}
+	if firstState.Status != orchestration.StatusInProgress || firstState.Stage != "agent_run" {
+		t.Fatalf("first state = %#v", firstState)
+	}
+	finalState, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][1])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody(final) error = %v", err)
+	}
+	if finalState.Status != orchestration.StatusReadyForReview || finalState.Stage != "pr_ready" {
+		t.Fatalf("final state = %#v", finalState)
+	}
+	if finalState.PR == nil || *finalState.PR != 101 {
+		t.Fatalf("final PR = %#v, want 101", finalState.PR)
+	}
+	if !strings.Contains(out.String(), "Prepared issue #71 for review") {
+		t.Fatalf("stdout = %q, want success summary", out.String())
+	}
+	wantCommands := []string{
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("status", "--porcelain"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("show-ref", "--verify", "--quiet", "refs/heads/issue-fix/71-fix-runner"),
+		gitCommand("ls-remote", "--exit-code", "--heads", "origin", "issue-fix/71-fix-runner"),
+		gitCommand("checkout", "main"),
+		gitCommand("checkout", "-b", "issue-fix/71-fix-runner"),
+		gitCommand("ls-files", "--others", "--exclude-standard"),
+		gitCommand("status", "--porcelain"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("add", "-u"),
+		gitCommand("ls-files", "--others", "--exclude-standard"),
+		gitCommand("add", "--", "new.txt"),
+		gitCommand("commit", "-m", "Fix issue #71: Fix runner"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("push", "-u", "origin", "issue-fix/71-fix-runner"),
+	}
+	if !reflect.DeepEqual(shell.cmds, wantCommands) {
+		t.Fatalf("shell commands = %#v, want %#v", shell.cmds, wantCommands)
+	}
+}
+
+func TestRunIssueFallsBackToPythonAfterGoSelectsPRReview(t *testing.T) {
+	runner := &recordingRunner{}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:    githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		linkedPR: &githublifecycle.PullRequest{Number: 101, Title: "Existing fix", HeadRefName: "issue-fix/71-fix-runner"},
+	}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetIssueLifecycle(lifecycle)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo"})
+	if !strings.Contains(errOut.String(), "falling back to python issue runner") || !strings.Contains(errOut.String(), "linked open PR #101") {
+		t.Fatalf("stderr = %q, want native selection fallback reason", errOut.String())
+	}
 }
 
 func TestRunBatchDryRunWiresPythonRunnerPerIssue(t *testing.T) {

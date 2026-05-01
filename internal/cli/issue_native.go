@@ -66,9 +66,6 @@ func nativeIssueFallbackReason(opts nativeIssueOptions) string {
 	if *opts.common.dryRun {
 		return "--dry-run is not supported by the Go-native issue path yet"
 	}
-	if opts.conflictRecoveryOnly {
-		return "--conflict-recovery-only is not supported by the Go-native issue path yet"
-	}
 	if strings.TrimSpace(*opts.common.local) != "" {
 		return "--local-config is not supported by the Go-native issue path yet"
 	}
@@ -101,6 +98,9 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to fetch issue #%d: %v\n", opts.issueID, err)
 		return 1
+	}
+	if opts.conflictRecoveryOnly {
+		return a.runNativeIssueConflictRecovery(ctx, repo, issue, opts, &latestState)
 	}
 	comments, err := a.issueLifecycle.ListIssueComments(ctx, repo, issue.Number)
 	if err != nil {
@@ -793,6 +793,121 @@ func (a *App) gitPushBranch(ctx context.Context, repoRoot, branchName string, fo
 	args = append(args, "origin", branchName)
 	_, err := a.runGit(ctx, repoRoot, args...)
 	return err
+}
+
+func (a *App) runNativeIssueConflictRecovery(
+	ctx context.Context,
+	repo string,
+	issue githublifecycle.Issue,
+	opts nativeIssueOptions,
+	latestState **orchestration.TrackedState,
+) int {
+	cwd := defaultSourceDir(*opts.common.dir)
+	repoRoot, err := a.gitRepoRoot(ctx, cwd)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve repository root: %v\n", err)
+		return 1
+	}
+	if dirty, err := a.gitHasChanges(ctx, repoRoot); err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect worktree status: %v\n", err)
+		return 1
+	} else if dirty {
+		_, _ = fmt.Fprintln(a.err, "orchestrator: git working tree must be clean before native issue execution")
+		return 1
+	}
+	originalBranch, err := a.gitCurrentBranch(ctx, repoRoot)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve current branch: %v\n", err)
+		return 1
+	}
+	baseBranch, _, err := a.resolveIssueBaseBranch(ctx, repo, repoRoot, originalBranch, opts.base)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve base branch: %v\n", err)
+		return 1
+	}
+	branchPrefix := strings.TrimSpace(*opts.common.branch)
+	if branchPrefix == "" {
+		branchPrefix = nativeIssueDefaultBranchPrefix
+	}
+	issueBranch := nativeIssueBranchName(issue, branchPrefix)
+	localBranchExists, err := a.gitLocalBranchExists(ctx, repoRoot, issueBranch)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect local branch %q: %v\n", issueBranch, err)
+		return 1
+	}
+	remoteBranchExists, err := a.gitRemoteBranchExists(ctx, repoRoot, issueBranch)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect remote branch %q: %v\n", issueBranch, err)
+		return 1
+	}
+
+	runnerName := fallbackString(strings.TrimSpace(*opts.common.runner), nativeIssueDefaultRunner)
+	agentName := fallbackString(strings.TrimSpace(*opts.common.agent), nativeIssueDefaultAgent)
+	modelName := fallbackString(strings.TrimSpace(*opts.common.model), nativeIssueDefaultModel)
+	branchLifecycle := orchestration.BranchLifecycleReused
+	var reusedBranchSync *orchestration.ReusedBranchSyncVerdict
+	postState := func(state orchestration.TrackedState) {
+		copy := state
+		*latestState = &copy
+		if err := a.safePostIssueState(ctx, repo, issue.Number, state); err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: warning: failed to post state for issue #%d: %v\n", issue.Number, err)
+		}
+	}
+	buildState := func(status, stage, nextAction, message string) orchestration.TrackedState {
+		return orchestration.TrackedState{
+			Status:           status,
+			TaskType:         "issue",
+			Issue:            intPtr(issue.Number),
+			Branch:           issueBranch,
+			BranchLifecycle:  branchLifecycle,
+			BaseBranch:       baseBranch,
+			Runner:           runnerName,
+			Agent:            agentName,
+			Model:            modelName,
+			Attempt:          1,
+			Stage:            stage,
+			NextAction:       nextAction,
+			Error:            message,
+			Timestamp:        time.Now().UTC().Format(time.RFC3339),
+			ReusedBranchSync: reusedBranchSync,
+		}
+	}
+
+	if !localBranchExists && !remoteBranchExists {
+		message := fmt.Sprintf(
+			"conflict recovery only requires an existing deterministic issue branch, but %q was not found locally or on origin; run the normal issue flow first",
+			issueBranch,
+		)
+		postState(buildState(orchestration.StatusBlocked, "sync_branch", "run_normal_issue_flow_first", message))
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %s\n", message)
+		return 1
+	}
+
+	_, reusedBranchSync, pushWithLease, err := a.prepareIssueBranchPreflight(ctx, repoRoot, baseBranch, issueBranch, localBranchExists, remoteBranchExists, true, opts.syncStrategy)
+	if err != nil {
+		postState(buildState(orchestration.StatusBlocked, "sync_branch", "resolve_branch_sync_conflict", err.Error()))
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to recover issue branch %q: %v\n", issueBranch, err)
+		return 1
+	}
+	if reusedBranchSync == nil {
+		message := fmt.Sprintf("conflict recovery for issue branch %q did not produce a sync verdict", issueBranch)
+		postState(buildState(orchestration.StatusFailed, "sync_branch", "inspect_recovery_result", message))
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %s\n", message)
+		return 1
+	}
+
+	if reusedBranchSync.Changed {
+		if err := a.gitPushBranch(ctx, repoRoot, issueBranch, pushWithLease); err != nil {
+			postState(buildState(orchestration.StatusFailed, "sync_branch", "inspect_push_failure", err.Error()))
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to push recovered issue branch %q: %v\n", issueBranch, err)
+			return 1
+		}
+		_, _ = fmt.Fprintln(a.out, reusedBranchSync.PushSummary(false))
+	}
+
+	postState(buildState(orchestration.StatusWaitingForAuthor, "sync_branch", "inspect_conflict_recovery_result", ""))
+	_, _ = fmt.Fprintln(a.out, reusedBranchSync.Summary(false))
+	return 0
 }
 
 func (a *App) assertNativeGitContext(ctx context.Context, repoRoot, branchName, operation string) error {

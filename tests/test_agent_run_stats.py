@@ -218,6 +218,27 @@ class AgentRunStatsTests(unittest.TestCase):
         self.assertEqual(run_stats["tokens_out"], 1400)
         self.assertEqual(run_stats["tokens_total"], 21400)
 
+    def test_run_agent_with_prompt_uses_explicit_utf8_text_encoding(self) -> None:
+        process = self._FakeProcess(stdout_lines=[], stderr_lines=[], poll_results=[0])
+
+        with patch("scripts.run_github_issues_to_opencode.subprocess.Popen", return_value=process) as popen_mock:
+            exit_code = run_agent_with_prompt(
+                prompt="fix it",
+                item_label="issue #91",
+                runner="opencode",
+                agent="build",
+                model=None,
+                dry_run=False,
+                timeout_seconds=900,
+                idle_timeout_seconds=None,
+                opencode_auto_approve=False,
+                track_tokens=False,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(popen_mock.call_args.kwargs["encoding"], "utf-8")
+        self.assertTrue(popen_mock.call_args.kwargs["text"])
+
     def test_run_agent_with_prompt_stops_when_cost_budget_exceeded(self) -> None:
         process = self._FakeProcess(
             stdout_lines=["Estimated cost: $0.4200\n"],

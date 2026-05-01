@@ -17,6 +17,7 @@ type DaemonTaskSnapshot struct {
 	RunID                string
 	ForceReprocess       bool
 	LatestStateStatus    string
+	LatestStateTaskType  string
 	LatestClaim          map[string]any
 	LatestDecomposition  map[string]any
 	LastHandledSignature string
@@ -98,23 +99,49 @@ func BuildDaemonReleaseComment(issueNumber int, runID, worker string, releasedAt
 }
 
 func ProcessedIssueStatus(raw json.RawMessage) string {
+	state, ok := decodeProcessedTrackedState(raw)
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(state.Status))
+}
+
+func ProcessedIssueSignature(raw json.RawMessage) string {
+	state, ok := decodeProcessedTrackedState(raw)
+	if !ok {
+		return ""
+	}
+	return daemonTaskSignature(DaemonTaskSnapshot{
+		LatestStateStatus:   state.Status,
+		LatestStateTaskType: state.TaskType,
+	})
+}
+
+func decodeProcessedTrackedState(raw json.RawMessage) (TrackedState, bool) {
 	if len(raw) == 0 {
-		return ""
+		return TrackedState{}, false
 	}
-	var payload map[string]any
+	var payload TrackedState
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return ""
+		return TrackedState{}, false
 	}
-	return normalizePayloadStatus(payload, "status")
+	if strings.TrimSpace(payload.Status) == "" {
+		return TrackedState{}, false
+	}
+	return payload, true
 }
 
 func daemonTaskSignature(snapshot DaemonTaskSnapshot) string {
 	decompositionStatus := normalizePayloadStatus(snapshot.LatestDecomposition, "status")
 	stateStatus := strings.ToLower(strings.TrimSpace(snapshot.LatestStateStatus))
+	stateTaskType := strings.ToLower(strings.TrimSpace(snapshot.LatestStateTaskType))
 	if decompositionStatus == "proposed" || decompositionStatus == "approved" || decompositionStatus == "children_created" {
 		return "decomposition:" + decompositionStatus
 	}
 	if stateStatus != "" {
+		if stateTaskType != "" {
+			return "state:" + stateTaskType + ":" + stateStatus
+		}
 		return "state:" + stateStatus
 	}
 	return "state:new"

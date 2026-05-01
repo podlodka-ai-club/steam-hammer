@@ -116,7 +116,7 @@ func TestCreateIssueUsesCurrentGitHubAPI(t *testing.T) {
 }
 
 func TestListIssueCommentsUsesCurrentGitHubAPI(t *testing.T) {
-	gh := &fakeGHCLI{outputs: []string{`[{"id":1,"body":"comment","html_url":"https://example.test/comment/1","created_at":"2026-05-01T10:00:00Z"}]`}}
+	gh := &fakeGHCLI{outputs: []string{`[{"id":1,"body":"comment","html_url":"https://example.test/comment/1","created_at":"2026-05-01T10:00:00Z","user":{"login":"reviewer"}}]`}}
 	adapter := NewAdapter(gh)
 
 	comments, err := adapter.ListIssueComments(context.Background(), "owner/repo", 71)
@@ -129,9 +129,46 @@ func TestListIssueCommentsUsesCurrentGitHubAPI(t *testing.T) {
 	if comments[0].ID != 1 || comments[0].Body != "comment" {
 		t.Fatalf("ListIssueComments() = %#v", comments)
 	}
+	if comments[0].User.Login != "reviewer" {
+		t.Fatalf("ListIssueComments() user = %#v", comments[0].User)
+	}
 	want := []string{"api", "repos/owner/repo/issues/71/comments", "--method", "GET", "-H", "Accept: application/vnd.github+json", "-f", "per_page=100"}
 	if !reflect.DeepEqual(gh.captureCalls[0], want) {
 		t.Fatalf("ListIssueComments command = %#v, want %#v", gh.captureCalls[0], want)
+	}
+}
+
+func TestReviewThreadsForPullRequestUsesCurrentGitHubGraphQL(t *testing.T) {
+	gh := &fakeGHCLI{outputs: []string{`{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"body":"Please update this","path":"internal/core/orchestration/session.go","line":42,"outdated":false,"url":"https://example.test/comment/7","author":{"login":"reviewer"}}]}}]}}}}}`}}
+	adapter := NewAdapter(gh)
+
+	threads, err := adapter.ReviewThreadsForPullRequest(context.Background(), "owner/repo", 101)
+	if err != nil {
+		t.Fatalf("ReviewThreadsForPullRequest() error = %v", err)
+	}
+	if len(threads) != 1 || len(threads[0].Comments) != 1 {
+		t.Fatalf("threads = %#v", threads)
+	}
+	comment := threads[0].Comments[0]
+	if comment.Author == nil || comment.Author.Login != "reviewer" || comment.Path != "internal/core/orchestration/session.go" || comment.Line != 42 {
+		t.Fatalf("comment = %#v", comment)
+	}
+	want := []string{"api", "graphql"}
+	if len(gh.captureCalls) != 1 || len(gh.captureCalls[0]) < len(want) || !reflect.DeepEqual(gh.captureCalls[0][:len(want)], want) {
+		t.Fatalf("Capture call prefix = %#v, want %#v", gh.captureCalls, want)
+	}
+}
+
+func TestConversationCommentsForPullRequestNormalizesIssueComments(t *testing.T) {
+	gh := &fakeGHCLI{outputs: []string{`[{"id":1,"body":"Please follow up","html_url":"https://example.test/comment/1","created_at":"2026-05-01T10:00:00Z","user":{"login":"reviewer"}}]`}}
+	adapter := NewAdapter(gh)
+
+	comments, err := adapter.ConversationCommentsForPullRequest(context.Background(), "owner/repo", 101)
+	if err != nil {
+		t.Fatalf("ConversationCommentsForPullRequest() error = %v", err)
+	}
+	if len(comments) != 1 || comments[0].Author != "reviewer" || comments[0].Body != "Please follow up" {
+		t.Fatalf("comments = %#v", comments)
 	}
 }
 

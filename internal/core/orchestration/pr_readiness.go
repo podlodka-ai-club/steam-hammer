@@ -67,6 +67,8 @@ type PullRequestReview struct {
 	State       string
 	SubmittedAt string
 	AuthorLogin string
+	Body        string
+	URL         string
 }
 
 type PRApprovalSummary struct {

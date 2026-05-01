@@ -256,10 +256,17 @@ func loadDaemonHandledState(sessionPath string) daemonHandledState {
 			continue
 		}
 		status := orchestration.ProcessedIssueStatus(value)
+		signature := orchestration.ProcessedIssueSignature(value)
+		if signature == "" {
+			if status == "" {
+				continue
+			}
+			signature = "state:" + status
+		}
 		if status == "" {
 			continue
 		}
-		state.signatures[id] = "state:" + status
+		state.signatures[id] = signature
 	}
 	return state
 }
@@ -374,6 +381,7 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 		}
 		if latestState != nil {
 			snapshot.LatestStateStatus = latestState.Status
+			snapshot.LatestStateTaskType = latestState.Payload.TaskType
 		}
 		if latestClaim != nil {
 			snapshot.LatestClaim = latestClaim.Payload

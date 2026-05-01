@@ -45,6 +45,8 @@ type PullRequestLifecycle interface {
 	CreatePullRequest(ctx context.Context, req CreatePullRequestRequest) (string, error)
 	CommentOnPullRequest(ctx context.Context, repo string, number int, body string) error
 	ReadinessForPullRequest(ctx context.Context, repo string, pr PullRequest) (PullRequestReadiness, error)
+	ReviewThreadsForPullRequest(ctx context.Context, repo string, number int) ([]PullRequestReviewThread, error)
+	ConversationCommentsForPullRequest(ctx context.Context, repo string, number int) ([]PullRequestConversationComment, error)
 }
 
 type GHCLI interface {
@@ -116,6 +118,7 @@ type IssueComment struct {
 	Body      string `json:"body,omitempty"`
 	HTMLURL   string `json:"html_url,omitempty"`
 	CreatedAt string `json:"created_at,omitempty"`
+	User      Actor  `json:"user,omitempty"`
 }
 
 type PullRequest struct {
@@ -146,10 +149,33 @@ type PullRequestReview struct {
 	AuthorLogin string `json:"authorLogin,omitempty"`
 	State       string `json:"state,omitempty"`
 	SubmittedAt string `json:"submittedAt,omitempty"`
+	Body        string `json:"body,omitempty"`
+	URL         string `json:"url,omitempty"`
 }
 
 type PullRequestChangedFile struct {
 	Path string `json:"path,omitempty"`
+}
+
+type PullRequestReviewThread struct {
+	IsResolved bool                       `json:"isResolved,omitempty"`
+	IsOutdated bool                       `json:"isOutdated,omitempty"`
+	Comments   []PullRequestReviewComment `json:"comments,omitempty"`
+}
+
+type PullRequestReviewComment struct {
+	Author   *Actor `json:"author,omitempty"`
+	Body     string `json:"body,omitempty"`
+	Path     string `json:"path,omitempty"`
+	Line     int    `json:"line,omitempty"`
+	Outdated bool   `json:"outdated,omitempty"`
+	URL      string `json:"url,omitempty"`
+}
+
+type PullRequestConversationComment struct {
+	Author string `json:"author,omitempty"`
+	Body   string `json:"body,omitempty"`
+	URL    string `json:"url,omitempty"`
 }
 
 type CreatePullRequestRequest struct {
@@ -377,6 +403,100 @@ func (a *Adapter) ReadinessForPullRequest(ctx context.Context, repo string, pr P
 	}, nil
 }
 
+func (a *Adapter) ReviewThreadsForPullRequest(ctx context.Context, repo string, number int) ([]PullRequestReviewThread, error) {
+	owner, name, err := splitRepoName(repo)
+	if err != nil {
+		return nil, err
+	}
+	query := strings.TrimSpace(`
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          isOutdated
+          comments(first: 100) {
+            nodes {
+              body
+              path
+              line
+              outdated
+              url
+              author {
+                login
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`)
+	output, err := a.gh.Capture(ctx,
+		"api", "graphql",
+		"-f", "query="+query,
+		"-F", "owner="+owner,
+		"-F", "name="+name,
+		"-F", fmt.Sprintf("number=%d", number),
+	)
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Data struct {
+			Repository struct {
+				PullRequest *struct {
+					ReviewThreads struct {
+						Nodes []struct {
+							IsResolved bool `json:"isResolved"`
+							IsOutdated bool `json:"isOutdated"`
+							Comments   struct {
+								Nodes []PullRequestReviewComment `json:"nodes"`
+							} `json:"comments"`
+						} `json:"nodes"`
+					} `json:"reviewThreads"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+	}
+	if err := decodeJSONObject(output, &payload); err != nil {
+		return nil, fmt.Errorf("unexpected response from gh api while fetching PR review threads: %w", err)
+	}
+	if payload.Data.Repository.PullRequest == nil {
+		return nil, fmt.Errorf("pull request #%d not found in repository %s", number, repo)
+	}
+	threads := make([]PullRequestReviewThread, 0, len(payload.Data.Repository.PullRequest.ReviewThreads.Nodes))
+	for _, node := range payload.Data.Repository.PullRequest.ReviewThreads.Nodes {
+		threads = append(threads, PullRequestReviewThread{
+			IsResolved: node.IsResolved,
+			IsOutdated: node.IsOutdated,
+			Comments:   append([]PullRequestReviewComment(nil), node.Comments.Nodes...),
+		})
+	}
+	return threads, nil
+}
+
+func (a *Adapter) ConversationCommentsForPullRequest(ctx context.Context, repo string, number int) ([]PullRequestConversationComment, error) {
+	comments, err := a.ListIssueComments(ctx, repo, number)
+	if err != nil {
+		return nil, err
+	}
+	normalized := make([]PullRequestConversationComment, 0, len(comments))
+	for _, comment := range comments {
+		author := strings.TrimSpace(comment.User.Login)
+		if author == "" {
+			author = "unknown"
+		}
+		normalized = append(normalized, PullRequestConversationComment{
+			Author: author,
+			Body:   strings.TrimSpace(comment.Body),
+			URL:    strings.TrimSpace(comment.HTMLURL),
+		})
+	}
+	return normalized, nil
+}
+
 type commitCheckRunsPayload struct {
 	CheckRuns []struct {
 		ID         any    `json:"id"`
@@ -572,4 +692,12 @@ func zeroIfEmpty(value string) string {
 		return ""
 	}
 	return value
+}
+
+func splitRepoName(repo string) (string, string, error) {
+	owner, name, ok := strings.Cut(strings.TrimSpace(repo), "/")
+	if !ok || strings.TrimSpace(owner) == "" || strings.TrimSpace(name) == "" {
+		return "", "", fmt.Errorf("invalid repo format %q. expected owner/name", repo)
+	}
+	return owner, name, nil
 }

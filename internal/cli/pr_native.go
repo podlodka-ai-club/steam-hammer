@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ type prReviewLifecycle interface {
 type nativePROptions struct {
 	prID                 int
 	common               commonOptions
+	sessionPath          string
 	allowBranchSwitch    bool
 	isolateWorktree      bool
 	postSummary          bool
@@ -92,7 +94,13 @@ func nativePRFallbackReason(opts nativePROptions) string {
 	return ""
 }
 
-func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions) int {
+func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions) (exitCode int) {
+	tracker := startNativeSessionTracker(opts.sessionPath, fmt.Sprintf("PR #%d", opts.prID), strconv.Itoa(opts.prID))
+	var latestState *orchestration.TrackedState
+	defer func() {
+		tracker.finish(latestState, exitCode)
+	}()
+
 	pullRequest, err := a.prLifecycle.FetchPullRequest(ctx, repo, opts.prID)
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to fetch PR #%d: %v\n", opts.prID, err)
@@ -145,6 +153,8 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 	linkedIssues := a.loadLinkedIssueContext(ctx, repo, pullRequest)
 
 	postState := func(state orchestration.TrackedState) {
+		copy := state
+		latestState = &copy
 		if err := a.safePostPRState(ctx, repo, pullRequest.Number, state); err != nil {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: warning: failed to post state for PR #%d: %v\n", pullRequest.Number, err)
 		}

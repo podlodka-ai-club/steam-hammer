@@ -1352,7 +1352,7 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
 	detach := fs.Bool("detach", false, "start the worker in the background and write logs/state to a predictable path")
 	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
-	_ = fs.String("autonomous-session-file", "", "internal autonomous session checkpoint path")
+	autonomousSessionFile := fs.String("autonomous-session-file", "", "internal autonomous session checkpoint path")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -1389,6 +1389,7 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 		noSyncReusedBranch:   *noSyncReusedBranch,
 		syncStrategy:         *syncStrategy,
 		detach:               *detach,
+		sessionPath:          strings.TrimSpace(*autonomousSessionFile),
 	}); handled {
 		return code
 	}
@@ -1474,7 +1475,7 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	syncStrategy := fs.String("sync-strategy", "", "reused branch sync strategy: rebase or merge")
 	detach := fs.Bool("detach", false, "start the worker in the background and write logs/state to a predictable path")
 	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
-	_ = fs.String("autonomous-session-file", "", "internal autonomous session checkpoint path")
+	autonomousSessionFile := fs.String("autonomous-session-file", "", "internal autonomous session checkpoint path")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -1504,6 +1505,7 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 		conflictRecoveryOnly: *conflictRecoveryOnly,
 		syncStrategy:         *syncStrategy,
 		detach:               *detach,
+		sessionPath:          strings.TrimSpace(*autonomousSessionFile),
 	}); ok {
 		return code
 	}

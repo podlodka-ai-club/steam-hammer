@@ -1545,7 +1545,7 @@ CI_TRANSIENT_LOG_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 
 def failure_state_for_stage(failure_stage: str) -> str:
-    return "blocked" if failure_stage in {"workflow_setup", "workflow_hooks", "workflow_checks", "residual_untracked_validation", "token_budget", "branch_context_validation"} else "failed"
+    return "blocked" if failure_stage in {"workflow_setup", "workflow_hooks", "workflow_checks", "residual_untracked_validation", "token_budget", "branch_context_validation", "ownership_validation"} else "failed"
 
 
 def failure_next_action_for_stage(failure_stage: str) -> str:
@@ -1565,6 +1565,8 @@ def failure_next_action_for_stage(failure_stage: str) -> str:
         return "raise_cost_budget_or_split_issue"
     if failure_stage == "branch_context_validation":
         return "restore_worker_branch_context_and_retry"
+    if failure_stage == "ownership_validation":
+        return "inspect_tracker_ownership_and_resume"
     return "inspect_error_and_retry"
 
 
@@ -1588,6 +1590,10 @@ class WorkflowCheckFailure(RuntimeError):
             f"Workflow check '{check_name}' failed"
             f" (exit code {exit_code if exit_code is not None else 'unknown'}){evidence}"
         )
+
+
+class OwnershipAmbiguityError(RuntimeError):
+    pass
 
 
 class WorkflowHookFailure(RuntimeError):
@@ -4209,6 +4215,100 @@ def format_recovered_state_context(state: dict) -> str:
     return details
 
 
+def _tracked_state_ownership_mismatches(
+    *,
+    state: dict | None,
+    expected_issue: int | str | None,
+    expected_pr: int | None,
+    expected_branch: str | None,
+    expected_base_branch: str | None,
+    tracker: str,
+) -> list[str]:
+    if not isinstance(state, dict):
+        return []
+
+    payload = _status_payload(state)
+    source = _as_optional_string(state.get("source")) or "tracker comment"
+    created_at = _as_optional_string(state.get("created_at")) or "unknown-time"
+    url = _as_optional_string(state.get("url"))
+    evidence = f"{source} at {created_at}"
+    if url:
+        evidence += f" ({url})"
+
+    mismatches: list[str] = []
+
+    observed_issue = payload.get("issue")
+    if expected_issue is not None and is_trackable_issue_number(observed_issue):
+        try:
+            normalized_observed_issue = normalize_issue_number(observed_issue, tracker)
+        except RuntimeError:
+            normalized_observed_issue = str(observed_issue).strip()
+        if str(normalized_observed_issue) != str(expected_issue):
+            mismatches.append(
+                f"{evidence} tracks issue {format_issue_ref(normalized_observed_issue, tracker=tracker)}, "
+                f"expected {format_issue_ref(expected_issue, tracker=tracker)}"
+            )
+
+    observed_pr = payload.get("pr")
+    if expected_pr is not None and type(observed_pr) is int and observed_pr != expected_pr:
+        mismatches.append(f"{evidence} tracks PR #{observed_pr}, expected linked PR #{expected_pr}")
+
+    observed_branch = _as_optional_string(payload.get("branch"))
+    if expected_branch and observed_branch and observed_branch != expected_branch:
+        mismatches.append(
+            f"{evidence} tracks branch '{observed_branch}', expected linked PR branch '{expected_branch}'"
+        )
+
+    observed_base_branch = _as_optional_string(payload.get("base_branch"))
+    if expected_base_branch and observed_base_branch and observed_base_branch != expected_base_branch:
+        mismatches.append(
+            f"{evidence} tracks base branch '{observed_base_branch}', expected linked PR base '{expected_base_branch}'"
+        )
+
+    return mismatches
+
+
+def recovered_issue_pr_ownership_mismatches(
+    *,
+    issue: dict,
+    linked_open_pr: dict | None,
+    recovered_issue_state: dict | None,
+    recovered_pr_state: dict | None,
+) -> list[str]:
+    tracker = issue_tracker(issue)
+    expected_issue = normalize_issue_number(issue.get("number"), tracker)
+    expected_pr = (
+        linked_open_pr.get("number")
+        if isinstance(linked_open_pr, dict) and type(linked_open_pr.get("number")) is int
+        else None
+    )
+    expected_branch = _as_optional_string(linked_open_pr.get("headRefName")) if isinstance(linked_open_pr, dict) else None
+    expected_base_branch = _as_optional_string(linked_open_pr.get("baseRefName")) if isinstance(linked_open_pr, dict) else None
+
+    mismatches: list[str] = []
+    mismatches.extend(
+        _tracked_state_ownership_mismatches(
+            state=recovered_issue_state,
+            expected_issue=expected_issue,
+            expected_pr=expected_pr,
+            expected_branch=expected_branch,
+            expected_base_branch=expected_base_branch,
+            tracker=tracker,
+        )
+    )
+    mismatches.extend(
+        _tracked_state_ownership_mismatches(
+            state=recovered_pr_state,
+            expected_issue=expected_issue,
+            expected_pr=expected_pr,
+            expected_branch=expected_branch,
+            expected_base_branch=expected_base_branch,
+            tracker=tracker,
+        )
+    )
+    return mismatches
+
+
 def _humanize_status_token(value: object) -> str:
     text = str(value or "").strip()
     if not text:
@@ -4366,6 +4466,7 @@ def format_orchestration_status_summary(snapshot: dict) -> str:
     state_source = _as_optional_string(latest_state.get("source") if isinstance(latest_state, dict) else None)
     issue_number = snapshot.get("issue_number")
     pr_number = snapshot.get("pr_number")
+    repo = _as_optional_string(snapshot.get("repo"))
     branch = _as_optional_string(snapshot.get("branch"))
     base_branch = _as_optional_string(snapshot.get("base_branch"))
     linked_issue_numbers = snapshot.get("linked_issue_numbers") if isinstance(snapshot.get("linked_issue_numbers"), list) else []
@@ -4419,6 +4520,8 @@ def format_orchestration_status_summary(snapshot: dict) -> str:
         lines.append(f"Issue: {format_issue_ref(issue_number)}")
     if isinstance(pr_number, int) and pr_number > 0:
         lines.append(f"PR: #{pr_number}")
+    if repo:
+        lines.append(f"Repo: {repo}")
     if linked_issue_numbers:
         lines.append(
             "Linked issues: " + ", ".join(format_issue_ref(number) for number in linked_issue_numbers if is_trackable_issue_number(number))
@@ -4544,6 +4647,7 @@ def load_issue_status_snapshot(repo: str, issue: dict, merge_policy: dict) -> di
         "target_number": issue_number,
         "issue_number": issue_number_value,
         "pr_number": pr_number,
+        "repo": repo,
         "latest_state": latest_state,
         "latest_status": str(latest_state.get("status") or "new") if isinstance(latest_state, dict) else "new",
         "next_action": payload.get("next_action"),
@@ -4554,7 +4658,17 @@ def load_issue_status_snapshot(repo: str, issue: dict, merge_policy: dict) -> di
         "required_file_validation": required_file_validation,
         "merge_readiness": merge_readiness,
         "decomposition": decomposition,
-        "warnings": issue_warnings + pr_warnings,
+        "warnings": issue_warnings
+        + pr_warnings
+        + [
+            "ownership ambiguity: " + mismatch
+            for mismatch in recovered_issue_pr_ownership_mismatches(
+                issue=issue,
+                linked_open_pr=linked_open_pr,
+                recovered_issue_state=issue_state,
+                recovered_pr_state=pr_state,
+            )
+        ],
     }
 
 
@@ -4592,6 +4706,7 @@ def load_pr_status_snapshot(repo: str, pr_number: int, merge_policy: dict) -> di
         "target_number": pr_number,
         "issue_number": issue_number,
         "pr_number": pr_number,
+        "repo": repo,
         "linked_issue_numbers": issue_numbers,
         "latest_state": pr_state,
         "latest_status": str(pr_state.get("status") or "new") if isinstance(pr_state, dict) else "new",
@@ -10127,6 +10242,8 @@ def main() -> int:
                         failure_stage = "residual_untracked_validation"
                     elif isinstance(exc, BranchContextMismatchError):
                         failure_stage = "branch_context_validation"
+                    elif isinstance(exc, OwnershipAmbiguityError):
+                        failure_stage = "ownership_validation"
                     elif isinstance(exc, TokenBudgetExceededError):
                         failure_stage = "token_budget"
                     elif isinstance(exc, CostBudgetExceededError):
@@ -10594,6 +10711,18 @@ def main() -> int:
                     print(
                         f"Found author clarification reply for {issue_label}: "
                         f"{clarification_answer.get('body')}"
+                    )
+
+                ownership_mismatches = recovered_issue_pr_ownership_mismatches(
+                    issue=issue,
+                    linked_open_pr=linked_open_pr,
+                    recovered_issue_state=recovered_issue_state,
+                    recovered_pr_state=recovered_pr_state,
+                )
+                if ownership_mismatches:
+                    raise OwnershipAmbiguityError(
+                        "Ambiguous tracker ownership evidence; refusing to continue automatically: "
+                        + "; ".join(ownership_mismatches)
                     )
 
                 if recovered_state is not None:
@@ -12322,6 +12451,8 @@ def main() -> int:
                 failure_stage = "residual_untracked_validation"
             elif isinstance(exc, BranchContextMismatchError):
                 failure_stage = "branch_context_validation"
+            elif isinstance(exc, OwnershipAmbiguityError):
+                failure_stage = "ownership_validation"
             elif isinstance(exc, TokenBudgetExceededError):
                 failure_stage = "token_budget"
             elif isinstance(exc, CostBudgetExceededError):

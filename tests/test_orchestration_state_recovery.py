@@ -20,6 +20,7 @@ from scripts.run_github_issues_to_opencode import (
     parse_clarification_request_text,
     main,
     parse_orchestration_state_comment_body,
+    recovered_issue_pr_ownership_mismatches,
     select_latest_parseable_orchestration_state,
 )
 
@@ -275,6 +276,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
             {
                 "target_type": "pr",
                 "target_number": 201,
+                "repo": "owner/repo",
                 "issue_number": 153,
                 "pr_number": 201,
                 "branch": "issue-fix/153-status",
@@ -310,8 +312,42 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertIn("Current: blocked at ci_checks", summary)
         self.assertIn("Next: inspect failing ci checks", summary)
         self.assertIn("Blockers: CI failing checks: unit (https://ci.example/unit)", summary)
+        self.assertIn("Repo: owner/repo", summary)
         self.assertIn("State source: pr #201", summary)
         self.assertIn("Source comment: https://example/pr/201#issuecomment-9", summary)
+
+    def test_recovered_issue_pr_ownership_mismatches_include_tracker_evidence(self) -> None:
+        mismatches = recovered_issue_pr_ownership_mismatches(
+            issue={"number": 52, "tracker": "github"},
+            linked_open_pr={
+                "number": 120,
+                "headRefName": "issue-fix/52-prevent-duplicate-processing",
+                "baseRefName": "main",
+            },
+            recovered_issue_state={
+                "source": "issue #52",
+                "created_at": "2026-04-29T10:00:00Z",
+                "url": "https://example/issues/52#issuecomment-11",
+                "payload": {
+                    "issue": 52,
+                    "pr": 120,
+                    "branch": "issue-fix/52-old-branch",
+                    "base_branch": "develop",
+                },
+            },
+            recovered_pr_state={
+                "source": "pr #120",
+                "created_at": "2026-04-29T10:05:00Z",
+                "url": "https://example/pull/120#issuecomment-12",
+                "payload": {"issue": 99},
+            },
+        )
+
+        self.assertEqual(len(mismatches), 3)
+        self.assertIn("issuecomment-11", mismatches[0])
+        self.assertIn("expected linked PR branch 'issue-fix/52-prevent-duplicate-processing'", mismatches[0])
+        self.assertIn("expected linked PR base 'main'", mismatches[1])
+        self.assertIn("tracks issue #99, expected #52", mismatches[2])
 
     def test_find_waiting_for_author_answer_uses_latest_author_reply_after_state(self) -> None:
         recovered_state = {
@@ -573,6 +609,102 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
 
         self.assertIn("question asked to the task author", note)
         self.assertIn("pause unless the run is explicitly forced", note)
+
+    def test_main_issue_flow_blocks_on_ambiguous_tracker_ownership(self) -> None:
+        args = argparse.Namespace(
+            repo="owner/repo",
+            issue=52,
+            pr=None,
+            from_review_comments=False,
+            state="open",
+            limit=10,
+            runner="opencode",
+            agent="build",
+            model=None,
+            agent_timeout_seconds=900,
+            agent_idle_timeout_seconds=None,
+            token_budget=None,
+            opencode_auto_approve=False,
+            branch_prefix="issue-fix",
+            include_empty=False,
+            stop_on_error=False,
+            fail_on_existing=False,
+            force_issue_flow=False,
+            skip_if_pr_exists=True,
+            skip_if_branch_exists=True,
+            force_reprocess=False,
+            sync_reused_branch=True,
+            sync_strategy="rebase",
+            base_branch="default",
+            dir=".",
+            local_config="local-config.json",
+            dry_run=True,
+            pr_followup_branch_prefix=None,
+            post_pr_summary=False,
+            max_attempts=2,
+            decompose="never",
+            create_child_issues=False,
+            track_tokens=False,
+        )
+
+        issue = {
+            "number": 52,
+            "title": "Prevent duplicate processing",
+            "body": "Implement duplicate guards",
+            "url": "https://example/issues/52",
+        }
+        linked_pr = {
+            "number": 120,
+            "url": "https://example/pull/120",
+            "headRefName": "issue-fix/52-prevent-duplicate-processing",
+            "baseRefName": "main",
+        }
+        issue_state_comments = [
+            {
+                "id": 11,
+                "created_at": "2026-04-29T10:00:00Z",
+                "html_url": "https://example/issues/52#issuecomment-11",
+                "body": (
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"waiting-for-ci","issue":52,"pr":120,'
+                    '"branch":"issue-fix/52-old-branch","base_branch":"main"}\n'
+                    "```"
+                ),
+            }
+        ]
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.parse_args", return_value=args))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.ensure_clean_worktree"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.detect_default_branch", return_value="main"))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.fetch_issue", return_value=issue))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.find_open_pr_for_issue", return_value=linked_pr))
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.remote_branch_exists", return_value=False))
+            stack.enter_context(
+                patch(
+                    "scripts.run_github_issues_to_opencode.fetch_issue_comments",
+                    side_effect=[issue_state_comments, []],
+                )
+            )
+            run_agent_mock = stack.enter_context(patch("scripts.run_github_issues_to_opencode.run_agent"))
+            state_post_mock = stack.enter_context(
+                patch("scripts.run_github_issues_to_opencode.safe_post_orchestration_state_comment")
+            )
+            stack.enter_context(patch("scripts.run_github_issues_to_opencode.safe_report_issue_automation_failure"))
+            stdout_mock = stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
+            stderr_mock = stack.enter_context(patch("sys.stderr", new_callable=io.StringIO))
+            exit_code = main()
+
+        self.assertEqual(exit_code, 1)
+        run_agent_mock.assert_not_called()
+        posted_state = state_post_mock.call_args.kwargs["state"]
+        self.assertEqual(posted_state["status"], "blocked")
+        self.assertEqual(posted_state["stage"], "ownership_validation")
+        self.assertEqual(posted_state["next_action"], "inspect_tracker_ownership_and_resume")
+        self.assertIn("issuecomment-11", posted_state["error"])
+        self.assertIn("expected linked PR branch 'issue-fix/52-prevent-duplicate-processing'", posted_state["error"])
+        self.assertIn("refusing to continue automatically", stderr_mock.getvalue().lower())
 
     def test_main_issue_flow_without_recovered_state_does_not_require_force_override(self) -> None:
         args = argparse.Namespace(

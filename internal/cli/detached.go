@@ -31,6 +31,7 @@ type detachedWorkerLogReport struct {
 type detachedWorkerLinkedReport struct {
 	Target      string `json:"target,omitempty"`
 	LatestState string `json:"latest_state,omitempty"`
+	Branch      string `json:"branch,omitempty"`
 	Current     string `json:"current,omitempty"`
 	Next        string `json:"next,omitempty"`
 	Blockers    string `json:"blockers,omitempty"`
@@ -231,6 +232,9 @@ func (a *App) runDetachedStatus(configuredRoot, name string, asJSON bool) int {
 		}
 		if report.Linked.Current != "" {
 			_, _ = fmt.Fprintf(a.out, "linked-current: %s\n", report.Linked.Current)
+		}
+		if report.Linked.Branch != "" {
+			_, _ = fmt.Fprintf(a.out, "linked-branch: %s\n", report.Linked.Branch)
 		}
 		if report.Linked.Next != "" {
 			_, _ = fmt.Fprintf(a.out, "linked-next: %s\n", report.Linked.Next)
@@ -488,6 +492,8 @@ func detachedWorkerLinkedStatus(state detachedWorkerState) (*detachedWorkerLinke
 			linked.Target = value
 		case "latest state":
 			linked.LatestState = value
+		case "branch":
+			linked.Branch = value
 		case "current":
 			linked.Current = value
 		case "next":

@@ -4,8 +4,8 @@ This note records the final bounded smoke coverage for the Go-first runtime boun
 
 ## Boundary Under Test
 
-- Go owns execution-mode selection, fresh-branch `run issue`, daemon selection/claim logic, detached worker surfaces, and post-batch verification wiring.
-- Python is a compatibility adapter for the still-unmigrated runtime paths: `run pr`, reused-branch/conflict-recovery issue paths, and batch/daemon worker execution loops that have not moved to Go yet.
+- Go owns execution-mode selection, fresh-branch `run issue`, the default explicit-repo `run pr` review loop, daemon selection/claim logic, detached worker surfaces, and post-batch verification wiring.
+- Python is a compatibility adapter for the still-unmigrated runtime paths: `run pr` fallback modes (`--dry-run`, isolated worktree, detach, follow-up/conflict-recovery variants), reused-branch/conflict-recovery issue paths, and batch/daemon worker execution loops that have not moved to Go yet.
 - Guardrail: when Go already selected `pr-review`, `run issue` must route to the explicit PR compatibility adapter (`--pr ... --from-review-comments`) instead of delegating the whole issue decision back to `--issue` Python flow.
 
 ## Checklist
@@ -13,7 +13,7 @@ This note records the final bounded smoke coverage for the Go-first runtime boun
 | Scenario | Coverage command | Expected evidence | Result |
 | --- | --- | --- | --- |
 | One-shot issue flow | `go test ./internal/cli -run TestRunIssueUsesGoNativeHappyPath -count=1` | Native issue path completes without Python runner calls. | Passed on 2026-05-01 |
-| PR review flow | `go test ./internal/cli -run 'TestRunIssueRoutesLinkedPRToPRCompatibilityAdapter|TestRunIssueRoutesReadyToMergeRecoveryToPRCompatibilityAdapter|TestRunPRCommandWiresPythonRunner' -count=1` | Go routes linked-PR issue recovery into explicit PR adapter; PR command still uses compatibility adapter. | Passed on 2026-05-01 |
+| PR review flow | `go test ./internal/cli -run 'TestRunPRUsesNativeRuntimeLoopWhenRepoExplicit|TestRunPRCommandAcceptsPythonPRFlags' -count=1` | Explicit-repo PR review runs natively without Python runner calls; compatibility fallback still works for unmigrated PR modes. | Passed on 2026-05-01 |
 | Detached batch flow | `go test ./internal/cli -run 'TestRunBatchDetachStartsOneWorkerPerIssue|TestRunBatchDetachPersistsBatchMetadataForChildWorkers' -count=1` | One worker per issue, isolated state, predictable worker metadata. | Passed on 2026-05-01 |
 | Daemon with `--max-parallel-tasks 3` | `go test ./internal/cli -run TestRunDaemonDetachStartsThreeWorkersWhenRequested -count=1` | Three detached daemon workers are prepared with isolated directories/state. | Passed on 2026-05-01 |
 | Verified merge queue path | `python3 -m unittest tests.test_pr_review_comments_mode tests.test_orchestration_state_recovery -q` | Readiness/merge-result verification reaches `ready-to-merge` and status summaries preserve verification evidence. | Passed on 2026-05-01 |

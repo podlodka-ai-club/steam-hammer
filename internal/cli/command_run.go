@@ -1349,6 +1349,19 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintln(a.err, "run pr requires --id N")
 		return 2
 	}
+	if code, ok := a.tryRunNativePR(ctx, nativePROptions{
+		prID:                 *id,
+		common:               opts,
+		allowBranchSwitch:    *allowBranchSwitch,
+		isolateWorktree:      *isolateWorktree,
+		postSummary:          *postSummary,
+		followupPrefix:       *followupPrefix,
+		conflictRecoveryOnly: *conflictRecoveryOnly,
+		syncStrategy:         *syncStrategy,
+		detach:               *detach,
+	}); ok {
+		return code
+	}
 
 	pythonArgs := buildPRPythonArgs(a.runtime.RunnerScript(), opts, *id, *allowBranchSwitch, *isolateWorktree, *postSummary, *followupPrefix, *conflictRecoveryOnly, *syncStrategy)
 	if *detach {

@@ -18,6 +18,7 @@ type App struct {
 	clone          BatchClonePreparer
 	daemon         daemonLifecycle
 	issueLifecycle issueLifecycle
+	prLifecycle    prReviewLifecycle
 	agentRunner    issueAgentRunner
 	runtime        runtimeProvider
 }
@@ -33,6 +34,7 @@ func NewApp(out, err io.Writer) *App {
 		clone:          ExecBatchClonePreparer{},
 		daemon:         adapter,
 		issueLifecycle: adapter,
+		prLifecycle:    adapter,
 		agentRunner:    nativeIssueAgentRunner{},
 		runtime:        defaultRuntimeProvider(),
 	}
@@ -56,6 +58,10 @@ func (a *App) SetDaemonLifecycle(lifecycle daemonLifecycle) {
 
 func (a *App) SetIssueLifecycle(lifecycle issueLifecycle) {
 	a.issueLifecycle = lifecycle
+}
+
+func (a *App) SetPRLifecycle(lifecycle prReviewLifecycle) {
+	a.prLifecycle = lifecycle
 }
 
 func (a *App) SetIssueAgentRunner(runner issueAgentRunner) {

@@ -97,8 +97,15 @@ type fakeDaemonLifecycle struct {
 	issue           githublifecycle.Issue
 	defaultBranch   string
 	linkedPR        *githublifecycle.PullRequest
+	pullRequest     githublifecycle.PullRequest
+	pullRequests    []githublifecycle.PullRequest
+	reviewThreads   []githublifecycle.PullRequestReviewThread
+	reviewThreadSeq [][]githublifecycle.PullRequestReviewThread
+	conversation    []githublifecycle.PullRequestConversationComment
+	conversationSeq [][]githublifecycle.PullRequestConversationComment
 	commentsByIssue map[int][]githublifecycle.IssueComment
 	commentBodies   map[int][]string
+	prCommentBodies map[int][]string
 	createdIssues   []githublifecycle.CreateIssueRequest
 	createIssue     githublifecycle.Issue
 	createdPRs      []githublifecycle.CreatePullRequestRequest
@@ -186,6 +193,56 @@ func (f *fakeDaemonLifecycle) CreatePullRequest(_ context.Context, req githublif
 		f.createPRURL = "https://github.com/owner/repo/pull/101"
 	}
 	return f.createPRURL, nil
+}
+
+func (f *fakeDaemonLifecycle) FetchPullRequest(_ context.Context, _ string, number int) (githublifecycle.PullRequest, error) {
+	if f.listErr != nil {
+		return githublifecycle.PullRequest{}, f.listErr
+	}
+	if len(f.pullRequests) > 0 {
+		pr := f.pullRequests[0]
+		f.pullRequests = f.pullRequests[1:]
+		return pr, nil
+	}
+	if f.pullRequest.Number == 0 {
+		f.pullRequest = githublifecycle.PullRequest{Number: number, Title: "Fix review feedback", URL: "https://github.com/owner/repo/pull/" + strconv.Itoa(number), HeadRefName: "feature/pr-" + strconv.Itoa(number), BaseRefName: "main"}
+	}
+	return f.pullRequest, nil
+}
+
+func (f *fakeDaemonLifecycle) CommentOnPullRequest(_ context.Context, _ string, number int, body string) error {
+	if f.commentErr != nil {
+		return f.commentErr
+	}
+	if f.prCommentBodies == nil {
+		f.prCommentBodies = map[int][]string{}
+	}
+	f.prCommentBodies[number] = append(f.prCommentBodies[number], body)
+	return nil
+}
+
+func (f *fakeDaemonLifecycle) ReviewThreadsForPullRequest(_ context.Context, _ string, _ int) ([]githublifecycle.PullRequestReviewThread, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if len(f.reviewThreadSeq) > 0 {
+		threads := f.reviewThreadSeq[0]
+		f.reviewThreadSeq = f.reviewThreadSeq[1:]
+		return append([]githublifecycle.PullRequestReviewThread(nil), threads...), nil
+	}
+	return append([]githublifecycle.PullRequestReviewThread(nil), f.reviewThreads...), nil
+}
+
+func (f *fakeDaemonLifecycle) ConversationCommentsForPullRequest(_ context.Context, _ string, _ int) ([]githublifecycle.PullRequestConversationComment, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if len(f.conversationSeq) > 0 {
+		comments := f.conversationSeq[0]
+		f.conversationSeq = f.conversationSeq[1:]
+		return append([]githublifecycle.PullRequestConversationComment(nil), comments...), nil
+	}
+	return append([]githublifecycle.PullRequestConversationComment(nil), f.conversation...), nil
 }
 
 func (r *recordingBatchClonePreparer) Prepare(sourceDir, targetDir string) (string, error) {
@@ -1367,6 +1424,100 @@ func TestRunPRCommandAcceptsPythonPRFlags(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments"})
+}
+
+func TestRunPRUsesNativeRuntimeLoopWhenRepoExplicit(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: ""},
+		{Stdout: " M internal/cli/pr_native.go\n"},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: ""},
+		{Stdout: "[feature/pr-72 abc123] Address review comments for PR #72\n"},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: "/repo\n"},
+		{Stdout: "pushed\n"},
+	}}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{ExitCode: 0, Stats: agentexec.Stats{ElapsedSeconds: 5}}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue: githublifecycle.Issue{Number: 243, Title: "Parent issue", Body: "Parent issue body", URL: "https://github.com/owner/repo/issues/243", Tracker: githublifecycle.TrackerGitHub},
+		pullRequests: []githublifecycle.PullRequest{
+			{
+				Number:                  72,
+				Title:                   "Move PR review runtime loop into Go",
+				Body:                    "PR description",
+				URL:                     "https://github.com/owner/repo/pull/72",
+				HeadRefName:             "feature/pr-72",
+				BaseRefName:             "main",
+				Author:                  &githublifecycle.Actor{Login: "author"},
+				ClosingIssuesReferences: []githublifecycle.IssueReference{{Number: 243}},
+			},
+			{
+				Number:                  72,
+				Title:                   "Move PR review runtime loop into Go",
+				Body:                    "PR description",
+				URL:                     "https://github.com/owner/repo/pull/72",
+				HeadRefName:             "feature/pr-72",
+				BaseRefName:             "main",
+				Author:                  &githublifecycle.Actor{Login: "author"},
+				ClosingIssuesReferences: []githublifecycle.IssueReference{{Number: 243}},
+			},
+		},
+		reviewThreadSeq: [][]githublifecycle.PullRequestReviewThread{
+			{{
+				Comments: []githublifecycle.PullRequestReviewComment{{
+					Body:   "Please add a regression test",
+					Path:   "internal/cli/pr_native.go",
+					Line:   12,
+					Author: &githublifecycle.Actor{Login: "reviewer"},
+				}},
+			}},
+			{},
+		},
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueAgentRunner(agent)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetPRLifecycle(lifecycle)
+
+	code := app.Run([]string{"run", "pr", "--id", "72", "--repo", "owner/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("python runner calls = %d, want 0", runner.calls)
+	}
+	if agent.callCount != 1 {
+		t.Fatalf("agent call count = %d, want 1", agent.callCount)
+	}
+	if got := agent.requests[0].Prompt; !strings.Contains(got, "review_comment") || !strings.Contains(got, "Issue #243") {
+		t.Fatalf("native PR prompt missing review or issue context: %q", got)
+	}
+	if len(lifecycle.prCommentBodies[72]) < 2 {
+		t.Fatalf("PR comments posted = %d, want at least 2", len(lifecycle.prCommentBodies[72]))
+	}
+	lastComment := lifecycle.prCommentBodies[72][len(lifecycle.prCommentBodies[72])-1]
+	state, err := orchestration.ParseOrchestrationStateCommentBody(lastComment)
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody() error = %v", err)
+	}
+	if state == nil || state.Status != orchestration.StatusWaitingForCI {
+		t.Fatalf("final PR state = %#v, want waiting-for-ci", state)
+	}
+	joinedShell := strings.Join(shell.cmds, "\n")
+	if !strings.Contains(joinedShell, "git 'commit' '-m' 'Address review comments for PR #72'") {
+		t.Fatalf("shell commands missing PR commit: %s", joinedShell)
+	}
+	if !strings.Contains(joinedShell, "git 'push' '-u' 'origin' 'feature/pr-72'") {
+		t.Fatalf("shell commands missing PR push: %s", joinedShell)
+	}
 }
 
 func TestRunPRCommandForwardsConflictRecoveryOnly(t *testing.T) {

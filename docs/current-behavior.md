@@ -80,7 +80,7 @@
 - daemon issue selection, claim/release comments, session checkpoint wiring и detached worker preparation;
 - detached worker registry/status surfaces и post-batch verification.
 - Python compatibility adapter:
-- `run pr` runtime и review-comments execution loop;
+- `run pr` fallback paths, которые еще не перенесены в Go: `--dry-run`, `--isolate-worktree`, `--detach`, `--post-pr-summary`, follow-up branch mode и conflict-recovery/sync-only варианты;
 - `doctor`, `autodoctor`, `status` и другие еще не перенесенные CLI compatibility surfaces;
 - batch/daemon worker execution paths, которые все еще запускаются через script adapter;
 - issue-path blockers, еще не реализованные в Go: reused branch handling, linked PR reuse internals beyond adapter routing, dedicated conflict-recovery-only runtime.
@@ -95,7 +95,7 @@
 
 ## Что еще не доведено до North Star
 
-- PR review runtime, reused-branch issue runtime и часть autonomous worker execution все еще не перенесены из Python compatibility adapter в Go.
+- Часть PR review runtime уже перенесена в Go для explicit-repo non-isolated execution, но fallback-only режимы все еще живут в Python compatibility adapter вместе с reused-branch issue runtime и частью autonomous worker execution.
 - Нет еще полноценной interactive `resume` поверхности и richer operator UX поверх сохраненного session checkpoint.
 - Нет dedicated conflict-recovery mode, который чинит только branch divergence без полного повторного issue run.
 - Нет обязательного post-batch verification workflow, который сам создает follow-up issue/checklist после крупных merge batches.

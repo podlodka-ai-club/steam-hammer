@@ -37,6 +37,7 @@ type IssueLifecycle interface {
 	ListIssues(ctx context.Context, repo, state string, limit int) ([]Issue, error)
 	ListIssueComments(ctx context.Context, repo string, number int) ([]IssueComment, error)
 	CommentOnIssue(ctx context.Context, repo string, number int, body string) error
+	CreateIssue(ctx context.Context, req CreateIssueRequest) (Issue, error)
 }
 
 type PullRequestLifecycle interface {
@@ -102,6 +103,12 @@ type Issue struct {
 	Assignees []Actor `json:"assignees,omitempty"`
 	CreatedAt string  `json:"createdAt,omitempty"`
 	UpdatedAt string  `json:"updatedAt,omitempty"`
+}
+
+type CreateIssueRequest struct {
+	Repo  string
+	Title string
+	Body  string
 }
 
 type IssueComment struct {
@@ -221,6 +228,32 @@ func (a *Adapter) CommentOnIssue(ctx context.Context, repo string, number int, b
 		"--repo", repo,
 		"--body", body,
 	)
+}
+
+func (a *Adapter) CreateIssue(ctx context.Context, req CreateIssueRequest) (Issue, error) {
+	if strings.TrimSpace(req.Repo) == "" {
+		return Issue{}, errors.New("create issue requires repo")
+	}
+	if strings.TrimSpace(req.Title) == "" {
+		return Issue{}, errors.New("create issue requires title")
+	}
+
+	output, err := a.gh.Capture(ctx,
+		"api", fmt.Sprintf("repos/%s/issues", req.Repo),
+		"--method", "POST",
+		"-H", "Accept: application/vnd.github+json",
+		"-f", "title="+req.Title,
+		"-f", "body="+req.Body,
+	)
+	if err != nil {
+		return Issue{}, err
+	}
+	var issue Issue
+	if err := decodeJSONObject(output, &issue); err != nil {
+		return Issue{}, fmt.Errorf("unexpected response from gh api while creating issue: %w", err)
+	}
+	issue.Tracker = TrackerGitHub
+	return issue, nil
 }
 
 func (a *Adapter) ListIssueComments(ctx context.Context, repo string, number int) ([]IssueComment, error) {

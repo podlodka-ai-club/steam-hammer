@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/githublifecycle"
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/workers"
 	"os"
 	"path/filepath"
@@ -73,12 +74,22 @@ type recordingBatchClonePreparer struct {
 	err        error
 }
 
+type fakeShellExecutor struct {
+	results []shellExecutionResult
+	err     error
+	cmds    []string
+	cwds    []string
+}
+
 type fakeDaemonLifecycle struct {
 	issues          []githublifecycle.Issue
 	commentsByIssue map[int][]githublifecycle.IssueComment
 	commentBodies   map[int][]string
+	createdIssues   []githublifecycle.CreateIssueRequest
+	createIssue     githublifecycle.Issue
 	listErr         error
 	commentErr      error
+	createErr       error
 }
 
 func (f *fakeDaemonLifecycle) ListIssues(_ context.Context, _ string, _ string, _ int) ([]githublifecycle.Issue, error) {
@@ -102,11 +113,25 @@ func (f *fakeDaemonLifecycle) CommentOnIssue(_ context.Context, _ string, number
 	if f.commentBodies == nil {
 		f.commentBodies = map[int][]string{}
 	}
+	if f.commentsByIssue == nil {
+		f.commentsByIssue = map[int][]githublifecycle.IssueComment{}
+	}
 	f.commentBodies[number] = append(f.commentBodies[number], body)
 	comments := f.commentsByIssue[number]
 	comments = append(comments, githublifecycle.IssueComment{ID: int64(len(comments) + 1), Body: body, CreatedAt: "2026-05-01T12:00:00Z"})
 	f.commentsByIssue[number] = comments
 	return nil
+}
+
+func (f *fakeDaemonLifecycle) CreateIssue(_ context.Context, req githublifecycle.CreateIssueRequest) (githublifecycle.Issue, error) {
+	f.createdIssues = append(f.createdIssues, req)
+	if f.createErr != nil {
+		return githublifecycle.Issue{}, f.createErr
+	}
+	if f.createIssue.Number == 0 {
+		f.createIssue = githublifecycle.Issue{Number: 164, URL: "https://github.com/owner/repo/issues/164"}
+	}
+	return f.createIssue, nil
 }
 
 func (r *recordingBatchClonePreparer) Prepare(sourceDir, targetDir string) (string, error) {
@@ -119,6 +144,20 @@ func (r *recordingBatchClonePreparer) Prepare(sourceDir, targetDir string) (stri
 		return "", err
 	}
 	return targetDir, nil
+}
+
+func (f *fakeShellExecutor) Run(_ context.Context, cwd, command string) (shellExecutionResult, error) {
+	f.cwds = append(f.cwds, cwd)
+	f.cmds = append(f.cmds, command)
+	if f.err != nil {
+		return shellExecutionResult{}, f.err
+	}
+	if len(f.results) == 0 {
+		return shellExecutionResult{}, nil
+	}
+	result := f.results[0]
+	f.results = f.results[1:]
+	return result, nil
 }
 
 type exitCodeError int
@@ -198,16 +237,128 @@ func TestVerifyHelpUsesProviderNeutralFollowUpDescription(t *testing.T) {
 	}
 }
 
-func TestVerifyCommandWiresPythonRunner(t *testing.T) {
+func TestVerifyCommandRunsGoVerificationPath(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repoDir, "tests"), 0o755); err != nil {
+		t.Fatalf("Mkdir(tests) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "go.mod"), []byte("module example.com/test\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(go.mod) error = %v", err)
+	}
 	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{{Stdout: "python ok\n", ExitCode: 0}, {Stdout: "go ok\n", ExitCode: 0}}}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
 
-	code := app.Run([]string{"verify", "--repo", "owner/repo", "--create-followup-issue", "--dry-run"})
+	code := app.Run([]string{"verify", "--repo", "owner/repo", "--tracker", "github", "--dir", repoDir})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--post-batch-verify", "--repo", "owner/repo", "--dry-run", "--create-followup-issue"})
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !reflect.DeepEqual(shell.cmds, []string{"python3 -m unittest discover -s tests -q", "go test ./..."}) {
+		t.Fatalf("shell cmds = %#v", shell.cmds)
+	}
+}
+
+func TestVerifyCommandUsesConfiguredWorkflowCommands(t *testing.T) {
+	repoDir := t.TempDir()
+	projectConfigPath := filepath.Join(repoDir, "project-config.json")
+	if err := os.WriteFile(projectConfigPath, []byte(`{"workflow":{"commands":{"test":"make test","build":"make build"}}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(project-config) error = %v", err)
+	}
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{{ExitCode: 0}, {ExitCode: 0}}}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+
+	code := app.Run([]string{"verify", "--dir", repoDir, "--project-config", projectConfigPath})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if !reflect.DeepEqual(shell.cmds, []string{"make test", "make build"}) {
+		t.Fatalf("shell cmds = %#v", shell.cmds)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+}
+
+func TestVerifyCommandCreatesFollowUpIssueFromGoRuntime(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repoDir, "tests"), 0o755); err != nil {
+		t.Fatalf("Mkdir(tests) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "go.mod"), []byte("module example.com/test\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(go.mod) error = %v", err)
+	}
+	var out strings.Builder
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{{Stdout: "FAILED (failures=1)\nOK\n", ExitCode: 0}, {Stderr: "go test failed\n", ExitCode: 1}}}
+	daemon := &fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{}}
+	app := NewApp(&out, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetDaemonLifecycle(daemon)
+
+	code := app.Run([]string{"verify", "--repo", "owner/repo", "--tracker", "github", "--dir", repoDir, "--create-followup-issue"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if len(daemon.createdIssues) != 1 {
+		t.Fatalf("created issues = %#v", daemon.createdIssues)
+	}
+	if !strings.Contains(daemon.createdIssues[0].Body, "go test failed") {
+		t.Fatalf("issue body = %q", daemon.createdIssues[0].Body)
+	}
+	if !strings.Contains(out.String(), "follow-up issue #164 created") {
+		t.Fatalf("stdout = %q, want created follow-up summary", out.String())
+	}
+}
+
+func TestPersistVerificationToSessionPreservesCheckpointShape(t *testing.T) {
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	raw := []byte("{\n  \"processed_issues\": {\"71\": {\"status\": \"ready-for-review\"}},\n  \"checkpoint\": {\n    \"phase\": \"completed\",\n    \"current\": \"Idle between autonomous runs\",\n    \"counts\": {\"processed\": 1, \"failures\": 0},\n    \"updated_at\": \"2026-04-28T12:10:00Z\"\n  }\n}\n")
+	if err := os.WriteFile(sessionPath, raw, 0o644); err != nil {
+		t.Fatalf("WriteFile(session) error = %v", err)
+	}
+
+	err := persistVerificationToSession(sessionPath, orchestration.VerificationResult{
+		Status:     orchestration.StatusFailed,
+		Summary:    "failed (1/2 passed; failed: go-test)",
+		NextAction: "create_follow_up_issue_and_fix_regression",
+		Commands: []orchestration.VerificationCommandResult{{
+			Name:          "go-test",
+			Command:       "go test ./...",
+			Status:        orchestration.StatusFailed,
+			ExitCode:      intPtr(1),
+			StderrExcerpt: "go test failed",
+		}},
+		FollowUpIssue: &orchestration.VerificationFollowUpIssue{Status: "recommended"},
+	})
+	if err != nil {
+		t.Fatalf("persistVerificationToSession() error = %v", err)
+	}
+
+	state, err := orchestration.LoadState(sessionPath)
+	if err != nil {
+		t.Fatalf("LoadState() error = %v", err)
+	}
+	if state.Checkpoint == nil || state.Checkpoint.Verification == nil {
+		t.Fatal("verification checkpoint = nil")
+	}
+	if got := state.Checkpoint.Verification.Commands[0].ExitCode; got == nil || *got != 1 {
+		t.Fatalf("exit code = %#v, want 1", got)
+	}
+	if got := state.Checkpoint.Verification.FollowUpIssue.Status; got != "recommended" {
+		t.Fatalf("follow-up status = %q, want recommended", got)
+	}
 }
 
 func TestStatusIssueCommandWiresPythonRunner(t *testing.T) {
@@ -908,8 +1059,10 @@ func TestRunDaemonParallelUsesIsolatedClonesPerWorker(t *testing.T) {
 func TestRunDaemonParallelRunsVerificationOnceAfterWorkers(t *testing.T) {
 	runner := &recordingRunner{}
 	cloner := &recordingBatchClonePreparer{}
+	shell := &fakeShellExecutor{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
 	app.SetBatchClonePreparer(cloner)
 	app.SetDaemonLifecycle(&fakeDaemonLifecycle{issues: []githublifecycle.Issue{{Number: 71}, {Number: 72}}, commentsByIssue: map[int][]githublifecycle.IssueComment{}})
 
@@ -917,20 +1070,11 @@ func TestRunDaemonParallelRunsVerificationOnceAfterWorkers(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	if runner.calls != 3 {
-		t.Fatalf("runner calls = %d, want 3", runner.calls)
+	if runner.calls != 2 {
+		t.Fatalf("runner calls = %d, want 2", runner.calls)
 	}
-	verifyCalls := 0
 	workerCalls := 0
 	for _, cmd := range runner.cmds {
-		joined := strings.Join(cmd, " ")
-		if strings.Contains(joined, "--post-batch-verify") {
-			verifyCalls++
-			if flagValue(cmd[1:], "--limit") != "" {
-				t.Fatalf("verification call should not include daemon batch limit: %#v", cmd)
-			}
-			continue
-		}
 		workerCalls++
 		if got := flagValue(cmd[1:], "--issue"); got == "" {
 			t.Fatalf("daemon worker missing --issue in %#v", cmd)
@@ -939,8 +1083,8 @@ func TestRunDaemonParallelRunsVerificationOnceAfterWorkers(t *testing.T) {
 	if workerCalls != 2 {
 		t.Fatalf("worker calls = %d, want 2", workerCalls)
 	}
-	if verifyCalls != 1 {
-		t.Fatalf("verify calls = %d, want 1", verifyCalls)
+	if len(shell.cmds) != 0 {
+		t.Fatalf("shell cmds = %#v, want none during dry-run verification", shell.cmds)
 	}
 }
 

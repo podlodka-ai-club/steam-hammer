@@ -91,6 +91,30 @@ func TestCommentMethodsUseCurrentGitHubCommands(t *testing.T) {
 	}
 }
 
+func TestCreateIssueUsesCurrentGitHubAPI(t *testing.T) {
+	gh := &fakeGHCLI{outputs: []string{`{"number":164,"title":"Verification failed","body":"Please fix it.","url":"https://github.com/owner/repo/issues/164","state":"OPEN"}`}}
+	adapter := NewAdapter(gh)
+
+	issue, err := adapter.CreateIssue(context.Background(), CreateIssueRequest{
+		Repo:  "owner/repo",
+		Title: "Verification failed",
+		Body:  "Please fix it.",
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue() error = %v", err)
+	}
+	if issue.Number != 164 || issue.URL != "https://github.com/owner/repo/issues/164" {
+		t.Fatalf("CreateIssue() = %#v", issue)
+	}
+	if issue.Tracker != TrackerGitHub {
+		t.Fatalf("Issue.Tracker = %q, want %q", issue.Tracker, TrackerGitHub)
+	}
+	want := []string{"api", "repos/owner/repo/issues", "--method", "POST", "-H", "Accept: application/vnd.github+json", "-f", "title=Verification failed", "-f", "body=Please fix it."}
+	if !reflect.DeepEqual(gh.captureCalls[0], want) {
+		t.Fatalf("CreateIssue command = %#v, want %#v", gh.captureCalls[0], want)
+	}
+}
+
 func TestListIssueCommentsUsesCurrentGitHubAPI(t *testing.T) {
 	gh := &fakeGHCLI{outputs: []string{`[{"id":1,"body":"comment","html_url":"https://example.test/comment/1","created_at":"2026-05-01T10:00:00Z"}]`}}
 	adapter := NewAdapter(gh)

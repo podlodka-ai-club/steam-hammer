@@ -2,6 +2,7 @@ package orchestration
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -70,5 +71,59 @@ func TestVerificationResultSummaryLineUsesCreatedFollowUpIssueRef(t *testing.T) 
 
 	if got := result.SummaryLine(); got != "Verification: failed (1/1 passed; failed: verify); follow-up issue PROJ-164 created" {
 		t.Fatalf("SummaryLine() = %q", got)
+	}
+}
+
+func TestConfiguredWorkflowCommandsUsesWorkflowCheckOrder(t *testing.T) {
+	commands := ConfiguredWorkflowCommands(map[string]any{
+		"workflow": map[string]any{
+			"commands": map[string]any{
+				"build": "make build",
+				"test":  "make test",
+				"lint":  "make lint",
+				"setup": "make setup",
+			},
+		},
+	})
+	if len(commands) != 3 {
+		t.Fatalf("len(commands) = %d, want 3", len(commands))
+	}
+	if commands[0].Name != "test" || commands[1].Name != "lint" || commands[2].Name != "build" {
+		t.Fatalf("commands = %#v", commands)
+	}
+}
+
+func TestWorkflowOutputExcerptCompactsWhitespace(t *testing.T) {
+	got := WorkflowOutputExcerpt("line 1\n\n  line 2\tline 3  ", 600)
+	if got != "line 1 line 2 line 3" {
+		t.Fatalf("WorkflowOutputExcerpt() = %q", got)
+	}
+}
+
+func TestRecommendedPostBatchFollowUpIssueIncludesEvidence(t *testing.T) {
+	issue := RecommendedPostBatchFollowUpIssue("owner/repo", VerificationResult{
+		Status:     StatusFailed,
+		Summary:    "failed (1/2 passed; failed: go-test)",
+		NextAction: "create_follow_up_issue_and_fix_regression",
+		Commands: []VerificationCommandResult{{
+			Name:          "go-test",
+			Command:       "go test ./...",
+			Status:        StatusFailed,
+			StderrExcerpt: "go test failed",
+		}},
+	}, []string{"https://github.com/owner/repo/pull/12"})
+
+	if issue.Title != "Post-batch verification failed: go-test" {
+		t.Fatalf("Title = %q", issue.Title)
+	}
+	for _, want := range []string{
+		"Repository: owner/repo",
+		"Touched PRs:",
+		"https://github.com/owner/repo/pull/12",
+		"evidence: go test failed",
+	} {
+		if !strings.Contains(issue.Body, want) {
+			t.Fatalf("Body missing %q\n%s", want, issue.Body)
+		}
 	}
 }

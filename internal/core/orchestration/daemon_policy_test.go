@@ -96,3 +96,10 @@ func TestProcessedIssueStatusReadsStatusField(t *testing.T) {
 		t.Fatalf("ProcessedIssueStatus() = %q, want %q", got, StatusWaitingForCI)
 	}
 }
+
+func TestProcessedIssueSignatureIncludesTaskType(t *testing.T) {
+	raw := json.RawMessage(`{"status":"waiting-for-ci","task_type":"pr"}`)
+	if got := ProcessedIssueSignature(raw); got != "state:pr:waiting-for-ci" {
+		t.Fatalf("ProcessedIssueSignature() = %q, want %q", got, "state:pr:waiting-for-ci")
+	}
+}

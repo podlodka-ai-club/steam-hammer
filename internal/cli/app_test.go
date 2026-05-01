@@ -926,6 +926,183 @@ func TestRunIssueUsesGoNativeHappyPath(t *testing.T) {
 	}
 }
 
+func TestRunIssueUsesGoNativeReusedBranchSyncPreflight(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 0},
+		{ExitCode: 0},
+		{},
+		{},
+		{},
+		{Stdout: "abc123\n"},
+		{},
+		{Stdout: "def456\n"},
+		{Stdout: ""},
+		{Stdout: "M internal/cli/command_run.go\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+		{},
+		{Stdout: ""},
+		{},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+		{},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+		createPRURL:   "https://github.com/owner/repo/pull/101",
+	}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{Stats: agentexec.Stats{ElapsedSeconds: 12}}}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo", "--no-skip-if-branch-exists"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("python runner calls = %d, want 0", runner.calls)
+	}
+	if agent.callCount != 1 {
+		t.Fatalf("agent call count = %d, want 1", agent.callCount)
+	}
+	if len(lifecycle.commentBodies[71]) != 2 {
+		t.Fatalf("comment bodies = %d, want 2", len(lifecycle.commentBodies[71]))
+	}
+	firstState, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][0])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody(first) error = %v", err)
+	}
+	if firstState.BranchLifecycle != orchestration.BranchLifecycleReused {
+		t.Fatalf("first state branch lifecycle = %q, want reused", firstState.BranchLifecycle)
+	}
+	if firstState.ReusedBranchSync == nil {
+		t.Fatal("first state reused_branch_sync = nil, want sync verdict")
+	}
+	if firstState.ReusedBranchSync.Status != orchestration.BranchSyncStatusSyncedCleanly || firstState.ReusedBranchSync.AppliedStrategy != "rebase" || !firstState.ReusedBranchSync.Changed {
+		t.Fatalf("first state sync verdict = %#v", firstState.ReusedBranchSync)
+	}
+	finalState, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][1])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody(final) error = %v", err)
+	}
+	if finalState.BranchLifecycle != orchestration.BranchLifecycleReused {
+		t.Fatalf("final state branch lifecycle = %q, want reused", finalState.BranchLifecycle)
+	}
+	if finalState.ReusedBranchSync == nil || finalState.ReusedBranchSync.AppliedStrategy != "rebase" {
+		t.Fatalf("final state sync verdict = %#v", finalState.ReusedBranchSync)
+	}
+	wantCommands := []string{
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("status", "--porcelain"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("show-ref", "--verify", "--quiet", "refs/heads/issue-fix/71-fix-runner"),
+		gitCommand("ls-remote", "--exit-code", "--heads", "origin", "issue-fix/71-fix-runner"),
+		gitCommand("checkout", "main"),
+		gitCommand("checkout", "issue-fix/71-fix-runner"),
+		gitCommand("fetch", "origin", "main"),
+		gitCommand("rev-parse", "HEAD"),
+		gitCommand("rebase", "origin/main"),
+		gitCommand("rev-parse", "HEAD"),
+		gitCommand("ls-files", "--others", "--exclude-standard"),
+		gitCommand("status", "--porcelain"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("add", "-u"),
+		gitCommand("ls-files", "--others", "--exclude-standard"),
+		gitCommand("commit", "-m", "Fix issue #71: Fix runner"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("push", "-u", "--force-with-lease", "origin", "issue-fix/71-fix-runner"),
+	}
+	if !reflect.DeepEqual(shell.cmds, wantCommands) {
+		t.Fatalf("shell commands = %#v, want %#v", shell.cmds, wantCommands)
+	}
+}
+
+func TestRunIssueBlocksWhenReusedBranchSyncCannotBeRecovered(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 0},
+		{ExitCode: 0},
+		{},
+		{},
+		{},
+		{Stdout: "abc123\n"},
+		{ExitCode: 1, Stderr: "merge conflict\n"},
+		{Stdout: ""},
+		{},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+	}
+	agent := &fakeIssueAgentRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo", "--no-skip-if-branch-exists", "--sync-strategy", "merge"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("python runner calls = %d, want 0", runner.calls)
+	}
+	if agent.callCount != 0 {
+		t.Fatalf("agent call count = %d, want 0", agent.callCount)
+	}
+	if len(lifecycle.commentBodies[71]) != 1 {
+		t.Fatalf("comment bodies = %d, want 1", len(lifecycle.commentBodies[71]))
+	}
+	blockedState, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][0])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody(blocked) error = %v", err)
+	}
+	if blockedState.Status != orchestration.StatusBlocked || blockedState.Stage != "sync_branch" {
+		t.Fatalf("blocked state = %#v", blockedState)
+	}
+	if blockedState.BranchLifecycle != orchestration.BranchLifecycleReused {
+		t.Fatalf("blocked branch lifecycle = %q, want reused", blockedState.BranchLifecycle)
+	}
+	if !strings.Contains(blockedState.Error, "resolve conflicts manually") {
+		t.Fatalf("blocked error = %q, want manual resolution hint", blockedState.Error)
+	}
+	wantCommands := []string{
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("status", "--porcelain"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("show-ref", "--verify", "--quiet", "refs/heads/issue-fix/71-fix-runner"),
+		gitCommand("ls-remote", "--exit-code", "--heads", "origin", "issue-fix/71-fix-runner"),
+		gitCommand("checkout", "main"),
+		gitCommand("checkout", "issue-fix/71-fix-runner"),
+		gitCommand("fetch", "origin", "main"),
+		gitCommand("rev-parse", "HEAD"),
+		gitCommand("merge", "--no-edit", "-X", "theirs", "origin/main"),
+		gitCommand("diff", "--name-only", "--diff-filter=U"),
+		gitCommand("merge", "--abort"),
+	}
+	if !reflect.DeepEqual(shell.cmds, wantCommands) {
+		t.Fatalf("shell commands = %#v, want %#v", shell.cmds, wantCommands)
+	}
+	if !strings.Contains(errOut.String(), "failed to prepare issue branch") {
+		t.Fatalf("stderr = %q, want explicit sync preflight failure", errOut.String())
+	}
+}
+
 func TestRunIssueRoutesLinkedPRToPRCompatibilityAdapter(t *testing.T) {
 	runner := &recordingRunner{}
 	lifecycle := &fakeDaemonLifecycle{

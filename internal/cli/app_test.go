@@ -1394,7 +1394,7 @@ func TestRunIssueBlocksWhenReusedBranchSyncCannotBeRecovered(t *testing.T) {
 	}
 }
 
-func TestRunIssueRoutesLinkedPRToPRCompatibilityAdapter(t *testing.T) {
+func TestRunIssueRoutesLinkedPRToPRReviewFlow(t *testing.T) {
 	runner := &recordingRunner{}
 	lifecycle := &fakeDaemonLifecycle{
 		issue:    githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
@@ -1404,18 +1404,19 @@ func TestRunIssueRoutesLinkedPRToPRCompatibilityAdapter(t *testing.T) {
 	app := NewApp(&strings.Builder{}, &errOut)
 	app.SetRunner(runner)
 	app.SetIssueLifecycle(lifecycle)
+	app.SetPRLifecycle(nil)
 
 	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--pr", "101", "--from-review-comments", "--repo", "owner/repo"})
-	if !strings.Contains(errOut.String(), "routing issue #71 to pr review compatibility adapter") || !strings.Contains(errOut.String(), "linked open PR #101") {
-		t.Fatalf("stderr = %q, want explicit adapter routing reason", errOut.String())
+	if !strings.Contains(errOut.String(), "routing issue #71 to pr review flow") || !strings.Contains(errOut.String(), "linked open PR #101") {
+		t.Fatalf("stderr = %q, want explicit routing reason", errOut.String())
 	}
 }
 
-func TestRunIssueRoutesReadyToMergeRecoveryToPRCompatibilityAdapter(t *testing.T) {
+func TestRunIssueRoutesReadyToMergeRecoveryToPRReviewFlow(t *testing.T) {
 	runner := &recordingRunner{}
 	stateBody, err := orchestration.BuildOrchestrationStateComment(orchestration.TrackedState{
 		Status:   orchestration.StatusReadyToMerge,
@@ -1437,6 +1438,7 @@ func TestRunIssueRoutesReadyToMergeRecoveryToPRCompatibilityAdapter(t *testing.T
 	app := NewApp(&strings.Builder{}, &errOut)
 	app.SetRunner(runner)
 	app.SetIssueLifecycle(lifecycle)
+	app.SetPRLifecycle(nil)
 
 	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo"})
 	if code != 0 {

@@ -24,7 +24,11 @@ func TestIsActionableReviewFeedback(t *testing.T) {
 func TestNormalizeReviewFeedback(t *testing.T) {
 	items, stats := NormalizeReviewFeedback(
 		[]ReviewThread{{
-			Comments: []ReviewThreadComment{{Author: "reviewer", Body: "Please rename this", Path: "app.go", Line: 12, URL: "https://example/1"}},
+			Comments: []ReviewThreadComment{
+				{Author: "reviewer", Body: "Please rename this", Path: "app.go", Line: 12, URL: "https://example/1"},
+				{Author: "reviewer", Body: "looks good", Path: "app.go", Line: 14, URL: "https://example/positive"},
+				{Author: "reviewer", Body: "Orchestration state update\n\n<!-- orchestration-state:v1 -->\n```json\n{\"status\":\"failed\"}\n```", Path: "app.go", Line: 16, URL: "https://example/state"},
+			},
 		}},
 		[]PullRequestReview{
 			{AuthorLogin: "reviewer", SubmittedAt: "2026-04-28T10:00:00Z", State: "COMMENTED", Body: "looks good"},
@@ -46,6 +50,9 @@ func TestNormalizeReviewFeedback(t *testing.T) {
 	if stats.CommentsDuplicates != 0 {
 		t.Fatalf("CommentsDuplicates = %d, want 0", stats.CommentsDuplicates)
 	}
+	if stats.CommentsNonActionable != 2 {
+		t.Fatalf("CommentsNonActionable = %d, want 2", stats.CommentsNonActionable)
+	}
 	if stats.ConversationDuplicates != 1 {
 		t.Fatalf("ConversationDuplicates = %d, want 1", stats.ConversationDuplicates)
 	}
@@ -60,6 +67,23 @@ func TestNormalizeReviewFeedback(t *testing.T) {
 	}
 	if items[1].Author != "reviewer2" || items[1].State != "APPROVED" {
 		t.Fatalf("review summary = %#v", items[1])
+	}
+}
+
+func TestParsePRReviewOutcomeSummaryNormalizesStatuses(t *testing.T) {
+	parsed := ParsePRReviewOutcomeSummary(PRReviewOutcomeMarker + `
+{"items":[
+  {"item":1,"status":"fixed","summary":"updated app.go"},
+  {"item":2,"status":"not_fixed","summary":"unsafe without product call","next_action":"decide behavior"},
+  {"item":3,"status":"blocked","summary":"needs credentials","next_action":"provide token"}
+]}`)
+	if parsed == nil || len(parsed.Items) != 3 {
+		t.Fatalf("parsed = %#v, want 3 items", parsed)
+	}
+	got := []string{parsed.Items[0].Status, parsed.Items[1].Status, parsed.Items[2].Status}
+	want := []string{"fixed", "not-fixed", "needs-human-follow-up"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("statuses = %#v, want %#v", got, want)
 	}
 }
 

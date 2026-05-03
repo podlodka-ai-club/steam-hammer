@@ -114,11 +114,24 @@ func ParsePRReviewOutcomeSummary(output string) *PRReviewOutcomeSummary {
 		return nil
 	}
 	for i := range payload.Items {
-		payload.Items[i].Status = strings.TrimSpace(strings.ToLower(payload.Items[i].Status))
+		payload.Items[i].Status = NormalizePRReviewOutcomeStatus(payload.Items[i].Status)
 		payload.Items[i].Summary = strings.TrimSpace(payload.Items[i].Summary)
 		payload.Items[i].NextAction = strings.TrimSpace(payload.Items[i].NextAction)
 	}
 	return &payload
+}
+
+func NormalizePRReviewOutcomeStatus(status string) string {
+	switch strings.TrimSpace(strings.ToLower(status)) {
+	case "fixed":
+		return "fixed"
+	case "not-fixed", "not_fixed":
+		return "not-fixed"
+	case "needs-human-follow-up", "needs_human_follow_up", "blocked":
+		return "needs-human-follow-up"
+	default:
+		return strings.TrimSpace(strings.ToLower(status))
+	}
 }
 
 type ReviewFeedbackStats struct {
@@ -129,6 +142,7 @@ type ReviewFeedbackStats struct {
 	CommentsOutdated          int
 	CommentsEmpty             int
 	CommentsPRAuthor          int
+	CommentsNonActionable     int
 	CommentsDuplicates        int
 	CommentsUsed              int
 	ReviewsTotal              int
@@ -206,6 +220,10 @@ func NormalizeReviewFeedback(threads []ReviewThread, reviews []PullRequestReview
 			}
 			if prAuthorLogin != "" && strings.EqualFold(author, prAuthorLogin) {
 				stats.CommentsPRAuthor++
+			}
+			if !IsActionableReviewFeedback(body) {
+				stats.CommentsNonActionable++
+				continue
 			}
 			items = append(items, ReviewFeedbackItem{
 				Type:   "review_comment",
@@ -295,6 +313,7 @@ func FormatReviewFeedbackStats(stats ReviewFeedbackStats) string {
 		"(from_pr_author:" + itoa(stats.CommentsPRAuthor) + ")" +
 		" excluded(outdated:" + itoa(stats.CommentsOutdated) +
 		", empty:" + itoa(stats.CommentsEmpty) +
+		", non_actionable:" + itoa(stats.CommentsNonActionable) +
 		", duplicates:" + itoa(stats.CommentsDuplicates) + ")" +
 		"; review_summaries=total:" + itoa(stats.ReviewsTotal) +
 		" included:" + itoa(stats.ReviewsUsed) +

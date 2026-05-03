@@ -1981,6 +1981,49 @@ func TestRunPRCommandAcceptsPythonPRFlags(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments"})
 }
 
+func TestBuildNativePRReviewPromptRequestsHyphenatedOutcomeStatuses(t *testing.T) {
+	prompt := buildNativePRReviewPrompt(
+		githublifecycle.PullRequest{Number: 72, Title: "Fix review feedback", URL: "https://github.com/owner/repo/pull/72", Body: "PR body"},
+		[]orchestration.ReviewFeedbackItem{{Type: "review_comment", Author: "reviewer", Body: "Please add tests", Path: "app.go", Line: 12}},
+		nil,
+		false,
+	)
+	if !strings.Contains(prompt, "fixed|not-fixed|needs-human-follow-up") {
+		t.Fatalf("prompt missing expected outcome statuses: %q", prompt)
+	}
+	if strings.Contains(prompt, "not_fixed|blocked") {
+		t.Fatalf("prompt contains legacy outcome statuses: %q", prompt)
+	}
+}
+
+func TestBuildPRReviewOutcomeSummaryFallbackUsesNotFixedStatus(t *testing.T) {
+	summary := buildPRReviewOutcomeSummary(&agentexec.Result{Output: "no structured result"}, []orchestration.ReviewFeedbackItem{{Body: "Please add tests"}})
+	if summary == nil || len(summary.Items) != 1 {
+		t.Fatalf("summary = %#v, want one fallback item", summary)
+	}
+	if summary.Items[0].Status != "not-fixed" {
+		t.Fatalf("status = %q, want not-fixed", summary.Items[0].Status)
+	}
+	if summary.Items[0].NextAction != "manual_review_follow_up_required" {
+		t.Fatalf("next_action = %q, want manual_review_follow_up_required", summary.Items[0].NextAction)
+	}
+}
+
+func TestBuildPRReviewFailureOutcomeMarksItemsForHumanFollowUp(t *testing.T) {
+	summary := buildPRReviewFailureOutcome([]orchestration.ReviewFeedbackItem{{Body: "Please add tests"}, {Body: "Please rename this"}}, "agent failed", "inspect_agent_failure")
+	if summary == nil || len(summary.Items) != 2 {
+		t.Fatalf("summary = %#v, want two failed items", summary)
+	}
+	for _, item := range summary.Items {
+		if item.Status != "needs-human-follow-up" {
+			t.Fatalf("status = %q, want needs-human-follow-up", item.Status)
+		}
+		if item.Summary != "agent failed" || item.NextAction != "inspect_agent_failure" {
+			t.Fatalf("item = %#v, want failure details", item)
+		}
+	}
+}
+
 func TestRunPRUsesNativeRuntimeLoopWhenRepoExplicit(t *testing.T) {
 	runner := &recordingRunner{}
 	shell := &fakeShellExecutor{results: []shellExecutionResult{

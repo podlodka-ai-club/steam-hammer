@@ -159,28 +159,29 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 			_, _ = fmt.Fprintf(a.err, "orchestrator: warning: failed to post state for PR #%d: %v\n", pullRequest.Number, err)
 		}
 	}
-	failedState := func(attempt int, stage, nextAction, message string) orchestration.TrackedState {
+	failedState := func(attempt int, stage, nextAction, message string, reviewOutcome *orchestration.PRReviewOutcomeSummary) orchestration.TrackedState {
 		return orchestration.TrackedState{
-			Status:     orchestration.StatusFailed,
-			TaskType:   "pr",
-			PR:         intPtr(pullRequest.Number),
-			Branch:     activeBranch,
-			BaseBranch: strings.TrimSpace(pullRequest.BaseRefName),
-			Runner:     runnerName,
-			Agent:      agentName,
-			Model:      modelName,
-			Attempt:    attempt,
-			Stage:      stage,
-			NextAction: nextAction,
-			Error:      message,
-			Timestamp:  time.Now().UTC().Format(time.RFC3339),
+			Status:         orchestration.StatusFailed,
+			TaskType:       "pr",
+			PR:             intPtr(pullRequest.Number),
+			Branch:         activeBranch,
+			BaseBranch:     strings.TrimSpace(pullRequest.BaseRefName),
+			Runner:         runnerName,
+			Agent:          agentName,
+			Model:          modelName,
+			Attempt:        attempt,
+			Stage:          stage,
+			NextAction:     nextAction,
+			Error:          message,
+			Timestamp:      time.Now().UTC().Format(time.RFC3339),
+			ReviewFeedback: reviewOutcome,
 		}
 	}
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		reviewItems, reviewStats, err := a.fetchNativePRReviewFeedback(ctx, repo, pullRequest)
 		if err != nil {
-			postState(failedState(attempt, "review_feedback", "inspect_review_feedback", err.Error()))
+			postState(failedState(attempt, "review_feedback", "inspect_review_feedback", err.Error(), nil))
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to collect review feedback for PR #%d: %v\n", pullRequest.Number, err)
 			return 1
 		}
@@ -222,7 +223,7 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 
 		preRunUntracked, err := a.gitUntrackedFiles(ctx, repoRoot)
 		if err != nil {
-			postState(failedState(attempt, "agent_run", "inspect_git_status", err.Error()))
+			postState(failedState(attempt, "agent_run", "inspect_git_status", err.Error(), buildPRReviewFailureOutcome(reviewItems, err.Error(), "inspect_git_status")))
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to capture untracked baseline: %v\n", err)
 			return 1
 		}
@@ -244,13 +245,13 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 			if result != nil && result.ClarificationRequest != nil {
 				message = stringValue(result.ClarificationRequest["reason"], message)
 			}
-			postState(failedState(attempt, "agent_run", "inspect_agent_failure", message))
+			postState(failedState(attempt, "agent_run", "inspect_agent_failure", message, buildPRReviewFailureOutcome(reviewItems, message, "inspect_agent_failure")))
 			_, _ = fmt.Fprintf(a.err, "orchestrator: agent failed for PR #%d: %v\n", pullRequest.Number, err)
 			return 1
 		}
 		if result != nil && result.ExitCode != 0 {
 			message := fmt.Sprintf("Agent exited with code %d", result.ExitCode)
-			postState(failedState(attempt, "agent_run", "inspect_agent_failure", message))
+			postState(failedState(attempt, "agent_run", "inspect_agent_failure", message, buildPRReviewFailureOutcome(reviewItems, message, "inspect_agent_failure")))
 			_, _ = fmt.Fprintf(a.err, "orchestrator: %s for PR #%d\n", message, pullRequest.Number)
 			return 1
 		}
@@ -262,20 +263,21 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 					_, _ = fmt.Fprintf(a.err, "orchestrator: warning: failed to post clarification request for PR #%d: %v\n", pullRequest.Number, err)
 				}
 				postState(orchestration.TrackedState{
-					Status:     orchestration.StatusWaitingForAuthor,
-					TaskType:   "pr",
-					PR:         intPtr(pullRequest.Number),
-					Branch:     activeBranch,
-					BaseBranch: strings.TrimSpace(pullRequest.BaseRefName),
-					Runner:     runnerName,
-					Agent:      agentName,
-					Model:      modelName,
-					Attempt:    attempt,
-					Stage:      "agent_run",
-					NextAction: "await_author_reply",
-					Error:      reason,
-					Timestamp:  time.Now().UTC().Format(time.RFC3339),
-					Stats:      statsMap(result.Stats),
+					Status:         orchestration.StatusWaitingForAuthor,
+					TaskType:       "pr",
+					PR:             intPtr(pullRequest.Number),
+					Branch:         activeBranch,
+					BaseBranch:     strings.TrimSpace(pullRequest.BaseRefName),
+					Runner:         runnerName,
+					Agent:          agentName,
+					Model:          modelName,
+					Attempt:        attempt,
+					Stage:          "agent_run",
+					NextAction:     "await_author_reply",
+					Error:          reason,
+					Timestamp:      time.Now().UTC().Format(time.RFC3339),
+					Stats:          statsMap(result.Stats),
+					ReviewFeedback: buildPRReviewFailureOutcome(reviewItems, reason, "await_author_reply"),
 				})
 				_, _ = fmt.Fprintf(a.out, "Paused PR #%d for clarification: %s\n", pullRequest.Number, question)
 				return 0
@@ -286,26 +288,26 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 
 		hasChanges, err := a.gitHasChanges(ctx, repoRoot)
 		if err != nil {
-			postState(failedState(attempt, "commit_push", "inspect_git_status", err.Error()))
+			postState(failedState(attempt, "commit_push", "inspect_git_status", err.Error(), reviewOutcome))
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect post-agent changes: %v\n", err)
 			return 1
 		}
 		if !hasChanges {
 			postState(orchestration.TrackedState{
-				Status:     orchestration.StatusWaitingForAuthor,
-				TaskType:   "pr",
-				PR:         intPtr(pullRequest.Number),
-				Branch:     activeBranch,
-				BaseBranch: strings.TrimSpace(pullRequest.BaseRefName),
-				Runner:     runnerName,
-				Agent:      agentName,
-				Model:      modelName,
-				Attempt:    attempt,
-				Stage:      "post_agent_check",
-				NextAction: "await_more_feedback_or_manual_changes",
-				Error:      "Agent produced no repository changes",
-				Timestamp:  time.Now().UTC().Format(time.RFC3339),
-				Stats:      statsMap(result.Stats),
+				Status:         orchestration.StatusWaitingForAuthor,
+				TaskType:       "pr",
+				PR:             intPtr(pullRequest.Number),
+				Branch:         activeBranch,
+				BaseBranch:     strings.TrimSpace(pullRequest.BaseRefName),
+				Runner:         runnerName,
+				Agent:          agentName,
+				Model:          modelName,
+				Attempt:        attempt,
+				Stage:          "post_agent_check",
+				NextAction:     "await_more_feedback_or_manual_changes",
+				Error:          "Agent produced no repository changes",
+				Timestamp:      time.Now().UTC().Format(time.RFC3339),
+				Stats:          statsMap(result.Stats),
 				ReviewFeedback: reviewOutcome,
 			})
 			_, _ = fmt.Fprintf(a.out, "No changes detected for PR #%d; skipping commit and push\n", pullRequest.Number)
@@ -313,53 +315,53 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 		}
 
 		if err := a.assertNativeGitContext(ctx, repoRoot, activeBranch, "commit PR review changes"); err != nil {
-			postState(failedState(attempt, "commit_push", "restore_branch_context", err.Error()))
+			postState(failedState(attempt, "commit_push", "restore_branch_context", err.Error(), reviewOutcome))
 			_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
 			return 1
 		}
 		if err := a.gitStageIssueChanges(ctx, repoRoot, preRunUntracked); err != nil {
-			postState(failedState(attempt, "commit_push", "inspect_stage_failure", err.Error()))
+			postState(failedState(attempt, "commit_push", "inspect_stage_failure", err.Error(), reviewOutcome))
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to stage PR changes: %v\n", err)
 			return 1
 		}
 		if err := a.gitCommit(ctx, repoRoot, nativePRCommitTitle(pullRequest)); err != nil {
-			postState(failedState(attempt, "commit_push", "inspect_commit_failure", err.Error()))
+			postState(failedState(attempt, "commit_push", "inspect_commit_failure", err.Error(), reviewOutcome))
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to commit PR changes: %v\n", err)
 			return 1
 		}
 		if err := a.gitPushBranch(ctx, repoRoot, activeBranch, false); err != nil {
-			postState(failedState(attempt, "commit_push", "inspect_push_failure", err.Error()))
+			postState(failedState(attempt, "commit_push", "inspect_push_failure", err.Error(), reviewOutcome))
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to push PR branch %q: %v\n", activeBranch, err)
 			return 1
 		}
 
 		postState(orchestration.TrackedState{
-			Status:     orchestration.StatusWaitingForCI,
-			TaskType:   "pr",
-			PR:         intPtr(pullRequest.Number),
-			Branch:     activeBranch,
-			BaseBranch: strings.TrimSpace(pullRequest.BaseRefName),
-			Runner:     runnerName,
-			Agent:      agentName,
-			Model:      modelName,
-			Attempt:    attempt,
-			Stage:      "pr_update",
-			NextAction: "wait_for_ci",
-			Timestamp:  time.Now().UTC().Format(time.RFC3339),
-			Stats:      statsMap(result.Stats),
+			Status:         orchestration.StatusWaitingForCI,
+			TaskType:       "pr",
+			PR:             intPtr(pullRequest.Number),
+			Branch:         activeBranch,
+			BaseBranch:     strings.TrimSpace(pullRequest.BaseRefName),
+			Runner:         runnerName,
+			Agent:          agentName,
+			Model:          modelName,
+			Attempt:        attempt,
+			Stage:          "pr_update",
+			NextAction:     "wait_for_ci",
+			Timestamp:      time.Now().UTC().Format(time.RFC3339),
+			Stats:          statsMap(result.Stats),
 			ReviewFeedback: reviewOutcome,
 		})
 
 		updatedPR, err := a.prLifecycle.FetchPullRequest(ctx, repo, pullRequest.Number)
 		if err != nil {
-			postState(failedState(attempt, "review_feedback", "inspect_review_feedback", err.Error()))
+			postState(failedState(attempt, "review_feedback", "inspect_review_feedback", err.Error(), reviewOutcome))
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to refresh PR #%d after push: %v\n", pullRequest.Number, err)
 			return 1
 		}
 		pullRequest = updatedPR
 		remainingItems, remainingStats, err := a.fetchNativePRReviewFeedback(ctx, repo, pullRequest)
 		if err != nil {
-			postState(failedState(attempt, "review_feedback", "inspect_review_feedback", err.Error()))
+			postState(failedState(attempt, "review_feedback", "inspect_review_feedback", err.Error(), reviewOutcome))
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to refresh review feedback for PR #%d: %v\n", pullRequest.Number, err)
 			return 1
 		}
@@ -371,20 +373,20 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 		if attempt >= maxAttempts {
 			blockedReviewOutcome := appendRemainingReviewOutcomes(reviewOutcome, remainingItems)
 			postState(orchestration.TrackedState{
-				Status:     orchestration.StatusBlocked,
-				TaskType:   "pr",
-				PR:         intPtr(pullRequest.Number),
-				Branch:     activeBranch,
-				BaseBranch: strings.TrimSpace(pullRequest.BaseRefName),
-				Runner:     runnerName,
-				Agent:      agentName,
-				Model:      modelName,
-				Attempt:    attempt,
-				Stage:      "review_feedback",
-				NextAction: "manual_review_follow_up_required",
-				Error:      fmt.Sprintf("%d actionable review items remain after %d/%d attempts", len(remainingItems), attempt, maxAttempts),
-				Timestamp:  time.Now().UTC().Format(time.RFC3339),
-				Stats:      statsMap(result.Stats),
+				Status:         orchestration.StatusBlocked,
+				TaskType:       "pr",
+				PR:             intPtr(pullRequest.Number),
+				Branch:         activeBranch,
+				BaseBranch:     strings.TrimSpace(pullRequest.BaseRefName),
+				Runner:         runnerName,
+				Agent:          agentName,
+				Model:          modelName,
+				Attempt:        attempt,
+				Stage:          "review_feedback",
+				NextAction:     "manual_review_follow_up_required",
+				Error:          fmt.Sprintf("%d actionable review items remain after %d/%d attempts", len(remainingItems), attempt, maxAttempts),
+				Timestamp:      time.Now().UTC().Format(time.RFC3339),
+				Stats:          statsMap(result.Stats),
 				ReviewFeedback: blockedReviewOutcome,
 			})
 			_, _ = fmt.Fprintf(a.out, "PR #%d still has %d actionable review items after %d/%d attempts; blocking for manual follow-up.\n", pullRequest.Number, len(remainingItems), attempt, maxAttempts)
@@ -540,7 +542,7 @@ func buildNativePRReviewPrompt(pullRequest githublifecycle.PullRequest, reviewIt
 		firstLine = "You are working on a small follow-up for an existing GitHub pull request review cycle in the current git branch."
 	}
 	return strings.TrimSpace(fmt.Sprintf(
-		"%s\nImplement the fix requested in PR review comments in repository files.\nDo not run git commands; git actions are handled by orchestration script.\n\nAfter finishing, print %s followed by JSON object like {\"items\":[{\"item\":1,\"status\":\"fixed|not_fixed|blocked\",\"summary\":\"what changed or why not\",\"next_action\":\"required only when not fixed\"}]}. Include one item per review comment in the same order. If code was changed, mention relevant files and tests.\n\nIf the requested change is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. Instead, stop and print %s followed by a JSON object like {\"question\":\"<focused question>\",\"reason\":\"<why clarification is required>\"}.\n\nPull Request: #%d - %s\nPR URL: %s\n\nPR description:\n%s\n\nLinked issue context:\n%s\n\nReview comments to address:\n%s",
+		"%s\nImplement the fix requested in PR review comments in repository files.\nDo not run git commands; git actions are handled by orchestration script.\n\nAfter finishing, print %s followed by JSON object like {\"items\":[{\"item\":1,\"status\":\"fixed|not-fixed|needs-human-follow-up\",\"summary\":\"what changed or why not\",\"next_action\":\"required only when not fixed\"}]}. Include one item per review comment in the same order. If code was changed, mention relevant files and tests.\n\nIf the requested change is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. Instead, stop and print %s followed by a JSON object like {\"question\":\"<focused question>\",\"reason\":\"<why clarification is required>\"}.\n\nPull Request: #%d - %s\nPR URL: %s\n\nPR description:\n%s\n\nLinked issue context:\n%s\n\nReview comments to address:\n%s",
 		firstLine,
 		orchestration.PRReviewOutcomeMarker,
 		orchestration.ClarificationRequestMarker,
@@ -570,9 +572,27 @@ func buildPRReviewOutcomeSummary(result *agentexec.Result, reviewItems []orchest
 		}
 		items = append(items, orchestration.PRReviewItemOutcome{
 			Item:       index + 1,
-			Status:     "not_fixed",
+			Status:     "not-fixed",
 			Summary:    fallbackString(summary, "No structured outcome provided by agent"),
 			NextAction: "manual_review_follow_up_required",
+		})
+	}
+	return &orchestration.PRReviewOutcomeSummary{Items: items}
+}
+
+func buildPRReviewFailureOutcome(reviewItems []orchestration.ReviewFeedbackItem, message, nextAction string) *orchestration.PRReviewOutcomeSummary {
+	if len(reviewItems) == 0 {
+		return nil
+	}
+	message = fallbackString(strings.TrimSpace(message), "Agent did not complete this review item")
+	nextAction = fallbackString(strings.TrimSpace(nextAction), "manual_review_follow_up_required")
+	items := make([]orchestration.PRReviewItemOutcome, 0, len(reviewItems))
+	for index := range reviewItems {
+		items = append(items, orchestration.PRReviewItemOutcome{
+			Item:       index + 1,
+			Status:     "needs-human-follow-up",
+			Summary:    message,
+			NextAction: nextAction,
 		})
 	}
 	return &orchestration.PRReviewOutcomeSummary{Items: items}
@@ -593,7 +613,7 @@ func appendRemainingReviewOutcomes(summary *orchestration.PRReviewOutcomeSummary
 		}
 		base.Items = append(base.Items, orchestration.PRReviewItemOutcome{
 			Item:       index + 1,
-			Status:     "not_fixed",
+			Status:     "not-fixed",
 			Summary:    fallbackString(text, "Review item remains actionable after retries"),
 			NextAction: "manual_review_follow_up_required",
 		})

@@ -211,7 +211,7 @@ func buildVerifyPythonArgs(script string, opts commonOptions, createFollowupIssu
 	return pythonArgs
 }
 
-func buildDaemonPythonArgs(script string, opts commonOptions, state string, limit int, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, syncReusedBranch, noSyncReusedBranch bool, syncStrategy, sessionPath string, postBatchVerify, createFollowupIssue bool, fs flagState) []string {
+func buildDaemonPythonArgs(script string, opts commonOptions, state string, limit int, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, syncReusedBranch, noSyncReusedBranch bool, syncStrategy, sessionPath string, postBatchVerify, createFollowupIssue, allowLiveSideEffects bool, fs flagState) []string {
 	pythonArgs := []string{script, "--autonomous", "--state", state, "--limit", strconv.Itoa(limit)}
 	pythonArgs = appendCommonPythonArgs(pythonArgs, opts)
 	if base != "" {
@@ -265,10 +265,13 @@ func buildDaemonPythonArgs(script string, opts commonOptions, state string, limi
 	if createFollowupIssue {
 		pythonArgs = append(pythonArgs, "--create-followup-issue")
 	}
+	if allowLiveSideEffects {
+		pythonArgs = append(pythonArgs, "--allow-live-side-effects")
+	}
 	return pythonArgs
 }
 
-func buildDaemonCLIArgs(opts commonOptions, state string, limit int, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, syncReusedBranch, noSyncReusedBranch bool, syncStrategy, sessionPath string, postBatchVerify, createFollowupIssue bool, fs flagState) []string {
+func buildDaemonCLIArgs(opts commonOptions, state string, limit int, base string, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, syncReusedBranch, noSyncReusedBranch bool, syncStrategy, sessionPath string, postBatchVerify, createFollowupIssue, allowLiveSideEffects bool, fs flagState) []string {
 	args := []string{"run", "daemon", "--state", state, "--limit", strconv.Itoa(limit)}
 	args = appendCommonPythonArgs(args, opts)
 	if base != "" {
@@ -321,6 +324,9 @@ func buildDaemonCLIArgs(opts commonOptions, state string, limit int, base string
 	}
 	if createFollowupIssue {
 		args = append(args, "--create-followup-issue")
+	}
+	if allowLiveSideEffects {
+		args = append(args, "--allow-live-side-effects")
 	}
 	return args
 }
@@ -1117,6 +1123,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	fs.StringVar(&base, "base-branch", "", "base branch mode: default or current")
 	postBatchVerify := fs.Bool("post-batch-verify", false, "run post-batch verification after the daemon cycle completes")
 	createFollowupIssue := fs.Bool("create-followup-issue", false, a.runtime.FollowUpIssueFlagDescription("post-batch verification"))
+	allowLiveSideEffects := fs.Bool("allow-live-side-effects", false, "opt in to live GitHub mutations for autonomous daemon runs")
 	detach := fs.Bool("detach", false, "start the worker in the background and write logs/state to a predictable path")
 	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
 	autonomousSessionFile := fs.String("autonomous-session-file", "", "internal autonomous session checkpoint path")
@@ -1147,6 +1154,15 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	if *state != "open" && *state != "closed" && *state != "all" {
 		_, _ = fmt.Fprintln(a.err, "run daemon requires --state to be one of: open, closed, all")
 		return 2
+	}
+	if !*opts.dryRun && !*allowLiveSideEffects {
+		_, _ = fmt.Fprintln(a.err, "run daemon can create live GitHub side effects; use --dry-run for a safe bounded smoke or pass --allow-live-side-effects to opt in")
+		return 2
+	}
+	if *opts.dryRun {
+		_, _ = fmt.Fprintln(a.out, "Side-effect mode: dry-run daemon smoke (no live GitHub mutations)")
+	} else {
+		_, _ = fmt.Fprintln(a.out, "Side-effect mode: live daemon run (--allow-live-side-effects enabled)")
 	}
 
 	flags := flagStateAdapter{fs: fs}
@@ -1206,6 +1222,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 				workerPaths.SessionPath,
 				*postBatchVerify,
 				*createFollowupIssue,
+				*allowLiveSideEffects,
 				flags,
 			)
 			workerArgs = append(workerArgs, "--max-parallel-tasks", "1", "--max-cycles", "1")
@@ -1254,7 +1271,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	defer cleanupSession()
 
 	if !shouldUseGoDaemonPolicy(opts, a.daemon) {
-		pythonArgs := buildDaemonPythonArgs(a.runtime.RunnerScript(), opts, *state, *limit, base, *includeEmpty, *stopOnError, *failOnExisting, *forceIssueFlow, *skipIfPRExists, *noSkipIfPRExists, *skipIfBranchExists, *noSkipIfBranchExists, *forceReprocess, *syncReusedBranch, *noSyncReusedBranch, *syncStrategy, sessionPath, *postBatchVerify, *createFollowupIssue, flags)
+		pythonArgs := buildDaemonPythonArgs(a.runtime.RunnerScript(), opts, *state, *limit, base, *includeEmpty, *stopOnError, *failOnExisting, *forceIssueFlow, *skipIfPRExists, *noSkipIfPRExists, *skipIfBranchExists, *noSkipIfBranchExists, *forceReprocess, *syncReusedBranch, *noSyncReusedBranch, *syncStrategy, sessionPath, *postBatchVerify, *createFollowupIssue, *allowLiveSideEffects, flags)
 
 		cycles := 0
 		for {

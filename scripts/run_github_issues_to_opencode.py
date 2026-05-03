@@ -790,7 +790,7 @@ def project_scope_defaults(project_config: dict) -> dict:
     return defaults
 
 
-def evaluate_issue_scope(issue: dict, scope_defaults: dict) -> dict:
+def evaluate_issue_scope(issue: dict, scope_defaults: dict, now: datetime | None = None) -> dict:
     labels_config = scope_defaults.get("labels") if isinstance(scope_defaults, dict) else None
     authors_config = scope_defaults.get("authors") if isinstance(scope_defaults, dict) else None
     assignees_config = scope_defaults.get("assignees") if isinstance(scope_defaults, dict) else None
@@ -916,7 +916,12 @@ def evaluate_issue_scope(issue: dict, scope_defaults: dict) -> dict:
                 "matched": {"priority_allow": []},
             }
 
-    now = datetime.now(timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
     created_at = _parse_iso_timestamp(issue.get("createdAt"))
     updated_at = _parse_iso_timestamp(issue.get("updatedAt"))
     if isinstance(max_age_days, int) and max_age_days > 0 and created_at is not None:
@@ -9322,6 +9327,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="When post-batch verification fails, create a GitHub follow-up issue instead of only recommending one.",
     )
+    parser.add_argument(
+        "--allow-live-side-effects",
+        action="store_true",
+        help=(
+            "Opt in to live GitHub mutations for autonomous runs. Without this flag, "
+            "autonomous smoke-style runs must use --dry-run."
+        ),
+    )
     return parser
 
 
@@ -9391,6 +9404,7 @@ def main() -> int:
     post_pr_summary = bool(getattr(args, "post_pr_summary", False))
     track_tokens = bool(getattr(args, "track_tokens", False))
     autonomous_mode = bool(getattr(args, "autonomous", False))
+    allow_live_side_effects = bool(getattr(args, "allow_live_side_effects", False))
     execution_mode = str(getattr(args, "mode", BUILTIN_DEFAULTS["mode"]))
     lightweight_mode = execution_mode == "lightweight"
     autonomous_session_file = _as_optional_string(getattr(args, "autonomous_session_file", None))
@@ -9509,6 +9523,16 @@ def main() -> int:
                 raise RuntimeError("--from-review-comments requires --pr <number>.")
             if pr_number_arg is not None and not from_review_comments:
                 raise RuntimeError("--pr requires --from-review-comments.")
+            if autonomous_mode and not status_mode and not args.dry_run and not allow_live_side_effects:
+                raise RuntimeError(
+                    "Autonomous runs can create live GitHub side effects; rerun with --dry-run "
+                    "for a safe bounded smoke or pass --allow-live-side-effects to opt in."
+                )
+            if autonomous_mode and not status_mode:
+                if args.dry_run:
+                    print("Side-effect mode: dry-run autonomous smoke (no live GitHub mutations)")
+                else:
+                    print("Side-effect mode: live autonomous run (--allow-live-side-effects enabled)")
             codehost = _parse_codehost(getattr(args, "codehost", BUILTIN_DEFAULTS["codehost"]))
             validate_provider_requirements(
                 tracker=tracker,

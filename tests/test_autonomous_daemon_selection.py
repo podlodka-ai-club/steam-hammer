@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime, timezone
 import io
 import json
 import os
@@ -187,6 +188,7 @@ class AutonomousDaemonSelectionTests(unittest.TestCase):
                 "priority": {"allow": ["priority:high"], "order": ["priority:high", "priority:low"]},
                 "freshness": {"max_age_days": 7, "max_idle_days": 7},
             },
+            now=datetime(2026, 4, 28, 10, 0, tzinfo=timezone.utc),
         )
 
         self.assertTrue(decision["eligible"])
@@ -201,10 +203,26 @@ class AutonomousDaemonSelectionTests(unittest.TestCase):
         decision = evaluate_issue_scope(
             issue=issue,
             scope_defaults={"freshness": {"max_idle_days": 1}},
+            now=datetime(2026, 4, 28, 10, 0, tzinfo=timezone.utc),
         )
 
         self.assertFalse(decision["eligible"])
         self.assertIn("too stale", decision["reason"])
+
+    def test_scope_evaluation_uses_supplied_fixed_time_for_freshness(self) -> None:
+        issue = {
+            "number": 94,
+            "createdAt": "2026-04-26T10:00:00Z",
+            "updatedAt": "2026-04-27T10:00:00Z",
+        }
+
+        decision = evaluate_issue_scope(
+            issue=issue,
+            scope_defaults={"freshness": {"max_age_days": 7, "max_idle_days": 7}},
+            now=datetime(2026, 4, 28, 10, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(decision["eligible"])
 
     def test_sort_autonomous_issues_prefers_priority_then_freshness(self) -> None:
         issues = [

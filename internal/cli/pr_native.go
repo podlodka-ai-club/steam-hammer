@@ -555,6 +555,79 @@ func buildNativePRReviewPrompt(pullRequest lifecycle.PullRequest, reviewItems []
 	))
 }
 
+func buildPRReviewOutcomeSummary(result *agentexec.Result, reviewItems []orchestration.ReviewFeedbackItem) *orchestration.PRReviewOutcomeSummary {
+	if result != nil {
+		if parsed := orchestration.ParsePRReviewOutcomeSummary(result.Output); parsed != nil {
+			return parsed
+		}
+	}
+	if len(reviewItems) == 0 {
+		return nil
+	}
+	items := make([]orchestration.PRReviewItemOutcome, 0, len(reviewItems))
+	for i, item := range reviewItems {
+		summary := strings.TrimSpace(item.Body)
+		if summary == "" {
+			summary = "Review item was included in the prompt, but the agent did not report a structured outcome."
+		}
+		items = append(items, orchestration.PRReviewItemOutcome{
+			Item:       i + 1,
+			Status:     "not-fixed",
+			Summary:    summary,
+			NextAction: "manual_review_follow_up_required",
+		})
+	}
+	return &orchestration.PRReviewOutcomeSummary{Items: items}
+}
+
+func buildPRReviewFailureOutcome(reviewItems []orchestration.ReviewFeedbackItem, message, nextAction string) *orchestration.PRReviewOutcomeSummary {
+	if len(reviewItems) == 0 {
+		return nil
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "PR review worker did not complete successfully."
+	}
+	nextAction = strings.TrimSpace(nextAction)
+	if nextAction == "" {
+		nextAction = "manual_review_follow_up_required"
+	}
+	items := make([]orchestration.PRReviewItemOutcome, 0, len(reviewItems))
+	for i := range reviewItems {
+		items = append(items, orchestration.PRReviewItemOutcome{
+			Item:       i + 1,
+			Status:     "needs-human-follow-up",
+			Summary:    message,
+			NextAction: nextAction,
+		})
+	}
+	return &orchestration.PRReviewOutcomeSummary{Items: items}
+}
+
+func appendRemainingReviewOutcomes(existing *orchestration.PRReviewOutcomeSummary, remainingItems []orchestration.ReviewFeedbackItem) *orchestration.PRReviewOutcomeSummary {
+	if len(remainingItems) == 0 {
+		return existing
+	}
+	items := make([]orchestration.PRReviewItemOutcome, 0, len(remainingItems))
+	if existing != nil {
+		items = append(items, existing.Items...)
+	}
+	start := len(items)
+	for i, item := range remainingItems {
+		summary := strings.TrimSpace(item.Body)
+		if summary == "" {
+			summary = "Actionable review item remains after PR-review worker attempt."
+		}
+		items = append(items, orchestration.PRReviewItemOutcome{
+			Item:       start + i + 1,
+			Status:     "not-fixed",
+			Summary:    summary,
+			NextAction: "manual_review_follow_up_required",
+		})
+	}
+	return &orchestration.PRReviewOutcomeSummary{Items: items}
+}
+
 func nativePRCommitTitle(pullRequest lifecycle.PullRequest) string {
 	return fmt.Sprintf("Address review comments for PR #%d", pullRequest.Number)
 }

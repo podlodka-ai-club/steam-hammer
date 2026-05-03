@@ -1212,6 +1212,27 @@ def autonomous_session_issue_status(state: dict, issue_number: int) -> str | Non
     return status if status else None
 
 
+def _linked_pr_requires_conflict_recovery(linked_open_pr: dict | None, repo: str | None = None) -> bool:
+    if not isinstance(linked_open_pr, dict):
+        return False
+    merge_state = str(linked_open_pr.get("mergeStateStatus") or "").strip()
+    mergeable = str(linked_open_pr.get("mergeable") or "").strip()
+    if not merge_state and not mergeable and repo:
+        pr_number = _as_positive_int(linked_open_pr.get("number"))
+        if pr_number is not None:
+            try:
+                pull_request = current_codehost_provider().fetch_pull_request(repo=repo, number=pr_number)
+            except Exception:  # noqa: BLE001
+                pull_request = {}
+            merge_state = str(pull_request.get("mergeStateStatus") or "").strip()
+            mergeable = str(pull_request.get("mergeable") or "").strip()
+    merge_readiness_state = classify_pr_merge_readiness_state(
+        merge_state=merge_state,
+        mergeable=mergeable,
+    )
+    return merge_readiness_state == "conflicting"
+
+
 def mark_autonomous_session_issue_processed(state: dict, issue_number: int, status: str) -> dict:
     if status not in AUTONOMOUS_BATCH_SINGLE_PASS_STATUSES:
         return state
@@ -1227,7 +1248,7 @@ def mark_autonomous_session_issue_processed(state: dict, issue_number: int, stat
 
 
 def filter_autonomous_issues_for_single_pass(
-    issues: list[dict], session_state: dict
+    issues: list[dict], session_state: dict, repo: str | None = None
 ) -> tuple[list[dict], list[int]]:
     if not autonomous_session_processed_issue_numbers(session_state):
         return list(issues), []
@@ -1240,6 +1261,17 @@ def filter_autonomous_issues_for_single_pass(
             continue
         processed_status = autonomous_session_issue_status(session_state, issue_number)
         if processed_status in AUTONOMOUS_SESSION_SKIP_STATUSES:
+            if repo:
+                try:
+                    linked_open_pr = current_codehost_provider().find_open_pr_for_issue(
+                        repo=repo,
+                        issue=issue,
+                    )
+                except Exception:  # noqa: BLE001
+                    linked_open_pr = None
+                if _linked_pr_requires_conflict_recovery(linked_open_pr, repo=repo):
+                    filtered.append(issue)
+                    continue
             skipped.append(issue_number)
             continue
         filtered.append(issue)
@@ -6968,6 +7000,7 @@ def choose_execution_mode(
     force_issue_flow: bool,
     recovered_state: dict | None = None,
     clarification_answer: dict | None = None,
+    repo: str | None = None,
 ) -> tuple[str, str]:
     recovered_status = ""
     if isinstance(recovered_state, dict):
@@ -6982,6 +7015,17 @@ def choose_execution_mode(
             pr_number = linked_open_pr.get("number")
             return "pr-review", f"recovered waiting-for-author state has a newer author answer for linked PR #{pr_number}"
         return "issue-flow", "recovered waiting-for-author state has a newer author answer"
+
+    if (
+        recovered_status == "blocked"
+        and linked_open_pr is not None
+        and _linked_pr_requires_conflict_recovery(linked_open_pr, repo=repo)
+    ):
+        pr_number = linked_open_pr.get("number")
+        return (
+            "pr-review",
+            f"recovered orchestration state is blocked, but linked open PR #{pr_number} is conflicting and needs sync recovery",
+        )
 
     if recovered_status in {"waiting-for-author", "blocked"}:
         return (
@@ -10339,6 +10383,7 @@ def main() -> int:
         issues, skipped_session_issues = filter_autonomous_issues_for_single_pass(
             issues=issues,
             session_state=autonomous_session_state,
+            repo=repo,
         )
         if skipped_session_issues:
             skipped_labels = ", ".join(f"#{issue_number}" for issue_number in skipped_session_issues)
@@ -10751,6 +10796,7 @@ def main() -> int:
                     force_issue_flow=force_issue_flow,
                     recovered_state=recovered_state,
                     clarification_answer=clarification_answer,
+                    repo=repo,
                 )
                 if mode == "skip":
                     skipped_recovered_state += 1

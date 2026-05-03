@@ -461,7 +461,11 @@ func linkedPRNumber(pr *githublifecycle.PullRequest) *orchestration.LinkedPullRe
 	if pr == nil {
 		return nil
 	}
-	return &orchestration.LinkedPullRequest{Number: pr.Number}
+	return &orchestration.LinkedPullRequest{
+		Number:           pr.Number,
+		MergeStateStatus: pr.MergeStateStatus,
+		Mergeable:        pr.Mergeable,
+	}
 }
 
 func parsedStatePayload(parsed *orchestration.ParsedTrackerComment[orchestration.TrackedState]) *orchestration.TrackedState {

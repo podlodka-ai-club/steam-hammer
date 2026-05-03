@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,8 +9,8 @@ import (
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/workers"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -175,13 +174,13 @@ func readDetachedWorkerState(path string) (detachedWorkerState, error) {
 	return workers.ReadState(path)
 }
 
-func (a *App) runDetachedStatus(configuredRoot, name string, asJSON bool) int {
+func (a *App) runDetachedStatus(ctx context.Context, configuredRoot, name string, asJSON bool) int {
 	workerPaths, err := resolveDetachedWorkerPaths(configuredRoot, ".", normalizeWorkerLookupName(name), workerLookupID(name))
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
 		return 1
 	}
-	report, err := detachedWorkerReportFromStateFile(workerPaths.StatePath)
+	report, err := a.detachedWorkerReportFromStateFile(ctx, workerPaths.StatePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: detached worker state not found: %s\n", workerPaths.StatePath)
@@ -298,8 +297,8 @@ func (a *App) runAutonomousSessionStatus(path string, asJSON bool) int {
 	return 0
 }
 
-func (a *App) runDetachedStatusList(configuredRoot string, asJSON bool) int {
-	reports, err := detachedWorkerReports(configuredRoot)
+func (a *App) runDetachedStatusList(ctx context.Context, configuredRoot string, asJSON bool) int {
+	reports, err := a.detachedWorkerReports(ctx, configuredRoot)
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect detached worker registry: %v\n", err)
 		return 1
@@ -346,14 +345,14 @@ func processRunning(pid int) (bool, error) {
 	return processAlive(pid)
 }
 
-func detachedWorkerReports(configuredRoot string) ([]detachedWorkerReport, error) {
+func (a *App) detachedWorkerReports(ctx context.Context, configuredRoot string) ([]detachedWorkerReport, error) {
 	states, err := workers.ListStates(configuredRoot, ".")
 	if err != nil {
 		return nil, err
 	}
 	reports := make([]detachedWorkerReport, 0, len(states))
 	for _, state := range states {
-		report, err := detachedWorkerReportFromState(state, true)
+		report, err := a.detachedWorkerReportFromState(ctx, state, true)
 		if err != nil {
 			return nil, err
 		}
@@ -362,19 +361,19 @@ func detachedWorkerReports(configuredRoot string) ([]detachedWorkerReport, error
 	return reports, nil
 }
 
-func detachedWorkerReportFromStateFile(statePath string) (detachedWorkerReport, error) {
-	return detachedWorkerReportFromStateFileWithBatch(statePath, true)
+func (a *App) detachedWorkerReportFromStateFile(ctx context.Context, statePath string) (detachedWorkerReport, error) {
+	return a.detachedWorkerReportFromStateFileWithBatch(ctx, statePath, true)
 }
 
-func detachedWorkerReportFromStateFileWithBatch(statePath string, includeBatch bool) (detachedWorkerReport, error) {
+func (a *App) detachedWorkerReportFromStateFileWithBatch(ctx context.Context, statePath string, includeBatch bool) (detachedWorkerReport, error) {
 	state, err := readDetachedWorkerState(statePath)
 	if err != nil {
 		return detachedWorkerReport{}, err
 	}
-	return detachedWorkerReportFromState(state, includeBatch)
+	return a.detachedWorkerReportFromState(ctx, state, includeBatch)
 }
 
-func detachedWorkerReportFromState(state detachedWorkerState, includeBatch bool) (detachedWorkerReport, error) {
+func (a *App) detachedWorkerReportFromState(ctx context.Context, state detachedWorkerState, includeBatch bool) (detachedWorkerReport, error) {
 	processStatus := detachedProcessStatus(state.PID)
 	logReport, err := detachedWorkerLogSummary(state.LogPath)
 	if err != nil {
@@ -386,14 +385,14 @@ func detachedWorkerReportFromState(state detachedWorkerState, includeBatch bool)
 		Log:           logReport,
 		Next:          detachedWorkerNextAction(state, processStatus),
 	}
-	if linked, err := detachedWorkerLinkedStatus(state); err == nil {
+	if linked, err := a.detachedWorkerLinkedStatus(ctx, state); err == nil {
 		report.Linked = linked
 	}
 	if session, err := detachedWorkerSessionStatus(state.SessionPath); err == nil {
 		report.Session = session
 	}
 	if includeBatch && state.Batch != nil {
-		if batch, err := detachedBatchStatus(*state.Batch); err == nil {
+		if batch, err := a.detachedBatchStatus(ctx, *state.Batch); err == nil {
 			report.Batch = batch
 		}
 	}
@@ -438,78 +437,63 @@ func detachedWorkerLogFreshness(report detachedWorkerLogReport) string {
 	return "updated " + report.UpdatedAt
 }
 
-func detachedWorkerLinkedStatus(state detachedWorkerState) (*detachedWorkerLinkedReport, error) {
+func (a *App) detachedWorkerLinkedStatus(ctx context.Context, state detachedWorkerState) (*detachedWorkerLinkedReport, error) {
 	if state.TargetKind != "issue" && state.TargetKind != "pr" {
 		return nil, nil
 	}
-	args := []string{defaultRuntimeProvider().RunnerScript(), "--status"}
-	if state.TargetKind == "issue" {
-		args = append(args, "--issue", state.TargetID)
-	} else {
-		args = append(args, "--pr", state.TargetID)
-	}
-	if state.Repo != "" {
-		args = append(args, "--repo", state.Repo)
-	}
-	if state.Tracker != "" {
-		args = append(args, "--tracker", state.Tracker)
-	}
-	if state.CodeHost != "" {
-		args = append(args, "--codehost", state.CodeHost)
-	}
-	if state.ClonePath != "" {
-		args = append(args, "--dir", state.ClonePath)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "python3", args...)
-	if state.ClonePath != "" {
-		cmd.Dir = state.ClonePath
-	}
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, err
+	if strings.TrimSpace(state.Repo) == "" {
+		return nil, nil
 	}
 	linked := &detachedWorkerLinkedReport{}
-	scanner := bufio.NewScanner(bytes.NewReader(output))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		key, value, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
-		}
-		value = strings.TrimSpace(value)
-		switch strings.ToLower(strings.TrimSpace(key)) {
-		case "target":
-			linked.Target = value
-		case "latest state":
-			linked.LatestState = value
-		case "branch":
-			linked.Branch = value
-		case "current":
-			linked.Current = value
-		case "next":
-			linked.Next = value
-		case "blockers":
-			linked.Blockers = value
-		case "pr":
-			linked.PR = value
-		case "pr readiness":
-			linked.PRReadiness = value
-		case "updated":
-			linked.Updated = value
-		}
+	linked.Target = fmt.Sprintf("%s #%s", state.TargetKind, state.TargetID)
+	linked.Updated = state.StartedAt
+	targetID, _ := strconv.Atoi(strings.TrimSpace(state.TargetID))
+	if targetID <= 0 {
+		return linked, nil
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
+
+	if state.TargetKind == "issue" {
+		status, _, err := a.issueStatusReport(ctx, state.Repo, targetID)
+		if err != nil {
+			return linked, nil
+		}
+		populateDetachedLinkedReport(linked, status)
+	} else {
+		status, _, err := a.prStatusReport(ctx, state.Repo, targetID)
+		if err != nil {
+			return linked, nil
+		}
+		populateDetachedLinkedReport(linked, status)
 	}
 	if *linked == (detachedWorkerLinkedReport{}) {
 		return nil, nil
 	}
 	return linked, nil
+}
+
+func populateDetachedLinkedReport(linked *detachedWorkerLinkedReport, status trackedStatusReport) {
+	linked.LatestState = strings.TrimSpace(status.LatestState)
+	linked.Branch = strings.TrimSpace(status.Branch)
+	linked.Current = strings.TrimSpace(status.Current)
+	linked.Next = strings.TrimSpace(status.Next)
+	linked.Blockers = strings.TrimSpace(status.Blockers)
+	linked.PR = strings.TrimSpace(status.PR)
+	linked.PRReadiness = strings.TrimSpace(status.PRReadiness)
+	linked.Updated = strings.TrimSpace(status.Updated)
+}
+
+func detachedPRReadinessSummary(payload orchestration.TrackedState) string {
+	if payload.MergeReadiness == nil {
+		return ""
+	}
+	status := strings.TrimSpace(payload.MergeReadiness.Status)
+	if status == "" {
+		status = strings.TrimSpace(payload.MergeReadiness.NextAction)
+	}
+	if status == "" {
+		status = strings.TrimSpace(payload.MergeReadiness.Error)
+	}
+	return status
 }
 
 func detachedWorkerSessionStatus(path string) (*detachedWorkerSessionReport, error) {
@@ -599,7 +583,7 @@ func detachedWorkerStateFromOptions(name, mode, targetKind, targetID string, opt
 	}
 }
 
-func detachedBatchStatus(batch detachedBatchMetadata) (*detachedBatchStatusReport, error) {
+func (a *App) detachedBatchStatus(ctx context.Context, batch detachedBatchMetadata) (*detachedBatchStatusReport, error) {
 	report := &detachedBatchStatusReport{
 		RequestedIssueIDs: append([]string(nil), batch.ChildIssueIDs...),
 		ActiveWorkers:     0,
@@ -617,7 +601,7 @@ func detachedBatchStatus(batch detachedBatchMetadata) (*detachedBatchStatusRepor
 		if err != nil {
 			return nil, err
 		}
-		workerReport, err := detachedWorkerReportFromState(state, false)
+		workerReport, err := a.detachedWorkerReportFromState(ctx, state, false)
 		if err != nil {
 			return nil, err
 		}

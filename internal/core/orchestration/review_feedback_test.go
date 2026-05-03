@@ -60,6 +60,30 @@ func TestNormalizeReviewFeedback(t *testing.T) {
 	}
 }
 
+func TestNormalizeReviewFeedbackFiltersNonActionableInlineComments(t *testing.T) {
+	items, stats := NormalizeReviewFeedback(
+		[]ReviewThread{{
+			Comments: []ReviewThreadComment{
+				{Author: "reviewer", Body: "LGTM", Path: "app.go", Line: 1, URL: "https://example/1"},
+				{Author: "reviewer", Body: "Please rename this", Path: "app.go", Line: 2, URL: "https://example/2"},
+			},
+		}},
+		nil,
+		nil,
+		"",
+	)
+
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1 (%#v)", len(items), items)
+	}
+	if got := strings.TrimSpace(items[0].Body); got != "Please rename this" {
+		t.Fatalf("inline item body = %q, want actionable comment", got)
+	}
+	if stats.CommentsNonActionable != 1 {
+		t.Fatalf("CommentsNonActionable = %d, want 1", stats.CommentsNonActionable)
+	}
+}
+
 func TestFormatReviewFeedbackStats(t *testing.T) {
 	summary := FormatReviewFeedbackStats(ReviewFeedbackStats{ThreadsTotal: 1, CommentsTotal: 2, CommentsUsed: 1, ReviewsTotal: 1, ConversationTotal: 1})
 	for _, want := range []string{"threads=total:1", "inline=total:2", "review_summaries=total:1", "conversation=total:1"} {

@@ -2,11 +2,14 @@ package cli
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -503,7 +506,7 @@ func (a *App) buildBatchWorkerLaunchCommand(ctx context.Context, opts commonOpti
 	if decision.Mode == orchestration.ExecutionModePRReview && linkedPR != nil {
 		pythonPR := workerLaunchCommand{
 			name: "python3",
-			args: buildPRPythonArgs(a.runtime.RunnerScript(), opts, linkedPR.Number, false, false, false, "", false, ""),
+			args: buildPRPythonArgs(a.runtime.RunnerScript(), opts, linkedPR.Number, true, false, false, "", false, ""),
 		}
 		if reason := nativePRFallbackReason(nativePROptions{prID: linkedPR.Number, common: opts}); reason != "" {
 			pythonPR.fallbackReason = reason
@@ -514,7 +517,7 @@ func (a *App) buildBatchWorkerLaunchCommand(ctx context.Context, opts commonOpti
 			pythonPR.fallbackReason = fmt.Sprintf("failed to resolve orchestrator executable: %v", err)
 			return pythonPR
 		}
-		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, false, false, false, "", false, "")}
+		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, true, false, false, "", false, "")}
 	}
 
 	if reason := nativeIssueFallbackReason(nativeIssueOptions{
@@ -674,7 +677,26 @@ func (a *App) daemonReviewFeedbackSignal(ctx context.Context, repo string, issue
 	if len(items) == 0 {
 		return "", nil
 	}
-	return fmt.Sprintf("pr-%d:actionable", linkedPR.Number), nil
+	identities := make([]string, 0, len(items))
+	for _, item := range items {
+		url := strings.TrimSpace(item.URL)
+		if url != "" {
+			identities = append(identities, url)
+			continue
+		}
+		identities = append(identities, strings.Join([]string{
+			strings.TrimSpace(item.Type),
+			strings.TrimSpace(item.Author),
+			orchestration.CanonicalReviewFeedbackText(item.Body),
+			strings.TrimSpace(item.State),
+			strings.TrimSpace(item.Path),
+			strconv.Itoa(item.Line),
+		}, "\x00"))
+	}
+	sort.Strings(identities)
+	payload := strings.Join(identities, "\n")
+	sum := sha1.Sum([]byte(payload))
+	return fmt.Sprintf("pr-%d:actionable:%s", linkedPR.Number, hex.EncodeToString(sum[:])), nil
 }
 
 func (a *App) claimDaemonIssues(ctx context.Context, config daemonParallelConfig, selected []daemonSelectedIssue) ([]daemonSelectedIssue, error) {

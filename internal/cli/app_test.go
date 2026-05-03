@@ -1702,6 +1702,60 @@ func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
 	assertCommandContainsFlag(t, runner.args, "--autonomous-session-file")
 }
 
+func TestRunDaemonRoutesLinkedPRWorkerWithSafeBranchSwitch(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetIssueLifecycle(&fakeDaemonLifecycle{
+		issue:           githublifecycle.Issue{Number: 71, Title: "Fix runtime", Body: "Body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		linkedPR:        &githublifecycle.PullRequest{Number: 101, Title: "Existing fix", HeadRefName: "feature/pr-101", BaseRefName: "main"},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{issues: []githublifecycle.Issue{{Number: 71}}, commentsByIssue: map[int][]githublifecycle.IssueComment{}})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--max-cycles", "1", "--poll-interval-seconds", "0", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	joined := strings.Join(runner.args, "\n")
+	if !strings.Contains(joined, "--pr") || !strings.Contains(joined, "101") {
+		t.Fatalf("runner args = %#v, want PR routing", runner.args)
+	}
+	if !strings.Contains(joined, "--allow-pr-branch-switch") {
+		t.Fatalf("runner args = %#v, want safe branch switch flag", runner.args)
+	}
+}
+
+func TestDaemonReviewFeedbackSignalUsesStableFeedbackIdentity(t *testing.T) {
+	lifecycle := &fakeDaemonLifecycle{
+		linkedPR: &githublifecycle.PullRequest{Number: 101, Author: &githublifecycle.Actor{Login: "author"}},
+		reviewThreadSeq: [][]githublifecycle.PullRequestReviewThread{
+			{{Comments: []githublifecycle.PullRequestReviewComment{{Body: "Please update naming", URL: "https://example/review/1", Author: &githublifecycle.Actor{Login: "reviewer"}}}}},
+			{{Comments: []githublifecycle.PullRequestReviewComment{{Body: "Please update naming", URL: "https://example/review/2", Author: &githublifecycle.Actor{Login: "reviewer"}}}}},
+		},
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetDaemonLifecycle(lifecycle)
+
+	first, err := app.daemonReviewFeedbackSignal(context.Background(), "owner/repo", githublifecycle.Issue{Number: 71})
+	if err != nil {
+		t.Fatalf("daemonReviewFeedbackSignal(first) error = %v", err)
+	}
+	second, err := app.daemonReviewFeedbackSignal(context.Background(), "owner/repo", githublifecycle.Issue{Number: 71})
+	if err != nil {
+		t.Fatalf("daemonReviewFeedbackSignal(second) error = %v", err)
+	}
+	if first == "" || second == "" {
+		t.Fatalf("signals should not be empty: first=%q second=%q", first, second)
+	}
+	if first == second {
+		t.Fatalf("signals should differ when actionable feedback changes: first=%q second=%q", first, second)
+	}
+}
+
 func TestRunDaemonReusesAutonomousSessionFileAcrossCycles(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})

@@ -1,9 +1,12 @@
 package orchestration
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 )
+
+const PRReviewOutcomeMarker = "<!-- orchestration-pr-review-outcomes:v1 -->"
 
 var reviewFeedbackOnlyPunctuationRE = regexp.MustCompile(`^[\W_]+$`)
 
@@ -69,6 +72,45 @@ type ReviewFeedbackItem struct {
 	Path   string
 	Line   int
 	URL    string
+}
+
+type PRReviewItemOutcome struct {
+	Item       int    `json:"item"`
+	Status     string `json:"status,omitempty"`
+	Summary    string `json:"summary,omitempty"`
+	NextAction string `json:"next_action,omitempty"`
+}
+
+type PRReviewOutcomeSummary struct {
+	Items []PRReviewItemOutcome `json:"items,omitempty"`
+}
+
+func ParsePRReviewOutcomeSummary(output string) *PRReviewOutcomeSummary {
+	raw := strings.TrimSpace(output)
+	if raw == "" || !strings.Contains(raw, PRReviewOutcomeMarker) {
+		return nil
+	}
+	afterMarker := strings.TrimSpace(strings.SplitN(raw, PRReviewOutcomeMarker, 2)[1])
+	if afterMarker == "" {
+		return nil
+	}
+	start := strings.Index(afterMarker, "{")
+	if start < 0 {
+		return nil
+	}
+	var payload PRReviewOutcomeSummary
+	if err := json.NewDecoder(strings.NewReader(afterMarker[start:])).Decode(&payload); err != nil {
+		return nil
+	}
+	if len(payload.Items) == 0 {
+		return nil
+	}
+	for i := range payload.Items {
+		payload.Items[i].Status = strings.TrimSpace(strings.ToLower(payload.Items[i].Status))
+		payload.Items[i].Summary = strings.TrimSpace(payload.Items[i].Summary)
+		payload.Items[i].NextAction = strings.TrimSpace(payload.Items[i].NextAction)
+	}
+	return &payload
 }
 
 type ReviewFeedbackStats struct {

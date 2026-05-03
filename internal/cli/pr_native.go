@@ -282,6 +282,8 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 			}
 		}
 
+		reviewOutcome := buildPRReviewOutcomeSummary(result, reviewItems)
+
 		hasChanges, err := a.gitHasChanges(ctx, repoRoot)
 		if err != nil {
 			postState(failedState(attempt, "commit_push", "inspect_git_status", err.Error()))
@@ -304,6 +306,7 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 				Error:      "Agent produced no repository changes",
 				Timestamp:  time.Now().UTC().Format(time.RFC3339),
 				Stats:      statsMap(result.Stats),
+				ReviewFeedback: reviewOutcome,
 			})
 			_, _ = fmt.Fprintf(a.out, "No changes detected for PR #%d; skipping commit and push\n", pullRequest.Number)
 			return 0
@@ -344,6 +347,7 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 			NextAction: "wait_for_ci",
 			Timestamp:  time.Now().UTC().Format(time.RFC3339),
 			Stats:      statsMap(result.Stats),
+			ReviewFeedback: reviewOutcome,
 		})
 
 		updatedPR, err := a.prLifecycle.FetchPullRequest(ctx, repo, pullRequest.Number)
@@ -365,6 +369,7 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 			return 0
 		}
 		if attempt >= maxAttempts {
+			blockedReviewOutcome := appendRemainingReviewOutcomes(reviewOutcome, remainingItems)
 			postState(orchestration.TrackedState{
 				Status:     orchestration.StatusBlocked,
 				TaskType:   "pr",
@@ -380,6 +385,7 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 				Error:      fmt.Sprintf("%d actionable review items remain after %d/%d attempts", len(remainingItems), attempt, maxAttempts),
 				Timestamp:  time.Now().UTC().Format(time.RFC3339),
 				Stats:      statsMap(result.Stats),
+				ReviewFeedback: blockedReviewOutcome,
 			})
 			_, _ = fmt.Fprintf(a.out, "PR #%d still has %d actionable review items after %d/%d attempts; blocking for manual follow-up.\n", pullRequest.Number, len(remainingItems), attempt, maxAttempts)
 			return 0
@@ -534,8 +540,9 @@ func buildNativePRReviewPrompt(pullRequest githublifecycle.PullRequest, reviewIt
 		firstLine = "You are working on a small follow-up for an existing GitHub pull request review cycle in the current git branch."
 	}
 	return strings.TrimSpace(fmt.Sprintf(
-		"%s\nImplement the fix requested in PR review comments in repository files.\nDo not run git commands; git actions are handled by orchestration script.\n\nIf the requested change is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. Instead, stop and print %s followed by a JSON object like {\"question\":\"<focused question>\",\"reason\":\"<why clarification is required>\"}.\n\nPull Request: #%d - %s\nPR URL: %s\n\nPR description:\n%s\n\nLinked issue context:\n%s\n\nReview comments to address:\n%s",
+		"%s\nImplement the fix requested in PR review comments in repository files.\nDo not run git commands; git actions are handled by orchestration script.\n\nAfter finishing, print %s followed by JSON object like {\"items\":[{\"item\":1,\"status\":\"fixed|not_fixed|blocked\",\"summary\":\"what changed or why not\",\"next_action\":\"required only when not fixed\"}]}. Include one item per review comment in the same order. If code was changed, mention relevant files and tests.\n\nIf the requested change is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. Instead, stop and print %s followed by a JSON object like {\"question\":\"<focused question>\",\"reason\":\"<why clarification is required>\"}.\n\nPull Request: #%d - %s\nPR URL: %s\n\nPR description:\n%s\n\nLinked issue context:\n%s\n\nReview comments to address:\n%s",
 		firstLine,
+		orchestration.PRReviewOutcomeMarker,
 		orchestration.ClarificationRequestMarker,
 		pullRequest.Number,
 		strings.TrimSpace(pullRequest.Title),
@@ -544,6 +551,54 @@ func buildNativePRReviewPrompt(pullRequest githublifecycle.PullRequest, reviewIt
 		strings.Join(issueContextLines, "\n"),
 		strings.Join(commentLines, "\n"),
 	))
+}
+
+func buildPRReviewOutcomeSummary(result *agentexec.Result, reviewItems []orchestration.ReviewFeedbackItem) *orchestration.PRReviewOutcomeSummary {
+	if result != nil {
+		if parsed := orchestration.ParsePRReviewOutcomeSummary(result.Output); parsed != nil {
+			return parsed
+		}
+	}
+	if len(reviewItems) == 0 {
+		return nil
+	}
+	items := make([]orchestration.PRReviewItemOutcome, 0, len(reviewItems))
+	for index, reviewItem := range reviewItems {
+		summary := strings.TrimSpace(reviewItem.Body)
+		if len(summary) > 220 {
+			summary = strings.TrimSpace(summary[:220]) + "..."
+		}
+		items = append(items, orchestration.PRReviewItemOutcome{
+			Item:       index + 1,
+			Status:     "not_fixed",
+			Summary:    fallbackString(summary, "No structured outcome provided by agent"),
+			NextAction: "manual_review_follow_up_required",
+		})
+	}
+	return &orchestration.PRReviewOutcomeSummary{Items: items}
+}
+
+func appendRemainingReviewOutcomes(summary *orchestration.PRReviewOutcomeSummary, remaining []orchestration.ReviewFeedbackItem) *orchestration.PRReviewOutcomeSummary {
+	if len(remaining) == 0 {
+		return summary
+	}
+	base := orchestration.PRReviewOutcomeSummary{}
+	if summary != nil {
+		base.Items = append(base.Items, summary.Items...)
+	}
+	for index, item := range remaining {
+		text := strings.TrimSpace(item.Body)
+		if len(text) > 220 {
+			text = strings.TrimSpace(text[:220]) + "..."
+		}
+		base.Items = append(base.Items, orchestration.PRReviewItemOutcome{
+			Item:       index + 1,
+			Status:     "not_fixed",
+			Summary:    fallbackString(text, "Review item remains actionable after retries"),
+			NextAction: "manual_review_follow_up_required",
+		})
+	}
+	return &base
 }
 
 func nativePRCommitTitle(pullRequest githublifecycle.PullRequest) string {

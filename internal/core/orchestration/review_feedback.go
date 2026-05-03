@@ -79,6 +79,7 @@ type ReviewFeedbackStats struct {
 	CommentsOutdated          int
 	CommentsEmpty             int
 	CommentsPRAuthor          int
+	CommentsNonActionable     int
 	CommentsDuplicates        int
 	CommentsUsed              int
 	ReviewsTotal              int
@@ -143,6 +144,10 @@ func NormalizeReviewFeedback(threads []ReviewThread, reviews []PullRequestReview
 			body := strings.TrimSpace(comment.Body)
 			if body == "" {
 				stats.CommentsEmpty++
+				continue
+			}
+			if !IsActionableReviewFeedback(body) {
+				stats.CommentsNonActionable++
 				continue
 			}
 			author := strings.TrimSpace(comment.Author)
@@ -240,6 +245,7 @@ func FormatReviewFeedbackStats(stats ReviewFeedbackStats) string {
 		"(from_pr_author:" + itoa(stats.CommentsPRAuthor) + ")" +
 		" excluded(outdated:" + itoa(stats.CommentsOutdated) +
 		", empty:" + itoa(stats.CommentsEmpty) +
+		", non_actionable:" + itoa(stats.CommentsNonActionable) +
 		", duplicates:" + itoa(stats.CommentsDuplicates) + ")" +
 		"; review_summaries=total:" + itoa(stats.ReviewsTotal) +
 		" included:" + itoa(stats.ReviewsUsed) +

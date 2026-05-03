@@ -2,11 +2,14 @@ package cli
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -503,7 +506,7 @@ func (a *App) buildBatchWorkerLaunchCommand(ctx context.Context, opts commonOpti
 	if decision.Mode == orchestration.ExecutionModePRReview && linkedPR != nil {
 		pythonPR := workerLaunchCommand{
 			name: "python3",
-			args: buildPRPythonArgs(a.runtime.RunnerScript(), opts, linkedPR.Number, false, false, false, "", false, ""),
+			args: buildPRPythonArgs(a.runtime.RunnerScript(), opts, linkedPR.Number, true, false, false, "", false, ""),
 		}
 		if reason := nativePRFallbackReason(nativePROptions{prID: linkedPR.Number, common: opts}); reason != "" {
 			pythonPR.fallbackReason = reason
@@ -514,7 +517,7 @@ func (a *App) buildBatchWorkerLaunchCommand(ctx context.Context, opts commonOpti
 			pythonPR.fallbackReason = fmt.Sprintf("failed to resolve orchestrator executable: %v", err)
 			return pythonPR
 		}
-		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, false, false, false, "", false, "")}
+		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, true, false, false, "", false, "")}
 	}
 
 	if reason := nativeIssueFallbackReason(nativeIssueOptions{
@@ -583,6 +586,11 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 			ForceReprocess:       config.forceReprocess,
 			LastHandledSignature: handled.signatures[issue.Number],
 		}
+		if reviewSignal, err := a.daemonReviewFeedbackSignal(ctx, strings.TrimSpace(*config.opts.repo), issue); err != nil {
+			return nil, err
+		} else {
+			snapshot.ReviewFeedbackSignal = reviewSignal
+		}
 		if latestState != nil {
 			snapshot.LatestStateStatus = latestState.Status
 			snapshot.LatestStateTaskType = latestState.Payload.TaskType
@@ -605,6 +613,90 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 		seen[issue.Number] = struct{}{}
 	}
 	return selected, nil
+}
+
+func (a *App) daemonReviewFeedbackSignal(ctx context.Context, repo string, issue corelifecycle.Issue) (string, error) {
+	linkedPR, err := a.daemon.FindOpenPullRequestForIssue(ctx, repo, issue)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect linked PR for issue #%d: %w", issue.Number, err)
+	}
+	if linkedPR == nil {
+		return "", nil
+	}
+	threads, err := a.daemon.ReviewThreadsForPullRequest(ctx, repo, linkedPR.Number)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch review threads for PR #%d: %w", linkedPR.Number, err)
+	}
+	conversation, err := a.daemon.ConversationCommentsForPullRequest(ctx, repo, linkedPR.Number)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch conversation comments for PR #%d: %w", linkedPR.Number, err)
+	}
+
+	normalizedThreads := make([]orchestration.ReviewThread, 0, len(threads))
+	for _, thread := range threads {
+		comments := make([]orchestration.ReviewThreadComment, 0, len(thread.Comments))
+		for _, comment := range thread.Comments {
+			author := ""
+			if comment.Author != nil {
+				author = strings.TrimSpace(comment.Author.Login)
+			}
+			comments = append(comments, orchestration.ReviewThreadComment{
+				Body:     strings.TrimSpace(comment.Body),
+				Path:     strings.TrimSpace(comment.Path),
+				Line:     comment.Line,
+				Outdated: comment.Outdated,
+				URL:      strings.TrimSpace(comment.URL),
+				Author:   author,
+			})
+		}
+		normalizedThreads = append(normalizedThreads, orchestration.ReviewThread{Resolved: thread.IsResolved, Outdated: thread.IsOutdated, Comments: comments})
+	}
+	normalizedConversation := make([]orchestration.ConversationComment, 0, len(conversation))
+	for _, comment := range conversation {
+		normalizedConversation = append(normalizedConversation, orchestration.ConversationComment{
+			Author: strings.TrimSpace(comment.Author),
+			Body:   strings.TrimSpace(comment.Body),
+			URL:    strings.TrimSpace(comment.URL),
+		})
+	}
+	normalizedReviews := make([]orchestration.PullRequestReview, 0, len(linkedPR.Reviews))
+	for _, review := range linkedPR.Reviews {
+		normalizedReviews = append(normalizedReviews, orchestration.PullRequestReview{
+			AuthorLogin: strings.TrimSpace(review.AuthorLogin),
+			State:       strings.TrimSpace(review.State),
+			SubmittedAt: strings.TrimSpace(review.SubmittedAt),
+			Body:        strings.TrimSpace(review.Body),
+			URL:         strings.TrimSpace(review.URL),
+		})
+	}
+	prAuthor := ""
+	if linkedPR.Author != nil {
+		prAuthor = strings.TrimSpace(linkedPR.Author.Login)
+	}
+	items, _ := orchestration.NormalizeReviewFeedback(normalizedThreads, normalizedReviews, normalizedConversation, prAuthor)
+	if len(items) == 0 {
+		return "", nil
+	}
+	identities := make([]string, 0, len(items))
+	for _, item := range items {
+		url := strings.TrimSpace(item.URL)
+		if url != "" {
+			identities = append(identities, url)
+			continue
+		}
+		identities = append(identities, strings.Join([]string{
+			strings.TrimSpace(item.Type),
+			strings.TrimSpace(item.Author),
+			orchestration.CanonicalReviewFeedbackText(item.Body),
+			strings.TrimSpace(item.State),
+			strings.TrimSpace(item.Path),
+			strconv.Itoa(item.Line),
+		}, "\x00"))
+	}
+	sort.Strings(identities)
+	payload := strings.Join(identities, "\n")
+	sum := sha1.Sum([]byte(payload))
+	return fmt.Sprintf("pr-%d:actionable:%s", linkedPR.Number, hex.EncodeToString(sum[:])), nil
 }
 
 func (a *App) claimDaemonIssues(ctx context.Context, config daemonParallelConfig, selected []daemonSelectedIssue) ([]daemonSelectedIssue, error) {

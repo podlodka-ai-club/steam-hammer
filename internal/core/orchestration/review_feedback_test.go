@@ -16,12 +16,19 @@ func TestIsActionableReviewFeedback(t *testing.T) {
 	if !IsActionableReviewFeedback("Use `strings.TrimSpace` here") {
 		t.Fatal("code-formatted feedback should be actionable")
 	}
+	if IsActionableReviewFeedback("Orchestration state update\n\n<!-- orchestration-state:v1 -->\n```json\n{\"status\":\"failed\"}\n```") {
+		t.Fatal("orchestration marker comment should not be actionable")
+	}
 }
 
 func TestNormalizeReviewFeedback(t *testing.T) {
 	items, stats := NormalizeReviewFeedback(
 		[]ReviewThread{{
-			Comments: []ReviewThreadComment{{Author: "reviewer", Body: "Please rename this", Path: "app.go", Line: 12, URL: "https://example/1"}},
+			Comments: []ReviewThreadComment{
+				{Author: "reviewer", Body: "Please rename this", Path: "app.go", Line: 12, URL: "https://example/1"},
+				{Author: "reviewer", Body: "looks good", Path: "app.go", Line: 14, URL: "https://example/positive"},
+				{Author: "reviewer", Body: "Orchestration state update\n\n<!-- orchestration-state:v1 -->\n```json\n{\"status\":\"failed\"}\n```", Path: "app.go", Line: 16, URL: "https://example/state"},
+			},
 		}},
 		[]PullRequestReview{
 			{AuthorLogin: "reviewer", SubmittedAt: "2026-04-28T10:00:00Z", State: "COMMENTED", Body: "looks good"},
@@ -42,6 +49,9 @@ func TestNormalizeReviewFeedback(t *testing.T) {
 	}
 	if stats.CommentsDuplicates != 0 {
 		t.Fatalf("CommentsDuplicates = %d, want 0", stats.CommentsDuplicates)
+	}
+	if stats.CommentsNonActionable != 2 {
+		t.Fatalf("CommentsNonActionable = %d, want 2", stats.CommentsNonActionable)
 	}
 	if stats.ConversationDuplicates != 1 {
 		t.Fatalf("ConversationDuplicates = %d, want 1", stats.ConversationDuplicates)

@@ -1,9 +1,12 @@
 package orchestration
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 )
+
+const PRReviewOutcomeMarker = "<!-- orchestration-pr-review-outcomes:v1 -->"
 
 var reviewFeedbackOnlyPunctuationRE = regexp.MustCompile(`^[\W_]+$`)
 
@@ -40,6 +43,14 @@ var nonActionableReviewFeedback = map[string]struct{}{
 	"done":             {},
 }
 
+var automationFeedbackMarkers = []string{
+	OrchestrationStateMarker,
+	OrchestrationClaimMarker,
+	OrchestrationDecompositionMarker,
+	PRReviewOutcomeMarker,
+	ClarificationRequestMarker,
+}
+
 type ReviewThreadComment struct {
 	Body     string
 	Path     string
@@ -69,6 +80,58 @@ type ReviewFeedbackItem struct {
 	Path   string
 	Line   int
 	URL    string
+}
+
+type PRReviewItemOutcome struct {
+	Item       int    `json:"item"`
+	Status     string `json:"status,omitempty"`
+	Summary    string `json:"summary,omitempty"`
+	NextAction string `json:"next_action,omitempty"`
+}
+
+type PRReviewOutcomeSummary struct {
+	Items []PRReviewItemOutcome `json:"items,omitempty"`
+}
+
+func ParsePRReviewOutcomeSummary(output string) *PRReviewOutcomeSummary {
+	raw := strings.TrimSpace(output)
+	if raw == "" || !strings.Contains(raw, PRReviewOutcomeMarker) {
+		return nil
+	}
+	afterMarker := strings.TrimSpace(strings.SplitN(raw, PRReviewOutcomeMarker, 2)[1])
+	if afterMarker == "" {
+		return nil
+	}
+	start := strings.Index(afterMarker, "{")
+	if start < 0 {
+		return nil
+	}
+	var payload PRReviewOutcomeSummary
+	if err := json.NewDecoder(strings.NewReader(afterMarker[start:])).Decode(&payload); err != nil {
+		return nil
+	}
+	if len(payload.Items) == 0 {
+		return nil
+	}
+	for i := range payload.Items {
+		payload.Items[i].Status = NormalizePRReviewOutcomeStatus(payload.Items[i].Status)
+		payload.Items[i].Summary = strings.TrimSpace(payload.Items[i].Summary)
+		payload.Items[i].NextAction = strings.TrimSpace(payload.Items[i].NextAction)
+	}
+	return &payload
+}
+
+func NormalizePRReviewOutcomeStatus(status string) string {
+	switch strings.TrimSpace(strings.ToLower(status)) {
+	case "fixed":
+		return "fixed"
+	case "not-fixed", "not_fixed":
+		return "not-fixed"
+	case "needs-human-follow-up", "needs_human_follow_up", "blocked":
+		return "needs-human-follow-up"
+	default:
+		return strings.TrimSpace(strings.ToLower(status))
+	}
 }
 
 type ReviewFeedbackStats struct {
@@ -102,6 +165,11 @@ func CanonicalReviewFeedbackText(body string) string {
 }
 
 func IsActionableReviewFeedback(body string) bool {
+	for _, marker := range automationFeedbackMarkers {
+		if marker != "" && strings.Contains(body, marker) {
+			return false
+		}
+	}
 	text := CanonicalReviewFeedbackText(body)
 	if text == "" {
 		return false
@@ -156,6 +224,10 @@ func NormalizeReviewFeedback(threads []ReviewThread, reviews []PullRequestReview
 			}
 			if prAuthorLogin != "" && strings.EqualFold(author, prAuthorLogin) {
 				stats.CommentsPRAuthor++
+			}
+			if !IsActionableReviewFeedback(body) {
+				stats.CommentsNonActionable++
+				continue
 			}
 			items = append(items, ReviewFeedbackItem{
 				Type:   "review_comment",

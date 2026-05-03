@@ -55,6 +55,7 @@ type TrackedState struct {
 	ResidualUntrackedCount int                       `json:"residual_untracked_count,omitempty"`
 	ReusedBranchSync       *ReusedBranchSyncVerdict  `json:"reused_branch_sync,omitempty"`
 	Stats                  map[string]any            `json:"stats,omitempty"`
+	ReviewFeedback         *PRReviewOutcomeSummary    `json:"review_feedback,omitempty"`
 	Decomposition          map[string]any            `json:"decomposition,omitempty"`
 }
 

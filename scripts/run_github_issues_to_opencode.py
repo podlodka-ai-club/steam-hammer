@@ -135,6 +135,7 @@ JIRA_ENV_VARS = {
 JIRA_ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
 
 AGENT_FAILURE_REPORT_MARKER = "<!-- orchestration-agent-failure:v1 -->"
+PR_REVIEW_OUTCOME_MARKER = "<!-- orchestration-pr-review-outcomes:v1 -->"
 SCOPE_DECISION_MARKER = "<!-- orchestration-scope:v1 -->"
 DECOMPOSITION_CHILD_ORDER_PREFIX = "Step"
 AGENT_FAILURE_LABEL_NAME = "auto:agent-failed"
@@ -4947,6 +4948,16 @@ def _canonical_feedback_text(body: str) -> str:
 
 
 def _is_actionable_feedback(body: str) -> bool:
+    automation_markers = (
+        ORCHESTRATION_STATE_MARKER,
+        ORCHESTRATION_CLAIM_MARKER,
+        DECOMPOSITION_PLAN_MARKER,
+        CLARIFICATION_REQUEST_MARKER,
+        PR_REVIEW_OUTCOME_MARKER,
+    )
+    if any(marker and marker in body for marker in automation_markers):
+        return False
+
     text = _canonical_feedback_text(body)
     if not text:
         return False
@@ -7011,6 +7022,9 @@ def build_pr_review_prompt(
         "You are working on an existing GitHub pull request review cycle in the current git branch.\n"
         "Implement the fix requested in PR review comments in repository files.\n"
         "Do not run git commands; git actions are handled by orchestration script.\n\n"
+        f"After finishing, print {PR_REVIEW_OUTCOME_MARKER} followed by a JSON object like "
+        '{"items":[{"item":1,"status":"fixed|not_fixed|blocked","summary":"what changed or why not","next_action":"required only when not fixed"}]}. '
+        "Include one item per review comment in the same order. If code was changed, mention relevant files and tests.\n\n"
         "If the requested change is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. "
         f"Instead, stop and print {CLARIFICATION_REQUEST_MARKER} followed by a JSON object like "
         '{"question":"<focused question>","reason":"<why clarification is required>"}.\n\n'

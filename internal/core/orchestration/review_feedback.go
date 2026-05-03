@@ -43,6 +43,14 @@ var nonActionableReviewFeedback = map[string]struct{}{
 	"done":             {},
 }
 
+var automationFeedbackMarkers = []string{
+	OrchestrationStateMarker,
+	OrchestrationClaimMarker,
+	OrchestrationDecompositionMarker,
+	PRReviewOutcomeMarker,
+	ClarificationRequestMarker,
+}
+
 type ReviewThreadComment struct {
 	Body     string
 	Path     string
@@ -143,6 +151,11 @@ func CanonicalReviewFeedbackText(body string) string {
 }
 
 func IsActionableReviewFeedback(body string) bool {
+	for _, marker := range automationFeedbackMarkers {
+		if marker != "" && strings.Contains(body, marker) {
+			return false
+		}
+	}
 	text := CanonicalReviewFeedbackText(body)
 	if text == "" {
 		return false

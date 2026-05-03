@@ -16,6 +16,9 @@ func TestIsActionableReviewFeedback(t *testing.T) {
 	if !IsActionableReviewFeedback("Use `strings.TrimSpace` here") {
 		t.Fatal("code-formatted feedback should be actionable")
 	}
+	if IsActionableReviewFeedback("Orchestration state update\n\n<!-- orchestration-state:v1 -->\n```json\n{\"status\":\"failed\"}\n```") {
+		t.Fatal("orchestration marker comment should not be actionable")
+	}
 }
 
 func TestNormalizeReviewFeedback(t *testing.T) {

@@ -4898,6 +4898,16 @@ def _canonical_feedback_text(body: str) -> str:
 
 
 def _is_actionable_feedback(body: str) -> bool:
+    automation_markers = (
+        ORCHESTRATION_STATE_MARKER,
+        ORCHESTRATION_CLAIM_MARKER,
+        DECOMPOSITION_PLAN_MARKER,
+        CLARIFICATION_REQUEST_MARKER,
+        PR_REVIEW_OUTCOME_MARKER,
+    )
+    if any(marker and marker in body for marker in automation_markers):
+        return False
+
     text = _canonical_feedback_text(body)
     if not text:
         return False

@@ -479,6 +479,17 @@ class PrReviewModeTests(unittest.TestCase):
                 "body": "",
                 "url": "https://example/comment/3",
             },
+            {
+                "author": "bot",
+                "body": (
+                    "Orchestration state update: failed\n\n"
+                    "<!-- orchestration-state:v1 -->\n"
+                    "```json\n"
+                    '{"status":"failed","next_action":"inspect_error_and_retry"}\n'
+                    "```"
+                ),
+                "url": "https://example/comment/4",
+            },
         ]
 
         items, stats = self.mod.normalize_review_items(
@@ -490,8 +501,8 @@ class PrReviewModeTests(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["type"], "conversation_comment")
         self.assertEqual(items[0]["author"], "bob")
-        self.assertEqual(stats["conversation_total"], 3)
-        self.assertEqual(stats["conversation_non_actionable"], 1)
+        self.assertEqual(stats["conversation_total"], 4)
+        self.assertEqual(stats["conversation_non_actionable"], 2)
         self.assertEqual(stats["conversation_empty"], 1)
 
     def test_normalize_review_items_mixed_sources_preserve_priority_and_deduplicate(self) -> None:

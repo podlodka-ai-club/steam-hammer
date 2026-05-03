@@ -450,78 +450,33 @@ func (a *App) detachedWorkerLinkedStatus(ctx context.Context, state detachedWork
 	}
 
 	if state.TargetKind == "issue" {
-		issue, err := a.issueLifecycle.FetchIssue(ctx, state.Repo, targetID)
+		status, _, err := a.issueStatusReport(ctx, state.Repo, targetID)
 		if err != nil {
 			return linked, nil
 		}
-		comments, err := a.issueLifecycle.ListIssueComments(ctx, state.Repo, targetID)
-		if err != nil {
-			return linked, nil
-		}
-		trackerComments := make([]orchestration.TrackerComment, 0, len(comments))
-		for _, comment := range comments {
-			trackerComments = append(trackerComments, orchestration.TrackerComment{ID: comment.ID, CreatedAt: comment.CreatedAt, HTMLURL: comment.HTMLURL, Body: comment.Body})
-		}
-		latest, _ := orchestration.SelectLatestParseableOrchestrationState(trackerComments, fmt.Sprintf("issue #%d", targetID))
-		if latest != nil {
-			linked.LatestState = strings.TrimSpace(latest.Status)
-			linked.Branch = strings.TrimSpace(latest.Payload.Branch)
-			linked.Current = strings.TrimSpace(latest.Payload.Stage)
-			linked.Next = strings.TrimSpace(latest.Payload.NextAction)
-			linked.Blockers = strings.TrimSpace(latest.Payload.Error)
-			linked.Updated = strings.TrimSpace(latest.Payload.Timestamp)
-			linked.PRReadiness = detachedPRReadinessSummary(latest.Payload)
-			if latest.Payload.PR != nil && *latest.Payload.PR > 0 {
-				linked.PR = fmt.Sprintf("#%d", *latest.Payload.PR)
-			}
-		}
-		pr, err := a.issueLifecycle.FindOpenPullRequestForIssue(ctx, state.Repo, issue)
-		if err != nil {
-			return linked, nil
-		}
-		if pr != nil && pr.Number > 0 {
-			linked.PR = fmt.Sprintf("#%d", pr.Number)
-			if linked.Branch == "" {
-				linked.Branch = strings.TrimSpace(pr.HeadRefName)
-			}
-		}
+		populateDetachedLinkedReport(linked, status)
 	} else {
-		pullRequest, err := a.prLifecycle.FetchPullRequest(ctx, state.Repo, targetID)
+		status, _, err := a.prStatusReport(ctx, state.Repo, targetID)
 		if err != nil {
 			return linked, nil
 		}
-		conversation, err := a.prLifecycle.ConversationCommentsForPullRequest(ctx, state.Repo, targetID)
-		if err != nil {
-			return linked, nil
-		}
-		trackerComments := make([]orchestration.TrackerComment, 0, len(conversation))
-		for _, comment := range conversation {
-			trackerComments = append(trackerComments, orchestration.TrackerComment{HTMLURL: comment.URL, Body: comment.Body})
-		}
-		latest, _ := orchestration.SelectLatestParseableOrchestrationState(trackerComments, fmt.Sprintf("pr #%d", targetID))
-		if latest != nil {
-			linked.LatestState = strings.TrimSpace(latest.Status)
-			linked.Branch = strings.TrimSpace(latest.Payload.Branch)
-			linked.Current = strings.TrimSpace(latest.Payload.Stage)
-			linked.Next = strings.TrimSpace(latest.Payload.NextAction)
-			linked.Blockers = strings.TrimSpace(latest.Payload.Error)
-			linked.Updated = strings.TrimSpace(latest.Payload.Timestamp)
-			linked.PRReadiness = detachedPRReadinessSummary(latest.Payload)
-			if latest.Payload.PR != nil && *latest.Payload.PR > 0 {
-				linked.PR = fmt.Sprintf("#%d", *latest.Payload.PR)
-			}
-		}
-		if linked.Branch == "" {
-			linked.Branch = strings.TrimSpace(pullRequest.HeadRefName)
-		}
-		if linked.PR == "" {
-			linked.PR = fmt.Sprintf("#%d", pullRequest.Number)
-		}
+		populateDetachedLinkedReport(linked, status)
 	}
 	if *linked == (detachedWorkerLinkedReport{}) {
 		return nil, nil
 	}
 	return linked, nil
+}
+
+func populateDetachedLinkedReport(linked *detachedWorkerLinkedReport, status trackedStatusReport) {
+	linked.LatestState = strings.TrimSpace(status.LatestState)
+	linked.Branch = strings.TrimSpace(status.Branch)
+	linked.Current = strings.TrimSpace(status.Current)
+	linked.Next = strings.TrimSpace(status.Next)
+	linked.Blockers = strings.TrimSpace(status.Blockers)
+	linked.PR = strings.TrimSpace(status.PR)
+	linked.PRReadiness = strings.TrimSpace(status.PRReadiness)
+	linked.Updated = strings.TrimSpace(status.Updated)
 }
 
 func detachedPRReadinessSummary(payload orchestration.TrackedState) string {

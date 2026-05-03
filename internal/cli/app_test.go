@@ -2544,6 +2544,109 @@ func TestStatusWorkerShowsBatchSummary(t *testing.T) {
 	}
 }
 
+func TestStatusWorkerBatchSummaryUsesLinkedIssueState(t *testing.T) {
+	targetDir := t.TempDir()
+	workerRoot := filepath.Join(targetDir, ".orchestrator", "workers")
+	states := []detachedWorkerState{
+		{
+			Name:       "issue-71",
+			Mode:       "run batch",
+			TargetKind: "issue",
+			TargetID:   "71",
+			Repo:       "owner/repo",
+			PID:        0,
+			StartedAt:  "2026-04-28T12:00:00Z",
+			LogPath:    filepath.Join(workerRoot, "issue-71", "worker.log"),
+			StatePath:  filepath.Join(workerRoot, "issue-71", "worker.json"),
+			ClonePath:  targetDir,
+			WorkDir:    targetDir,
+		},
+		{
+			Name:       "issue-72",
+			Mode:       "run batch",
+			TargetKind: "issue",
+			TargetID:   "72",
+			Repo:       "owner/repo",
+			PID:        0,
+			StartedAt:  "2026-04-28T12:01:00Z",
+			LogPath:    filepath.Join(workerRoot, "issue-72", "worker.log"),
+			StatePath:  filepath.Join(workerRoot, "issue-72", "worker.json"),
+			ClonePath:  targetDir,
+			WorkDir:    targetDir,
+		},
+	}
+	states = withDetachedBatchMetadata(states, []int{71, 72})
+	for _, state := range states {
+		if err := os.MkdirAll(filepath.Dir(state.StatePath), 0o755); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+		if err := os.WriteFile(state.LogPath, []byte("line 1\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile(log) error = %v", err)
+		}
+	}
+	if err := workers.WriteBatchStates(states); err != nil {
+		t.Fatalf("workers.WriteBatchStates() error = %v", err)
+	}
+	issue71State, err := orchestration.BuildOrchestrationStateComment(orchestration.TrackedState{
+		Status:     orchestration.StatusBlocked,
+		TaskType:   "issue",
+		Issue:      intPtr(71),
+		PR:         intPtr(101),
+		Stage:      "review_feedback",
+		NextAction: "resolve_review_comments",
+		Error:      "merge conflict in README.md",
+		Timestamp:  "2026-04-28T12:05:00Z",
+	})
+	if err != nil {
+		t.Fatalf("BuildOrchestrationStateComment(issue71) error = %v", err)
+	}
+	issue72State, err := orchestration.BuildOrchestrationStateComment(orchestration.TrackedState{
+		Status:     orchestration.StatusReadyToMerge,
+		TaskType:   "issue",
+		Issue:      intPtr(72),
+		PR:         intPtr(102),
+		Stage:      "merge_gate",
+		NextAction: "ready_for_merge",
+		MergeReadiness: &orchestration.PRMergeReadiness{
+			Status:     orchestration.StatusReadyToMerge,
+			NextAction: "ready_for_merge",
+		},
+		Timestamp: "2026-04-28T12:06:00Z",
+	})
+	if err != nil {
+		t.Fatalf("BuildOrchestrationStateComment(issue72) error = %v", err)
+	}
+	lifecycle := &fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{
+		71: {{ID: 1, Body: issue71State, CreatedAt: "2026-04-28T12:05:00Z"}},
+		72: {{ID: 2, Body: issue72State, CreatedAt: "2026-04-28T12:06:00Z"}},
+	}}
+
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetIssueLifecycle(lifecycle)
+	code := app.Run([]string{"status", "--worker", "issue-71", "--worker-dir", workerRoot})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	printed := out.String()
+	for _, want := range []string{
+		"linked-latest-state: blocked",
+		"linked-current: review_feedback",
+		"linked-next: resolve_review_comments",
+		"linked-blockers: merge conflict in README.md",
+		"linked-pr: #101",
+		"batch-done: issue #72: ready-to-merge (#102)",
+		"batch-linked-prs: issue #71 -> #101; issue #72 -> #102",
+		"batch-conflicts: issue #71: merge conflict in README.md",
+		"batch-verification: issue #72: ready-to-merge",
+		"batch-failures: none",
+	} {
+		if !strings.Contains(printed, want) {
+			t.Fatalf("stdout = %q, want %q", printed, want)
+		}
+	}
+}
+
 func TestStatusWorkerJSONIncludesBatchSummary(t *testing.T) {
 	targetDir := t.TempDir()
 	workerRoot := filepath.Join(targetDir, ".orchestrator", "workers")

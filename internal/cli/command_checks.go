@@ -20,6 +20,20 @@ type doctorCheck struct {
 	Detail string
 }
 
+type trackedStatusReport struct {
+	Target      string `json:"target"`
+	Repo        string `json:"repo"`
+	LatestState string `json:"latest_state"`
+	Branch      string `json:"branch,omitempty"`
+	BaseBranch  string `json:"base_branch,omitempty"`
+	Current     string `json:"current,omitempty"`
+	Next        string `json:"next,omitempty"`
+	Blockers    string `json:"blockers,omitempty"`
+	PR          string `json:"pr,omitempty"`
+	PRReadiness string `json:"pr_readiness,omitempty"`
+	Updated     string `json:"updated,omitempty"`
+}
+
 func (a *App) runDoctor(ctx context.Context, args []string) int {
 	if unsupported := firstUnsupportedFlag(args, unsupportedDoctorFlags); unsupported != "" {
 		_, _ = fmt.Fprintln(a.err, unsupported)
@@ -224,28 +238,63 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 }
 
 func (a *App) runIssueStatus(ctx context.Context, repo string, issueNumber int, asJSON bool) int {
+	report, warnings, err := a.issueStatusReport(ctx, repo, issueNumber)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+		return 1
+	}
+	for _, warning := range warnings {
+		_, _ = fmt.Fprintf(a.err, "Warning: %s\n", warning)
+	}
+	if asJSON {
+		encoded, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to encode issue status: %v\n", err)
+			return 1
+		}
+		_, _ = fmt.Fprintf(a.out, "%s\n", encoded)
+		return 0
+	}
+	_, _ = fmt.Fprintf(a.out, "Target: %s\n", report.Target)
+	_, _ = fmt.Fprintf(a.out, "Latest state: %s\n", report.LatestState)
+	if report.Branch != "" {
+		_, _ = fmt.Fprintf(a.out, "Branch: %s\n", report.Branch)
+	}
+	if report.Current != "" {
+		_, _ = fmt.Fprintf(a.out, "Current: %s\n", report.Current)
+	}
+	if report.Next != "" {
+		_, _ = fmt.Fprintf(a.out, "Next: %s\n", report.Next)
+	}
+	if report.Blockers != "" {
+		_, _ = fmt.Fprintf(a.out, "Blockers: %s\n", report.Blockers)
+	}
+	if report.PR != "" {
+		_, _ = fmt.Fprintf(a.out, "PR: %s\n", report.PR)
+	}
+	if report.Updated != "" {
+		_, _ = fmt.Fprintf(a.out, "Updated: %s\n", report.Updated)
+	}
+	return 0
+}
+
+func (a *App) issueStatusReport(ctx context.Context, repo string, issueNumber int) (trackedStatusReport, []string, error) {
 	issue, err := a.issueLifecycle.FetchIssue(ctx, repo, issueNumber)
 	if err != nil {
-		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to fetch issue #%d: %v\n", issueNumber, err)
-		return 1
+		return trackedStatusReport{}, nil, fmt.Errorf("failed to fetch issue #%d: %w", issueNumber, err)
 	}
 	comments, err := a.issueLifecycle.ListIssueComments(ctx, repo, issueNumber)
 	if err != nil {
-		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to list issue #%d comments: %v\n", issueNumber, err)
-		return 1
+		return trackedStatusReport{}, nil, fmt.Errorf("failed to list issue #%d comments: %w", issueNumber, err)
 	}
 	trackerComments := make([]orchestration.TrackerComment, 0, len(comments))
 	for _, comment := range comments {
 		trackerComments = append(trackerComments, orchestration.TrackerComment{ID: comment.ID, CreatedAt: comment.CreatedAt, HTMLURL: comment.HTMLURL, Body: comment.Body})
 	}
 	latest, warnings := orchestration.SelectLatestParseableOrchestrationState(trackerComments, fmt.Sprintf("issue #%d", issueNumber))
-	for _, warning := range warnings {
-		_, _ = fmt.Fprintf(a.err, "Warning: %s\n", warning)
-	}
 	linkedPR, err := a.issueLifecycle.FindOpenPullRequestForIssue(ctx, repo, issue)
 	if err != nil {
-		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to discover linked PR for issue #%d: %v\n", issueNumber, err)
-		return 1
+		return trackedStatusReport{}, warnings, fmt.Errorf("failed to discover linked PR for issue #%d: %w", issueNumber, err)
 	}
 	payload := orchestration.TrackedState{}
 	if latest != nil {
@@ -255,61 +304,73 @@ func (a *App) runIssueStatus(ctx context.Context, repo string, issueNumber int, 
 	if latest != nil && strings.TrimSpace(latest.Status) != "" {
 		status = latest.Status
 	}
-	if asJSON {
-		data := map[string]any{"target": fmt.Sprintf("issue #%d", issueNumber), "repo": repo, "latest_state": status, "branch": payload.Branch, "current": payload.Stage, "next": payload.NextAction, "blockers": payload.Error, "updated": payload.Timestamp}
-		if linkedPR != nil {
-			data["pr"] = fmt.Sprintf("#%d", linkedPR.Number)
+	report := trackedStatusReport{Target: fmt.Sprintf("issue #%d", issueNumber), Repo: repo, LatestState: status, Branch: strings.TrimSpace(payload.Branch), Current: strings.TrimSpace(payload.Stage), Next: strings.TrimSpace(payload.NextAction), Blockers: strings.TrimSpace(payload.Error), PRReadiness: detachedPRReadinessSummary(payload), Updated: strings.TrimSpace(payload.Timestamp)}
+	if linkedPR != nil {
+		report.PR = fmt.Sprintf("#%d", linkedPR.Number)
+		if report.Branch == "" {
+			report.Branch = strings.TrimSpace(linkedPR.HeadRefName)
 		}
-		encoded, err := json.MarshalIndent(data, "", "  ")
+	} else if payload.PR != nil && *payload.PR > 0 {
+		report.PR = fmt.Sprintf("#%d", *payload.PR)
+	}
+	return report, warnings, nil
+}
+
+func (a *App) runPRStatus(ctx context.Context, repo string, prNumber int, asJSON bool) int {
+	report, warnings, err := a.prStatusReport(ctx, repo, prNumber)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+		return 1
+	}
+	for _, warning := range warnings {
+		_, _ = fmt.Fprintf(a.err, "Warning: %s\n", warning)
+	}
+	if asJSON {
+		encoded, err := json.MarshalIndent(report, "", "  ")
 		if err != nil {
-			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to encode issue status: %v\n", err)
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to encode PR status: %v\n", err)
 			return 1
 		}
 		_, _ = fmt.Fprintf(a.out, "%s\n", encoded)
 		return 0
 	}
-	_, _ = fmt.Fprintf(a.out, "Target: issue #%d\n", issueNumber)
-	_, _ = fmt.Fprintf(a.out, "Latest state: %s\n", status)
-	if payload.Branch != "" {
-		_, _ = fmt.Fprintf(a.out, "Branch: %s\n", payload.Branch)
+	_, _ = fmt.Fprintf(a.out, "Target: %s\n", report.Target)
+	_, _ = fmt.Fprintf(a.out, "Latest state: %s\n", report.LatestState)
+	if report.Branch != "" {
+		_, _ = fmt.Fprintf(a.out, "Branch: %s\n", report.Branch)
 	}
-	if payload.Stage != "" {
-		_, _ = fmt.Fprintf(a.out, "Current: %s\n", payload.Stage)
+	if report.BaseBranch != "" {
+		_, _ = fmt.Fprintf(a.out, "Base branch: %s\n", report.BaseBranch)
 	}
-	if payload.NextAction != "" {
-		_, _ = fmt.Fprintf(a.out, "Next: %s\n", payload.NextAction)
+	if report.Current != "" {
+		_, _ = fmt.Fprintf(a.out, "Current: %s\n", report.Current)
 	}
-	if payload.Error != "" {
-		_, _ = fmt.Fprintf(a.out, "Blockers: %s\n", payload.Error)
+	if report.Next != "" {
+		_, _ = fmt.Fprintf(a.out, "Next: %s\n", report.Next)
 	}
-	if linkedPR != nil {
-		_, _ = fmt.Fprintf(a.out, "PR: #%d\n", linkedPR.Number)
+	if report.Blockers != "" {
+		_, _ = fmt.Fprintf(a.out, "Blockers: %s\n", report.Blockers)
 	}
-	if payload.Timestamp != "" {
-		_, _ = fmt.Fprintf(a.out, "Updated: %s\n", payload.Timestamp)
+	if report.Updated != "" {
+		_, _ = fmt.Fprintf(a.out, "Updated: %s\n", report.Updated)
 	}
 	return 0
 }
 
-func (a *App) runPRStatus(ctx context.Context, repo string, prNumber int, asJSON bool) int {
+func (a *App) prStatusReport(ctx context.Context, repo string, prNumber int) (trackedStatusReport, []string, error) {
 	pullRequest, err := a.prLifecycle.FetchPullRequest(ctx, repo, prNumber)
 	if err != nil {
-		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to fetch PR #%d: %v\n", prNumber, err)
-		return 1
+		return trackedStatusReport{}, nil, fmt.Errorf("failed to fetch PR #%d: %w", prNumber, err)
 	}
 	conversation, err := a.prLifecycle.ConversationCommentsForPullRequest(ctx, repo, prNumber)
 	if err != nil {
-		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to list PR #%d comments: %v\n", prNumber, err)
-		return 1
+		return trackedStatusReport{}, nil, fmt.Errorf("failed to list PR #%d comments: %w", prNumber, err)
 	}
 	trackerComments := make([]orchestration.TrackerComment, 0, len(conversation))
 	for _, comment := range conversation {
 		trackerComments = append(trackerComments, orchestration.TrackerComment{HTMLURL: comment.URL, Body: comment.Body})
 	}
 	latest, warnings := orchestration.SelectLatestParseableOrchestrationState(trackerComments, fmt.Sprintf("pr #%d", prNumber))
-	for _, warning := range warnings {
-		_, _ = fmt.Fprintf(a.err, "Warning: %s\n", warning)
-	}
 	payload := orchestration.TrackedState{}
 	if latest != nil {
 		payload = latest.Payload
@@ -324,37 +385,11 @@ func (a *App) runPRStatus(ctx context.Context, repo string, prNumber int, asJSON
 	if payload.BaseBranch == "" {
 		payload.BaseBranch = strings.TrimSpace(pullRequest.BaseRefName)
 	}
-	if asJSON {
-		data := map[string]any{"target": fmt.Sprintf("pr #%d", prNumber), "repo": repo, "latest_state": status, "branch": payload.Branch, "base_branch": payload.BaseBranch, "current": payload.Stage, "next": payload.NextAction, "blockers": payload.Error, "updated": payload.Timestamp}
-		encoded, err := json.MarshalIndent(data, "", "  ")
-		if err != nil {
-			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to encode PR status: %v\n", err)
-			return 1
-		}
-		_, _ = fmt.Fprintf(a.out, "%s\n", encoded)
-		return 0
+	prRef := fmt.Sprintf("#%d", pullRequest.Number)
+	if payload.PR != nil && *payload.PR > 0 {
+		prRef = fmt.Sprintf("#%d", *payload.PR)
 	}
-	_, _ = fmt.Fprintf(a.out, "Target: pr #%d\n", prNumber)
-	_, _ = fmt.Fprintf(a.out, "Latest state: %s\n", status)
-	if payload.Branch != "" {
-		_, _ = fmt.Fprintf(a.out, "Branch: %s\n", payload.Branch)
-	}
-	if payload.BaseBranch != "" {
-		_, _ = fmt.Fprintf(a.out, "Base branch: %s\n", payload.BaseBranch)
-	}
-	if payload.Stage != "" {
-		_, _ = fmt.Fprintf(a.out, "Current: %s\n", payload.Stage)
-	}
-	if payload.NextAction != "" {
-		_, _ = fmt.Fprintf(a.out, "Next: %s\n", payload.NextAction)
-	}
-	if payload.Error != "" {
-		_, _ = fmt.Fprintf(a.out, "Blockers: %s\n", payload.Error)
-	}
-	if payload.Timestamp != "" {
-		_, _ = fmt.Fprintf(a.out, "Updated: %s\n", payload.Timestamp)
-	}
-	return 0
+	return trackedStatusReport{Target: fmt.Sprintf("pr #%d", prNumber), Repo: repo, LatestState: status, Branch: strings.TrimSpace(payload.Branch), BaseBranch: strings.TrimSpace(payload.BaseBranch), Current: strings.TrimSpace(payload.Stage), Next: strings.TrimSpace(payload.NextAction), Blockers: strings.TrimSpace(payload.Error), PR: prRef, PRReadiness: detachedPRReadinessSummary(payload), Updated: strings.TrimSpace(payload.Timestamp)}, warnings, nil
 }
 
 func newFlagSet(name string, err io.Writer) *flag.FlagSet {

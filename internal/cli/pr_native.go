@@ -58,6 +58,9 @@ func nativePRFallbackReason(opts nativePROptions) string {
 	if opts.detach {
 		return "--detach requires worker launch and is handled before native PR execution"
 	}
+	if opts.isolateWorktree {
+		return "--isolate-worktree is not supported by the Go-native PR path yet"
+	}
 	if opts.postSummary {
 		return "--post-pr-summary is not supported by the Go-native PR path yet"
 	}
@@ -98,6 +101,10 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 		return 1
 	}
 	if opts.conflictRecoveryOnly {
+		if *opts.common.dryRun {
+			_, _ = fmt.Fprintf(a.out, "[dry-run] Native PR conflict recovery preflight succeeded for PR #%d on branch %q; sync/push/state updates skipped\n", pullRequest.Number, strings.TrimSpace(pullRequest.HeadRefName))
+			return 0
+		}
 		return a.runNativePRConflictRecovery(ctx, repo, pullRequest, opts, &latestState)
 	}
 
@@ -135,10 +142,6 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 			return 1
 		}
 		activeBranch = targetBranch
-	}
-	if opts.isolateWorktree {
-		_, _ = fmt.Fprintln(a.err, "orchestrator: --isolate-worktree is not implemented in the Go-native PR path yet; rerun without --isolate-worktree or prepare a dedicated isolated clone/worktree before running")
-		return 1
 	}
 	if *opts.common.dryRun {
 		_, _ = fmt.Fprintf(a.out, "[dry-run] Native PR flow preflight succeeded for PR #%d on branch %q; agent run skipped\n", pullRequest.Number, activeBranch)

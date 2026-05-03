@@ -615,7 +615,7 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 	return selected, nil
 }
 
-func (a *App) daemonReviewFeedbackSignal(ctx context.Context, repo string, issue githublifecycle.Issue) (string, error) {
+func (a *App) daemonReviewFeedbackSignal(ctx context.Context, repo string, issue corelifecycle.Issue) (string, error) {
 	linkedPR, err := a.daemon.FindOpenPullRequestForIssue(ctx, repo, issue)
 	if err != nil {
 		return "", fmt.Errorf("failed to inspect linked PR for issue #%d: %w", issue.Number, err)

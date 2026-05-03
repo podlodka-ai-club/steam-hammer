@@ -350,6 +350,49 @@ type daemonSelectedIssue struct {
 	opts       commonOptions
 }
 
+func daemonSelectionOutcome(issueNumber int, decision orchestration.DaemonTaskDecision) string {
+	status := strings.TrimSpace(decision.Status)
+	if status == "" {
+		if decision.Eligible {
+			status = orchestration.DaemonSelectionStatusRunnable
+		} else {
+			status = orchestration.DaemonSelectionStatusSkipped
+		}
+	}
+	code := strings.TrimSpace(decision.Code)
+	if code == "" {
+		code = "unspecified"
+	}
+	reason := strings.TrimSpace(decision.Reason)
+	if reason == "" && decision.Eligible {
+		reason = "eligible for execution"
+	}
+	if reason == "" {
+		reason = "no reason provided"
+	}
+	return fmt.Sprintf("orchestrator: daemon candidate issue #%d: %s (%s) - %s", issueNumber, status, code, reason)
+}
+
+func daemonRetryLimitReached(state *orchestration.ParsedTrackerComment[orchestration.TrackedState]) bool {
+	if state == nil {
+		return false
+	}
+	payload := state.Payload
+	if !strings.EqualFold(strings.TrimSpace(payload.Status), orchestration.StatusFailed) {
+		return false
+	}
+
+	nextAction := strings.ToLower(strings.TrimSpace(payload.NextAction))
+	errorText := strings.ToLower(strings.TrimSpace(payload.Error))
+	if strings.Contains(nextAction, "retry") && strings.Contains(nextAction, "limit") {
+		return true
+	}
+	if strings.Contains(errorText, "retry limit") {
+		return true
+	}
+	return false
+}
+
 func loadDaemonHandledState(sessionPath string) daemonHandledState {
 	state := daemonHandledState{signatures: map[int]string{}}
 	if strings.TrimSpace(sessionPath) == "" {
@@ -583,7 +626,13 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 	now := time.Now().UTC()
 	for _, issue := range issues {
 		if len(selected) >= config.maxParallelTasks {
-			break
+			decision := orchestration.DaemonTaskDecision{
+				Status: orchestration.DaemonSelectionStatusWaiting,
+				Code:   "queue_capacity",
+				Reason: fmt.Sprintf("waiting for free worker slot (%d/%d active this cycle)", len(selected), config.maxParallelTasks),
+			}
+			_, _ = fmt.Fprintln(a.err, daemonSelectionOutcome(issue.Number, decision))
+			continue
 		}
 		if _, ok := seen[issue.Number]; ok {
 			continue
@@ -607,9 +656,12 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 
 		snapshot := orchestration.DaemonTaskSnapshot{
 			IssueNumber:          issue.Number,
+			Tracker:              issue.Tracker,
+			ExpectedTracker:      strings.TrimSpace(*config.opts.tracker),
 			RunID:                config.runID,
 			ForceReprocess:       config.forceReprocess,
 			LastHandledSignature: handled.signatures[issue.Number],
+			RetryLimitReached:    daemonRetryLimitReached(latestState),
 		}
 		if conflictSignal, err := a.daemonPRConflictRecoverySignal(ctx, strings.TrimSpace(*config.opts.repo), issue); err != nil {
 			return nil, err
@@ -639,10 +691,8 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 		}
 		snapshot.OpenDependencyRefs = openDependencies
 		decision := orchestration.EvaluateDaemonTaskSelection(snapshot, now)
+		_, _ = fmt.Fprintln(a.err, daemonSelectionOutcome(issue.Number, decision))
 		if !decision.Eligible {
-			if decision.Reason != "" {
-				_, _ = fmt.Fprintf(a.err, "orchestrator: skipping issue #%d: %s\n", issue.Number, decision.Reason)
-			}
 			continue
 		}
 		workerOpts, err := resolveDaemonIssueOptions(config.opts, config.flags, config.projectConfig, issue, latestDecomposition != nil)

@@ -2421,6 +2421,81 @@ func TestRunDaemonTreatsSelfDependencyAsBlocked(t *testing.T) {
 	}
 }
 
+func TestRunDaemonReportsQueueCapacityWaitingCandidates(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{{Number: 330}, {Number: 331}},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{
+			330: {},
+			331: {},
+		},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "2", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run", "--max-parallel-tasks", "1"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "daemon candidate issue #331: waiting (queue_capacity)") {
+		t.Fatalf("stderr = %q, want queue-capacity waiting reason", errOut.String())
+	}
+}
+
+func TestRunDaemonSkipsUnsupportedProviderCandidates(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{{Number: 330, Tracker: "linear"}},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{
+			330: {},
+		},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "unsupported_provider") {
+		t.Fatalf("stderr = %q, want unsupported provider reason code", errOut.String())
+	}
+}
+
+func TestRunDaemonSkipsIssueAfterAgentRetryLimitReached(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{{Number: 330}},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{
+			330: {
+				{Body: orchestration.OrchestrationStateMarker + "\n```json\n{\"status\":\"failed\",\"next_action\":\"inspect_retry_limit\",\"error\":\"retry limit reached\"}\n```"},
+			},
+		},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "agent_failed_retry_limit") {
+		t.Fatalf("stderr = %q, want retry-limit reason code", errOut.String())
+	}
+}
+
 func TestRunDaemonRejectsNonPositiveParallelism(t *testing.T) {
 	runner := &recordingRunner{}
 	var errOut strings.Builder

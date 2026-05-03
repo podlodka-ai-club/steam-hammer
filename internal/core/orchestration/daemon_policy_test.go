@@ -99,6 +99,35 @@ func TestEvaluateDaemonTaskSelectionSkipsAlreadyHandledSignature(t *testing.T) {
 	}
 }
 
+func TestEvaluateDaemonTaskSelectionSkipsOpenDependencies(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:        249,
+		LatestStateStatus:  StatusReadyForReview,
+		OpenDependencyRefs: []string{"326", "327", "326"},
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if decision.Eligible {
+		t.Fatalf("Eligible = true, want false")
+	}
+	if decision.Reason != "blocked by open dependencies: #326, #327" {
+		t.Fatalf("Reason = %q", decision.Reason)
+	}
+	if decision.Signature != "state:ready-for-review" {
+		t.Fatalf("Signature = %q", decision.Signature)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionAllowsClosedDependencies(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:       249,
+		LatestStateStatus: StatusReadyForReview,
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if !decision.Eligible {
+		t.Fatalf("Eligible = false, want true (%q)", decision.Reason)
+	}
+}
+
 func TestEvaluateDaemonTaskSelectionPrefersReviewFeedbackSignal(t *testing.T) {
 	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
 		IssueNumber:          249,

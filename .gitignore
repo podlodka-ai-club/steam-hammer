@@ -7,3 +7,5 @@ __pycache__/
 .opencode/local-config.json
 opencode.jsonc
 local-config.json
+.orchestrator/
+analysis_report.html

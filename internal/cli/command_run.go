@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/podlodka-ai-club/steam-hammer/internal/core/githublifecycle"
+	corelifecycle "github.com/podlodka-ai-club/steam-hammer/internal/core/lifecycle"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 )
 
@@ -398,7 +398,7 @@ func shouldUseGoDaemonPolicy(opts commonOptions, lifecycle daemonLifecycle) bool
 		return false
 	}
 	tracker := strings.TrimSpace(*opts.tracker)
-	if tracker != "" && !strings.EqualFold(tracker, "github") {
+	if tracker != "" && !strings.EqualFold(tracker, corelifecycle.TrackerGitHub) {
 		return false
 	}
 	return true
@@ -839,6 +839,9 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 			selected, err = a.claimDaemonIssues(ctx, config, selected)
 			if err != nil {
 				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to claim daemon issues: %v\n", err)
+				if releaseErr := a.releaseDaemonClaims(ctx, config, selected); releaseErr != nil {
+					_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims after claim error: %v\n", releaseErr)
+				}
 				if config.stopOnError {
 					return 1
 				}
@@ -847,6 +850,7 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 			}
 		}
 		preparedWorkers := make([]daemonParallelPreparedWorker, 0, len(selected))
+		releaseClaimsAfterCycle := !selectionFailed && len(selected) > 0
 		if !selectionFailed {
 			for _, issue := range selected {
 				handled.signatures[issue.issueID] = issue.signature
@@ -855,6 +859,11 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 					_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
 					lastCode = 1
 					if config.stopOnError {
+						if releaseClaimsAfterCycle {
+							if releaseErr := a.releaseDaemonClaims(ctx, config, selected); releaseErr != nil {
+								_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims: %v\n", releaseErr)
+							}
+						}
 						for _, prepared := range preparedWorkers {
 							if prepared.cleanup != nil {
 								prepared.cleanup()
@@ -904,10 +913,12 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 			}
 			wg.Wait()
 			cancel()
-			if err := a.releaseDaemonClaims(ctx, config, selected); err != nil {
+			if releaseClaimsAfterCycle {
+				if err := a.releaseDaemonClaims(ctx, config, selected); err != nil {
 				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims: %v\n", err)
 				if cycleCode == 0 {
 					cycleCode = 1
+				}
 				}
 			}
 		}
@@ -965,12 +976,16 @@ func (a *App) runSerialDaemon(ctx context.Context, config daemonParallelConfig) 
 			selected, err = a.claimDaemonIssues(ctx, config, selected)
 			if err != nil {
 				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to claim daemon issues: %v\n", err)
+				if releaseErr := a.releaseDaemonClaims(ctx, config, selected); releaseErr != nil {
+					_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims after claim error: %v\n", releaseErr)
+				}
 				if config.stopOnError {
 					return 1
 				}
 				lastCode = 1
 				selected = nil
 			}
+			releaseClaimsAfterCycle := len(selected) > 0
 			cycleCode := 0
 			for _, issue := range selected {
 				handled.signatures[issue.issueID] = issue.signature
@@ -984,14 +999,18 @@ func (a *App) runSerialDaemon(ctx context.Context, config daemonParallelConfig) 
 					cycleCode = code
 				}
 				if code != 0 && config.stopOnError {
-					_ = a.releaseDaemonClaims(ctx, config, selected)
+					if releaseClaimsAfterCycle {
+						_ = a.releaseDaemonClaims(ctx, config, selected)
+					}
 					return code
 				}
 			}
-			if err := a.releaseDaemonClaims(ctx, config, selected); err != nil {
+			if releaseClaimsAfterCycle {
+				if err := a.releaseDaemonClaims(ctx, config, selected); err != nil {
 				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims: %v\n", err)
 				if cycleCode == 0 {
 					cycleCode = 1
+				}
 				}
 			}
 			if cycleCode == 0 && config.postBatchVerify {
@@ -1164,6 +1183,16 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 				workerPaths,
 			)
 			state.WorkDir = clonePath
+			pushRemote, err := detachedClonePushRemote(clonePath)
+			if err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker push remote for %s: %v\n", workerLabel, err)
+				if *stopOnError {
+					return 1
+				}
+				lastCode = 1
+				continue
+			}
+			state.PushRemote = pushRemote
 			if _, code := a.startDetachedWorkerState(state); code != 0 {
 				if *stopOnError {
 					return code
@@ -1386,6 +1415,16 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 				workerPaths,
 			)
 			state.WorkDir = clonePath
+			pushRemote, err := detachedClonePushRemote(clonePath)
+			if err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker push remote for issue %d: %v\n", id, err)
+				if *stopOnError {
+					return 1
+				}
+				lastCode = 1
+				continue
+			}
+			state.PushRemote = pushRemote
 			startedState, code := a.startDetachedWorkerState(state)
 			if code != 0 {
 				if *stopOnError {
@@ -1546,6 +1585,29 @@ func (a *App) prepareDetachedWorkerClone(configuredDir string, workerPaths detac
 	}
 	clonePath := filepath.Join(filepath.Dir(workerPaths.StatePath), "repo")
 	return a.clone.Prepare(sourceDir, clonePath)
+}
+
+func detachedClonePushRemote(clonePath string) (string, error) {
+	remote, err := gitOutput(clonePath, "config", "--get", "remote.origin.url")
+	if err != nil {
+		configPath := filepath.Join(clonePath, ".git", "config")
+		data, readErr := os.ReadFile(configPath)
+		if readErr != nil {
+			return "", err
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "url =") {
+				remote = strings.TrimSpace(strings.TrimPrefix(trimmed, "url ="))
+				break
+			}
+		}
+	}
+	trimmed := strings.TrimSpace(remote)
+	if trimmed == "" {
+		return "", fmt.Errorf("remote.origin.url is empty")
+	}
+	return trimmed, nil
 }
 
 func (a *App) runPR(ctx context.Context, args []string) int {

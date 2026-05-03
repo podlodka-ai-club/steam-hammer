@@ -1212,6 +1212,27 @@ def autonomous_session_issue_status(state: dict, issue_number: int) -> str | Non
     return status if status else None
 
 
+def _linked_pr_requires_conflict_recovery(linked_open_pr: dict | None, repo: str | None = None) -> bool:
+    if not isinstance(linked_open_pr, dict):
+        return False
+    merge_state = str(linked_open_pr.get("mergeStateStatus") or "").strip()
+    mergeable = str(linked_open_pr.get("mergeable") or "").strip()
+    if not merge_state and not mergeable and repo:
+        pr_number = _as_positive_int(linked_open_pr.get("number"))
+        if pr_number is not None:
+            try:
+                pull_request = current_codehost_provider().fetch_pull_request(repo=repo, number=pr_number)
+            except Exception:  # noqa: BLE001
+                pull_request = {}
+            merge_state = str(pull_request.get("mergeStateStatus") or "").strip()
+            mergeable = str(pull_request.get("mergeable") or "").strip()
+    merge_readiness_state = classify_pr_merge_readiness_state(
+        merge_state=merge_state,
+        mergeable=mergeable,
+    )
+    return merge_readiness_state == "conflicting"
+
+
 def mark_autonomous_session_issue_processed(state: dict, issue_number: int, status: str) -> dict:
     if status not in AUTONOMOUS_BATCH_SINGLE_PASS_STATUSES:
         return state
@@ -1227,7 +1248,7 @@ def mark_autonomous_session_issue_processed(state: dict, issue_number: int, stat
 
 
 def filter_autonomous_issues_for_single_pass(
-    issues: list[dict], session_state: dict
+    issues: list[dict], session_state: dict, repo: str | None = None
 ) -> tuple[list[dict], list[int]]:
     if not autonomous_session_processed_issue_numbers(session_state):
         return list(issues), []
@@ -1240,6 +1261,17 @@ def filter_autonomous_issues_for_single_pass(
             continue
         processed_status = autonomous_session_issue_status(session_state, issue_number)
         if processed_status in AUTONOMOUS_SESSION_SKIP_STATUSES:
+            if repo:
+                try:
+                    linked_open_pr = current_codehost_provider().find_open_pr_for_issue(
+                        repo=repo,
+                        issue=issue,
+                    )
+                except Exception:  # noqa: BLE001
+                    linked_open_pr = None
+                if _linked_pr_requires_conflict_recovery(linked_open_pr, repo=repo):
+                    filtered.append(issue)
+                    continue
             skipped.append(issue_number)
             continue
         filtered.append(issue)
@@ -2886,7 +2918,20 @@ def suggest_lightweight_focus_paths(issue: dict) -> list[str]:
     combined = f"{issue.get('title') or ''}\n{body}".lower()
     candidates = extract_required_file_paths_from_text(body)
 
-    if any(token in combined for token in ("python runner", "orchestration state", "scope check", "decomposition preflight", "state comments")):
+    if any(
+        token in combined
+        for token in (
+            "python runner",
+            "python compatibility adapter",
+            "compatibility adapter",
+            "python entrypoint",
+            "orchestration state",
+            "scope check",
+            "decomposition preflight",
+            "state comments",
+            "go migration",
+        )
+    ):
         candidates.append("scripts/run_github_issues_to_opencode.py")
     if any(token in combined for token in ("go cli wrapper", "go cli", "cli wrapper")):
         candidates.extend([
@@ -5769,6 +5814,19 @@ def sanitize_branch_for_path(branch_name: str) -> str:
     return _github_lifecycle.sanitize_branch_for_path(branch_name)
 
 
+def fetch_origin_branch_with_fallback(branch_name: str) -> None:
+    try:
+        run_command(["git", "fetch", "origin", branch_name])
+        return
+    except RuntimeError as fetch_error:
+        run_command(["git", "fetch", "origin"])
+        if remote_branch_exists(branch_name):
+            return
+        raise RuntimeError(
+            f"Target PR branch '{branch_name}' not found on origin after refresh"
+        ) from fetch_error
+
+
 def checkout_pr_target_branch(branch_name: str, dry_run: bool) -> None:
     local_exists = local_branch_exists(branch_name)
     remote_exists = remote_branch_exists(branch_name)
@@ -5792,7 +5850,7 @@ def checkout_pr_target_branch(branch_name: str, dry_run: bool) -> None:
         run_command(["git", "checkout", branch_name])
         return
 
-    run_command(["git", "fetch", "origin", branch_name])
+    fetch_origin_branch_with_fallback(branch_name)
     run_command(["git", "checkout", "-b", branch_name, "--track", f"origin/{branch_name}"])
 
 
@@ -5813,7 +5871,7 @@ def create_isolated_worktree_for_branch(branch_name: str, dry_run: bool) -> str 
             run_command(["git", "worktree", "add", worktree_dir, branch_name])
             return worktree_dir
 
-        run_command(["git", "fetch", "origin", branch_name])
+        fetch_origin_branch_with_fallback(branch_name)
         run_command(["git", "worktree", "add", "-b", branch_name, worktree_dir, f"origin/{branch_name}"])
         run_command(["git", "-C", worktree_dir, "branch", "--set-upstream-to", f"origin/{branch_name}", branch_name])
         return worktree_dir
@@ -6968,6 +7026,7 @@ def choose_execution_mode(
     force_issue_flow: bool,
     recovered_state: dict | None = None,
     clarification_answer: dict | None = None,
+    repo: str | None = None,
 ) -> tuple[str, str]:
     recovered_status = ""
     if isinstance(recovered_state, dict):
@@ -6982,6 +7041,17 @@ def choose_execution_mode(
             pr_number = linked_open_pr.get("number")
             return "pr-review", f"recovered waiting-for-author state has a newer author answer for linked PR #{pr_number}"
         return "issue-flow", "recovered waiting-for-author state has a newer author answer"
+
+    if (
+        recovered_status == "blocked"
+        and linked_open_pr is not None
+        and _linked_pr_requires_conflict_recovery(linked_open_pr, repo=repo)
+    ):
+        pr_number = linked_open_pr.get("number")
+        return (
+            "pr-review",
+            f"recovered orchestration state is blocked, but linked open PR #{pr_number} is conflicting and needs sync recovery",
+        )
 
     if recovered_status in {"waiting-for-author", "blocked"}:
         return (
@@ -10339,6 +10409,7 @@ def main() -> int:
         issues, skipped_session_issues = filter_autonomous_issues_for_single_pass(
             issues=issues,
             session_state=autonomous_session_state,
+            repo=repo,
         )
         if skipped_session_issues:
             skipped_labels = ", ".join(f"#{issue_number}" for issue_number in skipped_session_issues)
@@ -10751,6 +10822,7 @@ def main() -> int:
                     force_issue_flow=force_issue_flow,
                     recovered_state=recovered_state,
                     clarification_answer=clarification_answer,
+                    repo=repo,
                 )
                 if mode == "skip":
                     skipped_recovered_state += 1

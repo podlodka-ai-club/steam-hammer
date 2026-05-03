@@ -215,6 +215,9 @@ func (a *App) runDetachedStatus(configuredRoot, name string, asJSON bool) int {
 	if state.ClonePath != "" {
 		_, _ = fmt.Fprintf(a.out, "clone: %s\n", state.ClonePath)
 	}
+	if state.PushRemote != "" {
+		_, _ = fmt.Fprintf(a.out, "push-remote: %s\n", state.PushRemote)
+	}
 	if state.Runner != "" || state.Agent != "" || state.Model != "" {
 		_, _ = fmt.Fprintf(a.out, "agent: runner=%s agent=%s model=%s\n", state.Runner, state.Agent, state.Model)
 	}
@@ -591,6 +594,7 @@ func detachedWorkerStateFromOptions(name, mode, targetKind, targetID string, opt
 		SessionPath: paths.SessionPath,
 		StatePath:   paths.StatePath,
 		ClonePath:   strings.TrimSpace(*opts.dir),
+		PushRemote:  "",
 		WorkDir:     paths.WorkDir,
 	}
 }

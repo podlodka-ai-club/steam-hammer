@@ -54,6 +54,23 @@ The Python runner and Go CLI wrapper still do too much work.
         self.assertIn("`internal/cli/command_run.go`", prompt)
         self.assertIn("Compact issue context:", prompt)
 
+    def test_build_lightweight_prompt_adds_python_compatibility_adapter_focus_path(self) -> None:
+        issue = {
+            "number": 296,
+            "title": "Go migration: shrink Python compatibility adapter to removable boundary",
+            "url": "https://example.test/issues/296",
+            "body": """
+## Overview
+
+Go migration should own the critical runtime loops while the Python compatibility adapter is reduced to a removable boundary.
+""",
+        }
+
+        prompt = build_lightweight_prompt(issue)
+
+        self.assertIn("Focus paths:", prompt)
+        self.assertIn("`scripts/run_github_issues_to_opencode.py`", prompt)
+
     def test_main_lightweight_mode_skips_scope_and_state_comments_and_posts_summary(self) -> None:
         args = argparse.Namespace(
             repo="owner/repo",

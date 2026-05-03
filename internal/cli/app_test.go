@@ -23,6 +23,7 @@ type recordingRunner struct {
 	args  []string
 	calls int
 	cmds  [][]string
+	err   error
 }
 
 func (r *recordingRunner) Run(_ context.Context, name string, args ...string) error {
@@ -32,7 +33,7 @@ func (r *recordingRunner) Run(_ context.Context, name string, args ...string) er
 	r.args = append([]string(nil), args...)
 	r.calls++
 	r.cmds = append(r.cmds, append([]string{name}, args...))
-	return nil
+	return r.err
 }
 
 type failingRunner struct {
@@ -312,7 +313,7 @@ func TestHelpDoesNotInvokeRunner(t *testing.T) {
 }
 
 func TestDoctorCommandRunsGoNativeChecks(t *testing.T) {
-	runner := &recordingRunner{}
+	runner := &recordingRunner{err: os.ErrNotExist}
 	var out strings.Builder
 	app := NewApp(&out, &strings.Builder{})
 	app.SetRunner(runner)
@@ -330,7 +331,7 @@ func TestDoctorCommandRunsGoNativeChecks(t *testing.T) {
 }
 
 func TestAutoDoctorCommandIncludesNextStepGuidance(t *testing.T) {
-	runner := &recordingRunner{}
+	runner := &recordingRunner{err: os.ErrNotExist}
 	var out strings.Builder
 	app := NewApp(&out, &strings.Builder{})
 	app.SetRunner(runner)

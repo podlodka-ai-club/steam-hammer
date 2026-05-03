@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
@@ -105,8 +106,13 @@ func (a *App) runDoctor(ctx context.Context, args []string) int {
 			smokeStatus = "FAIL"
 			smokeDetail = fmt.Sprintf("%s CLI not found", runner)
 		} else {
-			smokeStatus = "PASS"
-			smokeDetail = "CLI invocation enabled"
+			if err := a.runDetachedWorkerSmokeValidation(ctx, dir); err != nil {
+				smokeStatus = "FAIL"
+				smokeDetail = err.Error()
+			} else {
+				smokeStatus = "PASS"
+				smokeDetail = "CLI invocation enabled; detached worker metadata smoke passed"
+			}
 		}
 	}
 	checks = append(checks, doctorCheck{Status: smokeStatus, Name: "Runner smoke check", Detail: smokeDetail})
@@ -130,6 +136,68 @@ func (a *App) runDoctor(ctx context.Context, args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func (a *App) runDetachedWorkerSmokeValidation(ctx context.Context, sourceDir string) error {
+	tempRoot, err := os.MkdirTemp("", "orchestrator-doctor-smoke-")
+	if err != nil {
+		return fmt.Errorf("detached worker smoke setup failed: %w", err)
+	}
+	defer os.RemoveAll(tempRoot)
+
+	workDir := filepath.Join(tempRoot, "repo")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return fmt.Errorf("detached worker smoke setup failed: %w", err)
+	}
+	if strings.TrimSpace(sourceDir) != "" {
+		workDir = sourceDir
+	}
+
+	paths, err := resolveDetachedWorkerPaths(tempRoot, workDir, "issue", "1")
+	if err != nil {
+		return fmt.Errorf("detached worker smoke path resolution failed: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.StatePath), 0o755); err != nil {
+		return fmt.Errorf("detached worker smoke setup failed: %w", err)
+	}
+	logBody := []byte("smoke log line\n")
+	if err := os.WriteFile(paths.LogPath, logBody, 0o644); err != nil {
+		return fmt.Errorf("detached worker smoke setup failed: %w", err)
+	}
+
+	state := detachedWorkerState{
+		Name:       "issue-1",
+		Mode:       "issue",
+		TargetKind: "issue",
+		TargetID:   "1",
+		Command:    []string{"orchestrator", "run", "issue", "--id", "1"},
+		StartedAt:  "2026-01-01T00:00:00Z",
+		PID:        os.Getpid(),
+		LogPath:    paths.LogPath,
+		StatePath:  paths.StatePath,
+		WorkDir:    workDir,
+	}
+	if err := writeDetachedWorkerState(state); err != nil {
+		return fmt.Errorf("detached worker smoke setup failed: %w", err)
+	}
+
+	report, err := a.detachedWorkerReportFromStateFileWithBatch(ctx, paths.StatePath, false)
+	if err != nil {
+		return fmt.Errorf("detached worker smoke status read failed: %w", err)
+	}
+	if report.Worker.Name != state.Name || report.Worker.TargetKind != state.TargetKind || report.Worker.TargetID != state.TargetID {
+		return errors.New("detached worker smoke ownership metadata mismatch")
+	}
+	if strings.TrimSpace(report.ProcessStatus) == "" {
+		return errors.New("detached worker smoke missing process status metadata")
+	}
+	if report.Log.Lines < 1 {
+		return errors.New("detached worker smoke missing log status metadata")
+	}
+	if strings.TrimSpace(report.Next) == "" {
+		return errors.New("detached worker smoke missing next action metadata")
+	}
+	return nil
 }
 
 func (a *App) runAutoDoctor(ctx context.Context, args []string) int {

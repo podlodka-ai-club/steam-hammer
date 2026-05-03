@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -342,6 +343,26 @@ func TestAutoDoctorCommandIncludesNextStepGuidance(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Autodoctor next steps:") {
 		t.Fatalf("stdout = %q, want next-step guidance", out.String())
+	}
+}
+
+func TestDoctorSmokeCheckValidatesDetachedWorkerMetadata(t *testing.T) {
+	targetDir := t.TempDir()
+	if err := exec.Command("git", "init", "-q", targetDir).Run(); err != nil {
+		t.Fatalf("git init error = %v", err)
+	}
+
+	runner := &recordingRunner{}
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"doctor", "--repo", "owner/repo", "--dir", targetDir, "--doctor-smoke-check"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0\noutput:\n%s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "[PASS] Runner smoke check: CLI invocation enabled; detached worker metadata smoke passed") {
+		t.Fatalf("stdout = %q, want detached worker smoke pass detail", out.String())
 	}
 }
 

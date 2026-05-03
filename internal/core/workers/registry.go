@@ -29,6 +29,7 @@ type State struct {
 	SessionPath string         `json:"session_path,omitempty"`
 	StatePath   string         `json:"state_path"`
 	ClonePath   string         `json:"clone_path,omitempty"`
+	PushRemote  string         `json:"push_remote,omitempty"`
 	WorkDir     string         `json:"work_dir"`
 	Batch       *BatchMetadata `json:"batch,omitempty"`
 }

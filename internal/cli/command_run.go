@@ -1071,6 +1071,16 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 				workerPaths,
 			)
 			state.WorkDir = clonePath
+			pushRemote, err := detachedClonePushRemote(clonePath)
+			if err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker push remote for %s: %v\n", workerLabel, err)
+				if *stopOnError {
+					return 1
+				}
+				lastCode = 1
+				continue
+			}
+			state.PushRemote = pushRemote
 			if _, code := a.startDetachedWorkerState(state); code != 0 {
 				if *stopOnError {
 					return code
@@ -1293,6 +1303,16 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 				workerPaths,
 			)
 			state.WorkDir = clonePath
+			pushRemote, err := detachedClonePushRemote(clonePath)
+			if err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker push remote for issue %d: %v\n", id, err)
+				if *stopOnError {
+					return 1
+				}
+				lastCode = 1
+				continue
+			}
+			state.PushRemote = pushRemote
 			startedState, code := a.startDetachedWorkerState(state)
 			if code != 0 {
 				if *stopOnError {
@@ -1453,6 +1473,29 @@ func (a *App) prepareDetachedWorkerClone(configuredDir string, workerPaths detac
 	}
 	clonePath := filepath.Join(filepath.Dir(workerPaths.StatePath), "repo")
 	return a.clone.Prepare(sourceDir, clonePath)
+}
+
+func detachedClonePushRemote(clonePath string) (string, error) {
+	remote, err := gitOutput(clonePath, "config", "--get", "remote.origin.url")
+	if err != nil {
+		configPath := filepath.Join(clonePath, ".git", "config")
+		data, readErr := os.ReadFile(configPath)
+		if readErr != nil {
+			return "", err
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "url =") {
+				remote = strings.TrimSpace(strings.TrimPrefix(trimmed, "url ="))
+				break
+			}
+		}
+	}
+	trimmed := strings.TrimSpace(remote)
+	if trimmed == "" {
+		return "", fmt.Errorf("remote.origin.url is empty")
+	}
+	return trimmed, nil
 }
 
 func (a *App) runPR(ctx context.Context, args []string) int {

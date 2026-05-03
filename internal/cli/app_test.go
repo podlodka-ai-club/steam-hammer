@@ -254,6 +254,14 @@ func (r *recordingBatchClonePreparer) Prepare(sourceDir, targetDir string) (stri
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		return "", err
 	}
+	gitDir := filepath.Join(targetDir, ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		return "", err
+	}
+	config := "[remote \"origin\"]\n\turl = https://github.com/owner/repo.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+	if err := os.WriteFile(filepath.Join(gitDir, "config"), []byte(config), 0o644); err != nil {
+		return "", err
+	}
 	return targetDir, nil
 }
 
@@ -1527,6 +1535,9 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 		if state.WorkDir != wantClonePath {
 			t.Fatalf("work dir = %q, want %q", state.WorkDir, wantClonePath)
 		}
+		if state.PushRemote != "https://github.com/owner/repo.git" {
+			t.Fatalf("push remote = %q, want https://github.com/owner/repo.git", state.PushRemote)
+		}
 	}
 	printed := out.String()
 	for _, want := range []string{"started detached worker issue-71", "started detached worker issue-72"} {
@@ -1826,6 +1837,9 @@ func TestRunDaemonDetachStartsOneWorkerPerParallelTask(t *testing.T) {
 		}
 		if state.WorkDir != wantClonePath {
 			t.Fatalf("work dir = %q, want %q", state.WorkDir, wantClonePath)
+		}
+		if state.PushRemote != "https://github.com/owner/repo.git" {
+			t.Fatalf("push remote = %q, want https://github.com/owner/repo.git", state.PushRemote)
 		}
 		wantSessionPath := filepath.Join(workerDir, "session.json")
 		if got := flagValue(state.Command[1:], "--autonomous-session-file"); got != wantSessionPath {
@@ -2427,6 +2441,7 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 		LogPath:    logPath,
 		StatePath:  statePath,
 		ClonePath:  targetDir,
+		PushRemote: "https://github.com/owner/repo.git",
 		WorkDir:    targetDir,
 	}
 	if err := os.WriteFile(logPath, []byte("line 1\nline 2\n"), 0o644); err != nil {
@@ -2448,6 +2463,7 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 		"target: issue #71",
 		"process: running",
 		"clone: " + targetDir,
+		"push-remote: https://github.com/owner/repo.git",
 		"agent: runner=opencode agent=build model=openai/gpt-4o",
 		"log-progress: lines=2",
 		"log-freshness: updated ",
@@ -2706,6 +2722,7 @@ func TestStatusWorkersJSONListsRegistryEntries(t *testing.T) {
 		SessionPath: sessionPath,
 		StatePath:   statePath,
 		ClonePath:   targetDir,
+		PushRemote:  "https://github.com/owner/repo.git",
 		WorkDir:     targetDir,
 	}); err != nil {
 		t.Fatalf("workers.WriteState() error = %v", err)
@@ -2735,6 +2752,9 @@ func TestStatusWorkersJSONListsRegistryEntries(t *testing.T) {
 	}
 	if worker.Worker.ClonePath != targetDir {
 		t.Fatalf("worker clone path = %q, want %q", worker.Worker.ClonePath, targetDir)
+	}
+	if worker.Worker.PushRemote != "https://github.com/owner/repo.git" {
+		t.Fatalf("worker push remote = %q, want https://github.com/owner/repo.git", worker.Worker.PushRemote)
 	}
 	if worker.ProcessStatus != "exited" {
 		t.Fatalf("process status = %q, want exited", worker.ProcessStatus)

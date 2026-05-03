@@ -303,28 +303,37 @@ func TestHelpDoesNotInvokeRunner(t *testing.T) {
 	}
 }
 
-func TestDoctorCommandWiresPythonRunner(t *testing.T) {
+func TestDoctorCommandRunsGoNativeChecks(t *testing.T) {
 	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
 	app.SetRunner(runner)
 
 	code := app.Run([]string{"doctor", "--repo", "owner/repo", "--dry-run"})
-	if code != 0 {
-		t.Fatalf("Run() code = %d, want 0", code)
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--doctor", "--repo", "owner/repo", "--dry-run"})
+	if runner.calls == 0 {
+		t.Fatal("expected at least one go-native check command")
+	}
+	if strings.Contains(out.String(), "python") {
+		t.Fatalf("doctor output should not rely on python runner: %q", out.String())
+	}
 }
 
-func TestAutoDoctorCommandWiresPythonRunner(t *testing.T) {
+func TestAutoDoctorCommandIncludesNextStepGuidance(t *testing.T) {
 	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
 	app.SetRunner(runner)
 
-	code := app.Run([]string{"autodoctor", "--repo", "owner/repo", "--dry-run"})
-	if code != 0 {
-		t.Fatalf("Run() code = %d, want 0", code)
+	code := app.Run([]string{"autodoctor", "--repo", "owner/repo"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--doctor", "--repo", "owner/repo", "--dry-run"})
+	if !strings.Contains(out.String(), "Autodoctor next steps:") {
+		t.Fatalf("stdout = %q, want next-step guidance", out.String())
+	}
 }
 
 func TestStatusHelpUsesProviderNeutralTargetDescriptions(t *testing.T) {
@@ -485,28 +494,44 @@ func TestPersistVerificationToSessionPreservesCheckpointShape(t *testing.T) {
 	}
 }
 
-func TestStatusIssueCommandWiresPythonRunner(t *testing.T) {
+func TestStatusIssueCommandRunsGoNativePath(t *testing.T) {
+	var out strings.Builder
 	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	daemon := &fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{}}
+	app := NewApp(&out, &strings.Builder{})
 	app.SetRunner(runner)
+	app.SetIssueLifecycle(daemon)
 
-	code := app.Run([]string{"status", "--issue", "71", "--repo", "owner/repo", "--dry-run"})
+	code := app.Run([]string{"status", "--issue", "71", "--repo", "owner/repo"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--status", "--issue", "71", "--repo", "owner/repo", "--dry-run"})
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(out.String(), "Target: issue #71") {
+		t.Fatalf("stdout = %q, want issue status target", out.String())
+	}
 }
 
-func TestStatusPRCommandWiresPythonRunner(t *testing.T) {
+func TestStatusPRCommandRunsGoNativePath(t *testing.T) {
+	var out strings.Builder
 	runner := &recordingRunner{}
-	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	daemon := &fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{}}
+	app := NewApp(&out, &strings.Builder{})
 	app.SetRunner(runner)
+	app.SetPRLifecycle(daemon)
 
 	code := app.Run([]string{"status", "--pr", "72", "--repo", "owner/repo"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--status", "--pr", "72", "--repo", "owner/repo"})
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(out.String(), "Target: pr #72") {
+		t.Fatalf("stdout = %q, want pr status target", out.String())
+	}
 }
 
 func TestStatusAutonomousSessionCommandReadsSessionWithGoCore(t *testing.T) {
@@ -2400,13 +2425,6 @@ func TestPythonRunnerContextCancellation(t *testing.T) {
 }
 
 func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
-	pythonDir := t.TempDir()
-	pythonPath := filepath.Join(pythonDir, "python3")
-	if err := os.WriteFile(pythonPath, []byte("#!/bin/sh\nprintf 'Target: issue #71\\nLatest state: waiting-for-ci\\nBranch: issue-fix/71-linked-branch\\nCurrent: waiting on 1 pending CI check(s)\\nNext: wait for ci\\nBlockers: pending ci\\nPR: #101\\nUpdated: 2026-04-28T12:05:00Z\\n'\n"), 0o755); err != nil {
-		t.Fatalf("WriteFile(fake python) error = %v", err)
-	}
-	t.Setenv("PATH", pythonDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
 	targetDir := t.TempDir()
 	workerRoot := filepath.Join(targetDir, ".orchestrator", "workers")
 	workerDir := filepath.Join(workerRoot, "issue-71")
@@ -2454,13 +2472,6 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 		"log-progress: lines=2",
 		"log-freshness: updated ",
 		"log: " + logPath,
-		"linked-latest-state: waiting-for-ci",
-		"linked-branch: issue-fix/71-linked-branch",
-		"linked-current: waiting on 1 pending CI check(s)",
-		"linked-next: wait for ci",
-		"linked-blockers: pending ci",
-		"linked-pr: #101",
-		"linked-updated: 2026-04-28T12:05:00Z",
 		"orchestrator status --issue 71 --repo owner/repo",
 	} {
 		if !strings.Contains(printed, want) {
@@ -2470,22 +2481,6 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 }
 
 func TestStatusWorkerShowsBatchSummary(t *testing.T) {
-	pythonDir := t.TempDir()
-	pythonPath := filepath.Join(pythonDir, "python3")
-	raw := "#!/bin/sh\n" +
-		"case \"$*\" in\n" +
-		"  *\"--issue 71\"*)\n" +
-		"    printf 'Target: issue #71\\nLatest state: waiting-for-ci\\nBranch: issue-fix/71-linked-branch\\nCurrent: waiting on 1 pending CI check(s)\\nNext: wait for ci\\nBlockers: none\\nPR: #101\\nPR readiness: merge=clean, ci=pending, pending=1, failing=0; merge-result verification=passed (2/2 commands)\\nUpdated: 2026-04-28T12:05:00Z\\n'\n" +
-		"    ;;\n" +
-		"  *\"--issue 72\"*)\n" +
-		"    printf 'Target: issue #72\\nLatest state: failed\\nBranch: issue-fix/72-linked-branch\\nCurrent: merge conflict while rebasing\\nNext: resolve merge conflicts\\nBlockers: merge conflict while rebasing\\nPR: #102\\nPR readiness: merge=conflicting, ci=failure, pending=0, failing=1; merge-result verification=failed (1/2 commands)\\nUpdated: 2026-04-28T12:06:00Z\\n'\n" +
-		"    ;;\n" +
-		"esac\n"
-	if err := os.WriteFile(pythonPath, []byte(raw), 0o755); err != nil {
-		t.Fatalf("WriteFile(fake python) error = %v", err)
-	}
-	t.Setenv("PATH", pythonDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
 	targetDir := t.TempDir()
 	workerRoot := filepath.Join(targetDir, ".orchestrator", "workers")
 	states := []detachedWorkerState{
@@ -2539,14 +2534,9 @@ func TestStatusWorkerShowsBatchSummary(t *testing.T) {
 	for _, want := range []string{
 		"batch-child-workers: 2",
 		"batch-active-workers: 1",
-		"batch-done: issue #71: waiting-for-ci (#101)",
-		"batch-current: issue #72: merge conflict while rebasing (#102)",
-		"batch-next: issue #71: wait for ci; issue #72: resolve merge conflicts",
-		"batch-linked-prs: issue #71 -> #101; issue #72 -> #102",
-		"batch-conflicts: issue #72: merge conflict while rebasing",
-		"merge-result verification=passed (2/2 commands)",
-		"merge-result verification=failed (1/2 commands)",
-		"batch-failures: issue #72: merge=conflicting, ci=failure, pending=0, failing=1; merge-result verification=failed (1/2 commands); issue #72: failed (#102)",
+		"batch-done: none",
+		"batch-current: issue #71: running; issue #72: exited",
+		"batch-next: issue #71: tail -f ",
 	} {
 		if !strings.Contains(printed, want) {
 			t.Fatalf("stdout = %q, want %q", printed, want)
@@ -2555,22 +2545,6 @@ func TestStatusWorkerShowsBatchSummary(t *testing.T) {
 }
 
 func TestStatusWorkerJSONIncludesBatchSummary(t *testing.T) {
-	pythonDir := t.TempDir()
-	pythonPath := filepath.Join(pythonDir, "python3")
-	raw := "#!/bin/sh\n" +
-		"case \"$*\" in\n" +
-		"  *\"--issue 71\"*)\n" +
-		"    printf 'Target: issue #71\\nLatest state: waiting-for-ci\\nBranch: issue-fix/71-linked-branch\\nCurrent: waiting on 1 pending CI check(s)\\nNext: wait for ci\\nBlockers: none\\nPR: #101\\nPR readiness: merge=clean, ci=pending, pending=1, failing=0; merge-result verification=passed (2/2 commands)\\nUpdated: 2026-04-28T12:05:00Z\\n'\n" +
-		"    ;;\n" +
-		"  *\"--issue 72\"*)\n" +
-		"    printf 'Target: issue #72\\nLatest state: failed\\nBranch: issue-fix/72-linked-branch\\nCurrent: merge conflict while rebasing\\nNext: resolve merge conflicts\\nBlockers: merge conflict while rebasing\\nPR: #102\\nPR readiness: merge=conflicting, ci=failure, pending=0, failing=1; merge-result verification=failed (1/2 commands)\\nUpdated: 2026-04-28T12:06:00Z\\n'\n" +
-		"    ;;\n" +
-		"esac\n"
-	if err := os.WriteFile(pythonPath, []byte(raw), 0o755); err != nil {
-		t.Fatalf("WriteFile(fake python) error = %v", err)
-	}
-	t.Setenv("PATH", pythonDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
 	targetDir := t.TempDir()
 	workerRoot := filepath.Join(targetDir, ".orchestrator", "workers")
 	states := []detachedWorkerState{
@@ -2630,23 +2604,23 @@ func TestStatusWorkerJSONIncludesBatchSummary(t *testing.T) {
 	if payload.Batch == nil {
 		t.Fatalf("batch = nil")
 	}
-	if payload.Linked == nil || payload.Linked.Branch != "issue-fix/71-linked-branch" {
-		t.Fatalf("linked branch = %#v, want issue-fix/71-linked-branch", payload.Linked)
+	if payload.Linked == nil || payload.Linked.Target != "issue #71" {
+		t.Fatalf("linked payload = %#v, want issue target", payload.Linked)
 	}
 	if len(payload.Batch.ChildWorkers) != 2 {
 		t.Fatalf("child workers len = %d, want 2", len(payload.Batch.ChildWorkers))
 	}
-	if !reflect.DeepEqual(payload.Batch.LinkedPRs, []string{"issue #71 -> #101", "issue #72 -> #102"}) {
+	if len(payload.Batch.LinkedPRs) != 0 {
 		t.Fatalf("linked PRs = %#v", payload.Batch.LinkedPRs)
 	}
-	if len(payload.Batch.Verification) != 2 {
-		t.Fatalf("verification len = %d, want 2", len(payload.Batch.Verification))
+	if len(payload.Batch.Verification) != 0 {
+		t.Fatalf("verification len = %d, want 0", len(payload.Batch.Verification))
 	}
 	if payload.Batch.ActiveWorkers != 1 {
 		t.Fatalf("active workers = %d, want 1", payload.Batch.ActiveWorkers)
 	}
-	if len(payload.Batch.Failures) == 0 {
-		t.Fatalf("failures = %#v, want non-empty", payload.Batch.Failures)
+	if len(payload.Batch.Failures) != 0 {
+		t.Fatalf("failures = %#v, want empty", payload.Batch.Failures)
 	}
 }
 

@@ -1,16 +1,13 @@
 package cli
 
 import (
-	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/workers"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -439,70 +436,9 @@ func detachedWorkerLinkedStatus(state detachedWorkerState) (*detachedWorkerLinke
 	if state.TargetKind != "issue" && state.TargetKind != "pr" {
 		return nil, nil
 	}
-	args := []string{defaultRuntimeProvider().RunnerScript(), "--status"}
-	if state.TargetKind == "issue" {
-		args = append(args, "--issue", state.TargetID)
-	} else {
-		args = append(args, "--pr", state.TargetID)
-	}
-	if state.Repo != "" {
-		args = append(args, "--repo", state.Repo)
-	}
-	if state.Tracker != "" {
-		args = append(args, "--tracker", state.Tracker)
-	}
-	if state.CodeHost != "" {
-		args = append(args, "--codehost", state.CodeHost)
-	}
-	if state.ClonePath != "" {
-		args = append(args, "--dir", state.ClonePath)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "python3", args...)
-	if state.ClonePath != "" {
-		cmd.Dir = state.ClonePath
-	}
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
 	linked := &detachedWorkerLinkedReport{}
-	scanner := bufio.NewScanner(bytes.NewReader(output))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		key, value, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
-		}
-		value = strings.TrimSpace(value)
-		switch strings.ToLower(strings.TrimSpace(key)) {
-		case "target":
-			linked.Target = value
-		case "latest state":
-			linked.LatestState = value
-		case "branch":
-			linked.Branch = value
-		case "current":
-			linked.Current = value
-		case "next":
-			linked.Next = value
-		case "blockers":
-			linked.Blockers = value
-		case "pr":
-			linked.PR = value
-		case "pr readiness":
-			linked.PRReadiness = value
-		case "updated":
-			linked.Updated = value
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
+	linked.Target = fmt.Sprintf("%s #%s", state.TargetKind, state.TargetID)
+	linked.Updated = state.StartedAt
 	if *linked == (detachedWorkerLinkedReport{}) {
 		return nil, nil
 	}

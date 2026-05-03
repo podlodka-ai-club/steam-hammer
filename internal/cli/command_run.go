@@ -447,6 +447,7 @@ type daemonParallelConfig struct {
 	detach               bool
 	workerDir            string
 	sessionPath          string
+	retryPolicy          orchestration.DaemonRetryPolicy
 	effectiveMaxCycles   int
 	pollIntervalSeconds  int
 }
@@ -572,7 +573,7 @@ func (a *App) buildBatchWorkerLaunchCommand(ctx context.Context, opts commonOpti
 }
 
 func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfig, handled daemonHandledState) ([]daemonSelectedIssue, error) {
-	issues, err := a.daemon.ListIssues(ctx, strings.TrimSpace(*config.opts.repo), config.state, config.limit)
+	issues, err := a.daemon.ListIssues(ctx, strings.TrimSpace(*config.opts.repo), config.state, daemonCandidateScanLimit(config))
 	if err != nil {
 		return nil, err
 	}
@@ -624,6 +625,11 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 		if latestState != nil {
 			snapshot.LatestStateStatus = latestState.Status
 			snapshot.LatestStateTaskType = latestState.Payload.TaskType
+			snapshot.LatestStateAttempt = latestState.Payload.Attempt
+			snapshot.LatestStateTimestamp = daemonStateTimestamp(latestState.Payload.Timestamp, latestState.CreatedAt)
+		}
+		for _, label := range issue.Labels {
+			snapshot.FailureLabels = append(snapshot.FailureLabels, label.Name)
 		}
 		if latestClaim != nil {
 			snapshot.LatestClaim = latestClaim.Payload
@@ -636,7 +642,7 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 			return nil, err
 		}
 		snapshot.OpenDependencyRefs = openDependencies
-		decision := orchestration.EvaluateDaemonTaskSelection(snapshot, now)
+		decision := orchestration.EvaluateDaemonTaskSelection(snapshot, now, config.retryPolicy)
 		if !decision.Eligible {
 			if decision.Reason != "" {
 				_, _ = fmt.Fprintf(a.err, "orchestrator: skipping issue #%d: %s\n", issue.Number, decision.Reason)
@@ -651,6 +657,33 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 		seen[issue.Number] = struct{}{}
 	}
 	return selected, nil
+}
+
+func daemonCandidateScanLimit(config daemonParallelConfig) int {
+	limit := config.limit
+	if config.retryPolicy.MaxAttempts > 0 || config.retryPolicy.Backoff > 0 {
+		if limit < 100 {
+			limit = 100
+		}
+	}
+	if limit < config.maxParallelTasks {
+		limit = config.maxParallelTasks
+	}
+	return limit
+}
+
+func daemonStateTimestamp(values ...string) time.Time {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err == nil {
+			return parsed.UTC()
+		}
+	}
+	return time.Time{}
 }
 
 func (a *App) openDaemonIssueDependencies(ctx context.Context, repo string, issue corelifecycle.Issue, comments []corelifecycle.IssueComment) ([]string, error) {
@@ -1211,6 +1244,11 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
 		return 1
 	}
+	retryPolicy, err := loadNativeDaemonRetryPolicy(*opts.dir, *opts.project, *opts.maxTry)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+		return 1
+	}
 	effectiveMaxCycles := *maxCycles
 	if *opts.dryRun && effectiveMaxCycles == 0 {
 		effectiveMaxCycles = 1
@@ -1373,6 +1411,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 			createFollowupIssue:  *createFollowupIssue,
 			workerDir:            *workerDir,
 			sessionPath:          sessionPath,
+			retryPolicy:          retryPolicy,
 			effectiveMaxCycles:   effectiveMaxCycles,
 			pollIntervalSeconds:  *pollIntervalSeconds,
 		})
@@ -1401,6 +1440,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		createFollowupIssue:  *createFollowupIssue,
 		workerDir:            *workerDir,
 		sessionPath:          sessionPath,
+		retryPolicy:          retryPolicy,
 		effectiveMaxCycles:   effectiveMaxCycles,
 		pollIntervalSeconds:  *pollIntervalSeconds,
 	})

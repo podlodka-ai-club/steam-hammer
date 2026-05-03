@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 )
 
 var nativePresetTierOrder = []string{"cheap", "default", "hard"}
@@ -59,6 +62,23 @@ func loadNativeProjectConfig(cwd, explicitPath string) (map[string]any, error) {
 		return nil, fmt.Errorf("failed to parse project config %s: %w", path, err)
 	}
 	return projectConfig, nil
+}
+
+func loadNativeDaemonRetryPolicy(cwd, explicitPath string, maxAttempts int) (orchestration.DaemonRetryPolicy, error) {
+	projectConfig, err := loadNativeProjectConfig(cwd, explicitPath)
+	if err != nil {
+		return orchestration.DaemonRetryPolicy{}, err
+	}
+	policy := orchestration.DaemonRetryPolicy{MaxAttempts: maxAttempts}
+	retry, _ := projectConfig["retry"].(map[string]any)
+	if len(retry) == 0 {
+		return policy, nil
+	}
+	if policy.MaxAttempts <= 0 {
+		policy.MaxAttempts = positiveConfigInt(retry["max_attempts"])
+	}
+	policy.Backoff = retryBackoffDuration(retry)
+	return policy, nil
 }
 
 func nativeProjectCLIDefaults(projectConfig map[string]any) map[string]any {
@@ -203,4 +223,34 @@ func positiveConfigInt(value any) int {
 		}
 	}
 	return 0
+}
+
+func retryBackoffDuration(retry map[string]any) time.Duration {
+	for _, key := range []string{"backoff", "backoff_duration"} {
+		if duration := optionalConfigDuration(retry[key]); duration > 0 {
+			return duration
+		}
+	}
+	if seconds := positiveConfigInt(retry["backoff_seconds"]); seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if seconds := positiveConfigInt(retry["initial_backoff_seconds"]); seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if minutes := positiveConfigInt(retry["backoff_minutes"]); minutes > 0 {
+		return time.Duration(minutes) * time.Minute
+	}
+	return 0
+}
+
+func optionalConfigDuration(value any) time.Duration {
+	text := optionalConfigString(value)
+	if text == "" {
+		return 0
+	}
+	duration, err := time.ParseDuration(text)
+	if err != nil || duration <= 0 {
+		return 0
+	}
+	return duration
 }

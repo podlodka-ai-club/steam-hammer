@@ -36,6 +36,7 @@ func applyNativeProjectConfigDefaults(opts *commonOptions, fs flagState) error {
 		}
 		applyNativeCommonDefaults(opts, fs, presetDefaults)
 	}
+	applyNativeGroomingDefaults(opts, fs, projectConfig)
 	applyNativeBudgetCaps(opts, projectConfig)
 	return nil
 }
@@ -111,6 +112,18 @@ func applyNativeCommonDefaults(opts *commonOptions, fs flagState, defaults map[s
 	setIntDefault(opts.idleTime, fs, "agent-idle-timeout-seconds", defaults["agent_idle_timeout_seconds"])
 }
 
+func applyNativeGroomingDefaults(opts *commonOptions, fs flagState, projectConfig map[string]any) {
+	grooming, _ := projectConfig["grooming"].(map[string]any)
+	if len(grooming) == 0 {
+		return
+	}
+	setStringDefault(opts.groomingMode, fs, "grooming-mode", grooming["mode"])
+	setBoolDefault(opts.groomingRequirePlanApproval, fs, "grooming-require-plan-approval", grooming["require_plan_approval"])
+	setBoolDefault(opts.groomingAskQuestions, fs, "grooming-ask-questions", grooming["ask_questions"])
+	setBoolDefault(opts.groomingAutoContinueAfterPlan, fs, "grooming-auto-continue-after-plan", grooming["auto_continue_after_plan"])
+	setIntDefault(opts.groomingMaxRounds, fs, "grooming-max-rounds", firstPresent(grooming, "max_rounds", "max_questions"))
+}
+
 func applyNativeBudgetCaps(opts *commonOptions, projectConfig map[string]any) {
 	budgets, _ := projectConfig["budgets"].(map[string]any)
 	if len(budgets) == 0 {
@@ -181,6 +194,34 @@ func setIntDefault(target *int, fs flagState, name string, value any) {
 	if normalized := positiveConfigInt(value); normalized > 0 {
 		*target = normalized
 	}
+}
+
+func setBoolDefault(target *bool, fs flagState, name string, value any) {
+	if target == nil || (fs != nil && fs.wasPassed(name)) {
+		return
+	}
+	normalized, ok := optionalConfigBool(value)
+	if !ok {
+		return
+	}
+	*target = normalized
+}
+
+func optionalConfigBool(value any) (bool, bool) {
+	typed, ok := value.(bool)
+	if !ok {
+		return false, false
+	}
+	return typed, true
+}
+
+func firstPresent(values map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := values[key]; ok {
+			return value
+		}
+	}
+	return nil
 }
 
 func optionalConfigString(value any) string {

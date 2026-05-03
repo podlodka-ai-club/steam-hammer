@@ -75,6 +75,9 @@ func nativeIssueFallbackReason(opts nativeIssueOptions) string {
 	if codehost := strings.TrimSpace(*opts.common.codehost); codehost != "" && !strings.EqualFold(codehost, lifecycle.CodeHostGitHub) {
 		return "native issue flow currently supports only the GitHub code host"
 	}
+	if groomingMode := strings.ToLower(strings.TrimSpace(*opts.common.groomingMode)); groomingMode != "" && groomingMode != "off" {
+		return "grooming mode is not supported by the Go-native issue path yet"
+	}
 	return ""
 }
 

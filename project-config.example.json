@@ -92,5 +92,12 @@
   },
   "communication": {
     "verbosity": "normal"
+  },
+  "grooming": {
+    "mode": "off",
+    "require_plan_approval": false,
+    "ask_questions": true,
+    "auto_continue_after_plan": true,
+    "max_rounds": 2
   }
 }

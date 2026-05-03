@@ -8,24 +8,29 @@ import (
 )
 
 type commonOptions struct {
-	mode        *string
-	lightweight *bool
-	repo        *string
-	tracker     *string
-	codehost    *string
-	dir         *string
-	runner      *string
-	agent       *string
-	model       *string
-	preset      *string
-	autoYes     *bool
-	branch      *string
-	dryRun      *bool
-	local       *string
-	project     *string
-	maxTry      *int
-	timeout     *int
-	idleTime    *int
+	mode                          *string
+	lightweight                   *bool
+	repo                          *string
+	tracker                       *string
+	codehost                      *string
+	dir                           *string
+	runner                        *string
+	agent                         *string
+	model                         *string
+	preset                        *string
+	autoYes                       *bool
+	branch                        *string
+	dryRun                        *bool
+	local                         *string
+	project                       *string
+	maxTry                        *int
+	timeout                       *int
+	idleTime                      *int
+	groomingMode                  *string
+	groomingRequirePlanApproval   *bool
+	groomingAskQuestions          *bool
+	groomingAutoContinueAfterPlan *bool
+	groomingMaxRounds             *int
 }
 
 func addCommonFlags(fs *flag.FlagSet, opts *commonOptions, runtime runtimeProvider) {
@@ -47,6 +52,11 @@ func addCommonFlags(fs *flag.FlagSet, opts *commonOptions, runtime runtimeProvid
 	opts.maxTry = fs.Int("max-attempts", 0, "retry policy placeholder maximum")
 	opts.timeout = fs.Int("agent-timeout-seconds", 0, "hard timeout for agent execution in seconds")
 	opts.idleTime = fs.Int("agent-idle-timeout-seconds", 0, "abort if agent produces no output for this many seconds")
+	opts.groomingMode = fs.String("grooming-mode", "", "grooming/planning mode: off, auto, or always")
+	opts.groomingRequirePlanApproval = fs.Bool("grooming-require-plan-approval", false, "require plan approval before implementation")
+	opts.groomingAskQuestions = fs.Bool("grooming-ask-questions", false, "allow grooming clarification questions")
+	opts.groomingAutoContinueAfterPlan = fs.Bool("grooming-auto-continue-after-plan", false, "continue automatically after posting grooming plan")
+	opts.groomingMaxRounds = fs.Int("grooming-max-rounds", 0, "maximum grooming clarification rounds")
 }
 
 func appendCommonPythonArgs(args []string, opts commonOptions) []string {
@@ -102,6 +112,21 @@ func appendCommonPythonArgs(args []string, opts commonOptions) []string {
 	}
 	if *opts.idleTime > 0 {
 		args = append(args, "--agent-idle-timeout-seconds", strconv.Itoa(*opts.idleTime))
+	}
+	if *opts.groomingMode != "" {
+		args = append(args, "--grooming-mode", *opts.groomingMode)
+	}
+	if *opts.groomingRequirePlanApproval {
+		args = append(args, "--grooming-require-plan-approval")
+	}
+	if *opts.groomingAskQuestions {
+		args = append(args, "--grooming-ask-questions")
+	}
+	if *opts.groomingAutoContinueAfterPlan {
+		args = append(args, "--grooming-auto-continue-after-plan")
+	}
+	if *opts.groomingMaxRounds > 0 {
+		args = append(args, "--grooming-max-rounds", strconv.Itoa(*opts.groomingMaxRounds))
 	}
 	return args
 }

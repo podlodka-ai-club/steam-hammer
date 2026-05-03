@@ -1761,6 +1761,62 @@ func TestRunIssueCommandForwardsLightweightFlag(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--issue", "20", "--lightweight"})
 }
 
+func TestRunIssueCommandForwardsGroomingFlags(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{
+		"run", "issue",
+		"--id", "20",
+		"--grooming-mode", "always",
+		"--grooming-require-plan-approval",
+		"--grooming-ask-questions",
+		"--grooming-auto-continue-after-plan",
+		"--grooming-max-rounds", "3",
+	})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	assertCommand(t, runner, []string{
+		runnerScript, "--issue", "20",
+		"--grooming-mode", "always",
+		"--grooming-require-plan-approval",
+		"--grooming-ask-questions",
+		"--grooming-auto-continue-after-plan",
+		"--grooming-max-rounds", "3",
+	})
+}
+
+func TestRunIssueProjectConfigAppliesGroomingDefaults(t *testing.T) {
+	runner := &recordingRunner{}
+	targetDir := t.TempDir()
+	projectConfig := `{"grooming":{"mode":"auto","require_plan_approval":true,"ask_questions":true,"auto_continue_after_plan":true,"max_questions":4}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
+
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	code := app.Run([]string{"run", "issue", "--id", "20", "--project-config", "project.json", "--dir", targetDir})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+
+	joined := strings.Join(append([]string{runner.name}, runner.args...), " ")
+	for _, want := range []string{
+		"--grooming-mode auto",
+		"--grooming-require-plan-approval",
+		"--grooming-ask-questions",
+		"--grooming-auto-continue-after-plan",
+		"--grooming-max-rounds 4",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("runner command = %q, want %q", joined, want)
+		}
+	}
+}
+
 func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})

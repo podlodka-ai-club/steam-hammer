@@ -129,7 +129,13 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 	}
 	if decision.Mode != orchestration.ExecutionModeIssueFlow {
 		if decision.Mode == orchestration.ExecutionModePRReview && linkedPR != nil {
-			_, _ = fmt.Fprintf(a.err, "orchestrator: routing issue #%d to pr review compatibility adapter: %s\n", issue.Number, decision.Reason)
+			_, _ = fmt.Fprintf(a.err, "orchestrator: routing issue #%d to pr review flow: %s\n", issue.Number, decision.Reason)
+			if code, ok := a.tryRunNativePR(ctx, nativePROptions{
+				prID:   linkedPR.Number,
+				common: opts.common,
+			}); ok {
+				return code
+			}
 			return a.runPython(ctx, buildPRPythonArgs(
 				a.runtime.RunnerScript(),
 				opts.common,

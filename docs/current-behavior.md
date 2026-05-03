@@ -87,7 +87,7 @@
 - daemon issue selection, claim/release comments, session checkpoint wiring и detached worker preparation;
 - detached worker registry/status surfaces и post-batch verification.
 - Python compatibility adapter:
-- `run pr` fallback paths, которые еще не перенесены в Go: `--dry-run`, `--isolate-worktree`, `--detach`, `--post-pr-summary`, follow-up branch mode и conflict-recovery/sync-only варианты;
+- `run pr` fallback paths, которые еще не перенесены в Go: `--post-pr-summary`, follow-up branch mode и `--sync-strategy` вне `--conflict-recovery-only`;
 - `doctor`, `autodoctor`, `status` и другие еще не перенесенные CLI compatibility surfaces;
 - batch/daemon worker execution paths, которые все еще запускаются через script adapter;
 - issue-path blockers, еще не реализованные в Go: linked PR reuse internals beyond adapter routing и dedicated conflict-recovery-only runtime.

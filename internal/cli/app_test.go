@@ -320,7 +320,8 @@ func TestHelpDoesNotInvokeRunner(t *testing.T) {
 func TestDoctorCommandRunsGoNativeChecks(t *testing.T) {
 	runner := &recordingRunner{err: os.ErrNotExist}
 	var out strings.Builder
-	app := NewApp(&out, &strings.Builder{})
+	var errOut strings.Builder
+	app := NewApp(&out, &errOut)
 	app.SetRunner(runner)
 
 	code := app.Run([]string{"doctor", "--repo", "owner/repo", "--dry-run"})
@@ -898,6 +899,8 @@ func TestRunIssueUsesGoNativeHappyPath(t *testing.T) {
 		{},
 		{Stdout: "issue-fix/71-fix-runner\n"},
 		{Stdout: "/repo\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
 		{},
 	}}
 	lifecycle := &fakeDaemonLifecycle{
@@ -1160,6 +1163,97 @@ func TestRunIssueUsesGoNativeReusedBranchSyncPreflight(t *testing.T) {
 		gitCommand("add", "-u"),
 		gitCommand("ls-files", "--others", "--exclude-standard"),
 		gitCommand("commit", "-m", "Fix issue #71: Fix runner"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("push", "-u", "--force-with-lease", "origin", "issue-fix/71-fix-runner"),
+	}
+	if !reflect.DeepEqual(shell.cmds, wantCommands) {
+		t.Fatalf("shell commands = %#v, want %#v", shell.cmds, wantCommands)
+	}
+}
+
+func TestRunIssuePushesSyncOnlyUpdateWhenReusedBranchChangedAndAgentNoop(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 0},
+		{ExitCode: 0},
+		{},
+		{},
+		{},
+		{Stdout: "abc123\n"},
+		{},
+		{Stdout: "def456\n"},
+		{Stdout: ""},
+		{Stdout: "\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+		{},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+		createPRURL:   "https://github.com/owner/repo/pull/101",
+	}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{Stats: agentexec.Stats{ElapsedSeconds: 7}}}
+	var out strings.Builder
+	var errOut strings.Builder
+	app := NewApp(&out, &errOut)
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo", "--no-skip-if-branch-exists"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0; stderr=%q cmds=%#v", code, errOut.String(), shell.cmds)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("python runner calls = %d, want 0", runner.calls)
+	}
+	if agent.callCount != 1 {
+		t.Fatalf("agent call count = %d, want 1", agent.callCount)
+	}
+	if len(lifecycle.createdPRs) != 1 {
+		t.Fatalf("created PRs = %d, want 1", len(lifecycle.createdPRs))
+	}
+	if len(lifecycle.commentBodies[71]) != 2 {
+		t.Fatalf("comment bodies = %d, want 2", len(lifecycle.commentBodies[71]))
+	}
+	finalState, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][1])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody(final) error = %v", err)
+	}
+	if finalState.Status != orchestration.StatusReadyForReview || finalState.Stage != "pr_ready" || finalState.NextAction != "wait_for_review" {
+		t.Fatalf("final state = %#v", finalState)
+	}
+	if finalState.ReusedBranchSync == nil || !finalState.ReusedBranchSync.Changed {
+		t.Fatalf("final state sync verdict = %#v, want changed sync verdict", finalState.ReusedBranchSync)
+	}
+	if !strings.Contains(out.String(), "No file changes from agent for issue #71; pushed sync-only branch updates") {
+		t.Fatalf("stdout = %q, want sync-only message", out.String())
+	}
+
+	wantCommands := []string{
+		gitCommand("rev-parse", "--show-toplevel"),
+		gitCommand("status", "--porcelain"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("show-ref", "--verify", "--quiet", "refs/heads/issue-fix/71-fix-runner"),
+		gitCommand("ls-remote", "--exit-code", "--heads", "origin", "issue-fix/71-fix-runner"),
+		gitCommand("checkout", "main"),
+		gitCommand("checkout", "issue-fix/71-fix-runner"),
+		gitCommand("fetch", "origin", "main"),
+		gitCommand("rev-parse", "HEAD"),
+		gitCommand("rebase", "origin/main"),
+		gitCommand("rev-parse", "HEAD"),
+		gitCommand("ls-files", "--others", "--exclude-standard"),
+		gitCommand("status", "--porcelain"),
+		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
+		gitCommand("rev-parse", "--show-toplevel"),
 		gitCommand("rev-parse", "--abbrev-ref", "HEAD"),
 		gitCommand("rev-parse", "--show-toplevel"),
 		gitCommand("push", "-u", "--force-with-lease", "origin", "issue-fix/71-fix-runner"),

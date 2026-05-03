@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/agentexec"
-	"github.com/podlodka-ai-club/steam-hammer/internal/core/githublifecycle"
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/lifecycle"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 )
 
@@ -78,10 +78,10 @@ func nativeIssueFallbackReason(opts nativeIssueOptions) string {
 	if *opts.common.maxTry > 0 {
 		return "--max-attempts is not supported by the Go-native issue path yet"
 	}
-	if tracker := strings.TrimSpace(*opts.common.tracker); tracker != "" && !strings.EqualFold(tracker, githublifecycle.TrackerGitHub) {
+	if tracker := strings.TrimSpace(*opts.common.tracker); tracker != "" && !strings.EqualFold(tracker, lifecycle.TrackerGitHub) {
 		return "native issue flow currently supports only the GitHub tracker"
 	}
-	if codehost := strings.TrimSpace(*opts.common.codehost); codehost != "" && !strings.EqualFold(codehost, githublifecycle.TrackerGitHub) {
+	if codehost := strings.TrimSpace(*opts.common.codehost); codehost != "" && !strings.EqualFold(codehost, lifecycle.CodeHostGitHub) {
 		return "native issue flow currently supports only the GitHub code host"
 	}
 	return ""
@@ -411,7 +411,7 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to push issue branch %q: %v\n", issueBranch, err)
 		return 1
 	}
-	prURL, err := a.issueLifecycle.CreatePullRequest(ctx, githublifecycle.CreatePullRequestRequest{
+	prURL, err := a.issueLifecycle.CreatePullRequest(ctx, lifecycle.CreatePullRequestRequest{
 		Repo:               repo,
 		BaseBranch:         baseBranch,
 		HeadBranch:         issueBranch,
@@ -457,7 +457,7 @@ type nilFlagState struct{}
 
 func (nilFlagState) wasPassed(string) bool { return false }
 
-func linkedPRNumber(pr *githublifecycle.PullRequest) *orchestration.LinkedPullRequest {
+func linkedPRNumber(pr *lifecycle.PullRequest) *orchestration.LinkedPullRequest {
 	if pr == nil {
 		return nil
 	}
@@ -493,7 +493,7 @@ func durationSeconds(seconds int) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-func buildNativeIssuePrompt(issue githublifecycle.Issue, lightweight bool) string {
+func buildNativeIssuePrompt(issue lifecycle.Issue, lightweight bool) string {
 	if lightweight {
 		return strings.TrimSpace(fmt.Sprintf(
 			"You are working on a small, well-scoped issue in the current git branch.\nImplement the fix in repository files using the smallest correct change.\nDo not run git commands; git actions are handled by orchestration script.\n\nIf the task is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. Instead, stop and print %s followed by a JSON object like {\"question\":\"<focused question>\",\"reason\":\"<why clarification is required>\"}.\n\nIssue: #%d - %s\nURL: %s\n\nIssue body:\n%s",
@@ -514,7 +514,7 @@ func buildNativeIssuePrompt(issue githublifecycle.Issue, lightweight bool) strin
 	))
 }
 
-func nativeIssueBranchName(issue githublifecycle.Issue, prefix string) string {
+func nativeIssueBranchName(issue lifecycle.Issue, prefix string) string {
 	cleaned := regexp.MustCompile(`[^a-zA-Z0-9]+`).ReplaceAllString(strings.ToLower(issue.Title), "-")
 	cleaned = strings.Trim(cleaned, "-")
 	if len(cleaned) > 40 {
@@ -527,7 +527,7 @@ func nativeIssueBranchName(issue githublifecycle.Issue, prefix string) string {
 	return fmt.Sprintf("%s/%d-%s", prefix, issue.Number, cleaned)
 }
 
-func nativeIssueCommitTitle(issue githublifecycle.Issue) string {
+func nativeIssueCommitTitle(issue lifecycle.Issue) string {
 	return fmt.Sprintf("Fix issue #%d: %s", issue.Number, issue.Title)
 }
 
@@ -798,7 +798,7 @@ func (a *App) gitPushBranch(ctx context.Context, repoRoot, branchName string, fo
 func (a *App) runNativeIssueConflictRecovery(
 	ctx context.Context,
 	repo string,
-	issue githublifecycle.Issue,
+	issue lifecycle.Issue,
 	opts nativeIssueOptions,
 	latestState **orchestration.TrackedState,
 ) int {

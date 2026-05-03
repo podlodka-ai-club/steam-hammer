@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	corelifecycle "github.com/podlodka-ai-club/steam-hammer/internal/core/lifecycle"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 )
 
@@ -394,7 +395,7 @@ func shouldUseGoDaemonPolicy(opts commonOptions, lifecycle daemonLifecycle) bool
 		return false
 	}
 	tracker := strings.TrimSpace(*opts.tracker)
-	if tracker != "" && !strings.EqualFold(tracker, "github") {
+	if tracker != "" && !strings.EqualFold(tracker, corelifecycle.TrackerGitHub) {
 		return false
 	}
 	return true

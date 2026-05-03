@@ -747,6 +747,9 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 			selected, err = a.claimDaemonIssues(ctx, config, selected)
 			if err != nil {
 				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to claim daemon issues: %v\n", err)
+				if releaseErr := a.releaseDaemonClaims(ctx, config, selected); releaseErr != nil {
+					_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims after claim error: %v\n", releaseErr)
+				}
 				if config.stopOnError {
 					return 1
 				}
@@ -755,6 +758,7 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 			}
 		}
 		preparedWorkers := make([]daemonParallelPreparedWorker, 0, len(selected))
+		releaseClaimsAfterCycle := !selectionFailed && len(selected) > 0
 		if !selectionFailed {
 			for _, issue := range selected {
 				handled.signatures[issue.issueID] = issue.signature
@@ -763,6 +767,11 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 					_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
 					lastCode = 1
 					if config.stopOnError {
+						if releaseClaimsAfterCycle {
+							if releaseErr := a.releaseDaemonClaims(ctx, config, selected); releaseErr != nil {
+								_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims: %v\n", releaseErr)
+							}
+						}
 						for _, prepared := range preparedWorkers {
 							if prepared.cleanup != nil {
 								prepared.cleanup()
@@ -812,10 +821,12 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 			}
 			wg.Wait()
 			cancel()
-			if err := a.releaseDaemonClaims(ctx, config, selected); err != nil {
+			if releaseClaimsAfterCycle {
+				if err := a.releaseDaemonClaims(ctx, config, selected); err != nil {
 				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims: %v\n", err)
 				if cycleCode == 0 {
 					cycleCode = 1
+				}
 				}
 			}
 		}
@@ -873,12 +884,16 @@ func (a *App) runSerialDaemon(ctx context.Context, config daemonParallelConfig) 
 			selected, err = a.claimDaemonIssues(ctx, config, selected)
 			if err != nil {
 				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to claim daemon issues: %v\n", err)
+				if releaseErr := a.releaseDaemonClaims(ctx, config, selected); releaseErr != nil {
+					_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims after claim error: %v\n", releaseErr)
+				}
 				if config.stopOnError {
 					return 1
 				}
 				lastCode = 1
 				selected = nil
 			}
+			releaseClaimsAfterCycle := len(selected) > 0
 			cycleCode := 0
 			for _, issue := range selected {
 				handled.signatures[issue.issueID] = issue.signature
@@ -892,14 +907,18 @@ func (a *App) runSerialDaemon(ctx context.Context, config daemonParallelConfig) 
 					cycleCode = code
 				}
 				if code != 0 && config.stopOnError {
-					_ = a.releaseDaemonClaims(ctx, config, selected)
+					if releaseClaimsAfterCycle {
+						_ = a.releaseDaemonClaims(ctx, config, selected)
+					}
 					return code
 				}
 			}
-			if err := a.releaseDaemonClaims(ctx, config, selected); err != nil {
+			if releaseClaimsAfterCycle {
+				if err := a.releaseDaemonClaims(ctx, config, selected); err != nil {
 				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims: %v\n", err)
 				if cycleCode == 0 {
 					cycleCode = 1
+				}
 				}
 			}
 			if cycleCode == 0 && config.postBatchVerify {

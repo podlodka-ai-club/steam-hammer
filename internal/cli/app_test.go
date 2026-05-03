@@ -2402,6 +2402,121 @@ func TestRunDaemonDetachStartsOneWorkerPerParallelTask(t *testing.T) {
 	}
 }
 
+func TestRunDaemonDetachPropagatesProjectPresetAndBudgets(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	cloner := &recordingBatchClonePreparer{}
+	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(execPath)
+	projectConfig := `{"defaults":{"preset":"default"},"presets":{"default":{"runner":"opencode","agent":"build","model":"openai/gpt-4o","track_tokens":true,"token_budget":20000}},"budgets":{"max_cost_usd":2.5}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--project-config", "project.json", "--allow-live-side-effects"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	joinedArgs := strings.Join(starter.req.Args, " ")
+	for _, want := range []string{"--preset default", "--runner opencode", "--agent build", "--model openai/gpt-4o", "--track-tokens", "--token-budget 20000"} {
+		if !strings.Contains(joinedArgs, want) {
+			t.Fatalf("worker args = %#v, want %q", starter.req.Args, want)
+		}
+	}
+	statePath := filepath.Join(targetDir, ".orchestrator", "workers", "daemon", "worker.json")
+	state, err := workers.ReadState(statePath)
+	if err != nil {
+		t.Fatalf("workers.ReadState(%q) error = %v", statePath, err)
+	}
+	if state.Preset != "default" || state.Runner != "opencode" || state.Agent != "build" || state.Model != "openai/gpt-4o" || !state.TrackTokens || state.TokenBudget != 20000 || state.CostBudget != 2.5 {
+		t.Fatalf("worker policy metadata = %#v", state)
+	}
+}
+
+func TestRunDaemonDetachKeepsCLIOverridesOverProjectPreset(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	cloner := &recordingBatchClonePreparer{}
+	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(execPath)
+	projectConfig := `{"defaults":{"preset":"default"},"presets":{"default":{"runner":"claude","model":"claude-sonnet-4-5","token_budget":20000},"hard":{"runner":"claude","model":"claude-opus-4-1","token_budget":40000}}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--project-config", "project.json", "--preset", "hard", "--runner", "opencode", "--allow-live-side-effects"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	joinedArgs := strings.Join(starter.req.Args, " ")
+	for _, want := range []string{"--preset hard", "--runner opencode", "--model claude-opus-4-1", "--token-budget 40000"} {
+		if !strings.Contains(joinedArgs, want) {
+			t.Fatalf("worker args = %#v, want %q", starter.req.Args, want)
+		}
+	}
+	if strings.Contains(joinedArgs, "--runner claude") {
+		t.Fatalf("worker args = %#v, should keep explicit runner override", starter.req.Args)
+	}
+}
+
+func TestRunDaemonAppliesRoutedPresetPerSelectedIssue(t *testing.T) {
+	runner := &recordingRunner{}
+	targetDir := t.TempDir()
+	projectConfig := `{"routing":{"default_preset":"hard","rules":[{"when":{"labels":["docs"],"task_types":["issue"]},"preset":"cheap"}]},"presets":{"cheap":{"runner":"opencode","agent":"build","model":"openai/gpt-4o-mini","token_budget":8000},"hard":{"runner":"claude","agent":"build","model":"claude-opus-4-1","token_budget":40000}}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetBatchClonePreparer(&recordingBatchClonePreparer{})
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{issues: []githublifecycle.Issue{{Number: 71, Labels: []githublifecycle.Label{{Name: "docs"}}}}, commentsByIssue: map[int][]githublifecycle.IssueComment{}})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--project-config", "project.json", "--limit", "1", "--poll-interval-seconds", "1", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	joinedArgs := strings.Join(runner.args, " ")
+	for _, want := range []string{"--preset cheap", "--runner opencode", "--model openai/gpt-4o-mini", "--token-budget 8000"} {
+		if !strings.Contains(joinedArgs, want) {
+			t.Fatalf("runner args = %#v, want routed preset %q", runner.args, want)
+		}
+	}
+}
+
+func TestRunDaemonReportsMissingRoutedPreset(t *testing.T) {
+	runner := &recordingRunner{}
+	targetDir := t.TempDir()
+	var errOut strings.Builder
+	projectConfig := `{"routing":{"default_preset":"missing"},"presets":{"cheap":{"runner":"opencode"}}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetBatchClonePreparer(&recordingBatchClonePreparer{})
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{issues: []githublifecycle.Issue{{Number: 71}}, commentsByIssue: map[int][]githublifecycle.IssueComment{}})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--project-config", "project.json", "--limit", "1", "--poll-interval-seconds", "1", "--max-cycles", "1", "--dry-run"})
+	if code == 0 {
+		t.Fatalf("Run() code = %d, want failure", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "unknown preset \"missing\"") {
+		t.Fatalf("stderr = %q, want missing preset validation", errOut.String())
+	}
+}
+
 func TestRunDaemonDetachStartsThreeWorkersWhenRequested(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
 	cloner := &recordingBatchClonePreparer{}

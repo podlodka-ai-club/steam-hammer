@@ -5801,6 +5801,19 @@ def sanitize_branch_for_path(branch_name: str) -> str:
     return _github_lifecycle.sanitize_branch_for_path(branch_name)
 
 
+def fetch_origin_branch_with_fallback(branch_name: str) -> None:
+    try:
+        run_command(["git", "fetch", "origin", branch_name])
+        return
+    except RuntimeError as fetch_error:
+        run_command(["git", "fetch", "origin"])
+        if remote_branch_exists(branch_name):
+            return
+        raise RuntimeError(
+            f"Target PR branch '{branch_name}' not found on origin after refresh"
+        ) from fetch_error
+
+
 def checkout_pr_target_branch(branch_name: str, dry_run: bool) -> None:
     local_exists = local_branch_exists(branch_name)
     remote_exists = remote_branch_exists(branch_name)
@@ -5824,7 +5837,7 @@ def checkout_pr_target_branch(branch_name: str, dry_run: bool) -> None:
         run_command(["git", "checkout", branch_name])
         return
 
-    run_command(["git", "fetch", "origin", branch_name])
+    fetch_origin_branch_with_fallback(branch_name)
     run_command(["git", "checkout", "-b", branch_name, "--track", f"origin/{branch_name}"])
 
 
@@ -5845,7 +5858,7 @@ def create_isolated_worktree_for_branch(branch_name: str, dry_run: bool) -> str 
             run_command(["git", "worktree", "add", worktree_dir, branch_name])
             return worktree_dir
 
-        run_command(["git", "fetch", "origin", branch_name])
+        fetch_origin_branch_with_fallback(branch_name)
         run_command(["git", "worktree", "add", "-b", branch_name, worktree_dir, f"origin/{branch_name}"])
         run_command(["git", "-C", worktree_dir, "branch", "--set-upstream-to", f"origin/{branch_name}", branch_name])
         return worktree_dir

@@ -217,10 +217,10 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 		return 2
 	}
 	if *workers {
-		return a.runDetachedStatusList(*workerDir, *asJSON)
+		return a.runDetachedStatusList(ctx, *workerDir, *asJSON)
 	}
 	if strings.TrimSpace(*worker) != "" {
-		return a.runDetachedStatus(*workerDir, *worker, *asJSON)
+		return a.runDetachedStatus(ctx, *workerDir, *worker, *asJSON)
 	}
 	if strings.TrimSpace(*autonomousSessionFile) != "" {
 		return a.runAutonomousSessionStatus(*autonomousSessionFile, *asJSON)

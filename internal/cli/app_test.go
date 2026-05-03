@@ -2617,7 +2617,10 @@ func TestStatusWorkerBatchSummaryUsesLinkedIssueState(t *testing.T) {
 		t.Fatalf("BuildOrchestrationStateComment(issue72) error = %v", err)
 	}
 	lifecycle := &fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{
-		71: {{ID: 1, Body: issue71State, CreatedAt: "2026-04-28T12:05:00Z"}},
+		71: {
+			{ID: 1, Body: issue71State, CreatedAt: "2026-04-28T12:05:00Z"},
+			{ID: 3, Body: orchestration.OrchestrationStateMarker + "\n```json\n{not-json}\n```", CreatedAt: "2026-04-28T12:07:00Z"},
+		},
 		72: {{ID: 2, Body: issue72State, CreatedAt: "2026-04-28T12:06:00Z"}},
 	}}
 

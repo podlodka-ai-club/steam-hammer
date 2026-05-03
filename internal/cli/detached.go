@@ -174,13 +174,13 @@ func readDetachedWorkerState(path string) (detachedWorkerState, error) {
 	return workers.ReadState(path)
 }
 
-func (a *App) runDetachedStatus(configuredRoot, name string, asJSON bool) int {
+func (a *App) runDetachedStatus(ctx context.Context, configuredRoot, name string, asJSON bool) int {
 	workerPaths, err := resolveDetachedWorkerPaths(configuredRoot, ".", normalizeWorkerLookupName(name), workerLookupID(name))
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
 		return 1
 	}
-	report, err := a.detachedWorkerReportFromStateFile(context.Background(), workerPaths.StatePath)
+	report, err := a.detachedWorkerReportFromStateFile(ctx, workerPaths.StatePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: detached worker state not found: %s\n", workerPaths.StatePath)
@@ -294,8 +294,8 @@ func (a *App) runAutonomousSessionStatus(path string, asJSON bool) int {
 	return 0
 }
 
-func (a *App) runDetachedStatusList(configuredRoot string, asJSON bool) int {
-	reports, err := a.detachedWorkerReports(context.Background(), configuredRoot)
+func (a *App) runDetachedStatusList(ctx context.Context, configuredRoot string, asJSON bool) int {
+	reports, err := a.detachedWorkerReports(ctx, configuredRoot)
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect detached worker registry: %v\n", err)
 		return 1

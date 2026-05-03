@@ -1636,7 +1636,7 @@ func TestRunBatchDetachRoutesLinkedPRToNativePRCommand(t *testing.T) {
 	}
 }
 
-func TestRunBatchDetachFallsBackToPythonWhenNativeIssueUnsupported(t *testing.T) {
+func TestRunBatchDetachKeepsNativeWorkerWithProjectConfig(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
 	cloner := &recordingBatchClonePreparer{}
 	targetDir := t.TempDir()
@@ -1644,21 +1644,32 @@ func TestRunBatchDetachFallsBackToPythonWhenNativeIssueUnsupported(t *testing.T)
 	app := NewApp(&strings.Builder{}, &errOut)
 	app.SetDetachedStarter(starter)
 	app.SetBatchClonePreparer(cloner)
-	app.SetExecutablePath(filepath.Join(targetDir, "orchestrator"))
+	execPath := filepath.Join(targetDir, "orchestrator")
+	app.SetExecutablePath(execPath)
 	app.SetIssueLifecycle(&fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{}})
+	projectConfig := `{"defaults":{"preset":"default","runner":"opencode","agent":"build","model":"openai/gpt-4o","max_attempts":2},"presets":{"default":{"runner":"claude","agent":"build","model":"claude-sonnet-4-5","max_attempts":3}},"budgets":{"max_attempts_per_task":2}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
 
 	code := app.Run([]string{"run", "batch", "--ids", "71", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--project-config", "project.json"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	if starter.req.Name != "python3" {
-		t.Fatalf("worker command = %q, want python3", starter.req.Name)
+	if starter.req.Name != execPath {
+		t.Fatalf("worker command = %q, want native executable %q", starter.req.Name, execPath)
 	}
-	if len(starter.req.Args) < 3 || !reflect.DeepEqual(starter.req.Args[:3], []string{runnerScript, "--issue", "71"}) {
-		t.Fatalf("worker args = %#v, want python issue adapter", starter.req.Args)
+	if len(starter.req.Args) < 4 || !reflect.DeepEqual(starter.req.Args[:4], []string{"run", "issue", "--id", "71"}) {
+		t.Fatalf("worker args = %#v, want native issue entrypoint", starter.req.Args)
 	}
-	if !strings.Contains(errOut.String(), "--project-config is not supported by the Go-native issue path yet") {
-		t.Fatalf("stderr = %q, want explicit native fallback reason", errOut.String())
+	joinedArgs := strings.Join(starter.req.Args, " ")
+	for _, want := range []string{"--runner claude", "--agent build", "--model claude-sonnet-4-5", "--max-attempts 2"} {
+		if !strings.Contains(joinedArgs, want) {
+			t.Fatalf("worker args = %#v, want project config default %q", starter.req.Args, want)
+		}
+	}
+	if strings.Contains(errOut.String(), "--project-config is not supported by the Go-native") {
+		t.Fatalf("stderr = %q, should not include project-config fallback reason", errOut.String())
 	}
 }
 

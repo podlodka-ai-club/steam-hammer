@@ -69,15 +69,6 @@ func nativeIssueFallbackReason(opts nativeIssueOptions) string {
 	if strings.TrimSpace(*opts.common.local) != "" {
 		return "--local-config is not supported by the Go-native issue path yet"
 	}
-	if strings.TrimSpace(*opts.common.project) != "" {
-		return "--project-config is not supported by the Go-native issue path yet"
-	}
-	if strings.TrimSpace(*opts.common.preset) != "" {
-		return "--preset is not supported by the Go-native issue path yet"
-	}
-	if *opts.common.maxTry > 0 {
-		return "--max-attempts is not supported by the Go-native issue path yet"
-	}
 	if tracker := strings.TrimSpace(*opts.common.tracker); tracker != "" && !strings.EqualFold(tracker, lifecycle.TrackerGitHub) {
 		return "native issue flow currently supports only the GitHub tracker"
 	}

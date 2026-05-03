@@ -64,6 +64,26 @@ func TestEvaluateDaemonTaskSelectionSkipsActiveForeignClaim(t *testing.T) {
 	}
 }
 
+func TestEvaluateDaemonTaskSelectionUsesFixedNowForExpiredForeignClaim(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:       249,
+		RunID:             "run-2",
+		LatestStateStatus: StatusReadyForReview,
+		LatestClaim: map[string]any{
+			"status":     "claimed",
+			"run_id":     "run-1",
+			"expires_at": "2026-05-01T12:05:00Z",
+		},
+	}, time.Date(2026, 5, 1, 12, 6, 0, 0, time.UTC))
+
+	if !decision.Eligible {
+		t.Fatalf("Eligible = false, want true (%q)", decision.Reason)
+	}
+	if decision.Signature != "state:ready-for-review" {
+		t.Fatalf("Signature = %q", decision.Signature)
+	}
+}
+
 func TestEvaluateDaemonTaskSelectionSkipsAlreadyHandledSignature(t *testing.T) {
 	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
 		IssueNumber:          249,

@@ -165,3 +165,142 @@ Notes:
 
 - If the smoke is intended to exercise detached concurrency only, stop after the ownership checks and do not merge anything.
 - If the smoke is intended to validate real merge progression, keep the batch bounded at 2-3 issues and require the verification row above to pass for every PR independently.
+
+## Detached Autonomous Go Smoke Commands
+
+Use these commands for the Go wrapper autonomous detached smoke. The default path below is bounded and safe: `--dry-run` avoids live issue claims, branch creation, pushes, PRs, and merges, while `--detach` still exercises worker metadata, log, session, status, and clone preparation surfaces.
+
+1. Preflight the environment and runner lookup:
+
+```bash
+go run ./cmd/orchestrator doctor \
+  --repo podlodka-ai-club/steam-hammer \
+  --runner opencode \
+  --agent build \
+  --model openai/gpt-5.4 \
+  --doctor-smoke-check
+```
+
+Expected output includes:
+
+```text
+Doctor diagnostics
+[PASS] Git repository: inside a git work tree
+[PASS] Clean worktree: working tree is clean
+[PASS] GitHub CLI: found at ...
+[PASS] gh auth: authenticated
+[PASS] Repository access: verified access to podlodka-ai-club/steam-hammer
+[PASS] Runner smoke check: CLI invocation enabled
+Doctor summary: N pass, 0 warn, 0 fail
+```
+
+2. Launch a bounded detached autonomous daemon smoke:
+
+```bash
+go run ./cmd/orchestrator run daemon \
+  --repo podlodka-ai-club/steam-hammer \
+  --runner opencode \
+  --agent build \
+  --model openai/gpt-5.4 \
+  --limit 2 \
+  --poll-interval-seconds 1 \
+  --max-parallel-tasks 2 \
+  --max-cycles 1 \
+  --dry-run \
+  --detach \
+  --post-batch-verify
+```
+
+Expected output includes one block per detached daemon worker:
+
+```text
+started detached worker daemon-1
+pid: <pid>
+log: <repo>/.orchestrator/workers/daemon-1/worker.log
+state: <repo>/.orchestrator/workers/daemon-1/worker.json
+session: <repo>/.orchestrator/workers/daemon-1/session.json
+next: orchestrator status --worker daemon-1
+started detached worker daemon-2
+pid: <pid>
+log: <repo>/.orchestrator/workers/daemon-2/worker.log
+state: <repo>/.orchestrator/workers/daemon-2/worker.json
+session: <repo>/.orchestrator/workers/daemon-2/session.json
+next: orchestrator status --worker daemon-2
+```
+
+3. Inspect the detached registry and each worker:
+
+```bash
+go run ./cmd/orchestrator status --workers
+go run ./cmd/orchestrator status --worker daemon-1
+go run ./cmd/orchestrator status --worker daemon-2
+go run ./cmd/orchestrator status --autonomous-session-file .orchestrator/workers/daemon-1/session.json
+go run ./cmd/orchestrator status --autonomous-session-file .orchestrator/workers/daemon-2/session.json
+```
+
+Expected `status --workers` output includes both daemon workers and points to their next status commands:
+
+```text
+daemon-1	<process-status>	lines=<n>	log=<freshness>	next: orchestrator status --worker daemon-1
+daemon-2	<process-status>	lines=<n>	log=<freshness>	next: orchestrator status --worker daemon-2
+```
+
+Expected `status --worker daemon-N` output includes:
+
+```text
+worker: daemon-N
+target: daemon
+repo: podlodka-ai-club/steam-hammer
+process: <running|exited|unknown>
+clone: <repo>/.orchestrator/workers/daemon-N/repo
+agent: runner=opencode agent=build model=openai/gpt-5.4
+log-progress: lines=<n>
+log: <repo>/.orchestrator/workers/daemon-N/worker.log
+state: <repo>/.orchestrator/workers/daemon-N/worker.json
+session: <repo>/.orchestrator/workers/daemon-N/session.json
+next: <status command or completion hint>
+```
+
+Expected session status output includes the autonomous checkpoint summary, for example:
+
+```text
+Autonomous session status
+Phase: ...
+Current: ...
+Active workers: ...
+Next checkpoint: ...
+```
+
+Safe defaults and live side effects:
+
+- `--dry-run` is the safe default for smoke evidence. It bounds daemon polling to one cycle when no explicit cycle count is provided, and the command above also sets `--max-cycles 1` for clarity.
+- `--detach` by itself is not a dry run. Without `--dry-run`, detached daemon workers may claim live issues, create branches, run agents, commit, push, open PRs, post state comments, and run post-batch verification.
+- `--opencode-auto-approve` is intentionally omitted from the safe smoke command. Add it only for an intentional live run where skipping OpenCode interactive approvals is acceptable.
+- `--post-batch-verify` is safe in the dry-run smoke because it only exercises the verification path after the bounded worker cycle. In a live run it can publish follow-up issues only if `--create-followup-issue` is also passed.
+
+To intentionally opt in to live detached autonomous side effects, remove `--dry-run` only after the preflight and status checks pass, keep `--limit`, `--max-parallel-tasks`, and `--max-cycles` small, and verify worker ownership before any merge progression:
+
+```bash
+go run ./cmd/orchestrator run daemon \
+  --repo podlodka-ai-club/steam-hammer \
+  --runner opencode \
+  --agent build \
+  --model openai/gpt-5.4 \
+  --limit 2 \
+  --poll-interval-seconds 120 \
+  --max-parallel-tasks 2 \
+  --max-cycles 1 \
+  --detach \
+  --post-batch-verify
+```
+
+Common troubleshooting:
+
+| Symptom | Likely Cause | Safe Response |
+| --- | --- | --- |
+| `orchestrator: detached worker state not found: .../worker.json` | The worker name or `--worker-dir` does not match the launch command, or the worker never started. | Re-run `status --workers` with the same `--worker-dir` used at launch, then inspect the exact worker name printed by the launch command. |
+| `orchestrator: failed to inspect detached worker state: ...` | `worker.json` is malformed, unreadable, or points at missing paths. | Do not restart over the same worker. Preserve the file, inspect the matching `worker.log`, and use a new `--worker-dir` for another smoke attempt. |
+| `detached worker <name> is already running with pid <pid>` | A worker with the same name still has a live process according to the registry. | Use `status --worker <name>` and wait for it to exit, or use a separate `--worker-dir` for a new smoke. |
+| `clone:` is missing or shared between daemon workers | Detached clone preparation failed or worker metadata is stale. | Treat ownership as ambiguous. Do not continue to live side effects or merge; relaunch from a clean source checkout or a fresh `--worker-dir`. |
+| `linked-branch`, `linked-pr`, or session summaries mention another issue/worker | Branch, PR, or state-comment ownership is contaminated. | Stop the smoke. Do not merge. Investigate the referenced issue/PR and start a new bounded run only after ownership is clear. |
+| `process: unknown` with stale `log-freshness` and no new `log-progress` | The worker process is gone or cannot be inspected, and the log is no longer advancing. | Read the worker log and session status. Treat missing completion evidence as failed smoke evidence. |

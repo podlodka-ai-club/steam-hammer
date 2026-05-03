@@ -790,7 +790,7 @@ def project_scope_defaults(project_config: dict) -> dict:
     return defaults
 
 
-def evaluate_issue_scope(issue: dict, scope_defaults: dict) -> dict:
+def evaluate_issue_scope(issue: dict, scope_defaults: dict, now: datetime | None = None) -> dict:
     labels_config = scope_defaults.get("labels") if isinstance(scope_defaults, dict) else None
     authors_config = scope_defaults.get("authors") if isinstance(scope_defaults, dict) else None
     assignees_config = scope_defaults.get("assignees") if isinstance(scope_defaults, dict) else None
@@ -916,7 +916,12 @@ def evaluate_issue_scope(issue: dict, scope_defaults: dict) -> dict:
                 "matched": {"priority_allow": []},
             }
 
-    now = datetime.now(timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
     created_at = _parse_iso_timestamp(issue.get("createdAt"))
     updated_at = _parse_iso_timestamp(issue.get("updatedAt"))
     if isinstance(max_age_days, int) and max_age_days > 0 and created_at is not None:

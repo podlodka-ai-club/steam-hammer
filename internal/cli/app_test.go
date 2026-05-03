@@ -747,7 +747,7 @@ func TestRunDaemonDetachUsesStableSessionFile(t *testing.T) {
 	app.SetDetachedStarter(starter)
 	app.SetBatchClonePreparer(cloner)
 
-	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--post-batch-verify", "--create-followup-issue"})
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--post-batch-verify", "--create-followup-issue", "--allow-live-side-effects"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
@@ -771,6 +771,9 @@ func TestRunDaemonDetachUsesStableSessionFile(t *testing.T) {
 	}
 	if !strings.Contains(joined, "--create-followup-issue") {
 		t.Fatalf("starter args = %q, want --create-followup-issue", joined)
+	}
+	if !strings.Contains(joined, "--allow-live-side-effects") {
+		t.Fatalf("starter args = %q, want --allow-live-side-effects", joined)
 	}
 }
 
@@ -1858,6 +1861,24 @@ func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
 	assertCommandContainsFlag(t, runner.args, "--autonomous-session-file")
 }
 
+func TestRunDaemonRequiresLiveSideEffectsOptIn(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--max-cycles", "1", "--poll-interval-seconds", "1"})
+	if code != 2 {
+		t.Fatalf("Run() code = %d, want 2", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "--allow-live-side-effects") {
+		t.Fatalf("stderr = %q, want live side-effects opt-in guidance", errOut.String())
+	}
+}
+
 func TestRunDaemonRoutesLinkedPRWorkerWithIsolatedWorktree(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -2021,7 +2042,7 @@ func TestRunDaemonDetachStartsOneWorkerPerParallelTask(t *testing.T) {
 	app.SetBatchClonePreparer(cloner)
 	app.SetExecutablePath(execPath)
 
-	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--max-parallel-tasks", "2"})
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--max-parallel-tasks", "2", "--allow-live-side-effects"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
@@ -2095,7 +2116,7 @@ func TestRunDaemonDetachStartsThreeWorkersWhenRequested(t *testing.T) {
 	app.SetBatchClonePreparer(cloner)
 	app.SetExecutablePath(execPath)
 
-	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--max-parallel-tasks", "3"})
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--max-parallel-tasks", "3", "--allow-live-side-effects"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}

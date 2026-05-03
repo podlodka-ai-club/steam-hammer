@@ -48,13 +48,32 @@ func WorkflowOutputExcerpt(text string, maxLen int) string {
 	return compact[:maxLen-3] + "..."
 }
 
+type PostBatchVerificationContext struct {
+	SessionPath  string
+	BatchIndex   int
+	TotalBatches int
+}
+
 func FormatPostBatchVerificationIssueBody(repo string, verification VerificationResult, touchedPRs []string) string {
+	return FormatFocusedPostBatchVerificationIssueBody(repo, verification, nil, PostBatchVerificationContext{}, touchedPRs)
+}
+
+func FormatFocusedPostBatchVerificationIssueBody(repo string, verification VerificationResult, failedCheck *VerificationCommandResult, context PostBatchVerificationContext, touchedPRs []string) string {
 	lines := []string{
 		"Automated post-batch verification detected a repository regression.",
 		"",
 		"Repository: " + strings.TrimSpace(repo),
 		"Result: " + fallbackVerificationSummary(verification),
 		"Next action: " + humanizeToken(fallbackVerificationNextAction(verification)),
+	}
+	if context.BatchIndex > 0 || context.TotalBatches > 0 || strings.TrimSpace(context.SessionPath) != "" {
+		lines = append(lines, "", "Affected batch/session:")
+		if context.BatchIndex > 0 || context.TotalBatches > 0 {
+			lines = append(lines, "- batch: "+formatBatchRef(context.BatchIndex, context.TotalBatches))
+		}
+		if sessionPath := strings.TrimSpace(context.SessionPath); sessionPath != "" {
+			lines = append(lines, "- session: `"+sessionPath+"`")
+		}
 	}
 	if len(touchedPRs) > 0 {
 		lines = append(lines, "", "Touched PRs:")
@@ -65,8 +84,12 @@ func FormatPostBatchVerificationIssueBody(repo string, verification Verification
 			}
 		}
 	}
-	lines = append(lines, "", "Verification commands:")
-	for _, result := range verification.Commands {
+	commands := verification.Commands
+	if failedCheck != nil {
+		commands = []VerificationCommandResult{*failedCheck}
+	}
+	lines = append(lines, "", "Failed verification check:")
+	for _, result := range commands {
 		name := strings.TrimSpace(result.Name)
 		if name == "" {
 			name = "command"
@@ -88,6 +111,8 @@ func FormatPostBatchVerificationIssueBody(repo string, verification Verification
 		}
 		if evidence != "" {
 			detail += "\n  - evidence: " + evidence
+		} else if strings.EqualFold(strings.TrimSpace(result.Status), StatusFailed) {
+			detail += "\n  - evidence: no log excerpt was captured; rerun the command locally or inspect the session logs"
 		}
 		lines = append(lines, detail)
 	}
@@ -104,6 +129,71 @@ func RecommendedPostBatchFollowUpIssue(repo string, verification VerificationRes
 			Body:  FormatPostBatchVerificationIssueBody(repo, verification, touchedPRs),
 		},
 	}
+}
+
+func RecommendedPostBatchFollowUpIssues(repo string, verification VerificationResult, context PostBatchVerificationContext, touchedPRs []string) []VerificationFollowUpIssue {
+	seen := map[string]struct{}{}
+	issues := make([]VerificationFollowUpIssue, 0)
+	for _, result := range verification.Commands {
+		if !strings.EqualFold(strings.TrimSpace(result.Status), StatusFailed) {
+			continue
+		}
+		key := PostBatchVerificationFailureKey(result)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		name := strings.TrimSpace(result.Name)
+		if name == "" {
+			name = "verification"
+		}
+		body := FormatFocusedPostBatchVerificationIssueBody(repo, verification, &result, context, touchedPRs)
+		marker := PostBatchVerificationIssueMarker(result)
+		if marker != "" && !strings.Contains(body, marker) {
+			body += "\n\n" + marker
+		}
+		issues = append(issues, VerificationFollowUpIssue{
+			Status: "recommended",
+			FollowUpIssueRequest: FollowUpIssueRequest{
+				Title: "Post-batch verification failed: " + name,
+				Body:  body,
+			},
+		})
+	}
+	return issues
+}
+
+func PostBatchVerificationIssueMarker(result VerificationCommandResult) string {
+	key := PostBatchVerificationFailureKey(result)
+	if key == "" {
+		return ""
+	}
+	return "<!-- steam-hammer:post-batch-verification:" + key + " -->"
+}
+
+func PostBatchVerificationFailureKey(result VerificationCommandResult) string {
+	value := strings.TrimSpace(result.Name)
+	if value == "" {
+		value = strings.TrimSpace(result.Command)
+	}
+	if value == "" {
+		value = "verification"
+	}
+	value = strings.ToLower(value)
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 func firstFailedVerificationName(results []VerificationCommandResult) string {
@@ -133,4 +223,17 @@ func fallbackVerificationNextAction(result VerificationResult) string {
 		return nextAction
 	}
 	return "inspect_verification_failures"
+}
+
+func formatBatchRef(batchIndex, totalBatches int) string {
+	if batchIndex > 0 && totalBatches > 0 {
+		return itoa(batchIndex) + "/" + itoa(totalBatches)
+	}
+	if batchIndex > 0 {
+		return itoa(batchIndex)
+	}
+	if totalBatches > 0 {
+		return "unknown/" + itoa(totalBatches)
+	}
+	return "unknown"
 }

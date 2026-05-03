@@ -127,3 +127,45 @@ func TestRecommendedPostBatchFollowUpIssueIncludesEvidence(t *testing.T) {
 		}
 	}
 }
+
+func TestRecommendedPostBatchFollowUpIssuesCreatesDistinctFailedChecks(t *testing.T) {
+	issues := RecommendedPostBatchFollowUpIssues("owner/repo", VerificationResult{
+		Status:     StatusFailed,
+		Summary:    "failed (1/3 passed; failed: test, lint)",
+		NextAction: "create_follow_up_issue_and_fix_regression",
+		Commands: []VerificationCommandResult{
+			{Name: "test", Command: "make test", Status: StatusFailed, StderrExcerpt: "test failed"},
+			{Name: "test", Command: "make test", Status: StatusFailed, StderrExcerpt: "test failed again"},
+			{Name: "lint", Command: "make lint", Status: StatusFailed, StdoutExcerpt: "lint failed"},
+			{Name: "build", Command: "make build", Status: "passed"},
+		},
+	}, PostBatchVerificationContext{SessionPath: "/tmp/session.json", BatchIndex: 2, TotalBatches: 3}, nil)
+
+	if len(issues) != 2 {
+		t.Fatalf("len(issues) = %d, want 2", len(issues))
+	}
+	if issues[0].Title != "Post-batch verification failed: test" || issues[1].Title != "Post-batch verification failed: lint" {
+		t.Fatalf("issues = %#v", issues)
+	}
+	for _, want := range []string{"batch: 2/3", "session: `/tmp/session.json`", "<!-- steam-hammer:post-batch-verification:test -->"} {
+		if !strings.Contains(issues[0].Body, want) {
+			t.Fatalf("Body missing %q\n%s", want, issues[0].Body)
+		}
+	}
+}
+
+func TestVerificationResultSummaryLineListsMultipleFollowUps(t *testing.T) {
+	first := 164
+	second := 165
+	result := VerificationResult{
+		Summary: "failed (0/2 passed; failed: test, lint)",
+		FollowUpIssues: []VerificationFollowUpIssue{
+			{Status: "created", IssueNumber: &first},
+			{Status: "created", IssueNumber: &second},
+		},
+	}
+
+	if got := result.SummaryLine(); got != "Verification: failed (0/2 passed; failed: test, lint); follow-up issues #164, #165 created" {
+		t.Fatalf("SummaryLine() = %q", got)
+	}
+}

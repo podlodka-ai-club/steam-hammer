@@ -1166,6 +1166,10 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	}
 
 	flags := flagStateAdapter{fs: fs}
+	if err := applyNativeProjectConfigDefaults(&opts, flags); err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+		return 1
+	}
 	effectiveMaxCycles := *maxCycles
 	if *opts.dryRun && effectiveMaxCycles == 0 {
 		effectiveMaxCycles = 1
@@ -1410,6 +1414,10 @@ func (a *App) runBatch(ctx context.Context, args []string) int {
 	}
 
 	flags := flagStateAdapter{fs: fs}
+	if err := applyNativeProjectConfigDefaults(&opts, flags); err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+		return 1
+	}
 	lastCode := 0
 	launchedStates := make([]detachedWorkerState, 0, len(ids.ids))
 	for _, id := range ids.ids {
@@ -1557,6 +1565,11 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintln(a.err, "run issue requires --id N")
 		return 2
 	}
+	flags := flagStateAdapter{fs: fs}
+	if err := applyNativeProjectConfigDefaults(&opts, flags); err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+		return 1
+	}
 	if code, handled := a.tryRunNativeIssue(ctx, nativeIssueOptions{
 		issueID:              *id,
 		common:               opts,
@@ -1597,7 +1610,7 @@ func (a *App) runIssue(ctx context.Context, args []string) int {
 		*syncReusedBranch,
 		*noSyncReusedBranch,
 		*syncStrategy,
-		flagStateAdapter{fs: fs},
+		flags,
 	)
 	if *detach {
 		workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "issue", strconv.Itoa(*id))
@@ -1702,6 +1715,11 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	if *id <= 0 {
 		_, _ = fmt.Fprintln(a.err, "run pr requires --id N")
 		return 2
+	}
+	flags := flagStateAdapter{fs: fs}
+	if err := applyNativeProjectConfigDefaults(&opts, flags); err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+		return 1
 	}
 	if *detach {
 		workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "pr", strconv.Itoa(*id))

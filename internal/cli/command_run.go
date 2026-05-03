@@ -506,7 +506,7 @@ func (a *App) buildBatchWorkerLaunchCommand(ctx context.Context, opts commonOpti
 	if decision.Mode == orchestration.ExecutionModePRReview && linkedPR != nil {
 		pythonPR := workerLaunchCommand{
 			name: "python3",
-			args: buildPRPythonArgs(a.runtime.RunnerScript(), opts, linkedPR.Number, true, false, false, "", false, ""),
+			args: buildPRPythonArgs(a.runtime.RunnerScript(), opts, linkedPR.Number, false, true, false, "", false, ""),
 		}
 		if reason := nativePRFallbackReason(nativePROptions{prID: linkedPR.Number, common: opts}); reason != "" {
 			pythonPR.fallbackReason = reason
@@ -517,7 +517,7 @@ func (a *App) buildBatchWorkerLaunchCommand(ctx context.Context, opts commonOpti
 			pythonPR.fallbackReason = fmt.Sprintf("failed to resolve orchestrator executable: %v", err)
 			return pythonPR
 		}
-		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, true, false, false, "", false, "")}
+		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, false, true, false, "", false, "")}
 	}
 
 	if reason := nativeIssueFallbackReason(nativeIssueOptions{

@@ -2933,6 +2933,11 @@ def suggest_lightweight_focus_paths(issue: dict) -> list[str]:
         )
     ):
         candidates.append("scripts/run_github_issues_to_opencode.py")
+    if "go migration" in combined:
+        candidates.extend([
+            "internal/core/orchestration/pr_readiness.go",
+            "internal/core/orchestration/merge_progression_models.go",
+        ])
     if any(token in combined for token in ("go cli wrapper", "go cli", "cli wrapper")):
         candidates.extend([
             "internal/cli/flags.go",

@@ -14,6 +14,8 @@ const (
 	MergeVerificationReasonNonOverlapping     = "non-overlapping"
 	MergeQueueActionAwaitTurn                 = "await_merge_queue_turn"
 	MergeQueueActionExecuteVerifiedMerge      = "execute_verified_merge"
+	MergeQueueActionAwaitAutoMerge            = "await_github_auto_merge"
+	MergeQueueActionManualMerge               = "merge_manually_or_enable_auto_merge"
 	ReviewFeedbackActionAddressRemaining      = "address_remaining_review_feedback"
 )
 
@@ -69,6 +71,22 @@ type SafeMergeExecutionDecision struct {
 	Queued     bool
 	NextAction string
 	Reason     string
+}
+
+type MergeAttemptResult struct {
+	Accepted bool
+	Status   string
+	Error    string
+}
+
+type PolicyDrivenMergeQueueDecision struct {
+	Status         string
+	Stage          string
+	Execute        bool
+	Queued         bool
+	NextAction     string
+	Reason         string
+	MergeAttempted bool
 }
 
 type OpenPullRequestCandidate struct {
@@ -292,5 +310,91 @@ func EvaluateSafeMergeExecution(readiness PRMergeReadiness, mergeInFlight bool) 
 		Queued:     false,
 		NextAction: MergeQueueActionExecuteVerifiedMerge,
 		Reason:     "merge gate passed and queue is clear",
+	}
+}
+
+func EvaluatePolicyDrivenMergeQueue(readiness PRMergeReadiness, mergeInFlight bool, autoMergeEnabled bool, attempt *MergeAttemptResult) PolicyDrivenMergeQueueDecision {
+	base := EvaluateSafeMergeExecution(readiness, mergeInFlight)
+	if !base.Execute {
+		status := strings.TrimSpace(readiness.Status)
+		if status == "" {
+			status = StatusBlocked
+		}
+		stage := "merge_gate"
+		if base.Queued {
+			status = StatusReadyToMerge
+			stage = "merge_queue"
+		}
+		return PolicyDrivenMergeQueueDecision{
+			Status:     status,
+			Stage:      stage,
+			Execute:    false,
+			Queued:     base.Queued,
+			NextAction: base.NextAction,
+			Reason:     base.Reason,
+		}
+	}
+
+	if !autoMergeEnabled {
+		return PolicyDrivenMergeQueueDecision{
+			Status:     StatusReadyToMerge,
+			Stage:      "merge_gate",
+			Execute:    false,
+			Queued:     false,
+			NextAction: "ready_for_merge",
+			Reason:     "merge gate passed and auto-merge is disabled",
+		}
+	}
+
+	if attempt == nil {
+		return PolicyDrivenMergeQueueDecision{
+			Status:         StatusReadyToMerge,
+			Stage:          "merge_execution",
+			Execute:        true,
+			Queued:         false,
+			NextAction:     MergeQueueActionExecuteVerifiedMerge,
+			Reason:         "merge gate passed and policy allows autonomous merge",
+			MergeAttempted: false,
+		}
+	}
+
+	attemptStatus := strings.ToLower(strings.TrimSpace(attempt.Status))
+	if attempt.Accepted {
+		return PolicyDrivenMergeQueueDecision{
+			Status:         StatusReadyToMerge,
+			Stage:          "merge_execution",
+			Execute:        false,
+			Queued:         false,
+			NextAction:     MergeQueueActionAwaitAutoMerge,
+			Reason:         optionalString(attempt.Error),
+			MergeAttempted: true,
+		}
+	}
+
+	nextAction := "inspect_merge_requirements"
+	status := StatusBlocked
+	if attemptStatus == StatusReadyToMerge {
+		nextAction = MergeQueueActionManualMerge
+		status = StatusWaitingForAuthor
+	}
+	if override := optionalString(attempt.Error); override != "" {
+		return PolicyDrivenMergeQueueDecision{
+			Status:         status,
+			Stage:          "merge_gate",
+			Execute:        false,
+			Queued:         false,
+			NextAction:     nextAction,
+			Reason:         override,
+			MergeAttempted: true,
+		}
+	}
+	return PolicyDrivenMergeQueueDecision{
+		Status:         status,
+		Stage:          "merge_gate",
+		Execute:        false,
+		Queued:         false,
+		NextAction:     nextAction,
+		Reason:         "merge request was not accepted by policy or code host",
+		MergeAttempted: true,
 	}
 }

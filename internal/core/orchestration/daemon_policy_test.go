@@ -81,16 +81,33 @@ func TestEvaluateDaemonTaskSelectionSkipsAlreadyHandledSignature(t *testing.T) {
 
 func TestEvaluateDaemonTaskSelectionPrefersReviewFeedbackSignal(t *testing.T) {
 	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
-		IssueNumber:           249,
-		LatestStateStatus:     StatusReadyForReview,
-		ReviewFeedbackSignal:  "pr-101:actionable",
-		LastHandledSignature:  "state:ready-for-review",
+		IssueNumber:          249,
+		LatestStateStatus:    StatusReadyForReview,
+		ReviewFeedbackSignal: "pr-101:actionable",
+		LastHandledSignature: "state:ready-for-review",
 	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
 
 	if !decision.Eligible {
 		t.Fatalf("Eligible = false, want true (%q)", decision.Reason)
 	}
 	if decision.Signature != "review:pr-101:actionable" {
+		t.Fatalf("Signature = %q", decision.Signature)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionPrefersConflictRecoverySignal(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:          249,
+		LatestStateStatus:    StatusReadyForReview,
+		PRConflictSignal:     "pr-101:DIRTY:CONFLICTING",
+		ReviewFeedbackSignal: "pr-101:actionable",
+		LastHandledSignature: "review:pr-101:actionable",
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if !decision.Eligible {
+		t.Fatalf("Eligible = false, want true (%q)", decision.Reason)
+	}
+	if decision.Signature != "conflict-recovery:pr-101:DIRTY:CONFLICTING" {
 		t.Fatalf("Signature = %q", decision.Signature)
 	}
 }

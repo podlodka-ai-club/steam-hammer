@@ -16,6 +16,7 @@ type DaemonTaskSnapshot struct {
 	IssueNumber          int
 	RunID                string
 	ForceReprocess       bool
+	PRConflictSignal     string
 	ReviewFeedbackSignal string
 	LatestStateStatus    string
 	LatestStateTaskType  string
@@ -133,6 +134,10 @@ func decodeProcessedTrackedState(raw json.RawMessage) (TrackedState, bool) {
 }
 
 func daemonTaskSignature(snapshot DaemonTaskSnapshot) string {
+	conflictSignal := strings.TrimSpace(snapshot.PRConflictSignal)
+	if conflictSignal != "" {
+		return "conflict-recovery:" + conflictSignal
+	}
 	reviewSignal := strings.TrimSpace(snapshot.ReviewFeedbackSignal)
 	if reviewSignal != "" {
 		return "review:" + reviewSignal

@@ -334,27 +334,45 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to commit PR changes: %v\n", err)
 			return 1
 		}
+		var pushRebase *orchestration.ReusedBranchSyncVerdict
 		if err := a.gitPushBranch(ctx, repoRoot, activeBranch, false); err != nil {
-			postState(failedState(attempt, "commit_push", "inspect_push_failure", err.Error(), reviewOutcome))
-			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to push PR branch %q: %v\n", activeBranch, err)
-			return 1
+			if isGitPushRejected(err) {
+				verdict, retryErr := a.rebasePRBranchAfterPushRejection(ctx, repoRoot, activeBranch)
+				if retryErr == nil {
+					pushRebase = &verdict
+					_, _ = fmt.Fprintln(a.out, verdict.Summary(false))
+					retryErr = a.gitPushBranch(ctx, repoRoot, activeBranch, false)
+				}
+				if retryErr == nil {
+					_, _ = fmt.Fprintf(a.out, "Retried PR branch push after rebasing on origin/%s.\n", activeBranch)
+				} else {
+					postState(failedState(attempt, "commit_push", "resolve_branch_sync_conflict", retryErr.Error(), reviewOutcome))
+					_, _ = fmt.Fprintf(a.err, "orchestrator: failed to recover rejected push for PR branch %q: %v\n", activeBranch, retryErr)
+					return 1
+				}
+			} else {
+				postState(failedState(attempt, "commit_push", "inspect_push_failure", err.Error(), reviewOutcome))
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to push PR branch %q: %v\n", activeBranch, err)
+				return 1
+			}
 		}
 
 		postState(orchestration.TrackedState{
-			Status:         orchestration.StatusWaitingForCI,
-			TaskType:       "pr",
-			PR:             intPtr(pullRequest.Number),
-			Branch:         activeBranch,
-			BaseBranch:     strings.TrimSpace(pullRequest.BaseRefName),
-			Runner:         runnerName,
-			Agent:          agentName,
-			Model:          modelName,
-			Attempt:        attempt,
-			Stage:          "pr_update",
-			NextAction:     "wait_for_ci",
-			Timestamp:      time.Now().UTC().Format(time.RFC3339),
-			Stats:          statsMap(result.Stats),
-			ReviewFeedback: reviewOutcome,
+			Status:           orchestration.StatusWaitingForCI,
+			TaskType:         "pr",
+			PR:               intPtr(pullRequest.Number),
+			Branch:           activeBranch,
+			BaseBranch:       strings.TrimSpace(pullRequest.BaseRefName),
+			Runner:           runnerName,
+			Agent:            agentName,
+			Model:            modelName,
+			Attempt:          attempt,
+			Stage:            "pr_update",
+			NextAction:       "wait_for_ci",
+			Timestamp:        time.Now().UTC().Format(time.RFC3339),
+			Stats:            statsMap(result.Stats),
+			ReviewFeedback:   reviewOutcome,
+			ReusedBranchSync: pushRebase,
 		})
 
 		updatedPR, err := a.prLifecycle.FetchPullRequest(ctx, repo, pullRequest.Number)
@@ -364,6 +382,10 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 			return 1
 		}
 		pullRequest = updatedPR
+		if prNeedsConflictRecovery(pullRequest) {
+			_, _ = fmt.Fprintf(a.out, "PR #%d is %s/%s after review update; running conflict recovery before more review feedback.\n", pullRequest.Number, strings.TrimSpace(pullRequest.MergeStateStatus), strings.TrimSpace(pullRequest.Mergeable))
+			return a.runNativePRConflictRecovery(ctx, repo, pullRequest, opts, &latestState)
+		}
 		remainingItems, remainingStats, err := a.fetchNativePRReviewFeedback(ctx, repo, pullRequest)
 		if err != nil {
 			postState(failedState(attempt, "review_feedback", "inspect_review_feedback", err.Error(), reviewOutcome))
@@ -743,6 +765,49 @@ func appendRemainingReviewOutcomes(existing *orchestration.PRReviewOutcomeSummar
 		})
 	}
 	return &orchestration.PRReviewOutcomeSummary{Items: items}
+}
+
+func prNeedsConflictRecovery(pullRequest lifecycle.PullRequest) bool {
+	return orchestration.ClassifyPRMergeReadinessState(pullRequest.MergeStateStatus, pullRequest.Mergeable) == orchestration.MergeReadinessConflicting
+}
+
+func isGitPushRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "fetch first") ||
+		strings.Contains(message, "non-fast-forward") ||
+		(strings.Contains(message, "failed to push some refs") && strings.Contains(message, "rejected"))
+}
+
+func (a *App) rebasePRBranchAfterPushRejection(ctx context.Context, repoRoot, branchName string) (orchestration.ReusedBranchSyncVerdict, error) {
+	remoteBranchRef := "origin/" + strings.TrimSpace(branchName)
+	beforeSyncSHA, err := a.gitCurrentHeadSHA(ctx, repoRoot)
+	if err != nil {
+		return orchestration.ReusedBranchSyncVerdict{}, err
+	}
+	if _, err := a.runGit(ctx, repoRoot, "fetch", "origin", branchName); err != nil {
+		return orchestration.ReusedBranchSyncVerdict{}, err
+	}
+	if _, err := a.runGit(ctx, repoRoot, "rebase", remoteBranchRef); err != nil {
+		_, _ = a.gitCommandSucceeds(ctx, repoRoot, "rebase", "--abort")
+		return orchestration.ReusedBranchSyncVerdict{}, err
+	}
+	afterSyncSHA, err := a.gitCurrentHeadSHA(ctx, repoRoot)
+	if err != nil {
+		return orchestration.ReusedBranchSyncVerdict{}, err
+	}
+	changed := beforeSyncSHA != afterSyncSHA
+	return orchestration.ReusedBranchSyncVerdict{
+		BranchName:        branchName,
+		RemoteBaseRef:     remoteBranchRef,
+		RequestedStrategy: "rebase",
+		AppliedStrategy:   "rebase",
+		Status:            branchSyncStatus(changed, false),
+		Changed:           changed,
+		AutoResolved:      false,
+	}, nil
 }
 
 func nativePRCommitTitle(pullRequest lifecycle.PullRequest) string {

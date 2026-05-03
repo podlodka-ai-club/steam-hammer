@@ -12,6 +12,7 @@ const (
 	OrchestrationStateMarker         = "<!-- orchestration-state:v1 -->"
 	OrchestrationClaimMarker         = "<!-- orchestration-claim:v1 -->"
 	OrchestrationDecompositionMarker = "<!-- orchestration-decomposition:v1 -->"
+	OrchestrationGroomingMarker      = "<!-- orchestration-grooming:v1 -->"
 	ClarificationRequestMarker       = "<!-- orchestration-clarification-request:v1 -->"
 )
 

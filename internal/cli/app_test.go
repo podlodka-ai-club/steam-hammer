@@ -185,7 +185,8 @@ func (f *fakeDaemonLifecycle) CreateIssue(_ context.Context, req githublifecycle
 		return githublifecycle.Issue{}, f.createErr
 	}
 	if f.createIssue.Number == 0 {
-		f.createIssue = githublifecycle.Issue{Number: 164, URL: "https://github.com/owner/repo/issues/164"}
+		number := 163 + len(f.createdIssues)
+		return githublifecycle.Issue{Number: number, URL: "https://github.com/owner/repo/issues/" + strconv.Itoa(number)}, nil
 	}
 	return f.createIssue, nil
 }
@@ -487,6 +488,115 @@ func TestVerifyCommandCreatesFollowUpIssueFromGoRuntime(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "follow-up issue #164 created") {
 		t.Fatalf("stdout = %q, want created follow-up summary", out.String())
+	}
+}
+
+func TestVerifyCommandCreatesOneFollowUpPerFailedCheck(t *testing.T) {
+	repoDir := t.TempDir()
+	projectConfigPath := filepath.Join(repoDir, "project-config.json")
+	if err := os.WriteFile(projectConfigPath, []byte(`{"workflow":{"commands":{"test":"make test","lint":"make lint","build":"make build"}}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(project-config) error = %v", err)
+	}
+	sessionPath := filepath.Join(repoDir, "session.json")
+	if err := os.WriteFile(sessionPath, []byte(`{"processed_issues":{},"checkpoint":{"batch_index":2,"total_batches":3}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(session) error = %v", err)
+	}
+	var out strings.Builder
+	shell := &fakeShellExecutor{results: []shellExecutionResult{{Stderr: "test failure", ExitCode: 1}, {Stderr: "lint failure", ExitCode: 1}, {ExitCode: 0}}}
+	daemon := &fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{}}
+	app := NewApp(&out, &strings.Builder{})
+	app.SetShellExecutor(shell)
+	app.SetDaemonLifecycle(daemon)
+
+	code := app.Run([]string{"verify", "--repo", "owner/repo", "--tracker", "github", "--dir", repoDir, "--project-config", projectConfigPath, "--autonomous-session-file", sessionPath, "--create-followup-issue"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if len(daemon.createdIssues) != 2 {
+		t.Fatalf("created issues = %#v", daemon.createdIssues)
+	}
+	if daemon.createdIssues[0].Title != "Post-batch verification failed: test" || daemon.createdIssues[1].Title != "Post-batch verification failed: lint" {
+		t.Fatalf("created issue titles = %#v", daemon.createdIssues)
+	}
+	for _, want := range []string{"batch: 2/3", "session: `" + sessionPath + "`", "follow-up issues #164, #165 created"} {
+		if !strings.Contains(daemon.createdIssues[0].Body+out.String(), want) {
+			t.Fatalf("missing %q\nbody=%s\nout=%s", want, daemon.createdIssues[0].Body, out.String())
+		}
+	}
+	state, err := orchestration.LoadState(sessionPath)
+	if err != nil {
+		t.Fatalf("LoadState() error = %v", err)
+	}
+	if got := len(state.Checkpoint.Verification.FollowUpIssues); got != 2 {
+		t.Fatalf("persisted follow-up issues = %d, want 2", got)
+	}
+}
+
+func TestVerifyCommandSuppressesDuplicatePostBatchFollowUp(t *testing.T) {
+	repoDir := t.TempDir()
+	projectConfigPath := filepath.Join(repoDir, "project-config.json")
+	if err := os.WriteFile(projectConfigPath, []byte(`{"workflow":{"commands":{"test":"make test"}}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(project-config) error = %v", err)
+	}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{{Stderr: "test failure", ExitCode: 1}}}
+	daemon := &fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{{Number: 222, Title: "Post-batch verification failed: test", Body: "existing", URL: "https://github.com/owner/repo/issues/222", State: "OPEN"}},
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetShellExecutor(shell)
+	app.SetDaemonLifecycle(daemon)
+
+	code := app.Run([]string{"verify", "--repo", "owner/repo", "--tracker", "github", "--dir", repoDir, "--project-config", projectConfigPath, "--create-followup-issue"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if len(daemon.createdIssues) != 0 {
+		t.Fatalf("created issues = %#v, want none", daemon.createdIssues)
+	}
+}
+
+func TestVerifyCommandPassingChecksDoNotCreateFollowUp(t *testing.T) {
+	repoDir := t.TempDir()
+	projectConfigPath := filepath.Join(repoDir, "project-config.json")
+	if err := os.WriteFile(projectConfigPath, []byte(`{"workflow":{"commands":{"test":"make test","build":"make build"}}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(project-config) error = %v", err)
+	}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{{ExitCode: 0}, {ExitCode: 0}}}
+	daemon := &fakeDaemonLifecycle{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetShellExecutor(shell)
+	app.SetDaemonLifecycle(daemon)
+
+	code := app.Run([]string{"verify", "--repo", "owner/repo", "--tracker", "github", "--dir", repoDir, "--project-config", projectConfigPath, "--create-followup-issue"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if len(daemon.createdIssues) != 0 {
+		t.Fatalf("created issues = %#v, want none", daemon.createdIssues)
+	}
+}
+
+func TestVerifyCommandFollowUpUsesMissingLogsFallback(t *testing.T) {
+	repoDir := t.TempDir()
+	projectConfigPath := filepath.Join(repoDir, "project-config.json")
+	if err := os.WriteFile(projectConfigPath, []byte(`{"workflow":{"commands":{"test":"make test"}}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(project-config) error = %v", err)
+	}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{{ExitCode: 1}}}
+	daemon := &fakeDaemonLifecycle{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetShellExecutor(shell)
+	app.SetDaemonLifecycle(daemon)
+
+	code := app.Run([]string{"verify", "--repo", "owner/repo", "--tracker", "github", "--dir", repoDir, "--project-config", projectConfigPath, "--create-followup-issue"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if len(daemon.createdIssues) != 1 {
+		t.Fatalf("created issues = %#v", daemon.createdIssues)
+	}
+	if !strings.Contains(daemon.createdIssues[0].Body, "no log excerpt was captured") {
+		t.Fatalf("issue body = %q", daemon.createdIssues[0].Body)
 	}
 }
 

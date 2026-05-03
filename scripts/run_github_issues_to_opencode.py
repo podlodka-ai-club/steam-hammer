@@ -2886,7 +2886,20 @@ def suggest_lightweight_focus_paths(issue: dict) -> list[str]:
     combined = f"{issue.get('title') or ''}\n{body}".lower()
     candidates = extract_required_file_paths_from_text(body)
 
-    if any(token in combined for token in ("python runner", "orchestration state", "scope check", "decomposition preflight", "state comments")):
+    if any(
+        token in combined
+        for token in (
+            "python runner",
+            "python compatibility adapter",
+            "compatibility adapter",
+            "python entrypoint",
+            "orchestration state",
+            "scope check",
+            "decomposition preflight",
+            "state comments",
+            "go migration",
+        )
+    ):
         candidates.append("scripts/run_github_issues_to_opencode.py")
     if any(token in combined for token in ("go cli wrapper", "go cli", "cli wrapper")):
         candidates.extend([

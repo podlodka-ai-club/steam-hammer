@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/dependencies"
 	corelifecycle "github.com/podlodka-ai-club/steam-hammer/internal/core/lifecycle"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 )
@@ -630,8 +631,16 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 		if latestDecomposition != nil {
 			snapshot.LatestDecomposition = latestDecomposition.Payload
 		}
+		openDependencies, err := a.openDaemonIssueDependencies(ctx, strings.TrimSpace(*config.opts.repo), issue, comments)
+		if err != nil {
+			return nil, err
+		}
+		snapshot.OpenDependencyRefs = openDependencies
 		decision := orchestration.EvaluateDaemonTaskSelection(snapshot, now)
 		if !decision.Eligible {
+			if decision.Reason != "" {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: skipping issue #%d: %s\n", issue.Number, decision.Reason)
+			}
 			continue
 		}
 		selected = append(selected, daemonSelectedIssue{
@@ -642,6 +651,38 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 		seen[issue.Number] = struct{}{}
 	}
 	return selected, nil
+}
+
+func (a *App) openDaemonIssueDependencies(ctx context.Context, repo string, issue corelifecycle.Issue, comments []corelifecycle.IssueComment) ([]string, error) {
+	commentBodies := make([]string, 0, len(comments))
+	for _, comment := range comments {
+		commentBodies = append(commentBodies, comment.Body)
+	}
+	tracker := strings.TrimSpace(issue.Tracker)
+	if tracker == "" {
+		tracker = corelifecycle.TrackerGitHub
+	}
+	refs := dependencies.ParseIssueReferences(dependencies.ParseInput{
+		Tracker:  tracker,
+		SelfRef:  strconv.Itoa(issue.Number),
+		Body:     issue.Body,
+		Comments: commentBodies,
+	})
+	openRefs := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		depNumber, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(ref, "#")))
+		if err != nil || depNumber <= 0 {
+			continue
+		}
+		depIssue, err := a.daemon.FetchIssue(ctx, repo, depNumber)
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect dependency #%d for issue #%d: %w", depNumber, issue.Number, err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(depIssue.State), "closed") {
+			openRefs = append(openRefs, strconv.Itoa(depNumber))
+		}
+	}
+	return openRefs, nil
 }
 
 func (a *App) daemonPRConflictRecoverySignal(ctx context.Context, repo string, issue corelifecycle.Issue) (string, error) {

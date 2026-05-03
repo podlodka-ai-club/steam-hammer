@@ -97,6 +97,7 @@ type fakeIssueAgentRunner struct {
 type fakeDaemonLifecycle struct {
 	issues          []githublifecycle.Issue
 	issue           githublifecycle.Issue
+	issuesByNumber  map[int]githublifecycle.Issue
 	defaultBranch   string
 	linkedPR        *githublifecycle.PullRequest
 	pullRequest     githublifecycle.PullRequest
@@ -120,6 +121,9 @@ type fakeDaemonLifecycle struct {
 func (f *fakeDaemonLifecycle) FetchIssue(_ context.Context, _ string, number int) (githublifecycle.Issue, error) {
 	if f.listErr != nil {
 		return githublifecycle.Issue{}, f.listErr
+	}
+	if issue, ok := f.issuesByNumber[number]; ok {
+		return issue, nil
 	}
 	if f.issue.Number == 0 {
 		f.issue = githublifecycle.Issue{Number: number, Title: "Fix runner", Body: "Body", URL: "https://github.com/owner/repo/issues/" + strconv.Itoa(number), Tracker: githublifecycle.TrackerGitHub}
@@ -2043,6 +2047,106 @@ func TestRunDaemonGoPolicyProcessesDistinctIssuesAcrossCycles(t *testing.T) {
 	}
 	if got := flagValue(runner.cmds[1][1:], "--issue"); got != "72" {
 		t.Fatalf("second issue = %q, want 72", got)
+	}
+}
+
+func TestRunDaemonSkipsIssueWithMixedOpenDependencies(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{
+			{Number: 330, Body: "Depends on: #325, #326", Tracker: githublifecycle.TrackerGitHub},
+			{Number: 331, Body: "", Tracker: githublifecycle.TrackerGitHub},
+		},
+		issuesByNumber: map[int]githublifecycle.Issue{
+			325: {Number: 325, State: "closed"},
+			326: {Number: 326, State: "open"},
+		},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "2", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if got := flagValue(runner.cmds[0][1:], "--issue"); got != "331" {
+		t.Fatalf("selected issue = %q, want 331", got)
+	}
+	if !strings.Contains(errOut.String(), "blocked by open dependencies: #326") {
+		t.Fatalf("stderr = %q, want dependency skip reason", errOut.String())
+	}
+}
+
+func TestRunDaemonAllowsIssueWhenAllDependenciesClosed(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{{Number: 330, Body: "Depends on: #325, #326", Tracker: githublifecycle.TrackerGitHub}},
+		issuesByNumber: map[int]githublifecycle.Issue{
+			325: {Number: 325, State: "closed"},
+			326: {Number: 326, State: "closed"},
+		},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if got := flagValue(runner.cmds[0][1:], "--issue"); got != "330" {
+		t.Fatalf("selected issue = %q, want 330", got)
+	}
+}
+
+func TestRunDaemonIgnoresMalformedDependencyReferences(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues:          []githublifecycle.Issue{{Number: 330, Body: "Depends on: #abc, not-an-issue", Tracker: githublifecycle.TrackerGitHub}},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+}
+
+func TestRunDaemonTreatsSelfDependencyAsBlocked(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{{Number: 330, Body: "Depends on: #330", State: "open", Tracker: githublifecycle.TrackerGitHub}},
+		issuesByNumber: map[int]githublifecycle.Issue{
+			330: {Number: 330, State: "open"},
+		},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "blocked by open dependencies: #330") {
+		t.Fatalf("stderr = %q, want self-dependency skip reason", errOut.String())
 	}
 }
 

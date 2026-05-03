@@ -22,6 +22,7 @@ type DaemonTaskSnapshot struct {
 	LatestStateTaskType  string
 	LatestClaim          map[string]any
 	LatestDecomposition  map[string]any
+	OpenDependencyRefs   []string
 	LastHandledSignature string
 }
 
@@ -37,6 +38,9 @@ func EvaluateDaemonTaskSelection(snapshot DaemonTaskSnapshot, now time.Time) Dae
 		signature = "state:new"
 	}
 
+	if len(snapshot.OpenDependencyRefs) > 0 {
+		return DaemonTaskDecision{Reason: "blocked by open dependencies: " + formatDependencyRefs(snapshot.OpenDependencyRefs), Signature: signature}
+	}
 	if snapshot.LastHandledSignature != "" && snapshot.LastHandledSignature == signature {
 		return DaemonTaskDecision{Reason: "already handled in this daemon session", Signature: signature}
 	}
@@ -75,6 +79,26 @@ func EvaluateDaemonTaskSelection(snapshot DaemonTaskSnapshot, now time.Time) Dae
 	}
 
 	return DaemonTaskDecision{Eligible: true, Signature: signature}
+}
+
+func formatDependencyRefs(refs []string) string {
+	parts := make([]string, 0, len(refs))
+	seen := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		if !strings.HasPrefix(ref, "#") {
+			ref = "#" + ref
+		}
+		if _, ok := seen[ref]; ok {
+			continue
+		}
+		seen[ref] = struct{}{}
+		parts = append(parts, ref)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func BuildDaemonClaimComment(issueNumber int, runID, worker string, claimedAt, expiresAt time.Time) string {

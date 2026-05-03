@@ -51,3 +51,29 @@ func TestParseIssueReferencesSkipsMalformedMarkerUntilValidPayload(t *testing.T)
 		t.Fatalf("ParseIssueReferences() = %v, want %v", refs, want)
 	}
 }
+
+func TestParseIssueReferencesGitHubSupportsCommaSeparatedAndMultipleLines(t *testing.T) {
+	refs := ParseIssueReferences(ParseInput{
+		Tracker: TrackerGitHub,
+		SelfRef: "330",
+		Body:    "Depends on: #325, #326\nBlocked by: #327 and not-an-issue",
+	})
+
+	want := []string{"325", "326", "327"}
+	if !reflect.DeepEqual(refs, want) {
+		t.Fatalf("ParseIssueReferences() = %v, want %v", refs, want)
+	}
+}
+
+func TestParseIssueReferencesKeepsSelfReferenceForSafeBlocking(t *testing.T) {
+	refs := ParseIssueReferences(ParseInput{
+		Tracker: TrackerGitHub,
+		SelfRef: "330",
+		Body:    "Depends on: #330",
+	})
+
+	want := []string{"330"}
+	if !reflect.DeepEqual(refs, want) {
+		t.Fatalf("ParseIssueReferences() = %v, want %v", refs, want)
+	}
+}

@@ -33,7 +33,6 @@ type ParseInput struct {
 // refs normalized as strings so the future Go core can remain tracker-agnostic.
 func ParseIssueReferences(input ParseInput) []string {
 	tracker := normalizeTracker(input.Tracker)
-	selfRef := strings.TrimSpace(input.SelfRef)
 	refs := make([]string, 0)
 	seen := make(map[string]struct{})
 
@@ -43,7 +42,7 @@ func ParseIssueReferences(input ParseInput) []string {
 
 	for _, text := range textSources {
 		for _, ref := range dependencyRefsFromMarkerPayload(text, tracker) {
-			if ref == "" || ref == selfRef {
+			if ref == "" {
 				continue
 			}
 			if _, ok := seen[ref]; ok {
@@ -59,7 +58,7 @@ func ParseIssueReferences(input ParseInput) []string {
 				continue
 			}
 			for _, ref := range extractIssueReferencesFromText(match[1], tracker) {
-				if ref == "" || ref == selfRef {
+				if ref == "" {
 					continue
 				}
 				if _, ok := seen[ref]; ok {

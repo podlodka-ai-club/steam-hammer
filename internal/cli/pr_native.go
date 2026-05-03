@@ -3,6 +3,8 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -58,15 +60,6 @@ func nativePRFallbackReason(opts nativePROptions) string {
 	if opts.detach {
 		return "--detach requires worker launch and is handled before native PR execution"
 	}
-	if opts.isolateWorktree {
-		return "--isolate-worktree is not supported by the Go-native PR path yet"
-	}
-	if opts.postSummary {
-		return "--post-pr-summary is not supported by the Go-native PR path yet"
-	}
-	if strings.TrimSpace(opts.followupPrefix) != "" {
-		return "--pr-followup-branch-prefix is not supported by the Go-native PR path yet"
-	}
 	if strings.TrimSpace(opts.syncStrategy) != "" && !opts.conflictRecoveryOnly {
 		return "--sync-strategy is not supported by the Go-native PR path yet"
 	}
@@ -116,26 +109,58 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 		return 1
 	}
 
-	targetBranch := strings.TrimSpace(pullRequest.HeadRefName)
-	if targetBranch == "" {
+	prBranch := strings.TrimSpace(pullRequest.HeadRefName)
+	if prBranch == "" {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: PR #%d is missing head branch metadata\n", pullRequest.Number)
 		return 1
 	}
-	activeBranch, err := a.gitCurrentBranch(ctx, repoRoot)
-	if err != nil {
-		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve current branch: %v\n", err)
-		return 1
+	if opts.isolateWorktree {
+		if *opts.common.dryRun {
+			preview := filepath.Join(os.TempDir(), fmt.Sprintf("opencode-pr-%s-<random>", sanitizeBranchForPath(prBranch)))
+			_, _ = fmt.Fprintf(a.out, "[dry-run] Would create isolated worktree for %q at %q\n", prBranch, preview)
+		} else {
+			worktreeDir, err := a.createNativePRIsolatedWorktree(ctx, repoRoot, prBranch)
+			if err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to create isolated PR worktree: %v\n", err)
+				return 1
+			}
+			defer func() {
+				if _, err := a.runGit(context.Background(), repoRoot, "worktree", "remove", "--force", worktreeDir); err != nil {
+					_, _ = fmt.Fprintf(a.err, "orchestrator: warning: failed to remove isolated worktree %q: %v\n", worktreeDir, err)
+				}
+			}()
+			repoRoot = worktreeDir
+		}
 	}
-	if activeBranch != targetBranch {
-		if !opts.allowBranchSwitch {
-			_, _ = fmt.Fprintf(a.err, "orchestrator: current branch %q does not match PR branch %q; rerun with --allow-pr-branch-switch or switch branches manually\n", activeBranch, targetBranch)
+	activeBranch := prBranch
+	if !opts.isolateWorktree || !*opts.common.dryRun {
+		currentBranch, err := a.gitCurrentBranch(ctx, repoRoot)
+		if err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve current branch: %v\n", err)
 			return 1
 		}
-		if _, err := a.runGit(ctx, repoRoot, "checkout", targetBranch); err != nil {
-			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to switch to PR branch %q: %v\n", targetBranch, err)
+		activeBranch = currentBranch
+		if activeBranch != prBranch {
+			if !opts.allowBranchSwitch {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: current branch %q does not match PR branch %q; rerun with --allow-pr-branch-switch or switch branches manually\n", activeBranch, prBranch)
+				return 1
+			}
+			if _, err := a.runGit(ctx, repoRoot, "checkout", prBranch); err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to switch to PR branch %q: %v\n", prBranch, err)
+				return 1
+			}
+			activeBranch = prBranch
+		}
+	}
+	if prefix := strings.Trim(strings.TrimSpace(opts.followupPrefix), "/"); prefix != "" {
+		followupBranch := fmt.Sprintf("%s/pr-%d-review-comments", prefix, pullRequest.Number)
+		if *opts.common.dryRun {
+			_, _ = fmt.Fprintf(a.out, "[dry-run] Would create follow-up branch %q from %q\n", followupBranch, activeBranch)
+		} else if err := a.createNativePRFollowupBranch(ctx, repoRoot, followupBranch); err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to create follow-up branch %q: %v\n", followupBranch, err)
 			return 1
 		}
-		activeBranch = targetBranch
+		activeBranch = followupBranch
 	}
 	if *opts.common.dryRun {
 		_, _ = fmt.Fprintf(a.out, "[dry-run] Native PR flow preflight succeeded for PR #%d on branch %q; agent run skipped\n", pullRequest.Number, activeBranch)
@@ -368,6 +393,11 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 			ReviewFeedback:   reviewOutcome,
 			ReusedBranchSync: pushRebase,
 		})
+		if opts.postSummary {
+			if err := a.safePostPRComment(ctx, repo, pullRequest.Number, buildNativePRSummaryComment(len(reviewItems))); err != nil {
+				_, _ = fmt.Fprintf(a.err, "orchestrator: warning: failed to post PR summary for PR #%d: %v\n", pullRequest.Number, err)
+			}
+		}
 
 		updatedPR, err := a.prLifecycle.FetchPullRequest(ctx, repo, pullRequest.Number)
 		if err != nil {
@@ -773,6 +803,80 @@ func isGitPushRejected(err error) bool {
 	return strings.Contains(message, "fetch first") ||
 		strings.Contains(message, "non-fast-forward") ||
 		(strings.Contains(message, "failed to push some refs") && strings.Contains(message, "rejected"))
+}
+
+func (a *App) createNativePRIsolatedWorktree(ctx context.Context, repoRoot, branchName string) (string, error) {
+	worktreeDir, err := os.MkdirTemp("", fmt.Sprintf("opencode-pr-%s-", sanitizeBranchForPath(branchName)))
+	if err != nil {
+		return "", err
+	}
+	created := false
+	defer func() {
+		if !created {
+			_ = os.RemoveAll(worktreeDir)
+		}
+	}()
+	localExists, err := a.gitLocalBranchExists(ctx, repoRoot, branchName)
+	if err != nil {
+		return "", err
+	}
+	if localExists {
+		if _, err := a.runGit(ctx, repoRoot, "worktree", "add", worktreeDir, branchName); err != nil {
+			return "", err
+		}
+		created = true
+		return worktreeDir, nil
+	}
+	if _, err := a.runGit(ctx, repoRoot, "fetch", "origin", branchName); err != nil {
+		return "", err
+	}
+	if _, err := a.runGit(ctx, repoRoot, "worktree", "add", "-b", branchName, worktreeDir, "origin/"+branchName); err != nil {
+		return "", err
+	}
+	if _, err := a.runGit(ctx, worktreeDir, "branch", "--set-upstream-to", "origin/"+branchName, branchName); err != nil {
+		return "", err
+	}
+	created = true
+	return worktreeDir, nil
+}
+
+func (a *App) createNativePRFollowupBranch(ctx context.Context, repoRoot, branchName string) error {
+	localExists, err := a.gitLocalBranchExists(ctx, repoRoot, branchName)
+	if err != nil {
+		return err
+	}
+	if localExists {
+		if _, err := a.runGit(ctx, repoRoot, "checkout", branchName); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(a.out, "Reusing existing follow-up branch: %s\n", branchName)
+		return nil
+	}
+	if _, err := a.runGit(ctx, repoRoot, "checkout", "-b", branchName); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(a.out, "Created follow-up branch: %s\n", branchName)
+	return nil
+}
+
+func buildNativePRSummaryComment(reviewItemsCount int) string {
+	return fmt.Sprintf("Automated follow-up completed.\n\n- Addressed review feedback items: %d\n- Please run another review pass for confirmation.", reviewItemsCount)
+}
+
+func sanitizeBranchForPath(branchName string) string {
+	branchName = strings.TrimSpace(branchName)
+	if branchName == "" {
+		return "branch"
+	}
+	var b strings.Builder
+	for _, r := range branchName {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 func (a *App) rebasePRBranchAfterPushRejection(ctx context.Context, repoRoot, branchName string) (orchestration.ReusedBranchSyncVerdict, error) {

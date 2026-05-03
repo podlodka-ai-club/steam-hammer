@@ -79,6 +79,22 @@ func TestEvaluateDaemonTaskSelectionSkipsAlreadyHandledSignature(t *testing.T) {
 	}
 }
 
+func TestEvaluateDaemonTaskSelectionPrefersReviewFeedbackSignal(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:           249,
+		LatestStateStatus:     StatusReadyForReview,
+		ReviewFeedbackSignal:  "pr-101:actionable",
+		LastHandledSignature:  "state:ready-for-review",
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if !decision.Eligible {
+		t.Fatalf("Eligible = false, want true (%q)", decision.Reason)
+	}
+	if decision.Signature != "review:pr-101:actionable" {
+		t.Fatalf("Signature = %q", decision.Signature)
+	}
+}
+
 func TestBuildDaemonClaimAndReleaseCommentsUseStableMarker(t *testing.T) {
 	claimed := BuildDaemonClaimComment(249, "run-1", "daemon-1", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC), time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC))
 	released := BuildDaemonReleaseComment(249, "run-1", "daemon-1", time.Date(2026, 5, 1, 12, 2, 0, 0, time.UTC))

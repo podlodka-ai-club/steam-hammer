@@ -23,6 +23,7 @@ type recordingRunner struct {
 	args  []string
 	calls int
 	cmds  [][]string
+	err   error
 }
 
 func (r *recordingRunner) Run(_ context.Context, name string, args ...string) error {
@@ -32,7 +33,7 @@ func (r *recordingRunner) Run(_ context.Context, name string, args ...string) er
 	r.args = append([]string(nil), args...)
 	r.calls++
 	r.cmds = append(r.cmds, append([]string{name}, args...))
-	return nil
+	return r.err
 }
 
 type failingRunner struct {
@@ -312,7 +313,7 @@ func TestHelpDoesNotInvokeRunner(t *testing.T) {
 }
 
 func TestDoctorCommandRunsGoNativeChecks(t *testing.T) {
-	runner := &recordingRunner{}
+	runner := &recordingRunner{err: os.ErrNotExist}
 	var out strings.Builder
 	app := NewApp(&out, &strings.Builder{})
 	app.SetRunner(runner)
@@ -330,7 +331,7 @@ func TestDoctorCommandRunsGoNativeChecks(t *testing.T) {
 }
 
 func TestAutoDoctorCommandIncludesNextStepGuidance(t *testing.T) {
-	runner := &recordingRunner{}
+	runner := &recordingRunner{err: os.ErrNotExist}
 	var out strings.Builder
 	app := NewApp(&out, &strings.Builder{})
 	app.SetRunner(runner)
@@ -1876,7 +1877,7 @@ func TestRunDaemonRoutesLinkedPRWorkerWithIsolatedWorktree(t *testing.T) {
 		t.Fatalf("runner calls = %d, want 1", runner.calls)
 	}
 	joined := strings.Join(runner.args, "\n")
-	if !strings.Contains(joined, "--pr") || !strings.Contains(joined, "101") {
+	if !strings.Contains(joined, "run\npr") || !strings.Contains(joined, "--id") || !strings.Contains(joined, "101") {
 		t.Fatalf("runner args = %#v, want PR routing", runner.args)
 	}
 	if !strings.Contains(joined, "--isolate-worktree") {
@@ -1884,6 +1885,34 @@ func TestRunDaemonRoutesLinkedPRWorkerWithIsolatedWorktree(t *testing.T) {
 	}
 	if strings.Contains(joined, "--allow-pr-branch-switch") {
 		t.Fatalf("runner args = %#v, should not include branch switch flag", runner.args)
+	}
+}
+
+func TestRunDaemonRoutesDirtyLinkedPRToConflictRecovery(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetIssueLifecycle(&fakeDaemonLifecycle{
+		issue:           githublifecycle.Issue{Number: 71, Title: "Fix runtime", Body: "Body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		linkedPR:        &githublifecycle.PullRequest{Number: 101, Title: "Existing fix", HeadRefName: "feature/pr-101", BaseRefName: "main", MergeStateStatus: "DIRTY", Mergeable: "CONFLICTING"},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues:          []githublifecycle.Issue{{Number: 71}},
+		linkedPR:        &githublifecycle.PullRequest{Number: 101, Title: "Existing fix", HeadRefName: "feature/pr-101", BaseRefName: "main", MergeStateStatus: "DIRTY", Mergeable: "CONFLICTING"},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--max-cycles", "1", "--poll-interval-seconds", "0", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	joined := strings.Join(runner.args, "\n")
+	if !strings.Contains(joined, "run\npr") || !strings.Contains(joined, "--id") || !strings.Contains(joined, "101") || !strings.Contains(joined, "--conflict-recovery-only") {
+		t.Fatalf("runner args = %#v, want PR conflict recovery routing", runner.args)
+	}
+	if strings.Contains(joined, "--isolate-worktree") {
+		t.Fatalf("runner args = %#v, conflict recovery should use native PR branch sync", runner.args)
 	}
 }
 
@@ -2330,6 +2359,130 @@ func TestRunPRUsesNativeRuntimeLoopWhenRepoExplicit(t *testing.T) {
 	}
 	if !strings.Contains(joinedShell, "git 'push' '-u' 'origin' 'feature/pr-72'") {
 		t.Fatalf("shell commands missing PR push: %s", joinedShell)
+	}
+}
+
+func TestRunPRNativeRunsConflictRecoveryWhenReviewUpdateLeavesPRDirty(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: ""},
+		{Stdout: " M internal/cli/pr_native.go\n"},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: ""},
+		{Stdout: "[feature/pr-72 abc123] Address review comments for PR #72\n"},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: "/repo\n"},
+		{Stdout: "pushed\n"},
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{ExitCode: 0},
+		{ExitCode: 0},
+		{},
+		{},
+		{},
+		{Stdout: "abc123\n"},
+		{},
+		{Stdout: "def456\n"},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: "/repo\n"},
+		{},
+	}}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{ExitCode: 0}}
+	lifecycle := &fakeDaemonLifecycle{
+		pullRequests: []githublifecycle.PullRequest{
+			{Number: 72, Title: "Fix review feedback", URL: "https://github.com/owner/repo/pull/72", HeadRefName: "feature/pr-72", BaseRefName: "main", Author: &githublifecycle.Actor{Login: "author"}},
+			{Number: 72, Title: "Fix review feedback", URL: "https://github.com/owner/repo/pull/72", HeadRefName: "feature/pr-72", BaseRefName: "main", MergeStateStatus: "DIRTY", Mergeable: "CONFLICTING", Author: &githublifecycle.Actor{Login: "author"}},
+		},
+		reviewThreadSeq: [][]githublifecycle.PullRequestReviewThread{{{
+			Comments: []githublifecycle.PullRequestReviewComment{{Body: "Please add a regression test", Path: "internal/cli/pr_native.go", Line: 12, Author: &githublifecycle.Actor{Login: "reviewer"}}},
+		}}},
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueAgentRunner(agent)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetPRLifecycle(lifecycle)
+
+	code := app.Run([]string{"run", "pr", "--id", "72", "--repo", "owner/repo", "--dir", "/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if agent.callCount != 1 {
+		t.Fatalf("agent call count = %d, want 1", agent.callCount)
+	}
+	lastComment := lifecycle.prCommentBodies[72][len(lifecycle.prCommentBodies[72])-1]
+	state, err := orchestration.ParseOrchestrationStateCommentBody(lastComment)
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody() error = %v", err)
+	}
+	if state == nil || state.Stage != "sync_branch" || state.ReusedBranchSync == nil || state.ReusedBranchSync.Status != orchestration.BranchSyncStatusSyncedCleanly {
+		t.Fatalf("final PR state = %#v, want conflict recovery sync state", state)
+	}
+}
+
+func TestRunPRNativeRebasesAndRetriesRejectedPush(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: ""},
+		{Stdout: " M internal/cli/pr_native.go\n"},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: ""},
+		{Stdout: "[feature/pr-72 abc123] Address review comments for PR #72\n"},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: "/repo\n"},
+		{ExitCode: 1, Stderr: "! [rejected] feature/pr-72 -> feature/pr-72 (fetch first)\nerror: failed to push some refs\n"},
+		{Stdout: "abc123\n"},
+		{},
+		{},
+		{Stdout: "def456\n"},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: "/repo\n"},
+		{Stdout: "pushed\n"},
+	}}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{ExitCode: 0}}
+	lifecycle := &fakeDaemonLifecycle{
+		pullRequests: []githublifecycle.PullRequest{
+			{Number: 72, Title: "Fix review feedback", URL: "https://github.com/owner/repo/pull/72", HeadRefName: "feature/pr-72", BaseRefName: "main", Author: &githublifecycle.Actor{Login: "author"}},
+			{Number: 72, Title: "Fix review feedback", URL: "https://github.com/owner/repo/pull/72", HeadRefName: "feature/pr-72", BaseRefName: "main", MergeStateStatus: "CLEAN", Mergeable: "MERGEABLE", Author: &githublifecycle.Actor{Login: "author"}},
+		},
+		reviewThreadSeq: [][]githublifecycle.PullRequestReviewThread{
+			{{Comments: []githublifecycle.PullRequestReviewComment{{Body: "Please add a regression test", Path: "internal/cli/pr_native.go", Line: 12, Author: &githublifecycle.Actor{Login: "reviewer"}}}}},
+			{},
+		},
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueAgentRunner(agent)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetPRLifecycle(lifecycle)
+
+	code := app.Run([]string{"run", "pr", "--id", "72", "--repo", "owner/repo", "--dir", "/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	joinedShell := strings.Join(shell.cmds, "\n")
+	if !strings.Contains(joinedShell, "git 'fetch' 'origin' 'feature/pr-72'") || !strings.Contains(joinedShell, "git 'rebase' 'origin/feature/pr-72'") {
+		t.Fatalf("shell commands missing rejected-push rebase recovery: %s", joinedShell)
+	}
+	lastComment := lifecycle.prCommentBodies[72][len(lifecycle.prCommentBodies[72])-1]
+	state, err := orchestration.ParseOrchestrationStateCommentBody(lastComment)
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody() error = %v", err)
+	}
+	if state == nil || state.ReusedBranchSync == nil || state.ReusedBranchSync.RemoteBaseRef != "origin/feature/pr-72" {
+		t.Fatalf("final PR state = %#v, want push rejection rebase verdict", state)
 	}
 }
 

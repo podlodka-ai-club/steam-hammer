@@ -501,6 +501,22 @@ func (a *App) buildBatchWorkerLaunchCommand(ctx context.Context, opts commonOpti
 		pythonIssue.fallbackReason = fmt.Sprintf("failed to inspect linked PR for issue #%d: %v", id, err)
 		return pythonIssue
 	}
+	if linkedPR != nil && prNeedsConflictRecovery(*linkedPR) {
+		pythonPR := workerLaunchCommand{
+			name: "python3",
+			args: buildPRPythonArgs(a.runtime.RunnerScript(), opts, linkedPR.Number, false, true, false, "", true, syncStrategy),
+		}
+		if reason := nativePRFallbackReason(nativePROptions{prID: linkedPR.Number, common: opts, conflictRecoveryOnly: true, syncStrategy: syncStrategy}); reason != "" {
+			pythonPR.fallbackReason = reason
+			return pythonPR
+		}
+		execPath, err := a.currentExecutable()
+		if err != nil {
+			pythonPR.fallbackReason = fmt.Sprintf("failed to resolve orchestrator executable: %v", err)
+			return pythonPR
+		}
+		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, false, false, false, "", true, syncStrategy)}
+	}
 	decision := orchestration.ChooseExecutionMode(id, linkedPRNumber(linkedPR), forceIssueFlow, parsedStatePayload(recoveredState), nil)
 
 	if decision.Mode == orchestration.ExecutionModePRReview && linkedPR != nil {
@@ -586,10 +602,17 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 			ForceReprocess:       config.forceReprocess,
 			LastHandledSignature: handled.signatures[issue.Number],
 		}
-		if reviewSignal, err := a.daemonReviewFeedbackSignal(ctx, strings.TrimSpace(*config.opts.repo), issue); err != nil {
+		if conflictSignal, err := a.daemonPRConflictRecoverySignal(ctx, strings.TrimSpace(*config.opts.repo), issue); err != nil {
 			return nil, err
 		} else {
-			snapshot.ReviewFeedbackSignal = reviewSignal
+			snapshot.PRConflictSignal = conflictSignal
+		}
+		if snapshot.PRConflictSignal == "" {
+			if reviewSignal, err := a.daemonReviewFeedbackSignal(ctx, strings.TrimSpace(*config.opts.repo), issue); err != nil {
+				return nil, err
+			} else {
+				snapshot.ReviewFeedbackSignal = reviewSignal
+			}
 		}
 		if latestState != nil {
 			snapshot.LatestStateStatus = latestState.Status
@@ -613,6 +636,19 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 		seen[issue.Number] = struct{}{}
 	}
 	return selected, nil
+}
+
+func (a *App) daemonPRConflictRecoverySignal(ctx context.Context, repo string, issue corelifecycle.Issue) (string, error) {
+	linkedPR, err := a.daemon.FindOpenPullRequestForIssue(ctx, repo, issue)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect linked PR for issue #%d: %w", issue.Number, err)
+	}
+	if linkedPR == nil || !prNeedsConflictRecovery(*linkedPR) {
+		return "", nil
+	}
+	mergeState := strings.TrimSpace(strings.ToUpper(linkedPR.MergeStateStatus))
+	mergeable := strings.TrimSpace(strings.ToUpper(linkedPR.Mergeable))
+	return fmt.Sprintf("pr-%d:%s:%s", linkedPR.Number, mergeState, mergeable), nil
 }
 
 func (a *App) daemonReviewFeedbackSignal(ctx context.Context, repo string, issue corelifecycle.Issue) (string, error) {
@@ -915,10 +951,10 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 			cancel()
 			if releaseClaimsAfterCycle {
 				if err := a.releaseDaemonClaims(ctx, config, selected); err != nil {
-				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims: %v\n", err)
-				if cycleCode == 0 {
-					cycleCode = 1
-				}
+					_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims: %v\n", err)
+					if cycleCode == 0 {
+						cycleCode = 1
+					}
 				}
 			}
 		}
@@ -1007,10 +1043,10 @@ func (a *App) runSerialDaemon(ctx context.Context, config daemonParallelConfig) 
 			}
 			if releaseClaimsAfterCycle {
 				if err := a.releaseDaemonClaims(ctx, config, selected); err != nil {
-				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims: %v\n", err)
-				if cycleCode == 0 {
-					cycleCode = 1
-				}
+					_, _ = fmt.Fprintf(a.err, "orchestrator: failed to release daemon claims: %v\n", err)
+					if cycleCode == 0 {
+						cycleCode = 1
+					}
 				}
 			}
 			if cycleCode == 0 && config.postBatchVerify {

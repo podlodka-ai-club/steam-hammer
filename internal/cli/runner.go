@@ -80,9 +80,9 @@ func (ExecBatchClonePreparer) Prepare(sourceDir, targetDir string) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve source repository root: %w", err)
 	}
-	originURL, err := gitOutput(repoRoot, "config", "--get", "remote.origin.url")
+	codehostRemote, err := resolveGitHubCodehostRemote(repoRoot)
 	if err != nil {
-		return "", fmt.Errorf("failed to resolve source repository origin: %w", err)
+		return "", err
 	}
 	if err := os.RemoveAll(targetDir); err != nil {
 		return "", fmt.Errorf("failed to reset worker clone directory: %w", err)
@@ -90,11 +90,55 @@ func (ExecBatchClonePreparer) Prepare(sourceDir, targetDir string) (string, erro
 	if err := os.MkdirAll(filepath.Dir(targetDir), 0o755); err != nil {
 		return "", fmt.Errorf("failed to create worker clone parent directory: %w", err)
 	}
-	cmd := exec.Command("git", "clone", "--quiet", originURL, targetDir)
+	cmd := exec.Command("git", "clone", "--quiet", codehostRemote, targetDir)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("git clone %q into %q failed: %w%s", originURL, targetDir, err, formatCommandOutput(output))
+		return "", fmt.Errorf("git clone %q into %q failed: %w%s", codehostRemote, targetDir, err, formatCommandOutput(output))
+	}
+	originURL, err := gitOutput(targetDir, "config", "--get", "remote.origin.url")
+	if err != nil {
+		return "", fmt.Errorf("failed to validate detached clone push remote: %w", err)
+	}
+	if !isGitHubRemoteURL(originURL) {
+		return "", fmt.Errorf("detached clone origin is not a GitHub codehost remote: %q", originURL)
 	}
 	return targetDir, nil
+}
+
+func resolveGitHubCodehostRemote(repoRoot string) (string, error) {
+	originURL, err := gitOutput(repoRoot, "config", "--get", "remote.origin.url")
+	if err == nil {
+		if isGitHubRemoteURL(originURL) {
+			return normalizeGitHubRemoteURL(originURL), nil
+		}
+	} else {
+		return "", fmt.Errorf("failed to resolve source repository origin: %w", err)
+	}
+	remotes, err := gitOutput(repoRoot, "config", "--get-regexp", `^remote\..*\.url$`)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve repository remotes: %w", err)
+	}
+	for _, line := range strings.Split(remotes, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) != 2 {
+			continue
+		}
+		if isGitHubRemoteURL(fields[1]) {
+			return normalizeGitHubRemoteURL(fields[1]), nil
+		}
+	}
+	return "", fmt.Errorf("no safe GitHub codehost remote found in %s; refusing to start detached worker clone", repoRoot)
+}
+
+func isGitHubRemoteURL(raw string) bool {
+	url := strings.ToLower(strings.TrimSpace(raw))
+	if url == "" {
+		return false
+	}
+	return strings.Contains(url, "github.com/") || strings.Contains(url, "github.com:")
+}
+
+func normalizeGitHubRemoteURL(raw string) string {
+	return strings.TrimSpace(raw)
 }
 
 func gitOutput(dir string, args ...string) (string, error) {

@@ -14,6 +14,7 @@ type State struct {
 
 type Checkpoint struct {
 	RunID          string               `json:"run_id,omitempty"`
+	Owner          *CheckpointOwner     `json:"owner,omitempty"`
 	Phase          string               `json:"phase,omitempty"`
 	BatchIndex     int                  `json:"batch_index,omitempty"`
 	TotalBatches   int                  `json:"total_batches,omitempty"`
@@ -27,6 +28,16 @@ type Checkpoint struct {
 	NextCheckpoint string               `json:"next_checkpoint,omitempty"`
 	UpdatedAt      string               `json:"updated_at,omitempty"`
 	Verification   *VerificationVerdict `json:"verification,omitempty"`
+}
+
+type CheckpointOwner struct {
+	Repo     string `json:"repo,omitempty"`
+	Dir      string `json:"dir,omitempty"`
+	Tracker  string `json:"tracker,omitempty"`
+	CodeHost string `json:"codehost,omitempty"`
+	Runner   string `json:"runner,omitempty"`
+	Agent    string `json:"agent,omitempty"`
+	Model    string `json:"model,omitempty"`
 }
 
 type Counts struct {

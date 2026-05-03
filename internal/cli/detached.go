@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/workers"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -178,7 +180,7 @@ func (a *App) runDetachedStatus(configuredRoot, name string, asJSON bool) int {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
 		return 1
 	}
-	report, err := detachedWorkerReportFromStateFile(workerPaths.StatePath)
+	report, err := a.detachedWorkerReportFromStateFile(context.Background(), workerPaths.StatePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: detached worker state not found: %s\n", workerPaths.StatePath)
@@ -293,7 +295,7 @@ func (a *App) runAutonomousSessionStatus(path string, asJSON bool) int {
 }
 
 func (a *App) runDetachedStatusList(configuredRoot string, asJSON bool) int {
-	reports, err := detachedWorkerReports(configuredRoot)
+	reports, err := a.detachedWorkerReports(context.Background(), configuredRoot)
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect detached worker registry: %v\n", err)
 		return 1
@@ -340,14 +342,14 @@ func processRunning(pid int) (bool, error) {
 	return processAlive(pid)
 }
 
-func detachedWorkerReports(configuredRoot string) ([]detachedWorkerReport, error) {
+func (a *App) detachedWorkerReports(ctx context.Context, configuredRoot string) ([]detachedWorkerReport, error) {
 	states, err := workers.ListStates(configuredRoot, ".")
 	if err != nil {
 		return nil, err
 	}
 	reports := make([]detachedWorkerReport, 0, len(states))
 	for _, state := range states {
-		report, err := detachedWorkerReportFromState(state, true)
+		report, err := a.detachedWorkerReportFromState(ctx, state, true)
 		if err != nil {
 			return nil, err
 		}
@@ -356,19 +358,19 @@ func detachedWorkerReports(configuredRoot string) ([]detachedWorkerReport, error
 	return reports, nil
 }
 
-func detachedWorkerReportFromStateFile(statePath string) (detachedWorkerReport, error) {
-	return detachedWorkerReportFromStateFileWithBatch(statePath, true)
+func (a *App) detachedWorkerReportFromStateFile(ctx context.Context, statePath string) (detachedWorkerReport, error) {
+	return a.detachedWorkerReportFromStateFileWithBatch(ctx, statePath, true)
 }
 
-func detachedWorkerReportFromStateFileWithBatch(statePath string, includeBatch bool) (detachedWorkerReport, error) {
+func (a *App) detachedWorkerReportFromStateFileWithBatch(ctx context.Context, statePath string, includeBatch bool) (detachedWorkerReport, error) {
 	state, err := readDetachedWorkerState(statePath)
 	if err != nil {
 		return detachedWorkerReport{}, err
 	}
-	return detachedWorkerReportFromState(state, includeBatch)
+	return a.detachedWorkerReportFromState(ctx, state, includeBatch)
 }
 
-func detachedWorkerReportFromState(state detachedWorkerState, includeBatch bool) (detachedWorkerReport, error) {
+func (a *App) detachedWorkerReportFromState(ctx context.Context, state detachedWorkerState, includeBatch bool) (detachedWorkerReport, error) {
 	processStatus := detachedProcessStatus(state.PID)
 	logReport, err := detachedWorkerLogSummary(state.LogPath)
 	if err != nil {
@@ -380,14 +382,14 @@ func detachedWorkerReportFromState(state detachedWorkerState, includeBatch bool)
 		Log:           logReport,
 		Next:          detachedWorkerNextAction(state, processStatus),
 	}
-	if linked, err := detachedWorkerLinkedStatus(state); err == nil {
+	if linked, err := a.detachedWorkerLinkedStatus(ctx, state); err == nil {
 		report.Linked = linked
 	}
 	if session, err := detachedWorkerSessionStatus(state.SessionPath); err == nil {
 		report.Session = session
 	}
 	if includeBatch && state.Batch != nil {
-		if batch, err := detachedBatchStatus(*state.Batch); err == nil {
+		if batch, err := a.detachedBatchStatus(ctx, *state.Batch); err == nil {
 			report.Batch = batch
 		}
 	}
@@ -432,17 +434,108 @@ func detachedWorkerLogFreshness(report detachedWorkerLogReport) string {
 	return "updated " + report.UpdatedAt
 }
 
-func detachedWorkerLinkedStatus(state detachedWorkerState) (*detachedWorkerLinkedReport, error) {
+func (a *App) detachedWorkerLinkedStatus(ctx context.Context, state detachedWorkerState) (*detachedWorkerLinkedReport, error) {
 	if state.TargetKind != "issue" && state.TargetKind != "pr" {
+		return nil, nil
+	}
+	if strings.TrimSpace(state.Repo) == "" {
 		return nil, nil
 	}
 	linked := &detachedWorkerLinkedReport{}
 	linked.Target = fmt.Sprintf("%s #%s", state.TargetKind, state.TargetID)
 	linked.Updated = state.StartedAt
+	targetID, _ := strconv.Atoi(strings.TrimSpace(state.TargetID))
+	if targetID <= 0 {
+		return linked, nil
+	}
+
+	if state.TargetKind == "issue" {
+		issue, err := a.issueLifecycle.FetchIssue(ctx, state.Repo, targetID)
+		if err != nil {
+			return linked, nil
+		}
+		comments, err := a.issueLifecycle.ListIssueComments(ctx, state.Repo, targetID)
+		if err != nil {
+			return linked, nil
+		}
+		trackerComments := make([]orchestration.TrackerComment, 0, len(comments))
+		for _, comment := range comments {
+			trackerComments = append(trackerComments, orchestration.TrackerComment{ID: comment.ID, CreatedAt: comment.CreatedAt, HTMLURL: comment.HTMLURL, Body: comment.Body})
+		}
+		latest, _ := orchestration.SelectLatestParseableOrchestrationState(trackerComments, fmt.Sprintf("issue #%d", targetID))
+		if latest != nil {
+			linked.LatestState = strings.TrimSpace(latest.Status)
+			linked.Branch = strings.TrimSpace(latest.Payload.Branch)
+			linked.Current = strings.TrimSpace(latest.Payload.Stage)
+			linked.Next = strings.TrimSpace(latest.Payload.NextAction)
+			linked.Blockers = strings.TrimSpace(latest.Payload.Error)
+			linked.Updated = strings.TrimSpace(latest.Payload.Timestamp)
+			linked.PRReadiness = detachedPRReadinessSummary(latest.Payload)
+			if latest.Payload.PR != nil && *latest.Payload.PR > 0 {
+				linked.PR = fmt.Sprintf("#%d", *latest.Payload.PR)
+			}
+		}
+		pr, err := a.issueLifecycle.FindOpenPullRequestForIssue(ctx, state.Repo, issue)
+		if err != nil {
+			return linked, nil
+		}
+		if pr != nil && pr.Number > 0 {
+			linked.PR = fmt.Sprintf("#%d", pr.Number)
+			if linked.Branch == "" {
+				linked.Branch = strings.TrimSpace(pr.HeadRefName)
+			}
+		}
+	} else {
+		pullRequest, err := a.prLifecycle.FetchPullRequest(ctx, state.Repo, targetID)
+		if err != nil {
+			return linked, nil
+		}
+		conversation, err := a.prLifecycle.ConversationCommentsForPullRequest(ctx, state.Repo, targetID)
+		if err != nil {
+			return linked, nil
+		}
+		trackerComments := make([]orchestration.TrackerComment, 0, len(conversation))
+		for _, comment := range conversation {
+			trackerComments = append(trackerComments, orchestration.TrackerComment{HTMLURL: comment.URL, Body: comment.Body})
+		}
+		latest, _ := orchestration.SelectLatestParseableOrchestrationState(trackerComments, fmt.Sprintf("pr #%d", targetID))
+		if latest != nil {
+			linked.LatestState = strings.TrimSpace(latest.Status)
+			linked.Branch = strings.TrimSpace(latest.Payload.Branch)
+			linked.Current = strings.TrimSpace(latest.Payload.Stage)
+			linked.Next = strings.TrimSpace(latest.Payload.NextAction)
+			linked.Blockers = strings.TrimSpace(latest.Payload.Error)
+			linked.Updated = strings.TrimSpace(latest.Payload.Timestamp)
+			linked.PRReadiness = detachedPRReadinessSummary(latest.Payload)
+			if latest.Payload.PR != nil && *latest.Payload.PR > 0 {
+				linked.PR = fmt.Sprintf("#%d", *latest.Payload.PR)
+			}
+		}
+		if linked.Branch == "" {
+			linked.Branch = strings.TrimSpace(pullRequest.HeadRefName)
+		}
+		if linked.PR == "" {
+			linked.PR = fmt.Sprintf("#%d", pullRequest.Number)
+		}
+	}
 	if *linked == (detachedWorkerLinkedReport{}) {
 		return nil, nil
 	}
 	return linked, nil
+}
+
+func detachedPRReadinessSummary(payload orchestration.TrackedState) string {
+	if payload.MergeReadiness == nil {
+		return ""
+	}
+	status := strings.TrimSpace(payload.MergeReadiness.Status)
+	if status == "" {
+		status = strings.TrimSpace(payload.MergeReadiness.NextAction)
+	}
+	if status == "" {
+		status = strings.TrimSpace(payload.MergeReadiness.Error)
+	}
+	return status
 }
 
 func detachedWorkerSessionStatus(path string) (*detachedWorkerSessionReport, error) {
@@ -531,7 +624,7 @@ func detachedWorkerStateFromOptions(name, mode, targetKind, targetID string, opt
 	}
 }
 
-func detachedBatchStatus(batch detachedBatchMetadata) (*detachedBatchStatusReport, error) {
+func (a *App) detachedBatchStatus(ctx context.Context, batch detachedBatchMetadata) (*detachedBatchStatusReport, error) {
 	report := &detachedBatchStatusReport{
 		RequestedIssueIDs: append([]string(nil), batch.ChildIssueIDs...),
 		ActiveWorkers:     0,
@@ -549,7 +642,7 @@ func detachedBatchStatus(batch detachedBatchMetadata) (*detachedBatchStatusRepor
 		if err != nil {
 			return nil, err
 		}
-		workerReport, err := detachedWorkerReportFromState(state, false)
+		workerReport, err := a.detachedWorkerReportFromState(ctx, state, false)
 		if err != nil {
 			return nil, err
 		}

@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 )
@@ -77,7 +76,11 @@ func (a *App) runDoctor(ctx context.Context, args []string) int {
 			checks = append(checks, doctorCheck{Status: "PASS", Name: "gh auth", Detail: "authenticated"})
 		}
 		if repo != "" {
-			checks = append(checks, doctorCheck{Status: "PASS", Name: "Repository access", Detail: fmt.Sprintf("requested repository: %s", repo)})
+			if err := a.runner.Run(ctx, "gh", "repo", "view", repo); err != nil {
+				checks = append(checks, doctorCheck{Status: "FAIL", Name: "Repository access", Detail: fmt.Sprintf("cannot access %s (check repo name and permissions)", repo)})
+			} else {
+				checks = append(checks, doctorCheck{Status: "PASS", Name: "Repository access", Detail: fmt.Sprintf("verified access to %s", repo)})
+			}
 		}
 	}
 
@@ -320,9 +323,6 @@ func (a *App) runPRStatus(ctx context.Context, repo string, prNumber int, asJSON
 	}
 	if payload.BaseBranch == "" {
 		payload.BaseBranch = strings.TrimSpace(pullRequest.BaseRefName)
-	}
-	if payload.Timestamp == "" {
-		payload.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	}
 	if asJSON {
 		data := map[string]any{"target": fmt.Sprintf("pr #%d", prNumber), "repo": repo, "latest_state": status, "branch": payload.Branch, "base_branch": payload.BaseBranch, "current": payload.Stage, "next": payload.NextAction, "blockers": payload.Error, "updated": payload.Timestamp}

@@ -104,6 +104,48 @@ func TestEvaluateSafeMergeExecution(t *testing.T) {
 	}
 }
 
+func TestEvaluatePolicyDrivenMergeQueue(t *testing.T) {
+	queued := EvaluatePolicyDrivenMergeQueue(PRMergeReadiness{Status: StatusReadyToMerge}, true, true, nil)
+	if !queued.Queued || queued.Status != StatusReadyToMerge || queued.Stage != "merge_queue" {
+		t.Fatalf("queued decision = %#v", queued)
+	}
+
+	execute := EvaluatePolicyDrivenMergeQueue(PRMergeReadiness{Status: StatusReadyToMerge}, false, true, nil)
+	if !execute.Execute || execute.NextAction != MergeQueueActionExecuteVerifiedMerge {
+		t.Fatalf("execute decision = %#v", execute)
+	}
+
+	accepted := EvaluatePolicyDrivenMergeQueue(
+		PRMergeReadiness{Status: StatusReadyToMerge},
+		false,
+		true,
+		&MergeAttemptResult{Accepted: true, Status: StatusReadyToMerge},
+	)
+	if accepted.Execute || accepted.NextAction != MergeQueueActionAwaitAutoMerge || accepted.Stage != "merge_execution" {
+		t.Fatalf("accepted decision = %#v", accepted)
+	}
+
+	policyBlocked := EvaluatePolicyDrivenMergeQueue(
+		PRMergeReadiness{Status: StatusReadyToMerge},
+		false,
+		true,
+		&MergeAttemptResult{Accepted: false, Status: StatusReadyToMerge, Error: "policy rejected auto-merge"},
+	)
+	if policyBlocked.Status != StatusWaitingForAuthor || policyBlocked.NextAction != MergeQueueActionManualMerge {
+		t.Fatalf("policy blocked decision = %#v", policyBlocked)
+	}
+
+	hardBlocked := EvaluatePolicyDrivenMergeQueue(
+		PRMergeReadiness{Status: StatusReadyToMerge},
+		false,
+		true,
+		&MergeAttemptResult{Accepted: false, Status: StatusBlocked, Error: "required checks missing"},
+	)
+	if hardBlocked.Status != StatusBlocked || hardBlocked.NextAction != "inspect_merge_requirements" {
+		t.Fatalf("hard blocked decision = %#v", hardBlocked)
+	}
+}
+
 func TestTrackedStateParsesTypedPRProgressionPayloads(t *testing.T) {
 	body := strings.Join([]string{
 		OrchestrationStateMarker,

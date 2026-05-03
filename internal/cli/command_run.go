@@ -1650,6 +1650,53 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintln(a.err, "run pr requires --id N")
 		return 2
 	}
+	if *detach {
+		workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "pr", strconv.Itoa(*id))
+		if err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
+			return 1
+		}
+		launchWithPython := func() int {
+			pythonArgs := buildPRPythonArgs(a.runtime.RunnerScript(), opts, *id, *allowBranchSwitch, *isolateWorktree, *postSummary, *followupPrefix, *conflictRecoveryOnly, *syncStrategy)
+			return a.startDetachedWorker(detachedWorkerStateFromOptions(
+				workerName("pr", strconv.Itoa(*id)),
+				"run pr",
+				"pr",
+				strconv.Itoa(*id),
+				opts,
+				append([]string{"python3"}, pythonArgs...),
+				workerPaths,
+			))
+		}
+		nativeOpts := nativePROptions{
+			prID:                 *id,
+			common:               opts,
+			allowBranchSwitch:    *allowBranchSwitch,
+			isolateWorktree:      *isolateWorktree,
+			postSummary:          *postSummary,
+			followupPrefix:       *followupPrefix,
+			conflictRecoveryOnly: *conflictRecoveryOnly,
+			syncStrategy:         *syncStrategy,
+		}
+		if reason := nativePRFallbackReason(nativeOpts); reason != "" {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: falling back to python pr runner: %s\n", reason)
+			return launchWithPython()
+		}
+		execPath, err := a.currentExecutable()
+		if err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: falling back to python pr runner: failed to resolve orchestrator executable: %v\n", err)
+			return launchWithPython()
+		}
+		return a.startDetachedWorker(detachedWorkerStateFromOptions(
+			workerName("pr", strconv.Itoa(*id)),
+			"run pr",
+			"pr",
+			strconv.Itoa(*id),
+			opts,
+			append([]string{execPath}, buildPRCLIArgs(opts, *id, *allowBranchSwitch, *isolateWorktree, *postSummary, *followupPrefix, *conflictRecoveryOnly, *syncStrategy)...),
+			workerPaths,
+		))
+	}
 	if code, ok := a.tryRunNativePR(ctx, nativePROptions{
 		prID:                 *id,
 		common:               opts,
@@ -1666,21 +1713,5 @@ func (a *App) runPR(ctx context.Context, args []string) int {
 	}
 
 	pythonArgs := buildPRPythonArgs(a.runtime.RunnerScript(), opts, *id, *allowBranchSwitch, *isolateWorktree, *postSummary, *followupPrefix, *conflictRecoveryOnly, *syncStrategy)
-	if *detach {
-		workerPaths, err := resolveDetachedWorkerPaths(*workerDir, *opts.dir, "pr", strconv.Itoa(*id))
-		if err != nil {
-			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve detached worker paths: %v\n", err)
-			return 1
-		}
-		return a.startDetachedWorker(detachedWorkerStateFromOptions(
-			workerName("pr", strconv.Itoa(*id)),
-			"run pr",
-			"pr",
-			strconv.Itoa(*id),
-			opts,
-			append([]string{"python3"}, pythonArgs...),
-			workerPaths,
-		))
-	}
 	return a.runPython(ctx, pythonArgs)
 }

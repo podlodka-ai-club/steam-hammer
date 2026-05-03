@@ -56,10 +56,7 @@ func (a *App) tryRunNativePR(ctx context.Context, opts nativePROptions) (int, bo
 
 func nativePRFallbackReason(opts nativePROptions) string {
 	if opts.detach {
-		return "--detach is not supported by the Go-native PR path yet"
-	}
-	if *opts.common.dryRun {
-		return "--dry-run is not supported by the Go-native PR path yet"
+		return "--detach requires worker launch and is handled before native PR execution"
 	}
 	if opts.isolateWorktree {
 		return "--isolate-worktree is not supported by the Go-native PR path yet"
@@ -70,10 +67,7 @@ func nativePRFallbackReason(opts nativePROptions) string {
 	if strings.TrimSpace(opts.followupPrefix) != "" {
 		return "--pr-followup-branch-prefix is not supported by the Go-native PR path yet"
 	}
-	if opts.conflictRecoveryOnly {
-		return "--conflict-recovery-only is not supported by the Go-native PR path yet"
-	}
-	if strings.TrimSpace(opts.syncStrategy) != "" {
+	if strings.TrimSpace(opts.syncStrategy) != "" && !opts.conflictRecoveryOnly {
 		return "--sync-strategy is not supported by the Go-native PR path yet"
 	}
 	if strings.TrimSpace(*opts.common.local) != "" {
@@ -105,6 +99,13 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to fetch PR #%d: %v\n", opts.prID, err)
 		return 1
+	}
+	if opts.conflictRecoveryOnly {
+		if *opts.common.dryRun {
+			_, _ = fmt.Fprintf(a.out, "[dry-run] Native PR conflict recovery preflight succeeded for PR #%d on branch %q; sync/push/state updates skipped\n", pullRequest.Number, strings.TrimSpace(pullRequest.HeadRefName))
+			return 0
+		}
+		return a.runNativePRConflictRecovery(ctx, repo, pullRequest, opts, &latestState)
 	}
 
 	cwd := defaultSourceDir(*opts.common.dir)
@@ -141,6 +142,10 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 			return 1
 		}
 		activeBranch = targetBranch
+	}
+	if *opts.common.dryRun {
+		_, _ = fmt.Fprintf(a.out, "[dry-run] Native PR flow preflight succeeded for PR #%d on branch %q; agent run skipped\n", pullRequest.Number, activeBranch)
+		return 0
 	}
 
 	runnerName := fallbackString(strings.TrimSpace(*opts.common.runner), nativePRDefaultRunner)
@@ -395,6 +400,118 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 		_, _ = fmt.Fprintf(a.out, "PR #%d still has %d actionable review items after attempt %d; continuing review feedback loop (%d/%d).\n", pullRequest.Number, len(remainingItems), attempt, attempt+1, maxAttempts)
 	}
 
+	return 0
+}
+
+func (a *App) runNativePRConflictRecovery(
+	ctx context.Context,
+	repo string,
+	pullRequest lifecycle.PullRequest,
+	opts nativePROptions,
+	latestState **orchestration.TrackedState,
+) int {
+	cwd := defaultSourceDir(*opts.common.dir)
+	repoRoot, err := a.gitRepoRoot(ctx, cwd)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve repository root: %v\n", err)
+		return 1
+	}
+	if dirty, err := a.gitHasChanges(ctx, repoRoot); err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect worktree status: %v\n", err)
+		return 1
+	} else if dirty {
+		_, _ = fmt.Fprintln(a.err, "orchestrator: git working tree must be clean before native PR execution")
+		return 1
+	}
+
+	prBranch := strings.TrimSpace(pullRequest.HeadRefName)
+	if prBranch == "" {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: PR #%d is missing head branch metadata\n", pullRequest.Number)
+		return 1
+	}
+	baseBranch := strings.TrimSpace(pullRequest.BaseRefName)
+	if baseBranch == "" {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: PR #%d is missing base branch metadata\n", pullRequest.Number)
+		return 1
+	}
+
+	localBranchExists, err := a.gitLocalBranchExists(ctx, repoRoot, prBranch)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect local branch %q: %v\n", prBranch, err)
+		return 1
+	}
+	remoteBranchExists, err := a.gitRemoteBranchExists(ctx, repoRoot, prBranch)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to inspect remote branch %q: %v\n", prBranch, err)
+		return 1
+	}
+
+	runnerName := fallbackString(strings.TrimSpace(*opts.common.runner), nativePRDefaultRunner)
+	agentName := fallbackString(strings.TrimSpace(*opts.common.agent), nativePRDefaultAgent)
+	modelName := fallbackString(strings.TrimSpace(*opts.common.model), nativePRDefaultModel)
+	branchLifecycle := orchestration.BranchLifecycleReused
+	var reusedBranchSync *orchestration.ReusedBranchSyncVerdict
+	postState := func(state orchestration.TrackedState) {
+		copy := state
+		*latestState = &copy
+		if err := a.safePostPRState(ctx, repo, pullRequest.Number, state); err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: warning: failed to post state for PR #%d: %v\n", pullRequest.Number, err)
+		}
+	}
+	buildState := func(status, stage, nextAction, message string) orchestration.TrackedState {
+		return orchestration.TrackedState{
+			Status:           status,
+			TaskType:         "pr",
+			PR:               intPtr(pullRequest.Number),
+			Branch:           prBranch,
+			BranchLifecycle:  branchLifecycle,
+			BaseBranch:       baseBranch,
+			Runner:           runnerName,
+			Agent:            agentName,
+			Model:            modelName,
+			Attempt:          1,
+			Stage:            stage,
+			NextAction:       nextAction,
+			Error:            message,
+			Timestamp:        time.Now().UTC().Format(time.RFC3339),
+			ReusedBranchSync: reusedBranchSync,
+		}
+	}
+
+	if !localBranchExists && !remoteBranchExists {
+		message := fmt.Sprintf(
+			"conflict recovery only requires an existing PR branch, but %q was not found locally or on origin; fetch the branch or run normal PR flow first",
+			prBranch,
+		)
+		postState(buildState(orchestration.StatusBlocked, "sync_branch", "run_normal_pr_flow_first", message))
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %s\n", message)
+		return 1
+	}
+
+	_, reusedBranchSync, pushWithLease, err := a.prepareIssueBranchPreflight(ctx, repoRoot, baseBranch, prBranch, localBranchExists, remoteBranchExists, true, opts.syncStrategy)
+	if err != nil {
+		postState(buildState(orchestration.StatusBlocked, "sync_branch", "resolve_branch_sync_conflict", err.Error()))
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to recover PR branch %q: %v\n", prBranch, err)
+		return 1
+	}
+	if reusedBranchSync == nil {
+		message := fmt.Sprintf("conflict recovery for PR branch %q did not produce a sync verdict", prBranch)
+		postState(buildState(orchestration.StatusFailed, "sync_branch", "inspect_recovery_result", message))
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %s\n", message)
+		return 1
+	}
+
+	if reusedBranchSync.Changed {
+		if err := a.gitPushBranch(ctx, repoRoot, prBranch, pushWithLease); err != nil {
+			postState(buildState(orchestration.StatusFailed, "sync_branch", "inspect_push_failure", err.Error()))
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to push recovered PR branch %q: %v\n", prBranch, err)
+			return 1
+		}
+		_, _ = fmt.Fprintln(a.out, reusedBranchSync.PushSummary(false))
+	}
+
+	postState(buildState(orchestration.StatusWaitingForAuthor, "sync_branch", "inspect_conflict_recovery_result", ""))
+	_, _ = fmt.Fprintln(a.out, reusedBranchSync.Summary(false))
 	return 0
 }
 

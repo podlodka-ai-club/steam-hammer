@@ -1708,6 +1708,116 @@ func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments", "--dry-run", "--isolate-worktree"})
 }
 
+func TestRunPRNativeDryRunWithRepoSkipsPythonRunner(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "feature/pr-72\n"},
+	}}
+	lifecycle := &fakeDaemonLifecycle{pullRequest: githublifecycle.PullRequest{Number: 72, HeadRefName: "feature/pr-72", BaseRefName: "main"}}
+	agent := &fakeIssueAgentRunner{}
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetPRLifecycle(lifecycle)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "pr", "--id", "72", "--repo", "owner/repo", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("python runner calls = %d, want 0", runner.calls)
+	}
+	if agent.callCount != 0 {
+		t.Fatalf("agent call count = %d, want 0", agent.callCount)
+	}
+	if !strings.Contains(out.String(), "[dry-run] Native PR flow preflight succeeded") {
+		t.Fatalf("stdout = %q, want dry-run native preflight message", out.String())
+	}
+}
+
+func TestRunPRConflictRecoveryOnlySyncsWithoutAgent(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{ExitCode: 0},
+		{ExitCode: 0},
+		{},
+		{},
+		{},
+		{Stdout: "abc123\n"},
+		{},
+		{Stdout: "def456\n"},
+		{Stdout: "feature/pr-72\n"},
+		{Stdout: "/repo\n"},
+		{},
+	}}
+	lifecycle := &fakeDaemonLifecycle{pullRequest: githublifecycle.PullRequest{Number: 72, HeadRefName: "feature/pr-72", BaseRefName: "main"}}
+	agent := &fakeIssueAgentRunner{}
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetPRLifecycle(lifecycle)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "pr", "--id", "72", "--repo", "owner/repo", "--dir", "/repo", "--conflict-recovery-only", "--sync-strategy", "rebase"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("python runner calls = %d, want 0", runner.calls)
+	}
+	if agent.callCount != 0 {
+		t.Fatalf("agent call count = %d, want 0", agent.callCount)
+	}
+	if len(lifecycle.prCommentBodies[72]) != 1 {
+		t.Fatalf("PR comment bodies = %d, want 1", len(lifecycle.prCommentBodies[72]))
+	}
+	state, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.prCommentBodies[72][0])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody() error = %v", err)
+	}
+	if state.Status != orchestration.StatusWaitingForAuthor || state.Stage != "sync_branch" || state.NextAction != "inspect_conflict_recovery_result" {
+		t.Fatalf("state = %#v", state)
+	}
+	if state.ReusedBranchSync == nil || state.ReusedBranchSync.Status != orchestration.BranchSyncStatusSyncedCleanly || !state.ReusedBranchSync.Changed {
+		t.Fatalf("sync verdict = %#v", state.ReusedBranchSync)
+	}
+	if !strings.Contains(out.String(), "Conflict recovery result for branch 'feature/pr-72': synced cleanly") {
+		t.Fatalf("stdout = %q, want recovery summary", out.String())
+	}
+}
+
+func TestRunPRDetachWithRepoUsesNativeWorkerCommand(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+	app.SetExecutablePath(execPath)
+
+	code := app.Run([]string{"run", "pr", "--id", "72", "--repo", "owner/repo", "--dir", targetDir, "--detach"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if starter.calls != 1 {
+		t.Fatalf("starter calls = %d, want 1", starter.calls)
+	}
+	if starter.req.Name != execPath {
+		t.Fatalf("worker command = %q, want %q", starter.req.Name, execPath)
+	}
+	if !reflect.DeepEqual(starter.req.Args[:4], []string{"run", "pr", "--id", "72"}) {
+		t.Fatalf("worker args = %#v, want native pr entrypoint", starter.req.Args)
+	}
+}
+
 func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})

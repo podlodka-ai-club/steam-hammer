@@ -214,6 +214,10 @@ func NormalizeReviewFeedback(threads []ReviewThread, reviews []PullRequestReview
 				stats.CommentsEmpty++
 				continue
 			}
+			if !IsActionableReviewFeedback(body) {
+				stats.CommentsNonActionable++
+				continue
+			}
 			author := strings.TrimSpace(comment.Author)
 			if author == "" {
 				author = "unknown"

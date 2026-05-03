@@ -254,6 +254,14 @@ func (r *recordingBatchClonePreparer) Prepare(sourceDir, targetDir string) (stri
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		return "", err
 	}
+	gitDir := filepath.Join(targetDir, ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		return "", err
+	}
+	config := "[remote \"origin\"]\n\turl = https://github.com/owner/repo.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+	if err := os.WriteFile(filepath.Join(gitDir, "config"), []byte(config), 0o644); err != nil {
+		return "", err
+	}
 	return targetDir, nil
 }
 
@@ -1394,7 +1402,7 @@ func TestRunIssueBlocksWhenReusedBranchSyncCannotBeRecovered(t *testing.T) {
 	}
 }
 
-func TestRunIssueRoutesLinkedPRToPRCompatibilityAdapter(t *testing.T) {
+func TestRunIssueRoutesLinkedPRToPRReviewFlow(t *testing.T) {
 	runner := &recordingRunner{}
 	lifecycle := &fakeDaemonLifecycle{
 		issue:    githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
@@ -1404,18 +1412,19 @@ func TestRunIssueRoutesLinkedPRToPRCompatibilityAdapter(t *testing.T) {
 	app := NewApp(&strings.Builder{}, &errOut)
 	app.SetRunner(runner)
 	app.SetIssueLifecycle(lifecycle)
+	app.SetPRLifecycle(nil)
 
 	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--pr", "101", "--from-review-comments", "--repo", "owner/repo"})
-	if !strings.Contains(errOut.String(), "routing issue #71 to pr review compatibility adapter") || !strings.Contains(errOut.String(), "linked open PR #101") {
-		t.Fatalf("stderr = %q, want explicit adapter routing reason", errOut.String())
+	if !strings.Contains(errOut.String(), "routing issue #71 to pr review flow") || !strings.Contains(errOut.String(), "linked open PR #101") {
+		t.Fatalf("stderr = %q, want explicit routing reason", errOut.String())
 	}
 }
 
-func TestRunIssueRoutesReadyToMergeRecoveryToPRCompatibilityAdapter(t *testing.T) {
+func TestRunIssueRoutesReadyToMergeRecoveryToPRReviewFlow(t *testing.T) {
 	runner := &recordingRunner{}
 	stateBody, err := orchestration.BuildOrchestrationStateComment(orchestration.TrackedState{
 		Status:   orchestration.StatusReadyToMerge,
@@ -1437,6 +1446,7 @@ func TestRunIssueRoutesReadyToMergeRecoveryToPRCompatibilityAdapter(t *testing.T
 	app := NewApp(&strings.Builder{}, &errOut)
 	app.SetRunner(runner)
 	app.SetIssueLifecycle(lifecycle)
+	app.SetPRLifecycle(nil)
 
 	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo"})
 	if code != 0 {
@@ -1527,6 +1537,9 @@ func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 		if state.WorkDir != wantClonePath {
 			t.Fatalf("work dir = %q, want %q", state.WorkDir, wantClonePath)
 		}
+		if state.PushRemote != "https://github.com/owner/repo.git" {
+			t.Fatalf("push remote = %q, want https://github.com/owner/repo.git", state.PushRemote)
+		}
 	}
 	printed := out.String()
 	for _, want := range []string{"started detached worker issue-71", "started detached worker issue-72"} {
@@ -1563,6 +1576,13 @@ func TestRunBatchDetachRoutesLinkedPRToNativePRCommand(t *testing.T) {
 	}
 	if !reflect.DeepEqual(starter.req.Args[:4], []string{"run", "pr", "--id", "101"}) {
 		t.Fatalf("worker args = %#v, want native pr entrypoint", starter.req.Args)
+	}
+	joined := strings.Join(starter.req.Args, " ")
+	if !strings.Contains(joined, "--isolate-worktree") {
+		t.Fatalf("worker args = %#v, want isolate worktree flag", starter.req.Args)
+	}
+	if strings.Contains(joined, "--allow-pr-branch-switch") {
+		t.Fatalf("worker args = %#v, should not include branch switch flag", starter.req.Args)
 	}
 }
 
@@ -1702,6 +1722,63 @@ func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
 	assertCommandContainsFlag(t, runner.args, "--autonomous-session-file")
 }
 
+func TestRunDaemonRoutesLinkedPRWorkerWithIsolatedWorktree(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetIssueLifecycle(&fakeDaemonLifecycle{
+		issue:           githublifecycle.Issue{Number: 71, Title: "Fix runtime", Body: "Body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		linkedPR:        &githublifecycle.PullRequest{Number: 101, Title: "Existing fix", HeadRefName: "feature/pr-101", BaseRefName: "main"},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{issues: []githublifecycle.Issue{{Number: 71}}, commentsByIssue: map[int][]githublifecycle.IssueComment{}})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--max-cycles", "1", "--poll-interval-seconds", "0", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	joined := strings.Join(runner.args, "\n")
+	if !strings.Contains(joined, "--pr") || !strings.Contains(joined, "101") {
+		t.Fatalf("runner args = %#v, want PR routing", runner.args)
+	}
+	if !strings.Contains(joined, "--isolate-worktree") {
+		t.Fatalf("runner args = %#v, want isolate worktree flag", runner.args)
+	}
+	if strings.Contains(joined, "--allow-pr-branch-switch") {
+		t.Fatalf("runner args = %#v, should not include branch switch flag", runner.args)
+	}
+}
+
+func TestDaemonReviewFeedbackSignalUsesStableFeedbackIdentity(t *testing.T) {
+	lifecycle := &fakeDaemonLifecycle{
+		linkedPR: &githublifecycle.PullRequest{Number: 101, Author: &githublifecycle.Actor{Login: "author"}},
+		reviewThreadSeq: [][]githublifecycle.PullRequestReviewThread{
+			{{Comments: []githublifecycle.PullRequestReviewComment{{Body: "Please update naming", URL: "https://example/review/1", Author: &githublifecycle.Actor{Login: "reviewer"}}}}},
+			{{Comments: []githublifecycle.PullRequestReviewComment{{Body: "Please update naming", URL: "https://example/review/2", Author: &githublifecycle.Actor{Login: "reviewer"}}}}},
+		},
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetDaemonLifecycle(lifecycle)
+
+	first, err := app.daemonReviewFeedbackSignal(context.Background(), "owner/repo", githublifecycle.Issue{Number: 71})
+	if err != nil {
+		t.Fatalf("daemonReviewFeedbackSignal(first) error = %v", err)
+	}
+	second, err := app.daemonReviewFeedbackSignal(context.Background(), "owner/repo", githublifecycle.Issue{Number: 71})
+	if err != nil {
+		t.Fatalf("daemonReviewFeedbackSignal(second) error = %v", err)
+	}
+	if first == "" || second == "" {
+		t.Fatalf("signals should not be empty: first=%q second=%q", first, second)
+	}
+	if first == second {
+		t.Fatalf("signals should differ when actionable feedback changes: first=%q second=%q", first, second)
+	}
+}
+
 func TestRunDaemonReusesAutonomousSessionFileAcrossCycles(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
@@ -1826,6 +1903,9 @@ func TestRunDaemonDetachStartsOneWorkerPerParallelTask(t *testing.T) {
 		}
 		if state.WorkDir != wantClonePath {
 			t.Fatalf("work dir = %q, want %q", state.WorkDir, wantClonePath)
+		}
+		if state.PushRemote != "https://github.com/owner/repo.git" {
+			t.Fatalf("push remote = %q, want https://github.com/owner/repo.git", state.PushRemote)
 		}
 		wantSessionPath := filepath.Join(workerDir, "session.json")
 		if got := flagValue(state.Command[1:], "--autonomous-session-file"); got != wantSessionPath {
@@ -2470,6 +2550,7 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 		LogPath:    logPath,
 		StatePath:  statePath,
 		ClonePath:  targetDir,
+		PushRemote: "https://github.com/owner/repo.git",
 		WorkDir:    targetDir,
 	}
 	if err := os.WriteFile(logPath, []byte("line 1\nline 2\n"), 0o644); err != nil {
@@ -2491,6 +2572,7 @@ func TestStatusWorkerReportsDetachedMetadata(t *testing.T) {
 		"target: issue #71",
 		"process: running",
 		"clone: " + targetDir,
+		"push-remote: https://github.com/owner/repo.git",
 		"agent: runner=opencode agent=build model=openai/gpt-4o",
 		"log-progress: lines=2",
 		"log-freshness: updated ",
@@ -2749,6 +2831,7 @@ func TestStatusWorkersJSONListsRegistryEntries(t *testing.T) {
 		SessionPath: sessionPath,
 		StatePath:   statePath,
 		ClonePath:   targetDir,
+		PushRemote:  "https://github.com/owner/repo.git",
 		WorkDir:     targetDir,
 	}); err != nil {
 		t.Fatalf("workers.WriteState() error = %v", err)
@@ -2778,6 +2861,9 @@ func TestStatusWorkersJSONListsRegistryEntries(t *testing.T) {
 	}
 	if worker.Worker.ClonePath != targetDir {
 		t.Fatalf("worker clone path = %q, want %q", worker.Worker.ClonePath, targetDir)
+	}
+	if worker.Worker.PushRemote != "https://github.com/owner/repo.git" {
+		t.Fatalf("worker push remote = %q, want https://github.com/owner/repo.git", worker.Worker.PushRemote)
 	}
 	if worker.ProcessStatus != "exited" {
 		t.Fatalf("process status = %q, want exited", worker.ProcessStatus)

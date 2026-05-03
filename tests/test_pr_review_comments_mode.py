@@ -1216,5 +1216,51 @@ class RequiredFileValidationTests(unittest.TestCase):
         self.assertEqual(result.get("missing_files"), [])
 
 
+class PRBranchCheckoutTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = load_script_module()
+
+    def test_checkout_pr_target_branch_falls_back_to_full_origin_fetch(self) -> None:
+        branch_name = "issue-fix/308-go-migration-auto-run-pr-conflict-recovery"
+        commands: list[list[str]] = []
+
+        def fake_run_command(args: list[str]) -> None:
+            commands.append(list(args))
+            if args == ["git", "fetch", "origin", branch_name]:
+                raise RuntimeError("Command failed: git fetch origin <branch>")
+
+        with (
+            mock.patch.object(self.mod, "local_branch_exists", return_value=False),
+            mock.patch.object(self.mod, "remote_branch_exists", side_effect=[False, True]),
+            mock.patch.object(self.mod, "run_command", side_effect=fake_run_command),
+        ):
+            self.mod.checkout_pr_target_branch(branch_name, dry_run=False)
+
+        self.assertEqual(
+            commands,
+            [
+                ["git", "fetch", "origin", branch_name],
+                ["git", "fetch", "origin"],
+                ["git", "checkout", "-b", branch_name, "--track", f"origin/{branch_name}"],
+            ],
+        )
+
+    def test_checkout_pr_target_branch_raises_when_branch_absent_after_refresh(self) -> None:
+        branch_name = "issue-fix/308-go-migration-auto-run-pr-conflict-recovery"
+
+        def fake_run_command(args: list[str]) -> None:
+            if args == ["git", "fetch", "origin", branch_name]:
+                raise RuntimeError("Command failed: git fetch origin <branch>")
+
+        with (
+            mock.patch.object(self.mod, "local_branch_exists", return_value=False),
+            mock.patch.object(self.mod, "remote_branch_exists", side_effect=[False, False]),
+            mock.patch.object(self.mod, "run_command", side_effect=fake_run_command),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not found on origin after refresh"):
+                self.mod.checkout_pr_target_branch(branch_name, dry_run=False)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,13 @@
 - `run pr` запускает review-comments flow для существующего PR.
 - `run daemon` запускает Go-owned polling/claim loop и затем dispatch'ит совместимый worker path для каждого выбранного таска.
 
+### Provider support matrix
+
+- Поддерживаемая tracker/code host комбинация для Go-native runtime paths: `github/github`.
+- `run issue --repo ...` и `run pr --repo ...` при `--tracker`/`--codehost`, отличных от `github/github`, делают явный fallback с понятной причиной в stderr.
+- Daemon Go-policy selection включается только для `github` tracker; для остальных tracker execution остается на compatibility path.
+- Jira tracker может быть передан в Python compatibility adapter flags, но Go-native issue/PR runtime под Jira пока не поддерживается.
+
 ### Issue flow
 
 - Поддерживаются одиночный запуск по `--issue` / `run issue --id` и batch/polling обработка списка issue.

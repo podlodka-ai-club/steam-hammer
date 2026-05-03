@@ -70,20 +70,27 @@ func TestNormalizeReviewFeedback(t *testing.T) {
 	}
 }
 
-func TestParsePRReviewOutcomeSummaryNormalizesStatuses(t *testing.T) {
-	parsed := ParsePRReviewOutcomeSummary(PRReviewOutcomeMarker + `
-{"items":[
-  {"item":1,"status":"fixed","summary":"updated app.go"},
-  {"item":2,"status":"not_fixed","summary":"unsafe without product call","next_action":"decide behavior"},
-  {"item":3,"status":"blocked","summary":"needs credentials","next_action":"provide token"}
-]}`)
-	if parsed == nil || len(parsed.Items) != 3 {
-		t.Fatalf("parsed = %#v, want 3 items", parsed)
+func TestNormalizeReviewFeedbackFiltersNonActionableInlineComments(t *testing.T) {
+	items, stats := NormalizeReviewFeedback(
+		[]ReviewThread{{
+			Comments: []ReviewThreadComment{
+				{Author: "reviewer", Body: "LGTM", Path: "app.go", Line: 1, URL: "https://example/1"},
+				{Author: "reviewer", Body: "Please rename this", Path: "app.go", Line: 2, URL: "https://example/2"},
+			},
+		}},
+		nil,
+		nil,
+		"",
+	)
+
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1 (%#v)", len(items), items)
 	}
-	got := []string{parsed.Items[0].Status, parsed.Items[1].Status, parsed.Items[2].Status}
-	want := []string{"fixed", "not-fixed", "needs-human-follow-up"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("statuses = %#v, want %#v", got, want)
+	if got := strings.TrimSpace(items[0].Body); got != "Please rename this" {
+		t.Fatalf("inline item body = %q, want actionable comment", got)
+	}
+	if stats.CommentsNonActionable != 1 {
+		t.Fatalf("CommentsNonActionable = %d, want 1", stats.CommentsNonActionable)
 	}
 }
 

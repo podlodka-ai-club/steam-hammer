@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/agentexec"
-	"github.com/podlodka-ai-club/steam-hammer/internal/core/githublifecycle"
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/lifecycle"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 )
 
@@ -19,10 +19,10 @@ const (
 )
 
 type prReviewLifecycle interface {
-	FetchPullRequest(ctx context.Context, repo string, number int) (githublifecycle.PullRequest, error)
+	FetchPullRequest(ctx context.Context, repo string, number int) (lifecycle.PullRequest, error)
 	CommentOnPullRequest(ctx context.Context, repo string, number int, body string) error
-	ReviewThreadsForPullRequest(ctx context.Context, repo string, number int) ([]githublifecycle.PullRequestReviewThread, error)
-	ConversationCommentsForPullRequest(ctx context.Context, repo string, number int) ([]githublifecycle.PullRequestConversationComment, error)
+	ReviewThreadsForPullRequest(ctx context.Context, repo string, number int) ([]lifecycle.PullRequestReviewThread, error)
+	ConversationCommentsForPullRequest(ctx context.Context, repo string, number int) ([]lifecycle.PullRequestConversationComment, error)
 }
 
 type nativePROptions struct {
@@ -85,10 +85,10 @@ func nativePRFallbackReason(opts nativePROptions) string {
 	if strings.TrimSpace(*opts.common.preset) != "" {
 		return "--preset is not supported by the Go-native PR path yet"
 	}
-	if tracker := strings.TrimSpace(*opts.common.tracker); tracker != "" && !strings.EqualFold(tracker, githublifecycle.TrackerGitHub) {
+	if tracker := strings.TrimSpace(*opts.common.tracker); tracker != "" && !strings.EqualFold(tracker, lifecycle.TrackerGitHub) {
 		return "native PR flow currently supports only the GitHub tracker"
 	}
-	if codehost := strings.TrimSpace(*opts.common.codehost); codehost != "" && !strings.EqualFold(codehost, githublifecycle.TrackerGitHub) {
+	if codehost := strings.TrimSpace(*opts.common.codehost); codehost != "" && !strings.EqualFold(codehost, lifecycle.CodeHostGitHub) {
 		return "native PR flow currently supports only the GitHub code host"
 	}
 	return ""
@@ -398,7 +398,7 @@ func (a *App) runNativePR(ctx context.Context, repo string, opts nativePROptions
 	return 0
 }
 
-func (a *App) fetchNativePRReviewFeedback(ctx context.Context, repo string, pullRequest githublifecycle.PullRequest) ([]orchestration.ReviewFeedbackItem, orchestration.ReviewFeedbackStats, error) {
+func (a *App) fetchNativePRReviewFeedback(ctx context.Context, repo string, pullRequest lifecycle.PullRequest) ([]orchestration.ReviewFeedbackItem, orchestration.ReviewFeedbackStats, error) {
 	threads, err := a.prLifecycle.ReviewThreadsForPullRequest(ctx, repo, pullRequest.Number)
 	if err != nil {
 		return nil, orchestration.ReviewFeedbackStats{}, err
@@ -456,11 +456,11 @@ func (a *App) fetchNativePRReviewFeedback(ctx context.Context, repo string, pull
 	return items, stats, nil
 }
 
-func (a *App) loadLinkedIssueContext(ctx context.Context, repo string, pullRequest githublifecycle.PullRequest) []githublifecycle.Issue {
+func (a *App) loadLinkedIssueContext(ctx context.Context, repo string, pullRequest lifecycle.PullRequest) []lifecycle.Issue {
 	if len(pullRequest.ClosingIssuesReferences) == 0 {
 		return nil
 	}
-	linked := make([]githublifecycle.Issue, 0, len(pullRequest.ClosingIssuesReferences))
+	linked := make([]lifecycle.Issue, 0, len(pullRequest.ClosingIssuesReferences))
 	for _, reference := range pullRequest.ClosingIssuesReferences {
 		if reference.Number <= 0 {
 			continue
@@ -475,7 +475,7 @@ func (a *App) loadLinkedIssueContext(ctx context.Context, repo string, pullReque
 	return linked
 }
 
-func buildNativePRReviewPrompt(pullRequest githublifecycle.PullRequest, reviewItems []orchestration.ReviewFeedbackItem, linkedIssues []githublifecycle.Issue, lightweight bool) string {
+func buildNativePRReviewPrompt(pullRequest lifecycle.PullRequest, reviewItems []orchestration.ReviewFeedbackItem, linkedIssues []lifecycle.Issue, lightweight bool) string {
 	issueContextLines := make([]string, 0, len(linkedIssues))
 	for _, issue := range linkedIssues {
 		issueContextLines = append(issueContextLines, strings.TrimSpace(fmt.Sprintf(
@@ -555,73 +555,7 @@ func buildNativePRReviewPrompt(pullRequest githublifecycle.PullRequest, reviewIt
 	))
 }
 
-func buildPRReviewOutcomeSummary(result *agentexec.Result, reviewItems []orchestration.ReviewFeedbackItem) *orchestration.PRReviewOutcomeSummary {
-	if result != nil {
-		if parsed := orchestration.ParsePRReviewOutcomeSummary(result.Output); parsed != nil {
-			return parsed
-		}
-	}
-	if len(reviewItems) == 0 {
-		return nil
-	}
-	items := make([]orchestration.PRReviewItemOutcome, 0, len(reviewItems))
-	for index, reviewItem := range reviewItems {
-		summary := strings.TrimSpace(reviewItem.Body)
-		if len(summary) > 220 {
-			summary = strings.TrimSpace(summary[:220]) + "..."
-		}
-		items = append(items, orchestration.PRReviewItemOutcome{
-			Item:       index + 1,
-			Status:     "not-fixed",
-			Summary:    fallbackString(summary, "No structured outcome provided by agent"),
-			NextAction: "manual_review_follow_up_required",
-		})
-	}
-	return &orchestration.PRReviewOutcomeSummary{Items: items}
-}
-
-func buildPRReviewFailureOutcome(reviewItems []orchestration.ReviewFeedbackItem, message, nextAction string) *orchestration.PRReviewOutcomeSummary {
-	if len(reviewItems) == 0 {
-		return nil
-	}
-	message = fallbackString(strings.TrimSpace(message), "Agent did not complete this review item")
-	nextAction = fallbackString(strings.TrimSpace(nextAction), "manual_review_follow_up_required")
-	items := make([]orchestration.PRReviewItemOutcome, 0, len(reviewItems))
-	for index := range reviewItems {
-		items = append(items, orchestration.PRReviewItemOutcome{
-			Item:       index + 1,
-			Status:     "needs-human-follow-up",
-			Summary:    message,
-			NextAction: nextAction,
-		})
-	}
-	return &orchestration.PRReviewOutcomeSummary{Items: items}
-}
-
-func appendRemainingReviewOutcomes(summary *orchestration.PRReviewOutcomeSummary, remaining []orchestration.ReviewFeedbackItem) *orchestration.PRReviewOutcomeSummary {
-	if len(remaining) == 0 {
-		return summary
-	}
-	base := orchestration.PRReviewOutcomeSummary{}
-	if summary != nil {
-		base.Items = append(base.Items, summary.Items...)
-	}
-	for index, item := range remaining {
-		text := strings.TrimSpace(item.Body)
-		if len(text) > 220 {
-			text = strings.TrimSpace(text[:220]) + "..."
-		}
-		base.Items = append(base.Items, orchestration.PRReviewItemOutcome{
-			Item:       index + 1,
-			Status:     "not-fixed",
-			Summary:    fallbackString(text, "Review item remains actionable after retries"),
-			NextAction: "manual_review_follow_up_required",
-		})
-	}
-	return &base
-}
-
-func nativePRCommitTitle(pullRequest githublifecycle.PullRequest) string {
+func nativePRCommitTitle(pullRequest lifecycle.PullRequest) string {
 	return fmt.Sprintf("Address review comments for PR #%d", pullRequest.Number)
 }
 

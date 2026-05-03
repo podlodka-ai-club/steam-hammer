@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/podlodka-ai-club/steam-hammer/internal/core/githublifecycle"
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/lifecycle"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 )
 
@@ -167,10 +167,10 @@ func (a *App) runPostBatchVerification(ctx context.Context, opts commonOptions, 
 	followUp := orchestration.RecommendedPostBatchFollowUpIssue(strings.TrimSpace(*opts.repo), verification, nil)
 	tracker := strings.TrimSpace(*opts.tracker)
 	if tracker == "" {
-		tracker = githublifecycle.TrackerGitHub
+		tracker = lifecycle.TrackerGitHub
 	}
-	if createFollowupIssue && strings.EqualFold(tracker, githublifecycle.TrackerGitHub) && a.daemon != nil && strings.TrimSpace(*opts.repo) != "" {
-		created, err := a.daemon.CreateIssue(ctx, githublifecycle.CreateIssueRequest{
+	if createFollowupIssue && strings.EqualFold(tracker, lifecycle.TrackerGitHub) && a.daemon != nil && strings.TrimSpace(*opts.repo) != "" {
+		created, err := a.daemon.CreateIssue(ctx, lifecycle.CreateIssueRequest{
 			Repo:  strings.TrimSpace(*opts.repo),
 			Title: followUp.Title,
 			Body:  followUp.Body,

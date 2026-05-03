@@ -10,7 +10,16 @@ const (
 )
 
 type LinkedPullRequest struct {
-	Number int
+	Number           int
+	MergeStateStatus string
+	Mergeable        string
+}
+
+func (pr *LinkedPullRequest) IsConflicting() bool {
+	if pr == nil {
+		return false
+	}
+	return ClassifyPRMergeReadinessState(pr.MergeStateStatus, pr.Mergeable) == MergeReadinessConflicting
 }
 
 type ExecutionModeDecision struct {
@@ -34,6 +43,13 @@ func ChooseExecutionMode(issueNumber int, linkedOpenPR *LinkedPullRequest, force
 			}
 		}
 		return ExecutionModeDecision{Mode: ExecutionModeIssueFlow, Reason: "recovered waiting-for-author state has a newer author answer"}
+	}
+
+	if recoveredStatus == StatusBlocked && linkedOpenPR != nil && linkedOpenPR.IsConflicting() {
+		return ExecutionModeDecision{
+			Mode:   ExecutionModePRReview,
+			Reason: fmt.Sprintf("recovered orchestration state is blocked, but linked open PR #%d is conflicting and needs sync recovery", linkedOpenPR.Number),
+		}
 	}
 
 	if recoveredStatus == StatusWaitingForAuthor || recoveredStatus == StatusBlocked {

@@ -1734,6 +1734,38 @@ func TestRunBatchDetachRoutesLinkedPRToNativePRCommand(t *testing.T) {
 	}
 }
 
+func TestRunPRDetachUsesNativeWorkerWithMigratedFlags(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+	app.SetExecutablePath(execPath)
+
+	code := app.Run([]string{"run", "pr", "--id", "72", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--isolate-worktree", "--post-pr-summary"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if starter.calls != 1 {
+		t.Fatalf("starter calls = %d, want 1", starter.calls)
+	}
+	if starter.req.Name != execPath {
+		t.Fatalf("worker command = %q, want native executable %q", starter.req.Name, execPath)
+	}
+	if len(starter.req.Args) < 4 || !reflect.DeepEqual(starter.req.Args[:4], []string{"run", "pr", "--id", "72"}) {
+		t.Fatalf("worker args = %#v, want native pr entrypoint", starter.req.Args)
+	}
+	joined := strings.Join(starter.req.Args, " ")
+	for _, want := range []string{"--repo owner/repo", "--isolate-worktree", "--post-pr-summary"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("worker args = %#v, want %q", starter.req.Args, want)
+		}
+	}
+	if strings.Contains(joined, runnerScript) || strings.Contains(starter.req.Name, "python") {
+		t.Fatalf("worker = %q %#v, should not use python fallback", starter.req.Name, starter.req.Args)
+	}
+}
+
 func TestRunBatchDetachKeepsNativeWorkerWithProjectConfig(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
 	cloner := &recordingBatchClonePreparer{}
@@ -1855,7 +1887,7 @@ func TestRunIssueCommandForwardsLightweightFlag(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--issue", "20", "--lightweight"})
 }
 
-func TestRunPRCommandWiresPythonRunner(t *testing.T) {
+func TestRunPRCommandFallsBackWithoutRepo(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
@@ -1865,6 +1897,41 @@ func TestRunPRCommandWiresPythonRunner(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--pr", "72", "--from-review-comments", "--dry-run", "--isolate-worktree"})
+}
+
+func TestRunPRNativeDryRunSupportsCompatibilityFlags(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "feature/pr-72\n"},
+	}}
+	lifecycle := &fakeDaemonLifecycle{pullRequest: githublifecycle.PullRequest{Number: 72, HeadRefName: "feature/pr-72", BaseRefName: "main"}}
+	agent := &fakeIssueAgentRunner{}
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetPRLifecycle(lifecycle)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "pr", "--id", "72", "--repo", "owner/repo", "--dry-run", "--from-review-comments", "--isolate-worktree", "--post-pr-summary", "--pr-followup-branch-prefix", "followup"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("python runner calls = %d, want 0", runner.calls)
+	}
+	if agent.callCount != 0 {
+		t.Fatalf("agent call count = %d, want 0", agent.callCount)
+	}
+	stdout := out.String()
+	for _, want := range []string{"[dry-run] Would create isolated worktree", "[dry-run] Would create follow-up branch", "[dry-run] Native PR flow preflight succeeded"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout = %q, want %q", stdout, want)
+		}
+	}
 }
 
 func TestRunPRNativeDryRunWithRepoSkipsPythonRunner(t *testing.T) {
@@ -2580,7 +2647,7 @@ func TestRunPRUsesNativeRuntimeLoopWhenRepoExplicit(t *testing.T) {
 	app.SetIssueLifecycle(lifecycle)
 	app.SetPRLifecycle(lifecycle)
 
-	code := app.Run([]string{"run", "pr", "--id", "72", "--repo", "owner/repo"})
+	code := app.Run([]string{"run", "pr", "--id", "72", "--repo", "owner/repo", "--post-pr-summary"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
@@ -2596,13 +2663,28 @@ func TestRunPRUsesNativeRuntimeLoopWhenRepoExplicit(t *testing.T) {
 	if len(lifecycle.prCommentBodies[72]) < 2 {
 		t.Fatalf("PR comments posted = %d, want at least 2", len(lifecycle.prCommentBodies[72]))
 	}
-	lastComment := lifecycle.prCommentBodies[72][len(lifecycle.prCommentBodies[72])-1]
-	state, err := orchestration.ParseOrchestrationStateCommentBody(lastComment)
-	if err != nil {
-		t.Fatalf("ParseOrchestrationStateCommentBody() error = %v", err)
+	var state *orchestration.TrackedState
+	for _, body := range lifecycle.prCommentBodies[72] {
+		parsed, err := orchestration.ParseOrchestrationStateCommentBody(body)
+		if err != nil {
+			t.Fatalf("ParseOrchestrationStateCommentBody() error = %v", err)
+		}
+		if parsed != nil {
+			state = parsed
+		}
 	}
 	if state == nil || state.Status != orchestration.StatusWaitingForCI {
 		t.Fatalf("final PR state = %#v, want waiting-for-ci", state)
+	}
+	foundSummary := false
+	for _, body := range lifecycle.prCommentBodies[72] {
+		if strings.Contains(body, "Automated follow-up completed") && strings.Contains(body, "Addressed review feedback items: 1") {
+			foundSummary = true
+			break
+		}
+	}
+	if !foundSummary {
+		t.Fatalf("PR comments = %#v, want post-pr-summary comment", lifecycle.prCommentBodies[72])
 	}
 	joinedShell := strings.Join(shell.cmds, "\n")
 	if !strings.Contains(joinedShell, "git 'commit' '-m' 'Address review comments for PR #72'") {

@@ -366,6 +366,59 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 		return 1
 	}
 	if !hasChanges {
+		if branchLifecycle == orchestration.BranchLifecycleReused && reusedBranchSync != nil && reusedBranchSync.Changed {
+			if err := a.assertNativeGitContext(ctx, repoRoot, issueBranch, "push sync-only issue branch updates"); err != nil {
+				postState(failedState("commit_push", "restore_branch_context", err.Error()))
+				_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+				return 1
+			}
+			if err := a.gitPushBranch(ctx, repoRoot, issueBranch, pushAfterAgentWithLease); err != nil {
+				postState(failedState("commit_push", "inspect_push_failure", err.Error()))
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to push sync-only issue branch %q: %v\n", issueBranch, err)
+				return 1
+			}
+			prURL, err := a.issueLifecycle.CreatePullRequest(ctx, lifecycle.CreatePullRequestRequest{
+				Repo:               repo,
+				BaseBranch:         baseBranch,
+				HeadBranch:         issueBranch,
+				Title:              issue.Title,
+				IssueRef:           fmt.Sprintf("#%d", issue.Number),
+				IssueURL:           issue.URL,
+				CloseLinkedIssue:   true,
+				StackedBaseContext: stackedBase,
+			})
+			if err != nil {
+				postState(failedState("pr_ready", "inspect_pr_creation_failure", err.Error()))
+				_, _ = fmt.Fprintf(a.err, "orchestrator: failed to create PR for sync-only issue #%d: %v\n", issue.Number, err)
+				return 1
+			}
+			prNumber := parsePullRequestNumber(prURL)
+			postState(orchestration.TrackedState{
+				Status:           orchestration.StatusReadyForReview,
+				TaskType:         "issue",
+				Issue:            intPtr(issue.Number),
+				PR:               prNumber,
+				Branch:           issueBranch,
+				BranchLifecycle:  branchLifecycle,
+				BaseBranch:       baseBranch,
+				Runner:           runnerName,
+				Agent:            agentName,
+				Model:            modelName,
+				Attempt:          1,
+				Stage:            "pr_ready",
+				NextAction:       "wait_for_review",
+				Error:            "Agent finished without changing files; pushed sync-only branch updates",
+				Timestamp:        time.Now().UTC().Format(time.RFC3339),
+				ReusedBranchSync: reusedBranchSync,
+				Stats:            statsMap(result.Stats),
+			})
+			if prURL != "" {
+				_, _ = fmt.Fprintf(a.out, "No file changes from agent for issue #%d; pushed sync-only branch updates and prepared PR: %s\n", issue.Number, prURL)
+			} else {
+				_, _ = fmt.Fprintf(a.out, "No file changes from agent for issue #%d; pushed sync-only branch updates and prepared PR\n", issue.Number)
+			}
+			return 0
+		}
 		postState(orchestration.TrackedState{
 			Status:           orchestration.StatusWaitingForAuthor,
 			TaskType:         "issue",

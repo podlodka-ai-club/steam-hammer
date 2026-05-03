@@ -1577,6 +1577,13 @@ func TestRunBatchDetachRoutesLinkedPRToNativePRCommand(t *testing.T) {
 	if !reflect.DeepEqual(starter.req.Args[:4], []string{"run", "pr", "--id", "101"}) {
 		t.Fatalf("worker args = %#v, want native pr entrypoint", starter.req.Args)
 	}
+	joined := strings.Join(starter.req.Args, " ")
+	if !strings.Contains(joined, "--isolate-worktree") {
+		t.Fatalf("worker args = %#v, want isolate worktree flag", starter.req.Args)
+	}
+	if strings.Contains(joined, "--allow-pr-branch-switch") {
+		t.Fatalf("worker args = %#v, should not include branch switch flag", starter.req.Args)
+	}
 }
 
 func TestRunBatchDetachFallsBackToPythonWhenNativeIssueUnsupported(t *testing.T) {
@@ -1715,7 +1722,7 @@ func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
 	assertCommandContainsFlag(t, runner.args, "--autonomous-session-file")
 }
 
-func TestRunDaemonRoutesLinkedPRWorkerWithSafeBranchSwitch(t *testing.T) {
+func TestRunDaemonRoutesLinkedPRWorkerWithIsolatedWorktree(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
@@ -1737,8 +1744,11 @@ func TestRunDaemonRoutesLinkedPRWorkerWithSafeBranchSwitch(t *testing.T) {
 	if !strings.Contains(joined, "--pr") || !strings.Contains(joined, "101") {
 		t.Fatalf("runner args = %#v, want PR routing", runner.args)
 	}
-	if !strings.Contains(joined, "--allow-pr-branch-switch") {
-		t.Fatalf("runner args = %#v, want safe branch switch flag", runner.args)
+	if !strings.Contains(joined, "--isolate-worktree") {
+		t.Fatalf("runner args = %#v, want isolate worktree flag", runner.args)
+	}
+	if strings.Contains(joined, "--allow-pr-branch-switch") {
+		t.Fatalf("runner args = %#v, should not include branch switch flag", runner.args)
 	}
 }
 

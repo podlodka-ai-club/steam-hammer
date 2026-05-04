@@ -4355,6 +4355,87 @@ func TestStatusWorkersJSONListsRegistryEntries(t *testing.T) {
 	}
 }
 
+func TestStatusMergeQueuePlanJSONScenarios(t *testing.T) {
+	baseReadiness := &orchestration.PRMergeReadiness{
+		Status:              orchestration.StatusReadyToMerge,
+		ReviewDecision:      orchestration.ReviewDecisionApproved,
+		MergeReadinessState: orchestration.MergeReadinessClean,
+		MergeResultVerification: &orchestration.VerificationVerdict{
+			Status: "passed",
+		},
+	}
+	basePolicy := &orchestration.MergePolicy{Auto: true, Method: "squash"}
+
+	tests := []struct {
+		name          string
+		issueState    orchestration.TrackedState
+		prState       orchestration.TrackedState
+		issueNumber   int
+		prNumber      int
+		branch        string
+		wantEligible  int
+		wantSkip      string
+		withLinkedPR  bool
+		withPRState   bool
+		issueCIChecks []orchestration.PRCICheck
+	}{
+		{name: "eligible pr", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(71), PR: intPtr(101), Branch: "issue-fix/71", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(71), PR: intPtr(101), Branch: "issue-fix/71", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 71, prNumber: 101, branch: "issue-fix/71", wantEligible: 1, withLinkedPR: true, withPRState: true},
+		{name: "missing verification", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(72), PR: intPtr(102), Branch: "issue-fix/72", MergeReadiness: &orchestration.PRMergeReadiness{Status: orchestration.StatusReadyToMerge, ReviewDecision: orchestration.ReviewDecisionApproved, MergeReadinessState: orchestration.MergeReadinessClean}, MergePolicy: basePolicy}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(72), PR: intPtr(102), Branch: "issue-fix/72", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 72, prNumber: 102, branch: "issue-fix/72", wantSkip: "missing-verification", withLinkedPR: true, withPRState: true},
+		{name: "stale linked state", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(73), PR: intPtr(103), Branch: "issue-fix/73", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(73), PR: intPtr(103), Branch: "other-branch", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 73, prNumber: 103, branch: "issue-fix/73", wantSkip: "stale-linked-state", withLinkedPR: true, withPRState: true},
+		{name: "review required", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(74), PR: intPtr(104), Branch: "issue-fix/74", MergeReadiness: &orchestration.PRMergeReadiness{Status: orchestration.StatusReadyToMerge, ReviewDecision: orchestration.ReviewDecisionReviewRequired, MergeReadinessState: orchestration.MergeReadinessClean, MergeResultVerification: &orchestration.VerificationVerdict{Status: "passed"}}, MergePolicy: basePolicy}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(74), PR: intPtr(104), Branch: "issue-fix/74", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 74, prNumber: 104, branch: "issue-fix/74", wantSkip: "review-required", withLinkedPR: true, withPRState: true},
+		{name: "ci failing", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(75), PR: intPtr(105), Branch: "issue-fix/75", MergeReadiness: baseReadiness, MergePolicy: basePolicy, CIChecks: []orchestration.PRCICheck{{Name: "ci/test", State: "failure"}}}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(75), PR: intPtr(105), Branch: "issue-fix/75", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 75, prNumber: 105, branch: "issue-fix/75", wantSkip: "ci-failing", withLinkedPR: true, withPRState: true},
+		{name: "conflict", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(76), PR: intPtr(106), Branch: "issue-fix/76", MergeReadiness: &orchestration.PRMergeReadiness{Status: orchestration.StatusReadyToMerge, ReviewDecision: orchestration.ReviewDecisionApproved, MergeReadinessState: orchestration.MergeReadinessConflicting, MergeResultVerification: &orchestration.VerificationVerdict{Status: "passed"}}, MergePolicy: basePolicy}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(76), PR: intPtr(106), Branch: "issue-fix/76", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 76, prNumber: 106, branch: "issue-fix/76", wantSkip: "merge-conflict", withLinkedPR: true, withPRState: true},
+		{name: "merge policy disabled", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(77), PR: intPtr(107), Branch: "issue-fix/77", MergeReadiness: baseReadiness, MergePolicy: &orchestration.MergePolicy{Auto: false, Method: "squash"}}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(77), PR: intPtr(107), Branch: "issue-fix/77", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 77, prNumber: 107, branch: "issue-fix/77", wantSkip: "merge-policy-disabled", withLinkedPR: true, withPRState: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issueBody, err := orchestration.BuildOrchestrationStateComment(tt.issueState)
+			if err != nil {
+				t.Fatalf("BuildOrchestrationStateComment(issue) error = %v", err)
+			}
+			lifecycle := &fakeDaemonLifecycle{
+				issues:         []githublifecycle.Issue{{Number: tt.issueNumber, Title: "Issue", Body: "Body", URL: "https://github.com/owner/repo/issues/" + strconv.Itoa(tt.issueNumber)}},
+				commentsByIssue: map[int][]githublifecycle.IssueComment{tt.issueNumber: {{ID: 1, Body: issueBody, CreatedAt: "2026-05-01T12:00:00Z"}}},
+			}
+			if tt.withLinkedPR {
+				lifecycle.linkedPR = &githublifecycle.PullRequest{Number: tt.prNumber, HeadRefName: tt.branch, BaseRefName: "main", URL: "https://github.com/owner/repo/pull/" + strconv.Itoa(tt.prNumber)}
+			}
+			if tt.withPRState {
+				prBody, err := orchestration.BuildOrchestrationStateComment(tt.prState)
+				if err != nil {
+					t.Fatalf("BuildOrchestrationStateComment(pr) error = %v", err)
+				}
+				lifecycle.conversation = []githublifecycle.PullRequestConversationComment{{Body: prBody, URL: "https://github.com/owner/repo/pull/" + strconv.Itoa(tt.prNumber) + "#issuecomment-1"}}
+			}
+
+			var out, errOut strings.Builder
+			app := NewApp(&out, &errOut)
+			app.SetDaemonLifecycle(lifecycle)
+			code := app.Run([]string{"status", "--repo", "owner/repo", "--merge-queue-plan", "--json"})
+			if code != 0 {
+				t.Fatalf("Run() code = %d, want 0, stderr=%q", code, errOut.String())
+			}
+			var payload mergeQueuePlanReport
+			if err := json.Unmarshal([]byte(out.String()), &payload); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v\n%s", err, out.String())
+			}
+			if got := len(payload.Eligible); got != tt.wantEligible {
+				t.Fatalf("eligible len = %d, want %d", got, tt.wantEligible)
+			}
+			if tt.wantSkip != "" {
+				if len(payload.Skipped) != 1 {
+					t.Fatalf("skipped len = %d, want 1", len(payload.Skipped))
+				}
+				if payload.Skipped[0].Reason != tt.wantSkip {
+					t.Fatalf("skip reason = %q, want %q", payload.Skipped[0].Reason, tt.wantSkip)
+				}
+			}
+		})
+	}
+}
+
+
 func assertCommand(t *testing.T, runner *recordingRunner, wantArgs []string) {
 	t.Helper()
 	if runner.calls != 1 {

@@ -164,26 +164,55 @@ func (a *App) runPostBatchVerification(ctx context.Context, opts commonOptions, 
 		return verification, nil
 	}
 
-	followUp := orchestration.RecommendedPostBatchFollowUpIssue(strings.TrimSpace(*opts.repo), verification, nil)
+	verificationContext := postBatchVerificationContext(sessionPath)
+	followUps := orchestration.RecommendedPostBatchFollowUpIssues(strings.TrimSpace(*opts.repo), verification, verificationContext, nil)
+	if len(followUps) == 0 {
+		followUp := orchestration.RecommendedPostBatchFollowUpIssue(strings.TrimSpace(*opts.repo), verification, nil)
+		followUps = append(followUps, followUp)
+	}
 	tracker := strings.TrimSpace(*opts.tracker)
 	if tracker == "" {
 		tracker = lifecycle.TrackerGitHub
 	}
 	if createFollowupIssue && strings.EqualFold(tracker, lifecycle.TrackerGitHub) && a.daemon != nil && strings.TrimSpace(*opts.repo) != "" {
-		created, err := a.daemon.CreateIssue(ctx, lifecycle.CreateIssueRequest{
-			Repo:  strings.TrimSpace(*opts.repo),
-			Title: followUp.Title,
-			Body:  followUp.Body,
-		})
+		repo := strings.TrimSpace(*opts.repo)
+		existingIssues, err := a.daemon.ListIssues(ctx, repo, "open", 100)
 		if err != nil {
 			return orchestration.VerificationResult{}, err
 		}
-		followUp.Status = "created"
-		followUp.IssueNumber = intPtr(created.Number)
-		followUp.IssueRef = "#" + fmt.Sprintf("%d", created.Number)
-		followUp.IssueURL = strings.TrimSpace(created.URL)
+		createdOrExisting := make([]orchestration.VerificationFollowUpIssue, 0, len(followUps))
+		for _, followUp := range followUps {
+			if existing := matchingOpenPostBatchFollowUp(existingIssues, followUp); existing != nil {
+				followUp.Status = "existing"
+				if existing.Number > 0 {
+					followUp.IssueNumber = intPtr(existing.Number)
+					followUp.IssueRef = "#" + fmt.Sprintf("%d", existing.Number)
+				}
+				followUp.IssueURL = strings.TrimSpace(existing.URL)
+				createdOrExisting = append(createdOrExisting, followUp)
+				continue
+			}
+			created, err := a.daemon.CreateIssue(ctx, lifecycle.CreateIssueRequest{
+				Repo:  repo,
+				Title: followUp.Title,
+				Body:  followUp.Body,
+			})
+			if err != nil {
+				return orchestration.VerificationResult{}, err
+			}
+			followUp.Status = "created"
+			followUp.IssueNumber = intPtr(created.Number)
+			followUp.IssueRef = "#" + fmt.Sprintf("%d", created.Number)
+			followUp.IssueURL = strings.TrimSpace(created.URL)
+			createdOrExisting = append(createdOrExisting, followUp)
+			existingIssues = append(existingIssues, created)
+		}
 		verification.NextAction = "fix_regression_from_follow_up_issue"
-		verification.FollowUpIssue = &followUp
+		verification.FollowUpIssues = createdOrExisting
+		if len(createdOrExisting) > 0 {
+			first := createdOrExisting[0]
+			verification.FollowUpIssue = &first
+		}
 		if err := persistVerificationToSession(sessionPath, verification); err != nil {
 			return orchestration.VerificationResult{}, err
 		}
@@ -192,12 +221,69 @@ func (a *App) runPostBatchVerification(ctx context.Context, opts commonOptions, 
 	}
 
 	verification.NextAction = "create_follow_up_issue_and_fix_regression"
-	verification.FollowUpIssue = &followUp
+	verification.FollowUpIssues = followUps
+	if len(followUps) > 0 {
+		first := followUps[0]
+		verification.FollowUpIssue = &first
+	}
 	if err := persistVerificationToSession(sessionPath, verification); err != nil {
 		return orchestration.VerificationResult{}, err
 	}
 	_, _ = fmt.Fprintln(a.out, verification.SummaryLine())
 	return verification, nil
+}
+
+func postBatchVerificationContext(sessionPath string) orchestration.PostBatchVerificationContext {
+	context := orchestration.PostBatchVerificationContext{SessionPath: strings.TrimSpace(sessionPath)}
+	if context.SessionPath == "" {
+		return context
+	}
+	raw, err := os.ReadFile(context.SessionPath)
+	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
+		return context
+	}
+	var state struct {
+		Checkpoint *struct {
+			BatchIndex   int `json:"batch_index,omitempty"`
+			TotalBatches int `json:"total_batches,omitempty"`
+		} `json:"checkpoint,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &state); err != nil || state.Checkpoint == nil {
+		return context
+	}
+	context.BatchIndex = state.Checkpoint.BatchIndex
+	context.TotalBatches = state.Checkpoint.TotalBatches
+	return context
+}
+
+func matchingOpenPostBatchFollowUp(issues []lifecycle.Issue, followUp orchestration.VerificationFollowUpIssue) *lifecycle.Issue {
+	title := strings.TrimSpace(followUp.Title)
+	marker := postBatchFollowUpMarker(followUp.Body)
+	for i := range issues {
+		issue := &issues[i]
+		if !strings.EqualFold(strings.TrimSpace(issue.State), "open") && strings.TrimSpace(issue.State) != "" {
+			continue
+		}
+		if title != "" && strings.TrimSpace(issue.Title) == title {
+			return issue
+		}
+		if marker != "" && strings.Contains(issue.Body, marker) {
+			return issue
+		}
+	}
+	return nil
+}
+
+func postBatchFollowUpMarker(body string) string {
+	start := strings.Index(body, "<!-- steam-hammer:post-batch-verification:")
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(body[start:], "-->")
+	if end < 0 {
+		return ""
+	}
+	return body[start : start+end+3]
 }
 
 func postBatchVerificationCommands(cwd, explicitProjectConfigPath string) ([]orchestration.VerificationCommand, error) {

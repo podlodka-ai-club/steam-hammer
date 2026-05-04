@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 )
 
 var nativePresetTierOrder = []string{"cheap", "default", "hard"}
@@ -61,10 +64,27 @@ func loadNativeProjectConfig(cwd, explicitPath string) (map[string]any, error) {
 	return projectConfig, nil
 }
 
+func loadNativeDaemonRetryPolicy(cwd, explicitPath string, maxAttempts int) (orchestration.DaemonRetryPolicy, error) {
+	projectConfig, err := loadNativeProjectConfig(cwd, explicitPath)
+	if err != nil {
+		return orchestration.DaemonRetryPolicy{}, err
+	}
+	policy := orchestration.DaemonRetryPolicy{MaxAttempts: maxAttempts}
+	retry, _ := projectConfig["retry"].(map[string]any)
+	if len(retry) == 0 {
+		return policy, nil
+	}
+	if policy.MaxAttempts <= 0 {
+		policy.MaxAttempts = positiveConfigInt(retry["max_attempts"])
+	}
+	policy.Backoff = retryBackoffDuration(retry)
+	return policy, nil
+}
+
 func nativeProjectCLIDefaults(projectConfig map[string]any) map[string]any {
 	defaults, _ := projectConfig["defaults"].(map[string]any)
 	cliDefaults := map[string]any{}
-	for _, key := range []string{"tracker", "codehost", "runner", "agent", "model", "preset", "agent_timeout_seconds", "agent_idle_timeout_seconds", "max_attempts"} {
+	for _, key := range []string{"tracker", "codehost", "runner", "agent", "model", "preset", "track_tokens", "token_budget", "agent_timeout_seconds", "agent_idle_timeout_seconds", "max_attempts"} {
 		if value, ok := defaults[key]; ok {
 			cliDefaults[key] = value
 		}
@@ -91,7 +111,7 @@ func nativePresetCLIDefaults(projectConfig map[string]any, presetName string) (m
 		return nil, fmt.Errorf("project config key presets.%s must be an object", presetName)
 	}
 	cliDefaults := map[string]any{"preset": presetName}
-	for _, key := range []string{"runner", "agent", "model", "agent_timeout_seconds", "agent_idle_timeout_seconds", "max_attempts"} {
+	for _, key := range []string{"runner", "agent", "model", "track_tokens", "token_budget", "agent_timeout_seconds", "agent_idle_timeout_seconds", "max_attempts"} {
 		if value, ok := presetConfig[key]; ok {
 			cliDefaults[key] = value
 		}
@@ -106,6 +126,8 @@ func applyNativeCommonDefaults(opts *commonOptions, fs flagState, defaults map[s
 	setStringDefault(opts.agent, fs, "agent", defaults["agent"])
 	setStringDefault(opts.model, fs, "model", defaults["model"])
 	setStringDefault(opts.preset, fs, "preset", defaults["preset"])
+	setBoolDefault(opts.trackTokens, fs, "track-tokens", defaults["track_tokens"])
+	setIntDefault(opts.tokenBudget, fs, "token-budget", defaults["token_budget"])
 	setIntDefault(opts.maxTry, fs, "max-attempts", defaults["max_attempts"])
 	setIntDefault(opts.timeout, fs, "agent-timeout-seconds", defaults["agent_timeout_seconds"])
 	setIntDefault(opts.idleTime, fs, "agent-idle-timeout-seconds", defaults["agent_idle_timeout_seconds"])
@@ -133,6 +155,20 @@ func applyNativeBudgetCaps(opts *commonOptions, projectConfig map[string]any) {
 			*opts.timeout = capSeconds
 		}
 	}
+	if cost := positiveConfigFloat(budgets["max_cost_usd"]); cost > 0 && opts.costBudget != nil {
+		*opts.costBudget = cost
+	}
+}
+
+func applyNativePresetToOptions(opts commonOptions, fs flagState, projectConfig map[string]any, presetName string) (commonOptions, error) {
+	updated := cloneCommonOptions(opts)
+	presetDefaults, err := nativePresetCLIDefaults(projectConfig, presetName)
+	if err != nil {
+		return commonOptions{}, err
+	}
+	applyNativeCommonDefaults(&updated, fs, presetDefaults)
+	applyNativeBudgetCaps(&updated, projectConfig)
+	return updated, nil
 }
 
 func capNativePresetToBudgetTier(projectConfig map[string]any, presetName, maxTier string) string {
@@ -183,6 +219,15 @@ func setIntDefault(target *int, fs flagState, name string, value any) {
 	}
 }
 
+func setBoolDefault(target *bool, fs flagState, name string, value any) {
+	if target == nil || (fs != nil && fs.wasPassed(name)) {
+		return
+	}
+	if normalized, ok := value.(bool); ok {
+		*target = normalized
+	}
+}
+
 func optionalConfigString(value any) string {
 	text, ok := value.(string)
 	if !ok {
@@ -200,6 +245,50 @@ func positiveConfigInt(value any) int {
 	case float64:
 		if typed >= 1 && typed == float64(int(typed)) {
 			return int(typed)
+		}
+	}
+	return 0
+}
+
+func retryBackoffDuration(retry map[string]any) time.Duration {
+	for _, key := range []string{"backoff", "backoff_duration"} {
+		if duration := optionalConfigDuration(retry[key]); duration > 0 {
+			return duration
+		}
+	}
+	if seconds := positiveConfigInt(retry["backoff_seconds"]); seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if seconds := positiveConfigInt(retry["initial_backoff_seconds"]); seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if minutes := positiveConfigInt(retry["backoff_minutes"]); minutes > 0 {
+		return time.Duration(minutes) * time.Minute
+	}
+	return 0
+}
+
+func optionalConfigDuration(value any) time.Duration {
+	text := optionalConfigString(value)
+	if text == "" {
+		return 0
+	}
+	duration, err := time.ParseDuration(text)
+	if err != nil || duration <= 0 {
+		return 0
+	}
+	return duration
+}
+
+func positiveConfigFloat(value any) float64 {
+	switch typed := value.(type) {
+	case int:
+		if typed > 0 {
+			return float64(typed)
+		}
+	case float64:
+		if typed > 0 {
+			return typed
 		}
 	}
 	return 0

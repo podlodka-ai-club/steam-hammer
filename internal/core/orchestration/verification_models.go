@@ -70,12 +70,13 @@ func (f VerificationFollowUpIssue) Request() FollowUpIssueRequest {
 }
 
 type VerificationResult struct {
-	Status        string                      `json:"status,omitempty"`
-	Summary       string                      `json:"summary,omitempty"`
-	Error         string                      `json:"error,omitempty"`
-	NextAction    string                      `json:"next_action,omitempty"`
-	Commands      []VerificationCommandResult `json:"commands,omitempty"`
-	FollowUpIssue *VerificationFollowUpIssue  `json:"follow_up_issue,omitempty"`
+	Status         string                      `json:"status,omitempty"`
+	Summary        string                      `json:"summary,omitempty"`
+	Error          string                      `json:"error,omitempty"`
+	NextAction     string                      `json:"next_action,omitempty"`
+	Commands       []VerificationCommandResult `json:"commands,omitempty"`
+	FollowUpIssue  *VerificationFollowUpIssue  `json:"follow_up_issue,omitempty"`
+	FollowUpIssues []VerificationFollowUpIssue `json:"follow_up_issues,omitempty"`
 }
 
 func SummarizeVerificationResults(results []VerificationCommandResult) string {
@@ -108,6 +109,31 @@ func (v VerificationResult) SummaryLine() string {
 		}
 	}
 	line := "Verification: " + summary
+	if len(v.FollowUpIssues) > 0 {
+		refs := make([]string, 0, len(v.FollowUpIssues))
+		created := 0
+		for _, issue := range v.FollowUpIssues {
+			issueRef := optionalString(issue.IssueRef)
+			if issueRef == "" && issue.IssueNumber != nil {
+				issueRef = "#" + itoa(*issue.IssueNumber)
+			}
+			if issueRef != "" {
+				refs = append(refs, issueRef)
+			}
+			if optionalString(issue.Status) == "created" {
+				created++
+			}
+		}
+		if len(refs) > 0 {
+			if len(refs) == 1 && created == len(v.FollowUpIssues) {
+				return line + "; follow-up issue " + refs[0] + " created"
+			}
+			if created == len(v.FollowUpIssues) {
+				return line + "; follow-up issues " + strings.Join(refs, ", ") + " created"
+			}
+			return line + "; follow-up issues " + strings.Join(refs, ", ")
+		}
+	}
 	if v.FollowUpIssue == nil {
 		return line
 	}

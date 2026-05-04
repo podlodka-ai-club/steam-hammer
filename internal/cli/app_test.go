@@ -1107,6 +1107,116 @@ func TestRunIssueUsesGoNativeHappyPath(t *testing.T) {
 	}
 }
 
+func TestRunIssueNoopWithExplanationPersistsStructuredReason(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 1},
+		{ExitCode: 2},
+		{},
+		{},
+		{Stdout: ""},
+		{Stdout: "\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+	}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{Output: strings.Join([]string{
+		"Done",
+		orchestration.NoOpResultMarker,
+		"```json",
+		`{"explanation":"Feature appears already implemented; verified by inspecting issue handler and existing tests","next_action":"Run go test ./... to verify the current behavior"}`,
+		"```",
+	}, "\n")}}
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if len(lifecycle.commentBodies[71]) != 3 {
+		t.Fatalf("comment bodies = %d, want 3 (state + explanation + final state)", len(lifecycle.commentBodies[71]))
+	}
+	if !strings.Contains(lifecycle.commentBodies[71][1], "Automation finished without code changes") {
+		t.Fatalf("noop comment = %q, want explanation heading", lifecycle.commentBodies[71][1])
+	}
+	finalState, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][2])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody(final) error = %v", err)
+	}
+	if finalState.Status != orchestration.StatusBlocked || finalState.NextAction != "inspect_noop_result" {
+		t.Fatalf("final state = %#v, want blocked inspect_noop_result", finalState)
+	}
+	if !strings.Contains(finalState.Error, "Feature appears already implemented") {
+		t.Fatalf("final error = %q, want persisted explanation", finalState.Error)
+	}
+	if !strings.Contains(out.String(), "recorded no-op explanation") {
+		t.Fatalf("stdout = %q, want no-op summary", out.String())
+	}
+}
+
+func TestRunIssueNoopWithoutExplanationFailsAsAgentQualityIssue(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 1},
+		{ExitCode: 2},
+		{},
+		{},
+		{Stdout: ""},
+		{Stdout: "\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+	}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{Output: "Done, no edits required."}}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if len(lifecycle.commentBodies[71]) != 2 {
+		t.Fatalf("comment bodies = %d, want 2 (state + failed state)", len(lifecycle.commentBodies[71]))
+	}
+	finalState, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][1])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody(final) error = %v", err)
+	}
+	if finalState.Status != orchestration.StatusFailed || finalState.NextAction != "inspect_noop_explanation" {
+		t.Fatalf("final state = %#v, want failed inspect_noop_explanation", finalState)
+	}
+	if strings.Contains(strings.ToLower(finalState.Status), "waiting-for-author") {
+		t.Fatalf("final state = %#v, want hard failure not waiting-for-author", finalState)
+	}
+	if !strings.Contains(finalState.Error, "did not provide a no-op explanation") {
+		t.Fatalf("final error = %q, want explicit no-op explanation failure", finalState.Error)
+	}
+	if !strings.Contains(errOut.String(), orchestration.NoOpResultMarker) {
+		t.Fatalf("stderr = %q, want missing marker guidance", errOut.String())
+	}
+}
+
 func TestRunIssueNativePersistsAutonomousSessionCheckpoint(t *testing.T) {
 	runner := &recordingRunner{}
 	shell := &fakeShellExecutor{results: []shellExecutionResult{

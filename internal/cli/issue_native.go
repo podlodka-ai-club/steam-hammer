@@ -422,8 +422,29 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 			}
 			return 0
 		}
+		noopResult := orchestration.LatestNoOpResultFromAgentOutput(result.Output)
+		if noopResult == nil {
+			postState(failedState("agent_run", "inspect_noop_explanation", "Agent finished without changing the worktree and did not provide a no-op explanation"))
+			_, _ = fmt.Fprintf(a.err, "orchestrator: issue #%d no-op result did not include %s payload\n", issue.Number, orchestration.NoOpResultMarker)
+			return 1
+		}
+		explanation := stringValue(noopResult["explanation"], stringValue(noopResult["reason"], "Agent finished without changing the worktree"))
+		nextAction := stringValue(noopResult["next_action"], "")
+		question := stringValue(noopResult["question"], "")
+		if question != "" {
+			explanation = explanation + "\n\nQuestion: " + question
+		}
+		if err := a.safePostIssueComment(ctx, repo, issue.Number, orchestration.BuildNoOpResultComment(explanation, nextAction)); err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: warning: failed to post no-op explanation for issue #%d: %v\n", issue.Number, err)
+		}
+		status := orchestration.StatusBlocked
+		followUpAction := "inspect_noop_result"
+		if question != "" {
+			status = orchestration.StatusWaitingForAuthor
+			followUpAction = "await_author_reply"
+		}
 		postState(orchestration.TrackedState{
-			Status:           orchestration.StatusWaitingForAuthor,
+			Status:           status,
 			TaskType:         "issue",
 			Issue:            intPtr(issue.Number),
 			Branch:           issueBranch,
@@ -434,13 +455,17 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 			Model:            modelName,
 			Attempt:          1,
 			Stage:            "agent_run",
-			NextAction:       "inspect_noop_result",
-			Error:            "Agent finished without changing the worktree",
+			NextAction:       followUpAction,
+			Error:            explanation,
 			Timestamp:        time.Now().UTC().Format(time.RFC3339),
 			ReusedBranchSync: reusedBranchSync,
 			Stats:            statsMap(result.Stats),
 		})
-		_, _ = fmt.Fprintf(a.out, "No changes detected for issue #%d; skipping commit and PR\n", issue.Number)
+		if status == orchestration.StatusWaitingForAuthor {
+			_, _ = fmt.Fprintf(a.out, "No changes detected for issue #%d; posted clarification question and paused\n", issue.Number)
+		} else {
+			_, _ = fmt.Fprintf(a.out, "No changes detected for issue #%d; recorded no-op explanation\n", issue.Number)
+		}
 		return 0
 	}
 	if err := a.assertNativeGitContext(ctx, repoRoot, issueBranch, "commit issue changes"); err != nil {
@@ -553,8 +578,9 @@ func durationSeconds(seconds int) time.Duration {
 func buildNativeIssuePrompt(issue lifecycle.Issue, lightweight bool) string {
 	if lightweight {
 		return strings.TrimSpace(fmt.Sprintf(
-			"You are working on a small, well-scoped issue in the current git branch.\nImplement the fix in repository files using the smallest correct change.\nDo not run git commands; git actions are handled by orchestration script.\n\nIf the task is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. Instead, stop and print %s followed by a JSON object like {\"question\":\"<focused question>\",\"reason\":\"<why clarification is required>\"}.\n\nIssue: #%d - %s\nURL: %s\n\nIssue body:\n%s",
+		"You are working on a small, well-scoped issue in the current git branch.\nImplement the fix in repository files using the smallest correct change.\nDo not run git commands; git actions are handled by orchestration script.\n\nIf the task is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. Instead, stop and print %s followed by a JSON object like {\"question\":\"<focused question>\",\"reason\":\"<why clarification is required>\"}.\n\nIf you finish with no file changes, you MUST print %s followed by JSON like {\"explanation\":\"what you checked and why no change was needed\",\"next_action\":\"verification or decomposition step\"}. Include \"question\" when author input is required.\n\nIssue: #%d - %s\nURL: %s\n\nIssue body:\n%s",
 			orchestration.ClarificationRequestMarker,
+			orchestration.NoOpResultMarker,
 			issue.Number,
 			issue.Title,
 			issue.URL,
@@ -562,8 +588,9 @@ func buildNativeIssuePrompt(issue lifecycle.Issue, lightweight bool) string {
 		))
 	}
 	return strings.TrimSpace(fmt.Sprintf(
-		"You are working on an issue in the current git branch.\nImplement the fix for the issue in the repository files.\nDo not run git commands; git actions are handled by orchestration script.\n\nIf the task is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. Instead, stop and print %s followed by a JSON object like {\"question\":\"<focused question>\",\"reason\":\"<why clarification is required>\"}.\n\nIssue: #%d - %s\nURL: %s\n\nIssue body:\n%s",
+		"You are working on an issue in the current git branch.\nImplement the fix for the issue in the repository files.\nDo not run git commands; git actions are handled by orchestration script.\n\nIf the task is ambiguous, unsafe, or needs product/business judgment, do not guess and do not wait for interactive approval. Instead, stop and print %s followed by a JSON object like {\"question\":\"<focused question>\",\"reason\":\"<why clarification is required>\"}.\n\nIf you finish with no file changes, you MUST print %s followed by JSON like {\"explanation\":\"what you checked and why no change was needed\",\"next_action\":\"verification or decomposition step\"}. Include \"question\" when author input is required.\n\nIssue: #%d - %s\nURL: %s\n\nIssue body:\n%s",
 		orchestration.ClarificationRequestMarker,
+		orchestration.NoOpResultMarker,
 		issue.Number,
 		issue.Title,
 		issue.URL,

@@ -14,6 +14,7 @@ const (
 	OrchestrationDecompositionMarker = "<!-- orchestration-decomposition:v1 -->"
 	OrchestrationGroomingMarker      = "<!-- orchestration-grooming:v1 -->"
 	ClarificationRequestMarker       = "<!-- orchestration-clarification-request:v1 -->"
+	NoOpResultMarker                 = "<!-- orchestration-noop-result:v1 -->"
 )
 
 var fencedJSONObjectRE = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{.*?\\})\\s*```")
@@ -102,6 +103,39 @@ func ParseClarificationRequestText(body string) (map[string]any, error) {
 
 func LatestClarificationRequestFromAgentOutput(output string) map[string]any {
 	payload, err := ParseClarificationRequestText(output)
+	if err != nil {
+		return nil
+	}
+	return payload
+}
+
+func ParseNoOpResultText(body string) (map[string]any, error) {
+	payload, err := parseMarkedJSONObject(body, NoOpResultMarker, "unable to parse no-op result payload")
+	if err != nil || payload == nil {
+		return nil, err
+	}
+
+	explanation := strings.TrimSpace(stringValue(payload["explanation"]))
+	if explanation == "" {
+		explanation = strings.TrimSpace(stringValue(payload["reason"]))
+	}
+	if explanation == "" {
+		return nil, errors.New("no-op payload must include a non-empty 'explanation' or 'reason'")
+	}
+
+	normalized := map[string]any{}
+	for key, value := range payload {
+		normalized[key] = value
+	}
+	normalized["explanation"] = explanation
+	if reason := strings.TrimSpace(stringValue(payload["reason"])); reason == "" {
+		normalized["reason"] = explanation
+	}
+	return normalized, nil
+}
+
+func LatestNoOpResultFromAgentOutput(output string) map[string]any {
+	payload, err := ParseNoOpResultText(output)
 	if err != nil {
 		return nil
 	}

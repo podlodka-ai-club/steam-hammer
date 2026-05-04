@@ -63,9 +63,6 @@ func nativeIssueFallbackReason(opts nativeIssueOptions) string {
 	if opts.detach {
 		return "--detach is not supported by the Go-native issue path yet"
 	}
-	if *opts.common.dryRun {
-		return "--dry-run is not supported by the Go-native issue path yet"
-	}
 	if strings.TrimSpace(*opts.common.local) != "" {
 		return "--local-config is not supported by the Go-native issue path yet"
 	}
@@ -244,6 +241,10 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 			_, _ = fmt.Fprintf(a.out, "Skipping issue #%d: branch %q already exists\n", issue.Number, issueBranch)
 			return 0
 		}
+	}
+	if *opts.common.dryRun {
+		_, _ = fmt.Fprintf(a.out, "[dry-run] Native issue flow preflight succeeded for issue #%d on branch %q from base %q; agent run skipped\n", issue.Number, issueBranch, baseBranch)
+		return 0
 	}
 
 	runnerName := fallbackString(strings.TrimSpace(*opts.common.runner), nativeIssueDefaultRunner)

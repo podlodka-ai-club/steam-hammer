@@ -783,16 +783,16 @@ func TestInitRefusesToOverwriteWithoutForce(t *testing.T) {
 	}
 }
 
-func TestRunIssueCommandWiresPythonRunner(t *testing.T) {
+func TestRunIssueCommandWithoutRepoUsesLegacyPythonRunner(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
 
-	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dry-run", "--base", "current"})
+	code := app.Run([]string{"run", "issue", "--id", "71", "--dry-run", "--base", "current"})
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run", "--base", "current"})
+	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--dry-run", "--base", "current"})
 }
 
 func TestRunIssueDetachStartsBackgroundWorkerWithPredictablePaths(t *testing.T) {
@@ -1722,7 +1722,7 @@ func TestRunIssueRoutesReadyToMergeRecoveryToPRReviewFlow(t *testing.T) {
 	}
 }
 
-func TestRunBatchDryRunWiresPythonRunnerPerIssue(t *testing.T) {
+func TestRunBatchDryRunWiresNativeWorkerPerIssue(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
@@ -1734,10 +1734,16 @@ func TestRunBatchDryRunWiresPythonRunnerPerIssue(t *testing.T) {
 	if runner.calls != 2 {
 		t.Fatalf("runner calls = %d, want 2", runner.calls)
 	}
-	if got := stripFlagPair(runner.cmds[0][1:], "--autonomous-session-file"); !reflect.DeepEqual(got, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run", "--base", "current"}) {
+	if strings.Contains(runner.cmds[0][0], "python") || strings.Contains(strings.Join(runner.cmds[0], " "), runnerScript) {
+		t.Fatalf("first runner command = %#v, should not use python issue fallback", runner.cmds[0])
+	}
+	if strings.Contains(runner.cmds[1][0], "python") || strings.Contains(strings.Join(runner.cmds[1], " "), runnerScript) {
+		t.Fatalf("second runner command = %#v, should not use python issue fallback", runner.cmds[1])
+	}
+	if got := stripFlagPair(runner.cmds[0][1:], "--autonomous-session-file"); !reflect.DeepEqual(got, []string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dry-run", "--base", "current"}) {
 		t.Fatalf("first runner args = %#v", runner.cmds[0][1:])
 	}
-	if got := stripFlagPair(runner.cmds[1][1:], "--autonomous-session-file"); !reflect.DeepEqual(got, []string{runnerScript, "--issue", "72", "--repo", "owner/repo", "--dry-run", "--base", "current"}) {
+	if got := stripFlagPair(runner.cmds[1][1:], "--autonomous-session-file"); !reflect.DeepEqual(got, []string{"run", "issue", "--id", "72", "--repo", "owner/repo", "--dry-run", "--base", "current"}) {
 		t.Fatalf("second runner args = %#v", runner.cmds[1][1:])
 	}
 }
@@ -2242,7 +2248,7 @@ func TestRunPRDetachWithRepoUsesNativeWorkerCommand(t *testing.T) {
 	}
 }
 
-func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
+func TestRunDaemonCommandWiresNativeIssueWorker(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})
 	app.SetRunner(runner)
@@ -2252,7 +2258,15 @@ func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run"})
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if strings.Contains(runner.name, "python") || strings.Contains(strings.Join(runner.args, " "), runnerScript) {
+		t.Fatalf("runner command = %q %#v, should not use python issue fallback", runner.name, runner.args)
+	}
+	if got := stripFlagPair(runner.args, "--autonomous-session-file"); !reflect.DeepEqual(got, []string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dry-run"}) {
+		t.Fatalf("runner args = %#v", runner.args)
+	}
 	assertCommandContainsFlag(t, runner.args, "--autonomous-session-file")
 }
 
@@ -2401,10 +2415,10 @@ func TestRunDaemonGoPolicyProcessesDistinctIssuesAcrossCycles(t *testing.T) {
 	if runner.calls != 2 {
 		t.Fatalf("runner calls = %d, want 2", runner.calls)
 	}
-	if got := flagValue(runner.cmds[0][1:], "--issue"); got != "71" {
+	if got := issueIDFlagValue(runner.cmds[0][1:]); got != "71" {
 		t.Fatalf("first issue = %q, want 71", got)
 	}
-	if got := flagValue(runner.cmds[1][1:], "--issue"); got != "72" {
+	if got := issueIDFlagValue(runner.cmds[1][1:]); got != "72" {
 		t.Fatalf("second issue = %q, want 72", got)
 	}
 }
@@ -2441,7 +2455,7 @@ func TestRunDaemonResumeAutonomousSessionSkipsProcessedAndPrintsSummary(t *testi
 	if runner.calls != 1 {
 		t.Fatalf("runner calls = %d, want 1", runner.calls)
 	}
-	if got := flagValue(runner.args, "--issue"); got != "72" {
+	if got := issueIDFlagValue(runner.args); got != "72" {
 		t.Fatalf("selected issue = %q, want 72; args=%#v", got, runner.args)
 	}
 	for _, want := range []string{"Resume summary:", "Resumed issue IDs: #72", "Skipped blockers: blocked by #70", "Next action: continue queued work"} {
@@ -2570,7 +2584,7 @@ func TestRunDaemonSkipsIssueWithMixedOpenDependencies(t *testing.T) {
 	if runner.calls != 1 {
 		t.Fatalf("runner calls = %d, want 1", runner.calls)
 	}
-	if got := flagValue(runner.cmds[0][1:], "--issue"); got != "331" {
+	if got := issueIDFlagValue(runner.cmds[0][1:]); got != "331" {
 		t.Fatalf("selected issue = %q, want 331", got)
 	}
 	if !strings.Contains(errOut.String(), "blocked by open dependencies: #326") {
@@ -2609,7 +2623,7 @@ func TestRunDaemonSkipsRetryBackoffWithoutStarvingRunnableIssue(t *testing.T) {
 	if runner.calls != 1 {
 		t.Fatalf("runner calls = %d, want 1", runner.calls)
 	}
-	if got := flagValue(runner.cmds[0][1:], "--issue"); got != "72" {
+	if got := issueIDFlagValue(runner.cmds[0][1:]); got != "72" {
 		t.Fatalf("selected issue = %q, want 72", got)
 	}
 	if len(lifecycle.listIssueLimits) != 1 || lifecycle.listIssueLimits[0] < 2 {
@@ -2640,7 +2654,7 @@ func TestRunDaemonAllowsIssueWhenAllDependenciesClosed(t *testing.T) {
 	if runner.calls != 1 {
 		t.Fatalf("runner calls = %d, want 1", runner.calls)
 	}
-	if got := flagValue(runner.cmds[0][1:], "--issue"); got != "330" {
+	if got := issueIDFlagValue(runner.cmds[0][1:]); got != "330" {
 		t.Fatalf("selected issue = %q, want 330", got)
 	}
 }
@@ -3039,8 +3053,8 @@ func TestRunDaemonParallelUsesIsolatedClonesPerWorker(t *testing.T) {
 	seenIssues := map[string]bool{}
 	seenDirs := map[string]bool{}
 	for _, cmd := range runner.cmds {
-		if got := flagValue(cmd[1:], "--issue"); got == "" {
-			t.Fatalf("daemon worker missing --issue in %#v", cmd)
+		if got := issueIDFlagValue(cmd[1:]); got == "" {
+			t.Fatalf("daemon worker missing issue id in %#v", cmd)
 		} else {
 			seenIssues[got] = true
 		}
@@ -3086,8 +3100,8 @@ func TestRunDaemonParallelRunsVerificationOnceAfterWorkers(t *testing.T) {
 	workerCalls := 0
 	for _, cmd := range runner.cmds {
 		workerCalls++
-		if got := flagValue(cmd[1:], "--issue"); got == "" {
-			t.Fatalf("daemon worker missing --issue in %#v", cmd)
+		if got := issueIDFlagValue(cmd[1:]); got == "" {
+			t.Fatalf("daemon worker missing issue id in %#v", cmd)
 		}
 	}
 	if workerCalls != 2 {
@@ -3559,7 +3573,15 @@ func TestRunDaemonCommandSupportsAllState(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run"})
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if strings.Contains(runner.name, "python") || strings.Contains(strings.Join(runner.args, " "), runnerScript) {
+		t.Fatalf("runner command = %q %#v, should not use python issue fallback", runner.name, runner.args)
+	}
+	if got := stripFlagPair(runner.args, "--autonomous-session-file"); !reflect.DeepEqual(got, []string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dry-run"}) {
+		t.Fatalf("runner args = %#v", runner.args)
+	}
 }
 
 func TestRunDaemonCommandMapsIssueFlowFlags(t *testing.T) {
@@ -4152,6 +4174,13 @@ func flagValue(args []string, flagName string) string {
 		}
 	}
 	return ""
+}
+
+func issueIDFlagValue(args []string) string {
+	if value := flagValue(args, "--id"); value != "" {
+		return value
+	}
+	return flagValue(args, "--issue")
 }
 
 func stripFlagPair(args []string, flagName string) []string {

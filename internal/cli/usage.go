@@ -6,7 +6,7 @@ func usage() string {
 	  orchestrator doctor [flags]
 	  orchestrator autodoctor [flags]
 	  orchestrator verify [flags]
-	  orchestrator status (--issue N | --pr N | --worker NAME | --workers | --autonomous-session-file PATH) [flags]
+	  orchestrator status (--issue N | --pr N | --worker NAME | --workers | --autonomous-session-file PATH | --merge-queue-plan) [flags]
 	  orchestrator run issue --id N [flags]
 	  orchestrator run batch --ids N[,M...] [flags]
 	  orchestrator run pr --id N [flags]

@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 )
@@ -33,6 +35,21 @@ type trackedStatusReport struct {
 	PR          string `json:"pr,omitempty"`
 	PRReadiness string `json:"pr_readiness,omitempty"`
 	Updated     string `json:"updated,omitempty"`
+}
+
+type mergeQueuePlanItem struct {
+	IssueNumber int    `json:"issue_number"`
+	PRNumber    int    `json:"pr_number"`
+	Branch      string `json:"branch,omitempty"`
+	Reason      string `json:"reason"`
+}
+
+type mergeQueuePlanReport struct {
+	Repo      string               `json:"repo"`
+	DryRun    bool                 `json:"dry_run"`
+	Eligible  []mergeQueuePlanItem `json:"eligible"`
+	Skipped   []mergeQueuePlanItem `json:"skipped"`
+	Generated string               `json:"generated_at"`
 }
 
 func (a *App) runDoctor(ctx context.Context, args []string) int {
@@ -256,6 +273,8 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 	workers := fs.Bool("workers", false, "list detached workers from the local registry")
 	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
 	autonomousSessionFile := fs.String("autonomous-session-file", "", "read daemon batch status from a session checkpoint file")
+	mergeQueuePlan := fs.Bool("merge-queue-plan", false, "print dry-run autonomous merge queue plan")
+	planLimit := fs.Int("limit", 100, "max open issues to scan for merge queue plan")
 	asJSON := fs.Bool("json", false, "print machine-readable JSON")
 
 	if err := fs.Parse(args); err != nil {
@@ -278,11 +297,14 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 	if strings.TrimSpace(*autonomousSessionFile) != "" {
 		targets++
 	}
+	if *mergeQueuePlan {
+		targets++
+	}
 	if *workers {
 		targets++
 	}
 	if targets != 1 {
-		_, _ = fmt.Fprintln(a.err, "status requires exactly one of --issue N, --pr N, --worker NAME, --workers, or --autonomous-session-file PATH")
+		_, _ = fmt.Fprintln(a.err, "status requires exactly one of --issue N, --pr N, --worker NAME, --workers, --autonomous-session-file PATH, or --merge-queue-plan")
 		return 2
 	}
 	if *workers {
@@ -294,6 +316,18 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 	if strings.TrimSpace(*autonomousSessionFile) != "" {
 		return a.runAutonomousSessionStatus(*autonomousSessionFile, *asJSON)
 	}
+	if *mergeQueuePlan {
+		repo := strings.TrimSpace(*opts.repo)
+		if repo == "" {
+			_, _ = fmt.Fprintln(a.err, "orchestrator: status --merge-queue-plan requires --repo owner/name")
+			return 2
+		}
+		if *planLimit <= 0 {
+			_, _ = fmt.Fprintln(a.err, "orchestrator: status --merge-queue-plan requires --limit > 0")
+			return 2
+		}
+		return a.runMergeQueuePlanStatus(ctx, repo, *planLimit, *asJSON)
+	}
 
 	repo := strings.TrimSpace(*opts.repo)
 	if repo == "" {
@@ -304,6 +338,178 @@ func (a *App) runStatus(ctx context.Context, args []string) int {
 		return a.runIssueStatus(ctx, repo, *issue, *asJSON)
 	}
 	return a.runPRStatus(ctx, repo, *pr, *asJSON)
+}
+
+func (a *App) runMergeQueuePlanStatus(ctx context.Context, repo string, limit int, asJSON bool) int {
+	report, err := a.mergeQueuePlanReport(ctx, repo, limit)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+		return 1
+	}
+	if asJSON {
+		encoded, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to encode merge queue plan: %v\n", err)
+			return 1
+		}
+		_, _ = fmt.Fprintf(a.out, "%s\n", encoded)
+		return 0
+	}
+	_, _ = fmt.Fprintf(a.out, "Merge queue plan (dry-run): %d eligible, %d skipped\n", len(report.Eligible), len(report.Skipped))
+	if len(report.Eligible) > 0 {
+		_, _ = fmt.Fprintln(a.out, "Eligible:")
+		for idx, item := range report.Eligible {
+			_, _ = fmt.Fprintf(a.out, "  %d. issue #%d -> PR #%d (%s): %s\n", idx+1, item.IssueNumber, item.PRNumber, fallbackString(item.Branch, "branch-unknown"), item.Reason)
+		}
+	}
+	if len(report.Skipped) > 0 {
+		_, _ = fmt.Fprintln(a.out, "Skipped:")
+		for _, item := range report.Skipped {
+			if item.PRNumber > 0 {
+				_, _ = fmt.Fprintf(a.out, "  - issue #%d -> PR #%d (%s): %s\n", item.IssueNumber, item.PRNumber, fallbackString(item.Branch, "branch-unknown"), item.Reason)
+				continue
+			}
+			_, _ = fmt.Fprintf(a.out, "  - issue #%d: %s\n", item.IssueNumber, item.Reason)
+		}
+	}
+	return 0
+}
+
+func (a *App) mergeQueuePlanReport(ctx context.Context, repo string, limit int) (mergeQueuePlanReport, error) {
+	issues, err := a.daemon.ListIssues(ctx, repo, "open", limit)
+	if err != nil {
+		return mergeQueuePlanReport{}, fmt.Errorf("failed to list open issues for merge queue plan: %w", err)
+	}
+	report := mergeQueuePlanReport{Repo: repo, DryRun: true, Eligible: []mergeQueuePlanItem{}, Skipped: []mergeQueuePlanItem{}, Generated: nowRFC3339()}
+	for _, issue := range issues {
+		skip := mergeQueuePlanItem{IssueNumber: issue.Number}
+		issueComments, err := a.daemon.ListIssueComments(ctx, repo, issue.Number)
+		if err != nil {
+			return mergeQueuePlanReport{}, fmt.Errorf("failed to list issue #%d comments: %w", issue.Number, err)
+		}
+		trackerIssueComments := make([]orchestration.TrackerComment, 0, len(issueComments))
+		for _, comment := range issueComments {
+			trackerIssueComments = append(trackerIssueComments, orchestration.TrackerComment{ID: comment.ID, CreatedAt: comment.CreatedAt, HTMLURL: comment.HTMLURL, Body: comment.Body})
+		}
+		issueState, _ := orchestration.SelectLatestParseableOrchestrationState(trackerIssueComments, fmt.Sprintf("issue #%d", issue.Number))
+		if issueState == nil || !strings.EqualFold(strings.TrimSpace(issueState.Status), orchestration.StatusReadyToMerge) {
+			skip.Reason = "not-ready-to-merge"
+			report.Skipped = append(report.Skipped, skip)
+			continue
+		}
+		linkedPR, err := a.daemon.FindOpenPullRequestForIssue(ctx, repo, issue)
+		if err != nil {
+			return mergeQueuePlanReport{}, fmt.Errorf("failed to find linked PR for issue #%d: %w", issue.Number, err)
+		}
+		if linkedPR == nil || linkedPR.Number <= 0 {
+			skip.Reason = "missing-linked-pr"
+			report.Skipped = append(report.Skipped, skip)
+			continue
+		}
+		skip.PRNumber = linkedPR.Number
+		skip.Branch = strings.TrimSpace(linkedPR.HeadRefName)
+
+		prComments, err := a.daemon.ConversationCommentsForPullRequest(ctx, repo, linkedPR.Number)
+		if err != nil {
+			return mergeQueuePlanReport{}, fmt.Errorf("failed to list PR #%d comments: %w", linkedPR.Number, err)
+		}
+		trackerPRComments := make([]orchestration.TrackerComment, 0, len(prComments))
+		for _, comment := range prComments {
+			trackerPRComments = append(trackerPRComments, orchestration.TrackerComment{HTMLURL: comment.URL, Body: comment.Body})
+		}
+		prState, _ := orchestration.SelectLatestParseableOrchestrationState(trackerPRComments, fmt.Sprintf("pr #%d", linkedPR.Number))
+		if prState == nil || !strings.EqualFold(strings.TrimSpace(prState.Status), orchestration.StatusReadyToMerge) {
+			skip.Reason = "stale-linked-state"
+			report.Skipped = append(report.Skipped, skip)
+			continue
+		}
+
+		if !mergeQueueOwnershipConsistent(issue.Number, issueState.Payload, linkedPR.Number, strings.TrimSpace(linkedPR.HeadRefName)) ||
+			!mergeQueueOwnershipConsistent(issue.Number, prState.Payload, linkedPR.Number, strings.TrimSpace(linkedPR.HeadRefName)) {
+			skip.Reason = "stale-linked-state"
+			report.Skipped = append(report.Skipped, skip)
+			continue
+		}
+
+		readiness := issueState.Payload.MergeReadiness
+		if readiness == nil {
+			readiness = prState.Payload.MergeReadiness
+		}
+		if readiness == nil {
+			skip.Reason = "stale-linked-state"
+			report.Skipped = append(report.Skipped, skip)
+			continue
+		}
+
+		policy := issueState.Payload.MergePolicy
+		if policy == nil {
+			policy = prState.Payload.MergePolicy
+		}
+		if policy != nil && !policy.Auto {
+			skip.Reason = "merge-policy-disabled"
+			report.Skipped = append(report.Skipped, skip)
+			continue
+		}
+
+		if strings.EqualFold(strings.TrimSpace(readiness.ReviewDecision), orchestration.ReviewDecisionReviewRequired) {
+			skip.Reason = "review-required"
+			report.Skipped = append(report.Skipped, skip)
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(readiness.MergeReadinessState), orchestration.MergeReadinessConflicting) {
+			skip.Reason = "merge-conflict"
+			report.Skipped = append(report.Skipped, skip)
+			continue
+		}
+		if mergeQueueHasFailingCI(issueState.Payload.CIChecks) || mergeQueueHasFailingCI(prState.Payload.CIChecks) {
+			skip.Reason = "ci-failing"
+			report.Skipped = append(report.Skipped, skip)
+			continue
+		}
+		verification := readiness.MergeResultVerification
+		if verification == nil || !strings.EqualFold(strings.TrimSpace(verification.Status), "passed") {
+			skip.Reason = "missing-verification"
+			report.Skipped = append(report.Skipped, skip)
+			continue
+		}
+
+		report.Eligible = append(report.Eligible, mergeQueuePlanItem{
+			IssueNumber: issue.Number,
+			PRNumber:    linkedPR.Number,
+			Branch:      strings.TrimSpace(linkedPR.HeadRefName),
+			Reason:      "ready-to-merge with passing verification",
+		})
+	}
+	sort.Slice(report.Eligible, func(i, j int) bool { return report.Eligible[i].IssueNumber < report.Eligible[j].IssueNumber })
+	sort.Slice(report.Skipped, func(i, j int) bool { return report.Skipped[i].IssueNumber < report.Skipped[j].IssueNumber })
+	return report, nil
+}
+
+func mergeQueueOwnershipConsistent(issueNumber int, state orchestration.TrackedState, prNumber int, branch string) bool {
+	if state.Issue != nil && *state.Issue != issueNumber {
+		return false
+	}
+	if state.PR != nil && *state.PR != prNumber {
+		return false
+	}
+	if stateBranch := strings.TrimSpace(state.Branch); stateBranch != "" && branch != "" && stateBranch != branch {
+		return false
+	}
+	return true
+}
+
+func mergeQueueHasFailingCI(checks []orchestration.PRCICheck) bool {
+	for _, check := range checks {
+		state := strings.ToLower(strings.TrimSpace(check.State))
+		if state == "failure" || state == "failed" || state == "error" {
+			return true
+		}
+	}
+	return false
+}
+
+func nowRFC3339() string {
+	return time.Now().UTC().Format(time.RFC3339)
 }
 
 func (a *App) runIssueStatus(ctx context.Context, repo string, issueNumber int, asJSON bool) int {

@@ -1742,6 +1742,40 @@ func TestRunBatchDryRunWiresPythonRunnerPerIssue(t *testing.T) {
 	}
 }
 
+func TestRunBatchDryRunUsesNativeIssueWorkerForGitHubIssues(t *testing.T) {
+	runner := &recordingRunner{}
+	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
+	lifecycle := &fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{}}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetExecutablePath(execPath)
+	app.SetIssueLifecycle(lifecycle)
+
+	code := app.Run([]string{"run", "batch", "--ids", "71,72", "--repo", "owner/repo", "--dry-run", "--base", "current"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 2 {
+		t.Fatalf("runner calls = %d, want 2", runner.calls)
+	}
+	for _, cmd := range runner.cmds {
+		assertNativeWorkerCommand(t, cmd, execPath, "issue")
+		if got := flagValue(cmd[1:], "--repo"); got != "owner/repo" {
+			t.Fatalf("worker repo = %q, want owner/repo; cmd=%#v", got, cmd)
+		}
+		if got := flagValue(cmd[1:], "--base"); got != "current" {
+			t.Fatalf("worker base = %q, want current; cmd=%#v", got, cmd)
+		}
+	}
+	if got := flagValue(runner.cmds[0][1:], "--id"); got != "71" {
+		t.Fatalf("first worker issue = %q, want 71", got)
+	}
+	if got := flagValue(runner.cmds[1][1:], "--id"); got != "72" {
+		t.Fatalf("second worker issue = %q, want 72", got)
+	}
+}
+
 func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
 	cloner := &recordingBatchClonePreparer{}
@@ -2253,6 +2287,37 @@ func TestRunDaemonCommandWiresPythonRunner(t *testing.T) {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
 	assertCommand(t, runner, []string{runnerScript, "--issue", "71", "--repo", "owner/repo", "--dry-run"})
+	assertCommandContainsFlag(t, runner.args, "--autonomous-session-file")
+}
+
+func TestRunDaemonSelectedGitHubIssueUsesNativeIssueWorker(t *testing.T) {
+	runner := &recordingRunner{}
+	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
+	lifecycle := &fakeDaemonLifecycle{
+		issues:          []githublifecycle.Issue{{Number: 71, Tracker: githublifecycle.TrackerGitHub}},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetExecutablePath(execPath)
+	app.SetDaemonLifecycle(lifecycle)
+	app.SetIssueLifecycle(lifecycle)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	assertNativeWorkerCommand(t, runner.cmds[0], execPath, "issue")
+	if got := flagValue(runner.args, "--id"); got != "71" {
+		t.Fatalf("worker issue = %q, want 71; args=%#v", got, runner.args)
+	}
+	if got := flagValue(runner.args, "--repo"); got != "owner/repo" {
+		t.Fatalf("worker repo = %q, want owner/repo; args=%#v", got, runner.args)
+	}
 	assertCommandContainsFlag(t, runner.args, "--autonomous-session-file")
 }
 
@@ -4135,6 +4200,22 @@ func assertCommand(t *testing.T, runner *recordingRunner, wantArgs []string) {
 	}
 	if !reflect.DeepEqual(stripFlagPair(runner.args, "--autonomous-session-file"), wantArgs) {
 		t.Fatalf("runner args = %#v, want %#v", runner.args, wantArgs)
+	}
+}
+
+func assertNativeWorkerCommand(t *testing.T, cmd []string, execPath string, target string) {
+	t.Helper()
+	if len(cmd) < 3 {
+		t.Fatalf("worker command = %#v, want native run %s command", cmd, target)
+	}
+	if cmd[0] != execPath {
+		t.Fatalf("worker command = %q, want native executable %q", cmd[0], execPath)
+	}
+	if cmd[0] == "python3" || strings.Contains(strings.Join(cmd, "\x00"), runnerScript) {
+		t.Fatalf("worker command = %#v, should not use python runner fallback", cmd)
+	}
+	if !reflect.DeepEqual(cmd[1:3], []string{"run", target}) {
+		t.Fatalf("worker args = %#v, want native run %s entrypoint", cmd[1:], target)
 	}
 }
 

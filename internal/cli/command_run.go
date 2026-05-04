@@ -341,6 +341,7 @@ func defaultSourceDir(configuredDir string) string {
 
 type daemonHandledState struct {
 	signatures map[int]string
+	processed  map[int]bool
 }
 
 type daemonSelectedIssue struct {
@@ -394,7 +395,7 @@ func daemonRetryLimitReached(state *orchestration.ParsedTrackerComment[orchestra
 }
 
 func loadDaemonHandledState(sessionPath string) daemonHandledState {
-	state := daemonHandledState{signatures: map[int]string{}}
+	state := daemonHandledState{signatures: map[int]string{}, processed: map[int]bool{}}
 	if strings.TrimSpace(sessionPath) == "" {
 		return state
 	}
@@ -422,6 +423,7 @@ func loadDaemonHandledState(sessionPath string) daemonHandledState {
 		if status == "" {
 			continue
 		}
+		state.processed[id] = true
 		state.signatures[id] = signature
 	}
 	return state
@@ -491,6 +493,7 @@ type daemonParallelConfig struct {
 	detach               bool
 	workerDir            string
 	sessionPath          string
+	resumeState          *orchestration.State
 	retryPolicy          orchestration.DaemonRetryPolicy
 	effectiveMaxCycles   int
 	pollIntervalSeconds  int
@@ -675,6 +678,10 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 			} else {
 				snapshot.ReviewFeedbackSignal = reviewSignal
 			}
+		}
+		if handled.processed[issue.Number] && !config.forceReprocess && snapshot.PRConflictSignal == "" && snapshot.ReviewFeedbackSignal == "" {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: skipping issue #%d: already handled in this daemon session\n", issue.Number)
+			continue
 		}
 		if latestState != nil {
 			snapshot.LatestStateStatus = latestState.Status
@@ -1039,6 +1046,86 @@ func daemonPayloadString(payload map[string]any, key string) string {
 	return strings.TrimSpace(value)
 }
 
+func daemonResumeSummaryLines(state orchestration.State, selected []daemonSelectedIssue) []string {
+	ids := make([]string, 0, len(selected))
+	for _, issue := range selected {
+		if issue.issueID > 0 {
+			ids = append(ids, "#"+strconv.Itoa(issue.issueID))
+		}
+	}
+	if len(ids) == 0 && state.Checkpoint != nil {
+		ids = checkpointIssueIDs(*state.Checkpoint)
+	}
+	nextAction := "none"
+	blockers := "none"
+	if state.Checkpoint != nil {
+		nextAction = daemonResumeNextAction(*state.Checkpoint)
+		blockers = daemonJoinOrNone(state.Checkpoint.Blockers)
+	}
+	return []string{
+		"Resume summary:",
+		"Resumed issue IDs: " + daemonJoinOrNone(ids),
+		"Skipped blockers: " + blockers,
+		"Next action: " + nextAction,
+	}
+}
+
+func daemonResumeNextAction(checkpoint orchestration.Checkpoint) string {
+	if next := daemonJoinOrNone(checkpoint.Next); next != "none" {
+		return next
+	}
+	if next := daemonJoinOrNone(checkpoint.IssuePRActions); next != "none" {
+		return next
+	}
+	if checkpoint.Verification != nil {
+		next := strings.TrimSpace(checkpoint.Verification.NextAction)
+		if next != "" {
+			return nativeSessionHumanize(next)
+		}
+	}
+	return "none"
+}
+
+func checkpointIssueIDs(checkpoint orchestration.Checkpoint) []string {
+	text := strings.Join(append(append(append([]string{}, checkpoint.InProgress...), checkpoint.Current), checkpoint.Next...), "\n")
+	fields := strings.FieldsFunc(text, func(r rune) bool {
+		return r < '0' || r > '9'
+	})
+	seen := map[int]struct{}{}
+	ids := make([]int, 0)
+	for _, field := range fields {
+		id, err := strconv.Atoi(field)
+		if err != nil || id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	result := make([]string, 0, len(ids))
+	for _, id := range ids {
+		result = append(result, "#"+strconv.Itoa(id))
+	}
+	return result
+}
+
+func daemonJoinOrNone(values []string) string {
+	trimmed := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			trimmed = append(trimmed, value)
+		}
+	}
+	if len(trimmed) == 0 {
+		return "none"
+	}
+	return strings.Join(trimmed, ", ")
+}
+
 func (a *App) prepareParallelDaemonWorker(ctx context.Context, config daemonParallelConfig, issue daemonSelectedIssue, sessionPath string) (daemonParallelPreparedWorker, error) {
 	workerOpts := issue.opts
 	if config.detach {
@@ -1109,6 +1196,7 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 	cycles := 0
 	lastCode := 0
 	handled := loadDaemonHandledState(config.sessionPath)
+	resumeSummaryPrinted := false
 	for {
 		cycles++
 		selectionFailed := false
@@ -1134,6 +1222,12 @@ func (a *App) runParallelDaemon(ctx context.Context, config daemonParallelConfig
 				lastCode = 1
 				selectionFailed = true
 			}
+		}
+		if !selectionFailed && config.resumeState != nil && !resumeSummaryPrinted {
+			for _, line := range daemonResumeSummaryLines(*config.resumeState, selected) {
+				_, _ = fmt.Fprintln(a.out, line)
+			}
+			resumeSummaryPrinted = true
 		}
 		preparedWorkers := make([]daemonParallelPreparedWorker, 0, len(selected))
 		releaseClaimsAfterCycle := !selectionFailed && len(selected) > 0
@@ -1249,6 +1343,7 @@ func (a *App) runSerialDaemon(ctx context.Context, config daemonParallelConfig) 
 	handled := loadDaemonHandledState(config.sessionPath)
 	cycles := 0
 	lastCode := 0
+	resumeSummaryPrinted := false
 	for {
 		cycles++
 		selected, err := a.selectDaemonIssues(ctx, config, handled)
@@ -1272,6 +1367,12 @@ func (a *App) runSerialDaemon(ctx context.Context, config daemonParallelConfig) 
 				selected = nil
 			}
 			releaseClaimsAfterCycle := len(selected) > 0
+			if config.resumeState != nil && !resumeSummaryPrinted {
+				for _, line := range daemonResumeSummaryLines(*config.resumeState, selected) {
+					_, _ = fmt.Fprintln(a.out, line)
+				}
+				resumeSummaryPrinted = true
+			}
 			cycleCode := 0
 			for _, issue := range selected {
 				handled.signatures[issue.issueID] = issue.signature
@@ -1371,6 +1472,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 	detach := fs.Bool("detach", false, "start the worker in the background and write logs/state to a predictable path")
 	workerDir := fs.String("worker-dir", "", "directory that stores detached worker state")
 	autonomousSessionFile := fs.String("autonomous-session-file", "", "internal autonomous session checkpoint path")
+	resumeAutonomousSessionFile := fs.String("resume-autonomous-session-file", "", "resume daemon work from an existing autonomous session checkpoint")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -1414,6 +1516,29 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
 		return 1
 	}
+	resumePath := strings.TrimSpace(*resumeAutonomousSessionFile)
+	if resumePath != "" && strings.TrimSpace(*autonomousSessionFile) != "" && strings.TrimSpace(*autonomousSessionFile) != resumePath {
+		_, _ = fmt.Fprintln(a.err, "run daemon requires --resume-autonomous-session-file and --autonomous-session-file to match when both are set")
+		return 2
+	}
+	var resumeState *orchestration.State
+	if resumePath != "" {
+		state, err := loadResumeAutonomousSessionState(resumePath, opts)
+		if err != nil {
+			_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+			return 1
+		}
+		if state.Checkpoint != nil && strings.EqualFold(strings.TrimSpace(state.Checkpoint.Phase), "completed") {
+			_, _ = fmt.Fprintln(a.out, "Resume summary:")
+			_, _ = fmt.Fprintln(a.out, "Completed session: nothing to resume")
+			for _, line := range daemonResumeSummaryLines(state, nil)[1:] {
+				_, _ = fmt.Fprintln(a.out, line)
+			}
+			return 0
+		}
+		resumeState = &state
+		*autonomousSessionFile = resumePath
+	}
 	retryPolicy, err := loadNativeDaemonRetryPolicy(*opts.dir, *opts.project, *opts.maxTry)
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
@@ -1432,6 +1557,11 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		effectiveMaxCycles = 1
 	}
 	if *detach {
+		if resumeState != nil {
+			for _, line := range daemonResumeSummaryLines(*resumeState, nil) {
+				_, _ = fmt.Fprintln(a.out, line)
+			}
+		}
 		execPath, err := a.currentExecutable()
 		if err != nil {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: failed to resolve orchestrator executable: %v\n", err)
@@ -1527,11 +1657,20 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		cleanupSession = func() { _ = os.Remove(sessionPath) }
 	}
 	defer cleanupSession()
+	if err := ensureAutonomousSessionOwner(sessionPath, opts); err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: failed to update daemon session ownership: %v\n", err)
+		return 1
+	}
 
 	if !shouldUseGoDaemonPolicy(opts, a.daemon) {
 		pythonArgs := buildDaemonPythonArgs(a.runtime.RunnerScript(), opts, *state, *limit, base, *includeEmpty, *stopOnError, *failOnExisting, *forceIssueFlow, *skipIfPRExists, *noSkipIfPRExists, *skipIfBranchExists, *noSkipIfBranchExists, *forceReprocess, *syncReusedBranch, *noSyncReusedBranch, *syncStrategy, sessionPath, *postBatchVerify, *createFollowupIssue, *allowLiveSideEffects, flags)
 
 		cycles := 0
+		if resumeState != nil {
+			for _, line := range daemonResumeSummaryLines(*resumeState, nil) {
+				_, _ = fmt.Fprintln(a.out, line)
+			}
+		}
 		for {
 			cycles++
 			code := a.runPython(ctx, pythonArgs)
@@ -1586,6 +1725,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 			createFollowupIssue:  *createFollowupIssue,
 			workerDir:            *workerDir,
 			sessionPath:          sessionPath,
+			resumeState:          resumeState,
 			retryPolicy:          retryPolicy,
 			effectiveMaxCycles:   effectiveMaxCycles,
 			pollIntervalSeconds:  *pollIntervalSeconds,
@@ -1616,6 +1756,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		createFollowupIssue:  *createFollowupIssue,
 		workerDir:            *workerDir,
 		sessionPath:          sessionPath,
+		resumeState:          resumeState,
 		retryPolicy:          retryPolicy,
 		effectiveMaxCycles:   effectiveMaxCycles,
 		pollIntervalSeconds:  *pollIntervalSeconds,

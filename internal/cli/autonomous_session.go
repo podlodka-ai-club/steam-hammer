@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -136,6 +137,89 @@ func saveAutonomousSessionState(path string, state orchestration.State) error {
 	}
 	encoded = append(encoded, '\n')
 	return os.WriteFile(path, encoded, 0o644)
+}
+
+func autonomousSessionOwner(opts commonOptions) orchestration.CheckpointOwner {
+	return orchestration.CheckpointOwner{
+		Repo:     strings.TrimSpace(*opts.repo),
+		Dir:      strings.TrimSpace(*opts.dir),
+		Tracker:  strings.TrimSpace(*opts.tracker),
+		CodeHost: strings.TrimSpace(*opts.codehost),
+		Runner:   strings.TrimSpace(*opts.runner),
+		Agent:    strings.TrimSpace(*opts.agent),
+		Model:    strings.TrimSpace(*opts.model),
+	}
+}
+
+func loadResumeAutonomousSessionState(path string, opts commonOptions) (orchestration.State, error) {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return orchestration.State{}, fmt.Errorf("resume requires --resume-autonomous-session-file PATH")
+	}
+	state, err := orchestration.LoadState(trimmed)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return orchestration.State{}, fmt.Errorf("resume checkpoint %s does not exist", trimmed)
+		}
+		return orchestration.State{}, fmt.Errorf("failed to load resume checkpoint %s: %w", trimmed, err)
+	}
+	if state.Checkpoint == nil {
+		return orchestration.State{}, fmt.Errorf("resume checkpoint %s does not contain checkpoint metadata", trimmed)
+	}
+	if err := validateAutonomousSessionOwner(state.Checkpoint.Owner, autonomousSessionOwner(opts)); err != nil {
+		return orchestration.State{}, err
+	}
+	return state, nil
+}
+
+func ensureAutonomousSessionOwner(path string, opts commonOptions) error {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return nil
+	}
+	state, err := loadAutonomousSessionState(trimmed)
+	if err != nil {
+		return err
+	}
+	if state.Checkpoint == nil {
+		state.Checkpoint = &orchestration.Checkpoint{}
+	}
+	owner := autonomousSessionOwner(opts)
+	if state.Checkpoint.Owner != nil && reflect.DeepEqual(*state.Checkpoint.Owner, owner) {
+		return nil
+	}
+	state.Checkpoint.Owner = &owner
+	return saveAutonomousSessionState(trimmed, state)
+}
+
+func validateAutonomousSessionOwner(saved *orchestration.CheckpointOwner, current orchestration.CheckpointOwner) error {
+	if saved == nil {
+		return nil
+	}
+	checks := []struct {
+		name string
+		want string
+		got  string
+	}{
+		{name: "repo", want: saved.Repo, got: current.Repo},
+		{name: "dir", want: saved.Dir, got: current.Dir},
+		{name: "tracker", want: saved.Tracker, got: current.Tracker},
+		{name: "codehost", want: saved.CodeHost, got: current.CodeHost},
+		{name: "runner", want: saved.Runner, got: current.Runner},
+		{name: "agent", want: saved.Agent, got: current.Agent},
+		{name: "model", want: saved.Model, got: current.Model},
+	}
+	for _, check := range checks {
+		want := strings.TrimSpace(check.want)
+		if want == "" {
+			continue
+		}
+		got := strings.TrimSpace(check.got)
+		if got != want {
+			return fmt.Errorf("resume checkpoint ownership mismatch for %s: checkpoint=%q current=%q", check.name, want, got)
+		}
+	}
+	return nil
 }
 
 func nativeSessionDoneSummary(label string, state orchestration.TrackedState) string {

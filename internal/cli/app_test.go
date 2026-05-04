@@ -2327,6 +2327,143 @@ func TestRunDaemonGoPolicyProcessesDistinctIssuesAcrossCycles(t *testing.T) {
 	}
 }
 
+func TestRunDaemonResumeAutonomousSessionSkipsProcessedAndPrintsSummary(t *testing.T) {
+	runner := &recordingRunner{}
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(sessionPath, []byte(`{
+  "processed_issues": {"71": {"status": "ready-for-review", "task_type": "issue", "issue": 71}},
+  "checkpoint": {
+    "phase": "running",
+    "owner": {"repo": "owner/repo"},
+    "current": "issue #72",
+    "next": ["continue queued work"],
+    "blockers": ["blocked by #70"]
+  }
+}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(session) error = %v", err)
+	}
+	var out strings.Builder
+	var errOut strings.Builder
+	app := NewApp(&out, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues:          []githublifecycle.Issue{{Number: 71}, {Number: 72}},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "2", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run", "--resume-autonomous-session-file", sessionPath})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0\nstderr=%s", code, errOut.String())
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if got := flagValue(runner.args, "--issue"); got != "72" {
+		t.Fatalf("selected issue = %q, want 72; args=%#v", got, runner.args)
+	}
+	for _, want := range []string{"Resume summary:", "Resumed issue IDs: #72", "Skipped blockers: blocked by #70", "Next action: continue queued work"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("stdout missing %q\n%s", want, out.String())
+		}
+	}
+	if !strings.Contains(errOut.String(), "skipping issue #71: already handled") {
+		t.Fatalf("stderr = %q, want processed issue skip", errOut.String())
+	}
+}
+
+func TestRunDaemonResumeMissingCheckpointFails(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dry-run", "--max-cycles", "1", "--resume-autonomous-session-file", filepath.Join(t.TempDir(), "missing.json")})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "does not exist") {
+		t.Fatalf("stderr = %q, want missing checkpoint error", errOut.String())
+	}
+}
+
+func TestRunDaemonResumeMalformedCheckpointFails(t *testing.T) {
+	runner := &recordingRunner{}
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(sessionPath, []byte("{"), 0o644); err != nil {
+		t.Fatalf("WriteFile(session) error = %v", err)
+	}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dry-run", "--max-cycles", "1", "--resume-autonomous-session-file", sessionPath})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "failed to load resume checkpoint") {
+		t.Fatalf("stderr = %q, want malformed checkpoint error", errOut.String())
+	}
+}
+
+func TestRunDaemonResumeCompletedCheckpointNoops(t *testing.T) {
+	runner := &recordingRunner{}
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(sessionPath, []byte(`{
+  "processed_issues": {"71": {"status": "ready-for-review", "task_type": "issue", "issue": 71}},
+  "checkpoint": {"phase": "completed", "owner": {"repo": "owner/repo"}, "current": "Idle between autonomous runs"}
+}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(session) error = %v", err)
+	}
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dry-run", "--max-cycles", "1", "--resume-autonomous-session-file", sessionPath})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(out.String(), "Completed session: nothing to resume") {
+		t.Fatalf("stdout = %q, want completed no-op summary", out.String())
+	}
+}
+
+func TestRunDaemonResumeOwnershipMismatchFails(t *testing.T) {
+	runner := &recordingRunner{}
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(sessionPath, []byte(`{
+  "processed_issues": {},
+  "checkpoint": {"phase": "running", "owner": {"repo": "other/repo"}}
+}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(session) error = %v", err)
+	}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dry-run", "--max-cycles", "1", "--resume-autonomous-session-file", sessionPath})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "ownership mismatch") {
+		t.Fatalf("stderr = %q, want ownership mismatch", errOut.String())
+	}
+}
+
 func TestRunDaemonSkipsIssueWithMixedOpenDependencies(t *testing.T) {
 	runner := &recordingRunner{}
 	var errOut strings.Builder

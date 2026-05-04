@@ -2820,6 +2820,74 @@ func TestRunDaemonAllowsIssueWhenAllDependenciesClosed(t *testing.T) {
 	}
 }
 
+func TestRunDaemonAppliesScopeAllowLabelsFromProjectConfig(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	targetDir := t.TempDir()
+	projectConfigPath := filepath.Join(targetDir, "project-config.json")
+	config := `{"scope":{"defaults":{"labels":{"allow":["demo"]}}}}`
+	if err := os.WriteFile(projectConfigPath, []byte(config), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", projectConfigPath, err)
+	}
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{
+			{Number: 370, Labels: []githublifecycle.Label{{Name: "bug"}}},
+			{Number: 371, Labels: []githublifecycle.Label{{Name: "demo"}}},
+		},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--project-config", projectConfigPath, "--limit", "2", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if got := flagValue(runner.cmds[0][1:], "--issue"); got != "371" {
+		t.Fatalf("selected issue = %q, want 371", got)
+	}
+	if !strings.Contains(errOut.String(), "scope_label_mismatch") {
+		t.Fatalf("stderr = %q, want scope-label mismatch skip reason", errOut.String())
+	}
+}
+
+func TestRunDaemonAppliesScopeDenyLabelsFromProjectConfig(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	targetDir := t.TempDir()
+	projectConfigPath := filepath.Join(targetDir, "project-config.json")
+	config := `{"scope":{"defaults":{"labels":{"allow":["demo"],"deny":["human discussion"]}}}}`
+	if err := os.WriteFile(projectConfigPath, []byte(config), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", projectConfigPath, err)
+	}
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{
+			{Number: 372, Labels: []githublifecycle.Label{{Name: "demo"}, {Name: "human discussion"}}},
+			{Number: 373, Labels: []githublifecycle.Label{{Name: "demo"}}},
+		},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--project-config", projectConfigPath, "--limit", "2", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if got := flagValue(runner.cmds[0][1:], "--issue"); got != "373" {
+		t.Fatalf("selected issue = %q, want 373", got)
+	}
+	if !strings.Contains(errOut.String(), "denied_by_label") {
+		t.Fatalf("stderr = %q, want denied-by-label skip reason", errOut.String())
+	}
+}
+
 func TestRunDaemonIgnoresMalformedDependencyReferences(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})

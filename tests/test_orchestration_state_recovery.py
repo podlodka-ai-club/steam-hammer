@@ -339,7 +339,7 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
                 "source": "pr #120",
                 "created_at": "2026-04-29T10:05:00Z",
                 "url": "https://example/pull/120#issuecomment-12",
-                "payload": {"issue": 99},
+                "payload": {"issue": 99, "pr": 120},
             },
         )
 
@@ -348,6 +348,63 @@ class OrchestrationStateRecoveryTests(unittest.TestCase):
         self.assertIn("expected linked PR branch 'issue-fix/52-prevent-duplicate-processing'", mismatches[0])
         self.assertIn("expected linked PR base 'main'", mismatches[1])
         self.assertIn("tracks issue #99, expected #52", mismatches[2])
+
+    def test_recovered_issue_pr_ownership_mismatches_detect_pr_number_mismatch(self) -> None:
+        mismatches = recovered_issue_pr_ownership_mismatches(
+            issue={"number": 52, "tracker": "github"},
+            linked_open_pr={"number": 120, "headRefName": "issue-fix/52-refactor", "baseRefName": "main"},
+            recovered_issue_state={
+                "source": "issue #52",
+                "created_at": "2026-04-29T10:00:00Z",
+                "url": "https://example/issues/52#issuecomment-11",
+                "payload": {"issue": 52, "pr": 999, "branch": "issue-fix/52-refactor", "base_branch": "main"},
+            },
+            recovered_pr_state=None,
+        )
+
+        self.assertEqual(len(mismatches), 1)
+        self.assertIn("tracks PR #999, expected linked PR #120", mismatches[0])
+
+    def test_recovered_issue_pr_ownership_mismatches_detect_missing_provider_references(self) -> None:
+        mismatches = recovered_issue_pr_ownership_mismatches(
+            issue={"number": 52, "tracker": "github"},
+            linked_open_pr={"number": 120, "headRefName": "issue-fix/52-refactor", "baseRefName": "main"},
+            recovered_issue_state={
+                "source": "issue #52",
+                "created_at": "2026-04-29T10:00:00Z",
+                "url": "https://example/issues/52#issuecomment-11",
+                "payload": {"branch": "issue-fix/52-refactor", "base_branch": "main"},
+            },
+            recovered_pr_state=None,
+        )
+
+        self.assertEqual(len(mismatches), 2)
+        self.assertIn("missing provider issue reference", mismatches[0])
+        self.assertIn("missing provider PR reference", mismatches[1])
+
+    def test_recovered_issue_pr_ownership_mismatches_accepts_non_github_provider_references(self) -> None:
+        mismatches = recovered_issue_pr_ownership_mismatches(
+            issue={"number": "PROJ-52", "tracker": "jira"},
+            linked_open_pr={"number": 120, "headRefName": "issue-fix/proj-52-refactor", "baseRefName": "main"},
+            recovered_issue_state={
+                "source": "issue PROJ-52",
+                "created_at": "2026-04-29T10:00:00Z",
+                "url": "https://tracker.example/browse/PROJ-52#comment-11",
+                "payload": {
+                    "provider_issue_ref": "PROJ-52",
+                    "provider_pr_ref": 120,
+                    "branch": "issue-fix/proj-52-refactor",
+                    "base_branch": "main",
+                },
+            },
+            recovered_pr_state=None,
+            extract_state_references=lambda payload: {
+                "issue": payload.get("provider_issue_ref"),
+                "pr": payload.get("provider_pr_ref"),
+            },
+        )
+
+        self.assertEqual(mismatches, [])
 
     def test_find_waiting_for_author_answer_uses_latest_author_reply_after_state(self) -> None:
         recovered_state = {

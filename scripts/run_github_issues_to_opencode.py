@@ -4334,12 +4334,20 @@ def _tracked_state_ownership_mismatches(
     return mismatches
 
 
+def _default_extract_state_ownership_references(payload: dict) -> dict[str, object]:
+    return {
+        "issue": payload.get("issue"),
+        "pr": payload.get("pr"),
+    }
+
+
 def recovered_issue_pr_ownership_mismatches(
     *,
     issue: dict,
     linked_open_pr: dict | None,
     recovered_issue_state: dict | None,
     recovered_pr_state: dict | None,
+    extract_state_references: Callable[[dict], dict[str, object]] | None = None,
 ) -> list[str]:
     tracker = issue_tracker(issue)
     expected_issue = normalize_issue_number(issue.get("number"), tracker)
@@ -4350,6 +4358,26 @@ def recovered_issue_pr_ownership_mismatches(
     )
     expected_branch = _as_optional_string(linked_open_pr.get("headRefName")) if isinstance(linked_open_pr, dict) else None
     expected_base_branch = _as_optional_string(linked_open_pr.get("baseRefName")) if isinstance(linked_open_pr, dict) else None
+
+    reference_extractor = extract_state_references or _default_extract_state_ownership_references
+
+    def enrich_state_with_references(state: dict | None) -> dict | None:
+        if not isinstance(state, dict):
+            return state
+        payload = _status_payload(state)
+        if not payload:
+            return state
+        references = reference_extractor(payload)
+        if not isinstance(references, dict):
+            return state
+        if "issue" in references:
+            payload.setdefault("issue", references.get("issue"))
+        if "pr" in references:
+            payload.setdefault("pr", references.get("pr"))
+        return state
+
+    recovered_issue_state = enrich_state_with_references(recovered_issue_state)
+    recovered_pr_state = enrich_state_with_references(recovered_pr_state)
 
     mismatches: list[str] = []
     mismatches.extend(
@@ -4372,6 +4400,34 @@ def recovered_issue_pr_ownership_mismatches(
             tracker=tracker,
         )
     )
+
+    expected_pr_requires_reference = expected_pr is not None
+    expected_issue_requires_reference = expected_issue is not None
+    for state, state_label in (
+        (recovered_issue_state, "issue state"),
+        (recovered_pr_state, "pr state"),
+    ):
+        if not isinstance(state, dict):
+            continue
+        payload = _status_payload(state)
+        if not isinstance(payload, dict):
+            continue
+        source = _as_optional_string(state.get("source")) or state_label
+        created_at = _as_optional_string(state.get("created_at")) or "unknown-time"
+        url = _as_optional_string(state.get("url"))
+        evidence = f"{source} at {created_at}"
+        if url:
+            evidence += f" ({url})"
+
+        if expected_issue_requires_reference and not is_trackable_issue_number(payload.get("issue")):
+            mismatches.append(
+                f"{evidence} is missing provider issue reference in orchestration state payload"
+            )
+        if expected_pr_requires_reference and type(payload.get("pr")) is not int:
+            mismatches.append(
+                f"{evidence} is missing provider PR reference in orchestration state payload"
+            )
+
     return mismatches
 
 

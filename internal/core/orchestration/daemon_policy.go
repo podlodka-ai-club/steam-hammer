@@ -18,15 +18,23 @@ type DaemonTaskSnapshot struct {
 	ExpectedTracker      string
 	RunID                string
 	ForceReprocess       bool
+	FailureLabels        []string
 	RetryLimitReached    bool
 	PRConflictSignal     string
 	ReviewFeedbackSignal string
 	LatestStateStatus    string
 	LatestStateTaskType  string
+	LatestStateAttempt   int
+	LatestStateTimestamp time.Time
 	LatestClaim          map[string]any
 	LatestDecomposition  map[string]any
 	OpenDependencyRefs   []string
 	LastHandledSignature string
+}
+
+type DaemonRetryPolicy struct {
+	MaxAttempts int
+	Backoff     time.Duration
 }
 
 type DaemonTaskDecision struct {
@@ -35,6 +43,8 @@ type DaemonTaskDecision struct {
 	Code      string
 	Reason    string
 	Signature string
+
+	NextEligibleAt time.Time
 }
 
 const (
@@ -53,12 +63,13 @@ const (
 	DaemonSelectionCodeDecompositionChildIssued = "decomposition_children_created"
 	DaemonSelectionCodeBlockedState             = "blocked_state"
 	DaemonSelectionCodeWaitingForAuthor         = "waiting_for_author"
+	DaemonSelectionCodeRetryBackoff             = "retry_backoff"
 	DaemonSelectionCodeScopeMismatch            = "scope_mismatch"
 	DaemonSelectionCodeAgentRetryLimit          = "agent_failed_retry_limit"
 	DaemonSelectionCodeUnsupportedProvider      = "unsupported_provider"
 )
 
-func EvaluateDaemonTaskSelection(snapshot DaemonTaskSnapshot, now time.Time) DaemonTaskDecision {
+func EvaluateDaemonTaskSelection(snapshot DaemonTaskSnapshot, now time.Time, retryPolicy ...DaemonRetryPolicy) DaemonTaskDecision {
 	signature := daemonTaskSignature(snapshot)
 	if signature == "" {
 		signature = "state:new"
@@ -98,6 +109,10 @@ func EvaluateDaemonTaskSelection(snapshot DaemonTaskSnapshot, now time.Time) Dae
 	decompositionStatus := normalizePayloadStatus(snapshot.LatestDecomposition, "status")
 
 	if !snapshot.ForceReprocess {
+		if decision := evaluateDaemonRetryPolicy(snapshot, stateStatus, signature, now, firstRetryPolicy(retryPolicy)); !decision.Eligible && decision.Reason != "" {
+			return decision
+		}
+
 		switch decompositionStatus {
 		case "proposed":
 			return DaemonTaskDecision{Status: DaemonSelectionStatusWaiting, Code: DaemonSelectionCodeDecompositionPending, Reason: "waiting for decomposition approval", Signature: signature}
@@ -117,6 +132,45 @@ func EvaluateDaemonTaskSelection(snapshot DaemonTaskSnapshot, now time.Time) Dae
 	}
 
 	return DaemonTaskDecision{Eligible: true, Status: DaemonSelectionStatusRunnable, Code: DaemonSelectionCodeRunnable, Signature: signature}
+}
+
+func firstRetryPolicy(policies []DaemonRetryPolicy) DaemonRetryPolicy {
+	if len(policies) == 0 {
+		return DaemonRetryPolicy{}
+	}
+	return policies[0]
+}
+
+func evaluateDaemonRetryPolicy(snapshot DaemonTaskSnapshot, stateStatus, signature string, now time.Time, policy DaemonRetryPolicy) DaemonTaskDecision {
+	if stateStatus != StatusFailed && !hasFailureLabel(snapshot.FailureLabels) {
+		return DaemonTaskDecision{Eligible: true, Signature: signature}
+	}
+	attempt := snapshot.LatestStateAttempt
+	if attempt <= 0 {
+		attempt = 1
+	}
+	if policy.MaxAttempts > 0 && attempt >= policy.MaxAttempts {
+		return DaemonTaskDecision{Status: DaemonSelectionStatusSkipped, Code: DaemonSelectionCodeAgentRetryLimit, Reason: fmt.Sprintf("retry limit reached after %d/%d attempts", attempt, policy.MaxAttempts), Signature: signature}
+	}
+	if policy.Backoff <= 0 || snapshot.LatestStateTimestamp.IsZero() {
+		return DaemonTaskDecision{Eligible: true, Signature: signature}
+	}
+	nextEligibleAt := snapshot.LatestStateTimestamp.Add(policy.Backoff).UTC()
+	if now.Before(nextEligibleAt) {
+		return DaemonTaskDecision{Status: DaemonSelectionStatusWaiting, Code: DaemonSelectionCodeRetryBackoff, Reason: "retry backoff has not elapsed; next eligible at " + nextEligibleAt.Format(time.RFC3339), Signature: signature, NextEligibleAt: nextEligibleAt}
+	}
+	return DaemonTaskDecision{Eligible: true, Signature: signature}
+}
+
+func hasFailureLabel(labels []string) bool {
+	for _, label := range labels {
+		normalized := strings.ToLower(strings.TrimSpace(label))
+		switch normalized {
+		case "auto:agent-failed", "agent-failed", "failed", "failure":
+			return true
+		}
+	}
+	return false
 }
 
 func formatDependencyRefs(refs []string) string {

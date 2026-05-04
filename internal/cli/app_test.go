@@ -116,6 +116,7 @@ type fakeDaemonLifecycle struct {
 	listErr         error
 	commentErr      error
 	createErr       error
+	listIssueLimits []int
 }
 
 func (f *fakeDaemonLifecycle) FetchIssue(_ context.Context, _ string, number int) (githublifecycle.Issue, error) {
@@ -148,11 +149,16 @@ func (f *fakeDaemonLifecycle) FindOpenPullRequestForIssue(_ context.Context, _ s
 	return f.linkedPR, nil
 }
 
-func (f *fakeDaemonLifecycle) ListIssues(_ context.Context, _ string, _ string, _ int) ([]githublifecycle.Issue, error) {
+func (f *fakeDaemonLifecycle) ListIssues(_ context.Context, _ string, _ string, limit int) ([]githublifecycle.Issue, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	return append([]githublifecycle.Issue(nil), f.issues...), nil
+	f.listIssueLimits = append(f.listIssueLimits, limit)
+	issues := f.issues
+	if limit > 0 && limit < len(issues) {
+		issues = issues[:limit]
+	}
+	return append([]githublifecycle.Issue(nil), issues...), nil
 }
 
 func (f *fakeDaemonLifecycle) ListIssueComments(_ context.Context, _ string, number int) ([]githublifecycle.IssueComment, error) {
@@ -2350,6 +2356,48 @@ func TestRunDaemonSkipsIssueWithMixedOpenDependencies(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "blocked by open dependencies: #326") {
 		t.Fatalf("stderr = %q, want dependency skip reason", errOut.String())
+	}
+}
+
+func TestRunDaemonSkipsRetryBackoffWithoutStarvingRunnableIssue(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	targetDir := t.TempDir()
+	projectConfigPath := filepath.Join(targetDir, "project-config.json")
+	if err := os.WriteFile(projectConfigPath, []byte(`{"retry":{"max_attempts":2,"backoff_seconds":300}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", projectConfigPath, err)
+	}
+	failedComment := githublifecycle.IssueComment{
+		ID:        1,
+		CreatedAt: "2099-05-01T11:59:00Z",
+		Body:      orchestration.OrchestrationStateMarker + "\n```json\n{\"status\":\"failed\",\"attempt\":1}\n```",
+	}
+	lifecycle := &fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{
+			{Number: 71, Labels: []githublifecycle.Label{{Name: "auto:agent-failed"}}},
+			{Number: 72},
+		},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{71: {failedComment}},
+	}
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(lifecycle)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--project-config", projectConfigPath, "--limit", "1", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if got := flagValue(runner.cmds[0][1:], "--issue"); got != "72" {
+		t.Fatalf("selected issue = %q, want 72", got)
+	}
+	if len(lifecycle.listIssueLimits) != 1 || lifecycle.listIssueLimits[0] < 2 {
+		t.Fatalf("list issue limits = %#v, want daemon to over-scan retry-limited front issue", lifecycle.listIssueLimits)
+	}
+	if !strings.Contains(errOut.String(), "retry backoff has not elapsed") || !strings.Contains(errOut.String(), "next eligible at") {
+		t.Fatalf("stderr = %q, want retry backoff skip reason", errOut.String())
 	}
 }
 

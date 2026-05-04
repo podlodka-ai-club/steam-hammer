@@ -175,7 +175,7 @@ func TestEvaluateDaemonTaskSelectionSkipsUnsupportedProvider(t *testing.T) {
 	}
 }
 
-func TestEvaluateDaemonTaskSelectionSkipsRetryLimitReached(t *testing.T) {
+func TestEvaluateDaemonTaskSelectionSkipsConfiguredRetryLimitReached(t *testing.T) {
 	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
 		IssueNumber:       249,
 		LatestStateStatus: StatusFailed,
@@ -220,6 +220,78 @@ func TestEvaluateDaemonTaskSelectionPrefersConflictRecoverySignal(t *testing.T) 
 	}
 	if decision.Signature != "conflict-recovery:pr-101:DIRTY:CONFLICTING" {
 		t.Fatalf("Signature = %q", decision.Signature)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionAllowsFirstFailureWithoutConfiguredBackoff(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:       249,
+		LatestStateStatus: StatusFailed,
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC), DaemonRetryPolicy{MaxAttempts: 2})
+
+	if !decision.Eligible {
+		t.Fatalf("Eligible = false, want true (%q)", decision.Reason)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionAllowsRetryableFailureAfterBackoff(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:          249,
+		LatestStateStatus:    StatusFailed,
+		LatestStateAttempt:   1,
+		LatestStateTimestamp: time.Date(2026, 5, 1, 11, 50, 0, 0, time.UTC),
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC), DaemonRetryPolicy{MaxAttempts: 2, Backoff: 5 * time.Minute})
+
+	if !decision.Eligible {
+		t.Fatalf("Eligible = false, want true (%q)", decision.Reason)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionSkipsFailureUntilBackoffElapsed(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:          249,
+		LatestStateStatus:    StatusFailed,
+		LatestStateAttempt:   1,
+		LatestStateTimestamp: time.Date(2026, 5, 1, 11, 59, 0, 0, time.UTC),
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC), DaemonRetryPolicy{MaxAttempts: 2, Backoff: 5 * time.Minute})
+
+	if decision.Eligible {
+		t.Fatalf("Eligible = true, want false")
+	}
+	if decision.NextEligibleAt.Format(time.RFC3339) != "2026-05-01T12:04:00Z" {
+		t.Fatalf("NextEligibleAt = %s", decision.NextEligibleAt.Format(time.RFC3339))
+	}
+	if !strings.Contains(decision.Reason, "next eligible at 2026-05-01T12:04:00Z") {
+		t.Fatalf("Reason = %q", decision.Reason)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionSkipsRetryLimitReached(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:        249,
+		FailureLabels:      []string{"auto:agent-failed"},
+		LatestStateAttempt: 2,
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC), DaemonRetryPolicy{MaxAttempts: 2, Backoff: 5 * time.Minute})
+
+	if decision.Eligible {
+		t.Fatalf("Eligible = true, want false")
+	}
+	if decision.Reason != "retry limit reached after 2/2 attempts" {
+		t.Fatalf("Reason = %q", decision.Reason)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionForceOverridesRetryPolicy(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:          249,
+		ForceReprocess:       true,
+		LatestStateStatus:    StatusFailed,
+		LatestStateAttempt:   2,
+		LatestStateTimestamp: time.Date(2026, 5, 1, 11, 59, 0, 0, time.UTC),
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC), DaemonRetryPolicy{MaxAttempts: 2, Backoff: 5 * time.Minute})
+
+	if !decision.Eligible {
+		t.Fatalf("Eligible = false, want true (%q)", decision.Reason)
 	}
 }
 

@@ -1,0 +1,693 @@
+# Multi-Provider Issue/PR -> AI Agent Runner
+
+Script can run in two modes:
+
+- Issue mode: fetches tracker issues, runs an AI agent on each issue body, and automates git workflow for a fix branch.
+- PR review mode: fetches unresolved code-host review feedback, builds a focused prompt for the agent, and prepares a follow-up commit.
+
+Memo link: https://www.notion.so/Hacker-Sprint-1-33f2db4c860e8064a657e199b4578f66
+
+## Retrospectives
+
+Session retrospectives live in [`retro/`](retro/). They capture lessons from orchestration runs, including worker behavior, blocker handling, PR validation gaps, and follow-up improvements for the autonomous orchestrator loop.
+
+- `gh` (GitHub CLI) authenticated (`gh auth status`)
+- Python 3.10+
+- `claude` (Claude Code CLI) — default runner
+- `opencode` — only if using `--runner opencode`
+
+## For QA teams
+
+When filing Jira issues for AI-assisted fixes, use the [Jira issue description template](docs/jira-issue-template.md) so the agent has enough context to generate accurate patches.
+
+```text
+.
+├── .gitignore
+├── README.md
+├── readme.md
+└── scripts
+    └── run_github_issues_to_opencode.py
+```
+
+## Run Example
+
+**With Claude (default):**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --limit 1
+```
+
+**With OpenCode:**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --limit 1 --runner opencode --agent build --model openai/gpt-4o
+```
+
+**With OpenCode auto-approval + explicit timeout (non-interactive friendly):**
+```bash
+   python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 20 --runner opencode --model openai/gpt-4o --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
+```
+
+**Issue run with automatic PR-review mode (when linked open PR exists):**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --runner opencode --agent build
+```
+
+**Force legacy issue-flow even if issue has open PR:**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --force-issue-flow
+```
+
+**Conflict recovery only for an existing reused issue branch:**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 31 --conflict-recovery-only --sync-strategy rebase
+```
+
+**Conflict recovery only for an existing PR branch:**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --pr 72 --from-review-comments --conflict-recovery-only --allow-pr-branch-switch
+```
+
+**Issue run stacked on current branch (opt-in):**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --issue 45 --base current --runner opencode --agent build
+```
+
+**Read autonomous batch status from the session checkpoint file:**
+```bash
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --status --autonomous-session-file .orchestrator/session.json
+```
+
+**Use Jira as the issue source:**
+```bash
+export JIRA_BASE_URL=https://mycompany.atlassian.net
+export JIRA_EMAIL=you@example.com
+export JIRA_API_TOKEN=your_token
+
+python scripts/run_github_issues_to_opencode.py \
+  --tracker jira \
+  --codehost github \
+  --issue PROJ-42 \
+  --repo owner/repo
+```
+
+## Doctor diagnostics
+
+Run environment diagnostics without starting an agent run:
+
+```bash
+python scripts/run_github_issues_to_opencode.py --doctor --repo owner/repo
+```
+
+Optional: include a lightweight runner CLI smoke check:
+
+```bash
+python scripts/run_github_issues_to_opencode.py --doctor --doctor-smoke-check --runner opencode --model openai/gpt-5.3-codex
+```
+
+Doctor output uses `[PASS]`, `[WARN]`, `[FAIL]` per check and prints a final summary.
+
+- `PASS`: check is healthy.
+- `WARN`: non-blocking issue or optional check skipped.
+- `FAIL`: blocking readiness issue.
+
+Exit codes:
+
+- `0` when there are no failed checks.
+- non-zero when one or more checks fail.
+
+## Verification paths
+
+Use a fast path while iterating on orchestration logic, then a full path before release or after a larger batch of changes.
+
+Fast smoke check:
+
+```bash
+python3 -m unittest \
+  tests.test_pr_review_comments_mode \
+  tests.test_existing_branch_pr_reuse \
+  tests.test_orchestration_state_recovery \
+  tests.test_project_workflow_config -q
+```
+
+Full confidence run:
+
+```bash
+python3 -m unittest discover -s tests -q
+```
+
+Guidance:
+
+- use the fast path for small runner/test-harness changes and local smoke checks;
+- use the full path before release, after post-batch hardening, or whenever provider/routing behavior changed.
+
+## Go orchestrator CLI
+
+Phase 1 includes a Go CLI wrapper around the existing Python runner. Install the binary once, or run it directly with Go:
+
+```bash
+go install ./cmd/orchestrator
+orchestrator --help
+```
+
+```bash
+go run ./cmd/orchestrator --help
+```
+
+Bootstrap config files for a repository before the first run:
+
+```bash
+orchestrator init
+orchestrator init --dir path/to/repo
+```
+
+`init` writes `project-config.json` and `local-config.json` scaffolds and refuses to overwrite existing files unless `--force` is passed.
+
+Available commands:
+
+```bash
+go run ./cmd/orchestrator init
+go run ./cmd/orchestrator doctor --repo owner/repo
+go run ./cmd/orchestrator autodoctor --repo owner/repo
+go run ./cmd/orchestrator verify --repo owner/repo
+go run ./cmd/orchestrator status --issue 71 --repo owner/repo
+go run ./cmd/orchestrator status --pr 72 --repo owner/repo
+go run ./cmd/orchestrator status --worker issue-71
+go run ./cmd/orchestrator status --autonomous-session-file .orchestrator/workers/daemon/session.json
+go run ./cmd/orchestrator run issue --id 71 --repo owner/repo --dry-run
+go run ./cmd/orchestrator run issue --id 71 --repo owner/repo --detach
+go run ./cmd/orchestrator run batch --ids 71,72 --repo owner/repo --dry-run
+go run ./cmd/orchestrator run batch --ids 71,72 --repo owner/repo --detach
+go run ./cmd/orchestrator run daemon --repo owner/repo --dry-run --max-cycles 1 --poll-interval-seconds 1 --post-batch-verify
+go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --dry-run
+go run ./cmd/orchestrator run pr --id 72 --repo owner/repo --detach
+go run ./cmd/orchestrator run daemon --repo owner/repo --detach
+```
+
+Bounded daemon smoke-test guidance, including the exact safe operator command, observed output, and the post-#204 detached batch branch-isolation checklist, is documented in [`docs/daemon-smoke-test.md`](docs/daemon-smoke-test.md).
+
+Common Python-runner examples map to the Go wrapper as follows:
+
+```bash
+go run ./cmd/orchestrator doctor --repo owner/repo
+go run ./cmd/orchestrator doctor --doctor-smoke-check --runner opencode --model openai/gpt-5.3-codex
+go run ./cmd/orchestrator autodoctor --repo owner/repo
+go run ./cmd/orchestrator verify --repo owner/repo --create-followup-issue
+go run ./cmd/orchestrator status --issue 20 --repo owner/repo
+go run ./cmd/orchestrator status --pr 22 --repo owner/repo
+go run ./cmd/orchestrator status --worker issue-20
+go run ./cmd/orchestrator status --workers
+go run ./cmd/orchestrator status --workers --json
+go run ./cmd/orchestrator status --autonomous-session-file .orchestrator/workers/daemon/session.json
+go run ./cmd/orchestrator run issue --id 20 --repo owner/repo
+go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --detach
+go run ./cmd/orchestrator run batch --ids 20,31 --repo owner/repo --dry-run
+go run ./cmd/orchestrator run batch --ids 20,31 --repo owner/repo --detach
+go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --agent build --model openai/gpt-4o
+go run ./cmd/orchestrator run issue --id 20 --repo owner/repo --runner opencode --model openai/gpt-5.3-codex --agent build --opencode-auto-approve --agent-timeout-seconds 900 --agent-idle-timeout-seconds 180
+go run ./cmd/orchestrator run issue --id 31 --repo owner/repo --force-issue-flow
+go run ./cmd/orchestrator run issue --id 31 --repo owner/repo --conflict-recovery-only --sync-strategy rebase
+go run ./cmd/orchestrator run issue --id 45 --repo owner/repo --base current --runner opencode --agent build
+go run ./cmd/orchestrator run daemon --repo owner/repo --limit 5 --poll-interval-seconds 120
+go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --allow-pr-branch-switch
+go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --detach
+go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --conflict-recovery-only --allow-pr-branch-switch
+go run ./cmd/orchestrator run pr --id 22 --repo owner/repo --runner opencode --agent review --model openai/gpt-4o --opencode-auto-approve --agent-timeout-seconds 900 --dry-run
+go run ./cmd/orchestrator run daemon --repo owner/repo --limit 1 --poll-interval-seconds 120 --detach
+```
+
+The Go handlers translate CLI intent into the current Python runner arguments, except `init`, which creates config scaffolds directly in Go. Use `--help` on any command to inspect flags without invoking the runner, and use `--dry-run` for issue/PR/daemon runs to avoid starting agents.
+
+Detached worker files live under `<repo>/.orchestrator/workers/` by default, or under `--worker-dir` if you override it. The predictable worker names are `issue-N`, `pr-N`, `daemon`, and `daemon-N` for detached parallel daemon workers, each with `worker.json` metadata and `worker.log`; detached daemon runs also keep `session.json` in the same directory. `worker.json` now keeps the target, pid, log path, clone path, start time, and selected runner/agent/model metadata so later status checks do not need manual `ps` or log-path reconstruction.
+
+Compatibility boundary for Phase 1:
+
+- `run issue` supports single-issue execution through the Python runner. `--issue N` is accepted as a compatibility alias for `--id N`.
+- `run batch` accepts an explicit issue list via `--ids N[,M...]` (or repeated `--id`) and either previews the per-issue launches with `--dry-run` or starts one detached worker per issue with `--detach`. Live detached batches now prepare a fresh per-worker clone under each worker directory so branch, PR, and verification state stay isolated per issue.
+- `run issue --conflict-recovery-only` reuses an existing issue or linked PR branch, syncs it with base, reports whether it was already current, synced cleanly, auto-resolved, or needs manual intervention, and then stops before agent execution.
+- `status` prints a concise summary from the latest parseable orchestration state comment for a single issue or PR, including current state, next action, blockers, source thread/comment, and PR readiness when available. It also accepts `--worker NAME` for detached runtime/process metadata, log progress, and linked issue/PR state, `--workers` to list the detached worker registry, and `--autonomous-session-file PATH` for daemon batch checkpoints. When a detached issue worker was launched via `run batch --detach`, `status --worker issue-N` also rolls up batch-level done/current/next, child workers, linked PRs, conflicts, verification, and failures. Parallel detached daemon workers are exposed the same way via `daemon-N` worker names. Add `--json` with `--worker` or `--workers` for structured output.
+- `run daemon` polls tracker issues through the Python runner in autonomous batch mode and reuses orchestration state. Foreground runs still execute one worktree task at a time, while `run daemon --detach --max-parallel-tasks N` launches `N` isolated daemon workers with separate worker/session state and per-worker clones under `.orchestrator/workers/daemon-N/`.
+- A single `run daemon` invocation now keeps a per-run batch session so later poll cycles skip true human-handoff states like `ready-for-review` while still re-queueing `waiting-for-ci` and `ready-to-merge` items for autonomous follow-up through CI and merge progression; this lets bounded runs make progress across distinct selected issues.
+- `verify` runs the repository post-batch verification path (`python3 -m unittest discover -s tests -q` and `go test ./...` when available), prints a concise pass/fail summary, and can create a GitHub follow-up issue on failure.
+- `run pr` supports PR review-comments execution. `--pr N` is accepted as a compatibility alias for `--id N`, and `--from-review-comments` is accepted as a no-op because the command always selects that mode.
+- `run pr --conflict-recovery-only` syncs the current PR branch with its base and exits before fetching review work for the agent.
+- `run daemon` repeatedly invokes the existing Python batch issue flow with `--limit` / `--state` polling semantics; use `--dry-run` to execute a single poll without looping. Add `--post-batch-verify` to run the same verification path automatically after the batch finishes.
+- The per-run skip list is scoped to the current daemon invocation only, so `--force-reprocess` still works for intentional reruns in later invocations.
+- `run issue`, `run pr`, and `run daemon` accept `--detach` to start a background worker and write predictable metadata/log files under `.orchestrator/workers/`.
+- `doctor` accepts `--doctor` as a no-op because the command already selects diagnostics mode.
+- `autodoctor` currently routes to the same diagnostics as `doctor`, so workflow-config validation is available from both entrypoints.
+- `init` creates local scaffolds for `project-config.json` and `local-config.json` so users can start with the Go CLI instead of copying files manually.
+- Precedence remains delegated to the Python runner: CLI flags forwarded by Go override local config, local config overrides project config, and project config overrides built-in defaults.
+
+## Project config scaffold (repository-level)
+
+You can define repository defaults and placeholders for future orchestration policies.
+
+1. Copy the scaffold and adapt it for your project:
+   ```bash
+   orchestrator init --skip-local-config
+   ```
+2. Keep using CLI flags and local config as usual. Precedence is:
+   - CLI flags
+   - local config (`local-config.json`)
+   - project config (`project-config.json`)
+   - built-in defaults in script
+
+Project config currently supports these sections:
+
+- `workflow.commands.setup|test|lint|build|e2e` (non-empty string shell command or `null`)
+- `workflow.hooks.pre_agent|post_agent|pre_pr_update|post_pr_update` (non-empty string shell command or `null`)
+- `workflow.readiness.required_checks|required_approvals|require_review|require_mergeable|require_required_file_evidence`
+- `workflow.merge.auto|method` (`method` is `merge`, `squash`, or `rebase`)
+- `defaults.tracker|preset|runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts` (used as parser defaults)
+- `scope.defaults.labels.allow|deny` (arrays of label names)
+- `scope.defaults.authors.allow|deny` (arrays of GitHub logins; optional placeholder)
+- `scope.defaults.assignees.allow|deny` (arrays of GitHub logins)
+- `scope.defaults.priority.allow|deny|order` (priority labels used for filtering and autonomous ordering)
+- `scope.defaults.freshness.max_age_days|max_idle_days` (positive integers for autonomous freshness guards)
+- `retry.max_attempts|escalate_to_preset` (positive integer plus escalation placeholder)
+- `budgets.max_attempts_per_task|max_runtime_minutes|max_cost_usd|max_model_tier`
+- `communication.verbosity` (`low`, `normal`, `high`)
+- `presets.<name>.runner|agent|model|track_tokens|token_budget|agent_timeout_seconds|agent_idle_timeout_seconds|max_attempts|escalate_to_preset`
+
+Validation is strict: unsupported keys or invalid value types fail fast with a config error.
+
+Preset resolution order is:
+
+- `--preset`
+- `local-config.json` `preset`
+- `project-config.json` `defaults.preset`
+- legacy non-preset defaults
+
+Selected preset values are applied before explicit CLI flags, so manual `--runner`, `--model`, `--agent`, and similar flags remain the final override layer.
+
+When no explicit `--preset` is provided, the orchestrator can now choose a preset per task from `routing.rules` and then cap it with project `budgets`. Matching rules win first, then `routing.default_preset`, then built-in cheap/default/hard heuristics when those presets exist.
+
+Scope rules are evaluated before any issue-mode agent execution:
+
+- deny labels always win;
+- if allow labels are configured, issue must match at least one allow label;
+- optional author allow/deny rules use the same semantics;
+- out-of-scope issues get a `blocked` orchestration state and a dedicated scope decision comment;
+- out-of-scope issues do not run the agent unless explicitly forced with `--force-reprocess`.
+
+Workflow checks are evaluated after agent changes are committed and before final PR-ready states are posted:
+
+- `setup` runs once before orchestration starts for the selected repository;
+- checks run in this order when configured: `test`, `lint`, `build`, `e2e`;
+- hooks can run before/after agent execution and before/after PR updates;
+- each command is executed via `bash -lc "<command>"` from repository `--dir`;
+- in `--dry-run`, checks are not executed and the script prints which checks would run;
+- on failure, orchestration posts a state update with `stage=workflow_checks` and a `workflow_checks` payload containing command, exit code, and output excerpts;
+- workflow-check failures block readiness transitions (`ready-for-review` / `waiting-for-ci`) and follow existing stop policy (`--stop-on-error`).
+- PR readiness can additionally require named CI checks, approvals, mergeability, and required-file evidence before the orchestrator posts `ready-to-merge`.
+
+Example `project-config.json` workflow block:
+
+```json
+{
+  "workflow": {
+    "commands": {
+      "setup": "python -m pip install -r requirements.txt",
+      "test": "python -m unittest",
+      "lint": "ruff check .",
+      "build": null,
+      "e2e": null
+    },
+    "hooks": {
+      "pre_agent": null,
+      "post_agent": null,
+      "pre_pr_update": null,
+      "post_pr_update": null
+    },
+    "readiness": {
+      "required_checks": ["ci / test"],
+      "required_approvals": 1,
+      "require_review": true,
+      "require_mergeable": true,
+      "require_required_file_evidence": true
+    },
+    "merge": {
+      "auto": false,
+      "method": "squash"
+    }
+  }
+}
+```
+
+Example `project-config.json` scope block:
+
+```json
+{
+  "scope": {
+    "defaults": {
+      "labels": {
+        "allow": ["autonomous", "bug"],
+        "deny": ["manual-only", "needs-product-decision"]
+      },
+      "authors": {
+        "allow": [],
+        "deny": ["dependabot[bot]"]
+      }
+    }
+  }
+}
+```
+
+Example `project-config.json` preset and retry block:
+
+```json
+{
+  "defaults": {
+    "preset": "default"
+  },
+  "retry": {
+    "max_attempts": 2,
+    "escalate_to_preset": "hard"
+  },
+  "presets": {
+    "cheap": {
+      "runner": "opencode",
+      "agent": "build",
+      "model": "openai/gpt-4o-mini",
+      "token_budget": 8000,
+      "max_attempts": 1,
+      "escalate_to_preset": "default"
+    },
+    "default": {
+      "runner": "opencode",
+      "agent": "build",
+      "model": "openai/gpt-4o",
+      "token_budget": 20000,
+      "max_attempts": 2,
+      "escalate_to_preset": "hard"
+    },
+    "hard": {
+      "runner": "claude",
+      "agent": "build",
+      "model": "claude-sonnet-4-5",
+      "token_budget": 40000,
+      "max_attempts": 3,
+      "escalate_to_preset": null
+    }
+  }
+}
+```
+
+Example `project-config.json` routing and budget block:
+
+```json
+{
+  "routing": {
+    "default_preset": "default",
+    "rules": [
+      {
+        "when": {
+          "labels": ["docs", "chore"],
+          "task_types": ["issue"]
+        },
+        "preset": "cheap"
+      },
+      {
+        "when": {
+          "needs_decomposition": true
+        },
+        "preset": "hard"
+      }
+    ]
+  },
+  "budgets": {
+    "max_attempts_per_task": 3,
+    "max_runtime_minutes": 20,
+    "max_cost_usd": 2.5,
+    "max_model_tier": "hard"
+  }
+}
+```
+
+You can also point to a different project config file:
+
+```bash
+python scripts/run_github_issues_to_opencode.py --project-config path/to/project-config.json --repo owner/repo --limit 1
+```
+
+## Local config preset (per user/per machine)
+
+You can define local defaults without changing repository defaults.
+
+1. Copy the example config and adjust it for your setup:
+   ```bash
+   cp local-config.example.json local-config.json
+   ```
+2. Keep using CLI flags as usual. Priority is:
+   - CLI flags
+   - local config (`local-config.json`)
+   - project config (`project-config.json`)
+   - built-in defaults in script
+
+`local-config.json` is ignored by git and stays local to your machine.
+
+Supported local config keys:
+
+- `tracker` (`github` or `jira`)
+- `state` (`open`, `closed`, `all`)
+- `limit` (positive integer)
+- `runner` (`claude` or `opencode`)
+- `agent` (string)
+- `model` (string or `null`)
+- `preset` (string)
+- `agent_timeout_seconds` (positive integer)
+- `agent_idle_timeout_seconds` (positive integer or `null`)
+- `token_budget` (positive integer or `null`)
+- `max_attempts` (positive integer)
+- `opencode_auto_approve` (boolean)
+- `branch_prefix` (string)
+- `include_empty` (boolean)
+- `stop_on_error` (boolean)
+- `fail_on_existing` (boolean)
+- `force_issue_flow` (boolean)
+- `skip_if_pr_exists` (boolean)
+- `skip_if_branch_exists` (boolean)
+- `force_reprocess` (boolean)
+- `sync_reused_branch` (boolean)
+- `sync_strategy` (`rebase` or `merge`)
+- `base_branch` (`default` or `current`)
+- `create_child_issues` (boolean)
+
+You can also point to a different local config file:
+
+```bash
+python scripts/run_github_issues_to_opencode.py --local-config path/to/local-config.json
+```
+
+**Use local defaults from repository config (`local-config.json`):**
+```bash
+cp local-config.example.json local-config.json
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --limit 1
+```
+
+Workflow per issue:
+
+1. Evaluates scope eligibility from project rules (`scope.defaults`) and prints decision (also in `--dry-run`)
+2. Out-of-scope issues are blocked (`status=blocked`, stage=`scope_check`) and get a dedicated scope comment; agent run is skipped unless `--force-reprocess` is set
+3. Pre-checks whether issue should be skipped (linked open PR and/or existing deterministic remote branch)
+4. Chooses a base branch (`default`: repository default branch from GitHub; `current`: currently checked-out branch)
+5. Runs planning-only decomposition preflight (`--decompose auto` by default); large tasks get a proposed plan comment and stop before branch/agent execution
+6. Creates a new issue branch from that base (`--branch-prefix`, default `issue-fix`) or reuses an existing one
+7. For reused branches, syncs with the latest selected base branch before agent run (default: `rebase`)
+8. Extracts image attachment references from issue content (or attachment metadata), downloads available images, and runs the AI agent with title/body context plus image files when present.
+9. On changes, creates commit
+10. Pushes issue branch to `origin`
+11. Reuses an existing open PR for the issue branch when present; otherwise creates one to the selected base branch
+12. Posts append-only orchestration state comments to GitHub issue/PR on key transitions
+13. On per-issue failure (agent, commit/push, PR create, etc.), posts a structured failure report comment to the issue and adds label `auto:agent-failed`
+14. On successful issue completion (or no-op completion), removes label `auto:agent-failed` from that issue if present
+
+Workflow in PR review mode:
+
+1. Loads PR metadata and all feedback sources:
+   - unresolved inline review thread comments
+   - latest review summary per reviewer (`CHANGES_REQUESTED`, `COMMENTED`, `APPROVED`)
+   - PR conversation comments (issue comments on the PR)
+2. Filters and de-duplicates feedback, then builds an actionable prompt with file/line links
+3. Adds PR description and linked issue context (including issue body when available)
+4. Selects PR target branch (`headRefName`) as execution branch
+   - by default switches current worktree to target PR branch (with safeguard)
+   - or runs in isolated temporary worktree with `--isolate-worktree`
+5. Runs AI agent on target branch (or optional follow-up branch from target)
+6. On changes, creates commit and pushes updates to the selected branch
+7. Optionally posts a summary comment to the PR
+8. Posts append-only orchestration state comments to the PR (`in-progress`, `waiting-for-ci`, `waiting-for-author`, `failed`)
+
+State comment format:
+
+- Marker: `<!-- orchestration-state:v1 -->`
+- Contains a human-readable header and a parseable JSON payload with fields like `status`, `task_type`, `issue`, `pr`, `branch`, `base_branch`, `runner`, `agent`, `model`, `attempt`, `stage`, `next_action`, `error`, `timestamp`
+- Dry-run never posts comments; it prints which state comment would be posted and where
+
+Automation failure reporting:
+
+- Failure label: `auto:agent-failed` (auto-created if missing with color `B60205` and description `Automation run failed for this issue`)
+- Failure issue comment includes: `status`, `stage`, `error`, `branch`, `base_branch`, `runner/agent/model`, `run id`, `timestamp`, and rerun hints
+- Failure comments include marker `<!-- orchestration-agent-failure:v1 -->` and JSON payload for machine-readable context
+- Dry-run prints which failure comment/label operations would run; it does not post or edit labels
+
+Scope decision comments:
+
+- Marker: `<!-- orchestration-scope:v1 -->`
+- Out-of-scope comment includes decision, reason, forced flag, and timestamp in machine-readable JSON
+- Dry-run prints where scope decision comment would be posted
+
+Planning-only decomposition comments:
+
+- Marker: `<!-- orchestration-decomposition:v1 -->`
+- `--decompose auto` proposes a decomposition plan for large/epic/multi-step issues before starting the agent
+- `--decompose always` forces plan-only behavior for an issue, useful for manual planning
+- `--decompose never` bypasses decomposition preflight and keeps the legacy issue-flow path
+- `--create-child-issues` when a decomposition plan is approved, creates child issues and records created child links in the plan payload
+- Existing parseable decomposition comments are treated idempotently and are not duplicated on rerun
+
+Useful options:
+
+- `--runner claude|opencode` to select the AI agent runner (default: `claude`)
+- `--preset name` to apply a named project-config preset before explicit CLI overrides
+- `--state open|closed|all`
+- `--include-empty` to process issues with empty body; image-only issues are now processed automatically when image attachments are detected.
+- Image attachment handling: when issue content includes image URLs or attachment metadata, the script downloads images to a temp directory and passes them to Claude as `--image <path>` arguments.
+- If image download fails for a specific attachment, processing continues with text prompt only and logs a warning.
+- Jira attachment API support is out of scope for this slice; current behavior relies on GitHub body image extraction and generic attachment metadata fallback.
+- `--stop-on-error` to stop on first failed run
+- `--dry-run` to preview without executing the agent (includes scope decision per issue)
+- `--pr N --from-review-comments` to run PR review-comments mode
+- `--pr-followup-branch-prefix prefix` to create a follow-up branch in PR mode instead of committing to target PR branch
+- `--allow-pr-branch-switch` allow switching current worktree to target PR branch when they differ
+- `--isolate-worktree` run PR mode in a temporary git worktree without touching current branch
+- `--post-pr-summary` to leave a short summary comment in the PR after successful PR mode run
+- `--model model-name` to override model (e.g. `claude-sonnet-4-6` for Claude, `openai/gpt-4o` for OpenCode)
+- `--agent name` agent name for OpenCode (ignored when using Claude)
+- `--branch-prefix prefix` to customize fix branch names
+- `--agent-timeout-seconds N` hard timeout for agent run (default: `900`)
+- `--agent-idle-timeout-seconds N` fail if agent prints no output for `N` seconds
+- `--token-budget N` (`--max-tokens` alias) stop the agent when cumulative tracked tokens exceed `N`
+- `--max-attempts N` retry policy placeholder for future rerun/escalation logic
+- `--opencode-auto-approve` pass `--dangerously-skip-permissions` to OpenCode (use with caution)
+- `--local-config path` load local JSON defaults (default: `local-config.json` under `--dir`)
+- `--project-config path` load repository JSON defaults scaffold (default: `project-config.json` under `--dir`)
+- `--fail-on-existing` strict mode: fail if issue branch or PR already exists
+- `--force-issue-flow` disable auto-switch to PR-review mode for `--issue`
+- `--skip-if-pr-exists` / `--no-skip-if-pr-exists` skip or process batch issues when a linked open PR exists (default: skip; single `--issue` uses state-aware PR-review progression instead of hard-skip)
+- `--skip-if-branch-exists` / `--no-skip-if-branch-exists` skip or process issues when deterministic issue branch exists on `origin` (default: skip)
+- `--force-reprocess` override skip guards and out-of-scope gating (scope decision is still logged/commented)
+- `--sync-reused-branch` / `--no-sync-reused-branch` enable or disable reused-branch sync before agent run (default: enabled)
+- `--sync-strategy rebase|merge` choose how to sync a reused branch with selected base (default: `rebase`)
+- `--base default|current` (`--base-branch` alias) choose issue-flow base mode; `current` enables stacked execution from your current branch (opt-in)
+- `--decompose auto|never|always` control planning-only decomposition preflight before issue-flow agent execution (default: `auto`)
+- `--create-child-issues` create missing approved/decomposition child issues and mark plan as `children_created` when all children are linked
+- `--doctor` run preflight diagnostics only (no agent run)
+- `--doctor-smoke-check` in doctor mode, run a lightweight runner CLI smoke check
+
+If `--repo` is not provided, script tries to detect repository from current `gh` context.
+
+Note: script expects a clean git working tree before run.
+
+PR mode notes:
+
+- `--pr` must be used together with `--from-review-comments`.
+- By default PR mode works on the target PR branch (`headRefName`) rather than the branch you started from.
+- Safeguard: if current branch differs from target PR branch, run fails unless you pass `--allow-pr-branch-switch` (or `--isolate-worktree`).
+- `--dry-run` prints selected target branch and whether execution will switch branches or use isolated worktree.
+- If PR is closed/non-open, script exits without changes.
+- If there are no actionable unresolved comments, script exits successfully without running the agent.
+- If recovered state is `waiting-for-ci`, script reads GitHub check-runs and commit statuses for PR `headRefOid`:
+  - pending checks -> emits `waiting-for-ci` (stage `ci_checks`);
+  - successful checks or no checks -> validates mergeability, approval state, and project merge policy before emitting `ready-to-merge` or requesting GitHub auto-merge;
+  - failing checks -> emits `blocked` and includes failing check names with URLs in state error/details.
+- Project config can define `workflow.merge.auto` and `workflow.merge.method` (`merge`, `squash`, `rebase`) to let orchestration request `gh pr merge --auto` once CI, approvals, and mergeability all allow it.
+- Prompt input priority is deterministic: unresolved inline comments first, then review summaries, then conversation comments.
+- Review summaries are taken from the latest review per author to avoid reprocessing superseded feedback.
+- Filtering rules are deterministic and backward-compatible:
+  - Exclude resolved/outdated inline threads, outdated inline comments, empty comments, and PR-author self-comments.
+  - Keep `CHANGES_REQUESTED` review summaries when non-empty.
+  - Keep `COMMENTED`/`APPROVED` review summaries only when actionable (for example: contains concrete change requests).
+  - Keep conversation comments only when actionable.
+  - Exclude obvious non-actionable noise (`lgtm`, `looks good`, `thanks`, `+1`, punctuation-only text, etc.).
+  - De-duplicate across all included sources while preserving priority order.
+- Prompt-generation logs now include per-source counts and included/excluded breakdown.
+
+Examples:
+
+```bash
+# Default PR mode with explicit branch-switch confirmation when needed
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --pr 22 --from-review-comments --allow-pr-branch-switch
+
+# Isolated PR mode: do not switch current branch
+python scripts/run_github_issues_to_opencode.py --repo owner/repo --pr 22 --from-review-comments --isolate-worktree
+```
+
+## Smoke test
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+## Troubleshooting hangs
+
+- If a run appears stuck, set an explicit timeout and idle-timeout:
+  - `--agent-timeout-seconds 900`
+  - `--agent-idle-timeout-seconds 180`
+- If OpenCode may be waiting for interactive permission approvals, try `--opencode-auto-approve` only in trusted environments.
+- If OpenCode exits with `-9`, treat it as SIGKILL by environment/runner (resource exhaustion or hard stop) rather than a model syntax issue. For predictable stability, start with:
+  - `--runner opencode --agent build --model openai/gpt-4o`
+- On timeout/idle-timeout the script now exits with a clear error so normal failure handling (`--stop-on-error`) can proceed.
+
+## Reruns and conflict resolution
+
+- Re-running is idempotent by default: issues are skipped when a linked open PR already exists.
+- Re-running is also skipped by default when deterministic issue branch already exists on `origin`.
+- Use `--force-reprocess` (or `--no-skip-if-pr-exists` / `--no-skip-if-branch-exists`) for intentional reruns.
+- When rerun skip guards are disabled, the script auto-detects existing issue branches and reuses them instead of failing on `git checkout -b`.
+- If an open PR already exists for the issue branch, the script reuses it (even if your currently checked-out local branch is different) when rerun skip guards are disabled.
+- PR reuse first checks `base+head`, then falls back to `head`-only lookup to avoid duplicate PR creation when reruns start from another feature branch.
+- Base branch selection is deterministic: by default issue runs target the repository default branch from GitHub; use `--base current` to stack on your current local branch.
+- On rerun with a reused branch, the script syncs that branch with the selected base before running the agent (`--sync-strategy rebase` by default).
+- If rebase sync for a reused branch conflicts, the script now automatically falls back to merge-based sync and resolves conflicted files in favor of the selected base branch.
+- In auto-switched `pr-review` runs (`--issue <n>` with linked open PR), the same conflict flow is applied so routine sync conflicts do not block unattended reruns.
+- Explicit rerun case is supported: when the issue already has an open PR that is conflicted with base (`mergeStateStatus=DIRTY`), pr-review mode auto-resolves routine sync conflicts, runs forced recovery verification, pushes the updated branch, and lets GitHub recalculate mergeability without manual conflict steps.
+- Conflict strategy is deterministic for trusted repositories: prefer selected base branch content (`git checkout --theirs`) for conflicted paths, then finish merge with `--no-edit`.
+- If merge-based auto-resolution still cannot finish, the run stops before agent execution with a clear error and hints to resolve conflicts.
+- If sync updates branch history and agent produces no new file changes, the script first runs forced recovery verification and only then pushes sync-only branch updates so existing PR conflict status can be refreshed safely.
+- For rebase-based sync that rewrites branch history, push uses `--force-with-lease` automatically.
+- The Go-native `run issue` path now performs the normal reused-branch sync preflight itself; dedicated sync-only recovery mode (`--conflict-recovery-only`) still goes through the compatibility path.
+- Use `--sync-strategy merge` if you prefer merge-based sync instead of rebase.
+- Use `--no-sync-reused-branch` only when you intentionally want to skip auto-sync.
+- Recovery verification always runs full-repo checks (`workflow.commands` when configured, otherwise detected repo defaults). You can add `workflow.verification.focused_commands` to also run extra uncached checks in a fresh clone before the branch is considered safely recovered.
+- Use `--dry-run` to preview selected base branch mode (`default` vs `current`), selected base branch name, and whether each issue will create or reuse branch/PR resources.
+- `--dry-run` also shows whether reused-branch sync will run and which strategy will be used.
+- In `--base current` mode, the runner warns when the current branch is dirty, has no upstream tracking branch, or is ahead of upstream.
+- Use `--fail-on-existing` when you want strict behavior and prefer the run to fail if branch/PR already exists.
+
+## Auto switch to PR-review mode
+
+- When you run with `--issue <n>`, the script checks whether this issue has a linked open PR.
+- For single-issue runs, a linked open PR does not hard-skip the task; it enters state-aware PR-review/check progression so actionable review feedback can still be addressed.
+- In batch issue runs, `--skip-if-pr-exists` remains enabled by default and skips issues that already have linked open PRs.
+- If PR-review is selected, it builds the agent prompt from issue + PR + review comments context.
+- The script logs that auto-switch happened and why (including the PR number).
+- `--dry-run` prints selected mode (`issue-flow` or `pr-review`) and the reason.
+- Use `--force-issue-flow` to keep legacy issue-flow behavior.
+
+## Orchestration state recovery (first slice)
+
+- For single-item runs (`--issue <n>` or `--pr <n> --from-review-comments`), the script inspects recent issue/PR comments for marker `<!-- orchestration-state:v1 -->`.
+- It parses JSON payloads from those comments, ignores malformed payloads safely, and logs a warning for each malformed comment.
+- It recovers the latest parseable state by comment `created_at` and prints recovered context (including in `--dry-run`).
+- Recovered `waiting-for-author` causes issue processing to skip by default with a clear reason; use `--force-issue-flow` to override.
+- Recovered `ready-for-review` keeps behavior conservative and, when an open linked PR exists, prefers PR-review path (no silent override of existing branch/PR checks).
+- Recovered `waiting-for-ci` now performs a first-slice CI read from GitHub checks for the PR head SHA and updates orchestration state to `waiting-for-ci` / `ready-to-merge` / `blocked` based on pending/success/failure.
+- Recovered `failed` state does not block rerun; previous failure details are logged and appended to the agent prompt as additional context.
+
+## Verification
+
+Run the precedence smoke test:
+
+```bash
+python3 -m unittest tests/test_local_config_precedence.py
+```

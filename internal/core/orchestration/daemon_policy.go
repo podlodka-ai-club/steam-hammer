@@ -16,6 +16,9 @@ type DaemonTaskSnapshot struct {
 	IssueNumber          int
 	Tracker              string
 	ExpectedTracker      string
+	IssueLabels          []string
+	ScopeLabelAllow      []string
+	ScopeLabelDeny       []string
 	RunID                string
 	ForceReprocess       bool
 	FailureLabels        []string
@@ -65,6 +68,8 @@ const (
 	DaemonSelectionCodeWaitingForAuthor         = "waiting_for_author"
 	DaemonSelectionCodeRetryBackoff             = "retry_backoff"
 	DaemonSelectionCodeScopeMismatch            = "scope_mismatch"
+	DaemonSelectionCodeScopeLabelMismatch       = "scope_label_mismatch"
+	DaemonSelectionCodeDeniedByLabel            = "denied_by_label"
 	DaemonSelectionCodeAgentRetryLimit          = "agent_failed_retry_limit"
 	DaemonSelectionCodeUnsupportedProvider      = "unsupported_provider"
 )
@@ -82,6 +87,14 @@ func EvaluateDaemonTaskSelection(snapshot DaemonTaskSnapshot, now time.Time, ret
 	}
 	if tracker != "" && tracker != "github" {
 		return DaemonTaskDecision{Status: DaemonSelectionStatusSkipped, Code: DaemonSelectionCodeUnsupportedProvider, Reason: "unsupported provider for daemon selection: " + tracker, Signature: signature}
+	}
+	if deniedLabel := firstMatchingLabel(snapshot.IssueLabels, snapshot.ScopeLabelDeny); deniedLabel != "" {
+		return DaemonTaskDecision{Status: DaemonSelectionStatusSkipped, Code: DaemonSelectionCodeDeniedByLabel, Reason: "denied by label: " + deniedLabel, Signature: signature}
+	}
+	if len(snapshot.ScopeLabelAllow) > 0 {
+		if allowedLabel := firstMatchingLabel(snapshot.IssueLabels, snapshot.ScopeLabelAllow); allowedLabel == "" {
+			return DaemonTaskDecision{Status: DaemonSelectionStatusSkipped, Code: DaemonSelectionCodeScopeLabelMismatch, Reason: "scope label mismatch: requires one of " + formatLabelList(snapshot.ScopeLabelAllow), Signature: signature}
+		}
 	}
 	if snapshot.RetryLimitReached {
 		return DaemonTaskDecision{Status: DaemonSelectionStatusSkipped, Code: DaemonSelectionCodeAgentRetryLimit, Reason: "agent failed retry limit reached", Signature: signature}
@@ -171,6 +184,38 @@ func hasFailureLabel(labels []string) bool {
 		}
 	}
 	return false
+}
+
+func firstMatchingLabel(issueLabels, candidates []string) string {
+	normalizedIssueLabels := make(map[string]string, len(issueLabels))
+	for _, label := range issueLabels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" {
+			continue
+		}
+		normalizedIssueLabels[strings.ToLower(trimmed)] = trimmed
+	}
+	for _, candidate := range candidates {
+		normalizedCandidate := strings.ToLower(strings.TrimSpace(candidate))
+		if normalizedCandidate == "" {
+			continue
+		}
+		if matched, ok := normalizedIssueLabels[normalizedCandidate]; ok {
+			return matched
+		}
+	}
+	return ""
+}
+
+func formatLabelList(labels []string) string {
+	parts := make([]string, 0, len(labels))
+	for _, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 func formatDependencyRefs(refs []string) string {

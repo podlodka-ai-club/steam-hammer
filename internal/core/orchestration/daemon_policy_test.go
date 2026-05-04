@@ -161,6 +161,59 @@ func TestEvaluateDaemonTaskSelectionSkipsScopeMismatch(t *testing.T) {
 	}
 }
 
+func TestEvaluateDaemonTaskSelectionSkipsWhenAllowLabelMissing(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:     249,
+		IssueLabels:     []string{"bug"},
+		ScopeLabelAllow: []string{"demo"},
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if decision.Eligible {
+		t.Fatalf("Eligible = true, want false")
+	}
+	if decision.Status != DaemonSelectionStatusSkipped || decision.Code != DaemonSelectionCodeScopeLabelMismatch {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
+	}
+	if !strings.Contains(decision.Reason, "scope label mismatch") {
+		t.Fatalf("Reason = %q", decision.Reason)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionAllowsWhenAllowLabelPresent(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:       249,
+		IssueLabels:       []string{"demo"},
+		ScopeLabelAllow:   []string{"demo"},
+		LatestStateStatus: StatusReadyForReview,
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if !decision.Eligible {
+		t.Fatalf("Eligible = false, want true (%q)", decision.Reason)
+	}
+	if decision.Status != DaemonSelectionStatusRunnable || decision.Code != DaemonSelectionCodeRunnable {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionSkipsDeniedLabelEvenWhenAllowMatched(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:     249,
+		IssueLabels:     []string{"demo", "human discussion"},
+		ScopeLabelAllow: []string{"demo"},
+		ScopeLabelDeny:  []string{"human discussion"},
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if decision.Eligible {
+		t.Fatalf("Eligible = true, want false")
+	}
+	if decision.Status != DaemonSelectionStatusSkipped || decision.Code != DaemonSelectionCodeDeniedByLabel {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
+	}
+	if !strings.Contains(decision.Reason, "denied by label") {
+		t.Fatalf("Reason = %q", decision.Reason)
+	}
+}
+
 func TestEvaluateDaemonTaskSelectionSkipsUnsupportedProvider(t *testing.T) {
 	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
 		IssueNumber: 249,

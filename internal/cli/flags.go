@@ -30,6 +30,12 @@ type commonOptions struct {
 	maxTry      *int
 	timeout     *int
 	idleTime    *int
+	groomMode   *string
+	requirePlan *bool
+	askQuestions *bool
+	autoContinueAfterPlan *bool
+	maxQuestions *int
+	maxRounds *int
 }
 
 func cloneCommonOptions(opts commonOptions) commonOptions {
@@ -55,6 +61,12 @@ func cloneCommonOptions(opts commonOptions) commonOptions {
 		maxTry:      intPtrValue(opts.maxTry),
 		timeout:     intPtrValue(opts.timeout),
 		idleTime:    intPtrValue(opts.idleTime),
+		groomMode:   stringPtrValue(opts.groomMode),
+		requirePlan: boolPtrValue(opts.requirePlan),
+		askQuestions: boolPtrValue(opts.askQuestions),
+		autoContinueAfterPlan: boolPtrValue(opts.autoContinueAfterPlan),
+		maxQuestions: intPtrValue(opts.maxQuestions),
+		maxRounds: intPtrValue(opts.maxRounds),
 	}
 }
 
@@ -112,6 +124,12 @@ func addCommonFlags(fs *flag.FlagSet, opts *commonOptions, runtime runtimeProvid
 	opts.maxTry = fs.Int("max-attempts", 0, "retry policy placeholder maximum")
 	opts.timeout = fs.Int("agent-timeout-seconds", 0, "hard timeout for agent execution in seconds")
 	opts.idleTime = fs.Int("agent-idle-timeout-seconds", 0, "abort if agent produces no output for this many seconds")
+	opts.groomMode = fs.String("grooming-mode", "", "grooming mode override: off, auto, always")
+	opts.requirePlan = fs.Bool("grooming-require-plan-approval", false, "require explicit plan approval before implementation")
+	opts.askQuestions = fs.Bool("grooming-ask-questions", false, "allow grooming follow-up questions")
+	opts.autoContinueAfterPlan = fs.Bool("grooming-auto-continue-after-plan", false, "continue automatically after posting a plan")
+	opts.maxQuestions = fs.Int("grooming-max-questions", 0, "maximum follow-up questions allowed during grooming")
+	opts.maxRounds = fs.Int("grooming-max-rounds", 0, "maximum grooming rounds allowed")
 }
 
 func appendCommonPythonArgs(args []string, opts commonOptions) []string {
@@ -173,6 +191,24 @@ func appendCommonPythonArgs(args []string, opts commonOptions) []string {
 	}
 	if *opts.idleTime > 0 {
 		args = append(args, "--agent-idle-timeout-seconds", strconv.Itoa(*opts.idleTime))
+	}
+	if *opts.groomMode != "" {
+		args = append(args, "--grooming-mode", *opts.groomMode)
+	}
+	if *opts.requirePlan {
+		args = append(args, "--grooming-require-plan-approval")
+	}
+	if *opts.askQuestions {
+		args = append(args, "--grooming-ask-questions")
+	}
+	if *opts.autoContinueAfterPlan {
+		args = append(args, "--grooming-auto-continue-after-plan")
+	}
+	if *opts.maxQuestions > 0 {
+		args = append(args, "--grooming-max-questions", strconv.Itoa(*opts.maxQuestions))
+	}
+	if *opts.maxRounds > 0 {
+		args = append(args, "--grooming-max-rounds", strconv.Itoa(*opts.maxRounds))
 	}
 	return args
 }

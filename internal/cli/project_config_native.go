@@ -12,6 +12,7 @@ import (
 )
 
 var nativePresetTierOrder = []string{"cheap", "default", "hard"}
+var groomingModeChoices = map[string]bool{"off": true, "auto": true, "always": true}
 
 func applyNativeProjectConfigDefaults(opts *commonOptions, fs flagState) error {
 	projectConfig, err := loadNativeProjectConfig(*opts.dir, *opts.project)
@@ -40,6 +41,9 @@ func applyNativeProjectConfigDefaults(opts *commonOptions, fs flagState) error {
 		applyNativeCommonDefaults(opts, fs, presetDefaults)
 	}
 	applyNativeBudgetCaps(opts, projectConfig)
+	if err := applyNativeGroomingDefaults(opts, fs, projectConfig); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -131,6 +135,78 @@ func applyNativeCommonDefaults(opts *commonOptions, fs flagState, defaults map[s
 	setIntDefault(opts.maxTry, fs, "max-attempts", defaults["max_attempts"])
 	setIntDefault(opts.timeout, fs, "agent-timeout-seconds", defaults["agent_timeout_seconds"])
 	setIntDefault(opts.idleTime, fs, "agent-idle-timeout-seconds", defaults["agent_idle_timeout_seconds"])
+}
+
+func applyNativeGroomingDefaults(opts *commonOptions, fs flagState, projectConfig map[string]any) error {
+	grooming, ok := projectConfig["grooming"]
+	if !ok || grooming == nil {
+		return nil
+	}
+	groomingConfig, ok := grooming.(map[string]any)
+	if !ok {
+		return fmt.Errorf("project config key grooming must be an object")
+	}
+
+	allowedKeys := map[string]bool{
+		"mode":                     true,
+		"require_plan_approval":    true,
+		"ask_questions":            true,
+		"auto_continue_after_plan": true,
+		"max_questions":            true,
+		"max_rounds":               true,
+	}
+	for key := range groomingConfig {
+		if !allowedKeys[key] {
+			return fmt.Errorf("unsupported grooming config key %q", key)
+		}
+	}
+
+	if value, exists := groomingConfig["mode"]; exists {
+		mode := optionalConfigString(value)
+		if mode == "" {
+			return fmt.Errorf("project config key grooming.mode must be one of: off, auto, always")
+		}
+		if !groomingModeChoices[mode] {
+			return fmt.Errorf("unsupported grooming mode %q in project config; expected one of: off, auto, always", mode)
+		}
+		setStringDefault(opts.groomMode, fs, "grooming-mode", mode)
+	}
+	if value, exists := groomingConfig["require_plan_approval"]; exists {
+		normalized, ok := value.(bool)
+		if !ok {
+			return fmt.Errorf("project config key grooming.require_plan_approval must be a boolean")
+		}
+		setBoolDefault(opts.requirePlan, fs, "grooming-require-plan-approval", normalized)
+	}
+	if value, exists := groomingConfig["ask_questions"]; exists {
+		normalized, ok := value.(bool)
+		if !ok {
+			return fmt.Errorf("project config key grooming.ask_questions must be a boolean")
+		}
+		setBoolDefault(opts.askQuestions, fs, "grooming-ask-questions", normalized)
+	}
+	if value, exists := groomingConfig["auto_continue_after_plan"]; exists {
+		normalized, ok := value.(bool)
+		if !ok {
+			return fmt.Errorf("project config key grooming.auto_continue_after_plan must be a boolean")
+		}
+		setBoolDefault(opts.autoContinueAfterPlan, fs, "grooming-auto-continue-after-plan", normalized)
+	}
+	if value, exists := groomingConfig["max_questions"]; exists {
+		normalized, ok := strictPositiveConfigInt(value)
+		if !ok {
+			return fmt.Errorf("project config key grooming.max_questions must be a positive integer")
+		}
+		setIntDefault(opts.maxQuestions, fs, "grooming-max-questions", normalized)
+	}
+	if value, exists := groomingConfig["max_rounds"]; exists {
+		normalized, ok := strictPositiveConfigInt(value)
+		if !ok {
+			return fmt.Errorf("project config key grooming.max_rounds must be a positive integer")
+		}
+		setIntDefault(opts.maxRounds, fs, "grooming-max-rounds", normalized)
+	}
+	return nil
 }
 
 func applyNativeBudgetCaps(opts *commonOptions, projectConfig map[string]any) {
@@ -248,6 +324,20 @@ func positiveConfigInt(value any) int {
 		}
 	}
 	return 0
+}
+
+func strictPositiveConfigInt(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		if typed > 0 {
+			return typed, true
+		}
+	case float64:
+		if typed >= 1 && typed == float64(int(typed)) {
+			return int(typed), true
+		}
+	}
+	return 0, false
 }
 
 func retryBackoffDuration(retry map[string]any) time.Duration {

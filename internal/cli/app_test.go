@@ -2003,6 +2003,88 @@ func TestRunIssueCommandForwardsLightweightFlag(t *testing.T) {
 	assertCommand(t, runner, []string{runnerScript, "--issue", "20", "--lightweight"})
 }
 
+func TestRunIssueWithoutGroomingConfigPreservesExistingArgs(t *testing.T) {
+	runner := &recordingRunner{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "issue", "--id", "20"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	joined := strings.Join(runner.args, " ")
+	if strings.Contains(joined, "--grooming-") {
+		t.Fatalf("runner args = %#v, should not include grooming flags by default", runner.args)
+	}
+}
+
+func TestRunIssueUsesGroomingDefaultsFromProjectConfig(t *testing.T) {
+	runner := &recordingRunner{}
+	targetDir := t.TempDir()
+	projectConfig := `{"grooming":{"mode":"auto","require_plan_approval":true,"ask_questions":true,"auto_continue_after_plan":true,"max_questions":4,"max_rounds":2}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "issue", "--id", "20", "--dir", targetDir, "--project-config", "project.json"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	joined := strings.Join(runner.args, " ")
+	for _, want := range []string{"--grooming-mode auto", "--grooming-require-plan-approval", "--grooming-ask-questions", "--grooming-auto-continue-after-plan", "--grooming-max-questions 4", "--grooming-max-rounds 2"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("runner args = %#v, want %q", runner.args, want)
+		}
+	}
+}
+
+func TestRunIssueRejectsInvalidGroomingModeInProjectConfig(t *testing.T) {
+	runner := &recordingRunner{}
+	targetDir := t.TempDir()
+	projectConfig := `{"grooming":{"mode":"sometimes"}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "issue", "--id", "20", "--dir", targetDir, "--project-config", "project.json"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "unsupported grooming mode") {
+		t.Fatalf("stderr = %q, want grooming mode validation", errOut.String())
+	}
+}
+
+func TestRunIssueGroomingCLIOverridesProjectConfig(t *testing.T) {
+	runner := &recordingRunner{}
+	targetDir := t.TempDir()
+	projectConfig := `{"grooming":{"mode":"auto","max_questions":4}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+
+	code := app.Run([]string{"run", "issue", "--id", "20", "--dir", targetDir, "--project-config", "project.json", "--grooming-mode", "always", "--grooming-max-questions", "9"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if got := flagValue(runner.args, "--grooming-mode"); got != "always" {
+		t.Fatalf("grooming mode = %q, want always", got)
+	}
+	if got := flagValue(runner.args, "--grooming-max-questions"); got != "9" {
+		t.Fatalf("grooming max questions = %q, want 9", got)
+	}
+}
+
 func TestRunPRCommandFallsBackWithoutRepo(t *testing.T) {
 	runner := &recordingRunner{}
 	app := NewApp(&strings.Builder{}, &strings.Builder{})

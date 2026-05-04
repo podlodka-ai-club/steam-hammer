@@ -592,7 +592,7 @@ func (a *App) buildBatchWorkerLaunchCommand(ctx context.Context, opts commonOpti
 		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, false, true, false, "", false, "")}
 	}
 
-	if reason := nativeIssueFallbackReason(nativeIssueOptions{
+	if reason := nativeIssueWorkerDispatchFallbackReason(nativeIssueOptions{
 		issueID:              id,
 		common:               opts,
 		base:                 base,

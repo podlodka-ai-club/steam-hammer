@@ -78,6 +78,22 @@ func nativeIssueFallbackReason(opts nativeIssueOptions) string {
 	return ""
 }
 
+func nativeIssueWorkerDispatchFallbackReason(opts nativeIssueOptions) string {
+	if opts.detach {
+		return "--detach is not supported by the Go-native issue path yet"
+	}
+	if strings.TrimSpace(*opts.common.local) != "" {
+		return "--local-config is not supported by the Go-native issue path yet"
+	}
+	if tracker := strings.TrimSpace(*opts.common.tracker); tracker != "" && !strings.EqualFold(tracker, lifecycle.TrackerGitHub) {
+		return "native issue flow currently supports only the GitHub tracker"
+	}
+	if codehost := strings.TrimSpace(*opts.common.codehost); codehost != "" && !strings.EqualFold(codehost, lifecycle.CodeHostGitHub) {
+		return "native issue flow currently supports only the GitHub code host"
+	}
+	return ""
+}
+
 func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueOptions) (exitCode int) {
 	tracker := startNativeSessionTracker(opts.sessionPath, fmt.Sprintf("issue #%d", opts.issueID), strconv.Itoa(opts.issueID))
 	var latestState *orchestration.TrackedState

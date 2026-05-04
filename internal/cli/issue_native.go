@@ -453,7 +453,7 @@ func (a *App) runNativeIssue(ctx context.Context, repo string, opts nativeIssueO
 		if err := a.safePostIssueComment(ctx, repo, issue.Number, orchestration.BuildNoOpResultComment(explanation, nextAction)); err != nil {
 			_, _ = fmt.Fprintf(a.err, "orchestrator: warning: failed to post no-op explanation for issue #%d: %v\n", issue.Number, err)
 		}
-		status := orchestration.StatusBlocked
+		status := orchestration.StatusFailed
 		followUpAction := "inspect_noop_result"
 		if question != "" {
 			status = orchestration.StatusWaitingForAuthor

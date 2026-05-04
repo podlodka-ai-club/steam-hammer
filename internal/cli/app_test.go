@@ -1154,8 +1154,8 @@ func TestRunIssueNoopWithExplanationPersistsStructuredReason(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseOrchestrationStateCommentBody(final) error = %v", err)
 	}
-	if finalState.Status != orchestration.StatusBlocked || finalState.NextAction != "inspect_noop_result" {
-		t.Fatalf("final state = %#v, want blocked inspect_noop_result", finalState)
+	if finalState.Status != orchestration.StatusFailed || finalState.NextAction != "inspect_noop_result" {
+		t.Fatalf("final state = %#v, want failed inspect_noop_result", finalState)
 	}
 	if !strings.Contains(finalState.Error, "Feature appears already implemented") {
 		t.Fatalf("final error = %q, want persisted explanation", finalState.Error)
@@ -1214,6 +1214,61 @@ func TestRunIssueNoopWithoutExplanationFailsAsAgentQualityIssue(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), orchestration.NoOpResultMarker) {
 		t.Fatalf("stderr = %q, want missing marker guidance", errOut.String())
+	}
+}
+
+func TestRunIssueNoopWithQuestionPausesForAuthor(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 1},
+		{ExitCode: 2},
+		{},
+		{},
+		{Stdout: ""},
+		{Stdout: "\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+	}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{Output: strings.Join([]string{
+		"Done",
+		orchestration.NoOpResultMarker,
+		"```json",
+		`{"explanation":"I need one product decision before changing behavior","question":"Should we prefer retryable failure or explicit author pause for this edge case?"}`,
+		"```",
+	}, "\n")}}
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if len(lifecycle.commentBodies[71]) != 3 {
+		t.Fatalf("comment bodies = %d, want 3 (state + explanation + final state)", len(lifecycle.commentBodies[71]))
+	}
+	finalState, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][2])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody(final) error = %v", err)
+	}
+	if finalState.Status != orchestration.StatusWaitingForAuthor || finalState.NextAction != "await_author_reply" {
+		t.Fatalf("final state = %#v, want waiting-for-author await_author_reply", finalState)
+	}
+	if !strings.Contains(finalState.Error, "Question:") {
+		t.Fatalf("final error = %q, want persisted question", finalState.Error)
+	}
+	if !strings.Contains(out.String(), "posted clarification question and paused") {
+		t.Fatalf("stdout = %q, want clarification summary", out.String())
 	}
 }
 

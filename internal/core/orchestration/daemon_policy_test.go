@@ -266,6 +266,32 @@ func TestEvaluateDaemonTaskSelectionSkipsFailureUntilBackoffElapsed(t *testing.T
 	}
 }
 
+func TestEvaluateDaemonTaskSelectionNoopFailureRespectsBackoffThenBecomesRunnable(t *testing.T) {
+	policy := DaemonRetryPolicy{MaxAttempts: 3, Backoff: 5 * time.Minute}
+	snapshot := DaemonTaskSnapshot{
+		IssueNumber:          249,
+		LatestStateStatus:    StatusFailed,
+		LatestStateAttempt:   1,
+		LatestStateTimestamp: time.Date(2026, 5, 1, 11, 59, 0, 0, time.UTC),
+	}
+
+	waiting := EvaluateDaemonTaskSelection(snapshot, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC), policy)
+	if waiting.Eligible {
+		t.Fatalf("Eligible = true, want false")
+	}
+	if waiting.Status != DaemonSelectionStatusWaiting || waiting.Code != DaemonSelectionCodeRetryBackoff {
+		t.Fatalf("waiting decision status/code = %q/%q", waiting.Status, waiting.Code)
+	}
+
+	runnable := EvaluateDaemonTaskSelection(snapshot, time.Date(2026, 5, 1, 12, 6, 0, 0, time.UTC), policy)
+	if !runnable.Eligible {
+		t.Fatalf("Eligible = false, want true (%q)", runnable.Reason)
+	}
+	if runnable.Status != DaemonSelectionStatusRunnable || runnable.Code != DaemonSelectionCodeRunnable {
+		t.Fatalf("runnable decision status/code = %q/%q", runnable.Status, runnable.Code)
+	}
+}
+
 func TestEvaluateDaemonTaskSelectionSkipsRetryLimitReached(t *testing.T) {
 	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
 		IssueNumber:        249,

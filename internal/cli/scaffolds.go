@@ -104,6 +104,14 @@ const projectConfigScaffold = `{
   },
   "communication": {
     "verbosity": "normal"
+  },
+  "grooming": {
+    "mode": "off",
+    "require_plan_approval": false,
+    "ask_questions": false,
+    "auto_continue_after_plan": false,
+    "max_questions": 3,
+    "max_rounds": 2
   }
 }
 `

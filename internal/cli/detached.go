@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/orchestration"
 	"github.com/podlodka-ai-club/steam-hammer/internal/core/workers"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -219,6 +220,9 @@ func (a *App) runDetachedStatus(ctx context.Context, configuredRoot, name string
 	}
 	if state.Runner != "" || state.Agent != "" || state.Model != "" {
 		_, _ = fmt.Fprintf(a.out, "agent: runner=%s agent=%s model=%s\n", state.Runner, state.Agent, state.Model)
+	}
+	if state.Preset != "" || state.TrackTokens || state.TokenBudget > 0 || state.CostBudget > 0 {
+		_, _ = fmt.Fprintf(a.out, "policy: preset=%s track_tokens=%t token_budget=%d cost_budget_usd=%.4f\n", state.Preset, state.TrackTokens, state.TokenBudget, state.CostBudget)
 	}
 	_, _ = fmt.Fprintf(a.out, "log-progress: lines=%d\n", report.Log.Lines)
 	_, _ = fmt.Fprintf(a.out, "log-freshness: %s\n", detachedWorkerLogFreshness(report.Log))
@@ -573,6 +577,10 @@ func detachedWorkerStateFromOptions(name, mode, targetKind, targetID string, opt
 		Runner:      strings.TrimSpace(*opts.runner),
 		Agent:       strings.TrimSpace(*opts.agent),
 		Model:       strings.TrimSpace(*opts.model),
+		Preset:      strings.TrimSpace(*opts.preset),
+		TrackTokens: opts.trackTokens != nil && *opts.trackTokens,
+		TokenBudget: positiveIntPtrValue(opts.tokenBudget),
+		CostBudget:  positiveFloatPtrValue(opts.costBudget),
 		Command:     append([]string(nil), command...),
 		LogPath:     paths.LogPath,
 		SessionPath: paths.SessionPath,
@@ -581,6 +589,20 @@ func detachedWorkerStateFromOptions(name, mode, targetKind, targetID string, opt
 		PushRemote:  "",
 		WorkDir:     paths.WorkDir,
 	}
+}
+
+func positiveIntPtrValue(value *int) int {
+	if value != nil && *value > 0 {
+		return *value
+	}
+	return 0
+}
+
+func positiveFloatPtrValue(value *float64) float64 {
+	if value != nil && !math.IsNaN(*value) && *value > 0 {
+		return *value
+	}
+	return 0
 }
 
 func (a *App) detachedBatchStatus(ctx context.Context, batch detachedBatchMetadata) (*detachedBatchStatusReport, error) {

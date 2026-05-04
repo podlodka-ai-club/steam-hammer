@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"strconv"
 )
 
@@ -18,6 +19,9 @@ type commonOptions struct {
 	agent       *string
 	model       *string
 	preset      *string
+	trackTokens *bool
+	tokenBudget *int
+	costBudget  *float64
 	autoYes     *bool
 	branch      *string
 	dryRun      *bool
@@ -26,6 +30,63 @@ type commonOptions struct {
 	maxTry      *int
 	timeout     *int
 	idleTime    *int
+}
+
+func cloneCommonOptions(opts commonOptions) commonOptions {
+	return commonOptions{
+		mode:        stringPtrValue(opts.mode),
+		lightweight: boolPtrValue(opts.lightweight),
+		repo:        stringPtrValue(opts.repo),
+		tracker:     stringPtrValue(opts.tracker),
+		codehost:    stringPtrValue(opts.codehost),
+		dir:         stringPtrValue(opts.dir),
+		runner:      stringPtrValue(opts.runner),
+		agent:       stringPtrValue(opts.agent),
+		model:       stringPtrValue(opts.model),
+		preset:      stringPtrValue(opts.preset),
+		trackTokens: boolPtrValue(opts.trackTokens),
+		tokenBudget: intPtrValue(opts.tokenBudget),
+		costBudget:  floatPtrValue(opts.costBudget),
+		autoYes:     boolPtrValue(opts.autoYes),
+		branch:      stringPtrValue(opts.branch),
+		dryRun:      boolPtrValue(opts.dryRun),
+		local:       stringPtrValue(opts.local),
+		project:     stringPtrValue(opts.project),
+		maxTry:      intPtrValue(opts.maxTry),
+		timeout:     intPtrValue(opts.timeout),
+		idleTime:    intPtrValue(opts.idleTime),
+	}
+}
+
+func stringPtrValue(value *string) *string {
+	if value == nil {
+		return stringPtr("")
+	}
+	return stringPtr(*value)
+}
+
+func boolPtrValue(value *bool) *bool {
+	copy := false
+	if value != nil {
+		copy = *value
+	}
+	return &copy
+}
+
+func intPtrValue(value *int) *int {
+	copy := 0
+	if value != nil {
+		copy = *value
+	}
+	return &copy
+}
+
+func floatPtrValue(value *float64) *float64 {
+	copy := math.NaN()
+	if value != nil {
+		copy = *value
+	}
+	return &copy
 }
 
 func addCommonFlags(fs *flag.FlagSet, opts *commonOptions, runtime runtimeProvider) {
@@ -39,6 +100,10 @@ func addCommonFlags(fs *flag.FlagSet, opts *commonOptions, runtime runtimeProvid
 	opts.agent = fs.String("agent", "", "OpenCode agent name")
 	opts.model = fs.String("model", "", "optional model override")
 	opts.preset = fs.String("preset", "", "named project config preset")
+	opts.trackTokens = fs.Bool("track-tokens", false, "track token usage from runner output")
+	opts.tokenBudget = fs.Int("token-budget", 0, "abort when tracked token usage exceeds this limit")
+	costBudget := math.NaN()
+	opts.costBudget = &costBudget
 	opts.autoYes = fs.Bool("opencode-auto-approve", false, "allow OpenCode to skip interactive approvals")
 	opts.branch = fs.String("branch-prefix", "", "prefix for per-issue git branches")
 	opts.dryRun = fs.Bool("dry-run", false, "print actions without running the agent")
@@ -78,6 +143,12 @@ func appendCommonPythonArgs(args []string, opts commonOptions) []string {
 	}
 	if *opts.preset != "" {
 		args = append(args, "--preset", *opts.preset)
+	}
+	if *opts.trackTokens {
+		args = append(args, "--track-tokens")
+	}
+	if *opts.tokenBudget > 0 {
+		args = append(args, "--token-budget", strconv.Itoa(*opts.tokenBudget))
 	}
 	if *opts.autoYes {
 		args = append(args, "--opencode-auto-approve")

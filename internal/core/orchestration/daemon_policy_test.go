@@ -22,6 +22,9 @@ func TestEvaluateDaemonTaskSelectionSkipsWaitingForAuthorWithoutApprovedPlan(t *
 	if decision.Reason != "waiting for decomposition approval" {
 		t.Fatalf("Reason = %q", decision.Reason)
 	}
+	if decision.Status != DaemonSelectionStatusWaiting || decision.Code != DaemonSelectionCodeDecompositionPending {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
+	}
 	if decision.Signature != "decomposition:proposed" {
 		t.Fatalf("Signature = %q", decision.Signature)
 	}
@@ -38,6 +41,9 @@ func TestEvaluateDaemonTaskSelectionAllowsApprovedDecompositionRerun(t *testing.
 
 	if !decision.Eligible {
 		t.Fatalf("Eligible = false, want true (%q)", decision.Reason)
+	}
+	if decision.Status != DaemonSelectionStatusRunnable || decision.Code != DaemonSelectionCodeRunnable {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
 	}
 	if decision.Signature != "decomposition:approved" {
 		t.Fatalf("Signature = %q", decision.Signature)
@@ -61,6 +67,9 @@ func TestEvaluateDaemonTaskSelectionSkipsActiveForeignClaim(t *testing.T) {
 	}
 	if decision.Reason != "actively claimed by another daemon worker" {
 		t.Fatalf("Reason = %q", decision.Reason)
+	}
+	if decision.Status != DaemonSelectionStatusWaiting || decision.Code != DaemonSelectionCodeExistingClaim {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
 	}
 }
 
@@ -97,6 +106,9 @@ func TestEvaluateDaemonTaskSelectionSkipsAlreadyHandledSignature(t *testing.T) {
 	if decision.Reason != "already handled in this daemon session" {
 		t.Fatalf("Reason = %q", decision.Reason)
 	}
+	if decision.Status != DaemonSelectionStatusSkipped || decision.Code != DaemonSelectionCodeSessionDuplicate {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
+	}
 }
 
 func TestEvaluateDaemonTaskSelectionSkipsOpenDependencies(t *testing.T) {
@@ -112,6 +124,9 @@ func TestEvaluateDaemonTaskSelectionSkipsOpenDependencies(t *testing.T) {
 	if decision.Reason != "blocked by open dependencies: #326, #327" {
 		t.Fatalf("Reason = %q", decision.Reason)
 	}
+	if decision.Status != DaemonSelectionStatusBlocked || decision.Code != DaemonSelectionCodeOpenDependencies {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
+	}
 	if decision.Signature != "state:ready-for-review" {
 		t.Fatalf("Signature = %q", decision.Signature)
 	}
@@ -125,6 +140,53 @@ func TestEvaluateDaemonTaskSelectionAllowsClosedDependencies(t *testing.T) {
 
 	if !decision.Eligible {
 		t.Fatalf("Eligible = false, want true (%q)", decision.Reason)
+	}
+	if decision.Status != DaemonSelectionStatusRunnable || decision.Code != DaemonSelectionCodeRunnable {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionSkipsScopeMismatch(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:     249,
+		Tracker:         "jira",
+		ExpectedTracker: "github",
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if decision.Eligible {
+		t.Fatalf("Eligible = true, want false")
+	}
+	if decision.Status != DaemonSelectionStatusSkipped || decision.Code != DaemonSelectionCodeScopeMismatch {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionSkipsUnsupportedProvider(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber: 249,
+		Tracker:     "linear",
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if decision.Eligible {
+		t.Fatalf("Eligible = true, want false")
+	}
+	if decision.Status != DaemonSelectionStatusSkipped || decision.Code != DaemonSelectionCodeUnsupportedProvider {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionSkipsConfiguredRetryLimitReached(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:       249,
+		LatestStateStatus: StatusFailed,
+		RetryLimitReached: true,
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if decision.Eligible {
+		t.Fatalf("Eligible = true, want false")
+	}
+	if decision.Status != DaemonSelectionStatusSkipped || decision.Code != DaemonSelectionCodeAgentRetryLimit {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
 	}
 }
 

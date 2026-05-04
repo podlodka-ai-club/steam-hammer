@@ -22,6 +22,10 @@ type State struct {
 	Runner      string         `json:"runner,omitempty"`
 	Agent       string         `json:"agent,omitempty"`
 	Model       string         `json:"model,omitempty"`
+	Preset      string         `json:"preset,omitempty"`
+	TrackTokens bool           `json:"track_tokens,omitempty"`
+	TokenBudget int            `json:"token_budget,omitempty"`
+	CostBudget  float64        `json:"cost_budget_usd,omitempty"`
 	Command     []string       `json:"command"`
 	StartedAt   string         `json:"started_at"`
 	PID         int            `json:"pid"`

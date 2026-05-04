@@ -191,7 +191,8 @@ func (f *fakeDaemonLifecycle) CreateIssue(_ context.Context, req githublifecycle
 		return githublifecycle.Issue{}, f.createErr
 	}
 	if f.createIssue.Number == 0 {
-		f.createIssue = githublifecycle.Issue{Number: 164, URL: "https://github.com/owner/repo/issues/164"}
+		number := 163 + len(f.createdIssues)
+		return githublifecycle.Issue{Number: number, URL: "https://github.com/owner/repo/issues/" + strconv.Itoa(number)}, nil
 	}
 	return f.createIssue, nil
 }
@@ -493,6 +494,115 @@ func TestVerifyCommandCreatesFollowUpIssueFromGoRuntime(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "follow-up issue #164 created") {
 		t.Fatalf("stdout = %q, want created follow-up summary", out.String())
+	}
+}
+
+func TestVerifyCommandCreatesOneFollowUpPerFailedCheck(t *testing.T) {
+	repoDir := t.TempDir()
+	projectConfigPath := filepath.Join(repoDir, "project-config.json")
+	if err := os.WriteFile(projectConfigPath, []byte(`{"workflow":{"commands":{"test":"make test","lint":"make lint","build":"make build"}}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(project-config) error = %v", err)
+	}
+	sessionPath := filepath.Join(repoDir, "session.json")
+	if err := os.WriteFile(sessionPath, []byte(`{"processed_issues":{},"checkpoint":{"batch_index":2,"total_batches":3}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(session) error = %v", err)
+	}
+	var out strings.Builder
+	shell := &fakeShellExecutor{results: []shellExecutionResult{{Stderr: "test failure", ExitCode: 1}, {Stderr: "lint failure", ExitCode: 1}, {ExitCode: 0}}}
+	daemon := &fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{}}
+	app := NewApp(&out, &strings.Builder{})
+	app.SetShellExecutor(shell)
+	app.SetDaemonLifecycle(daemon)
+
+	code := app.Run([]string{"verify", "--repo", "owner/repo", "--tracker", "github", "--dir", repoDir, "--project-config", projectConfigPath, "--autonomous-session-file", sessionPath, "--create-followup-issue"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if len(daemon.createdIssues) != 2 {
+		t.Fatalf("created issues = %#v", daemon.createdIssues)
+	}
+	if daemon.createdIssues[0].Title != "Post-batch verification failed: test" || daemon.createdIssues[1].Title != "Post-batch verification failed: lint" {
+		t.Fatalf("created issue titles = %#v", daemon.createdIssues)
+	}
+	for _, want := range []string{"batch: 2/3", "session: `" + sessionPath + "`", "follow-up issues #164, #165 created"} {
+		if !strings.Contains(daemon.createdIssues[0].Body+out.String(), want) {
+			t.Fatalf("missing %q\nbody=%s\nout=%s", want, daemon.createdIssues[0].Body, out.String())
+		}
+	}
+	state, err := orchestration.LoadState(sessionPath)
+	if err != nil {
+		t.Fatalf("LoadState() error = %v", err)
+	}
+	if got := len(state.Checkpoint.Verification.FollowUpIssues); got != 2 {
+		t.Fatalf("persisted follow-up issues = %d, want 2", got)
+	}
+}
+
+func TestVerifyCommandSuppressesDuplicatePostBatchFollowUp(t *testing.T) {
+	repoDir := t.TempDir()
+	projectConfigPath := filepath.Join(repoDir, "project-config.json")
+	if err := os.WriteFile(projectConfigPath, []byte(`{"workflow":{"commands":{"test":"make test"}}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(project-config) error = %v", err)
+	}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{{Stderr: "test failure", ExitCode: 1}}}
+	daemon := &fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{{Number: 222, Title: "Post-batch verification failed: test", Body: "existing", URL: "https://github.com/owner/repo/issues/222", State: "OPEN"}},
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetShellExecutor(shell)
+	app.SetDaemonLifecycle(daemon)
+
+	code := app.Run([]string{"verify", "--repo", "owner/repo", "--tracker", "github", "--dir", repoDir, "--project-config", projectConfigPath, "--create-followup-issue"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if len(daemon.createdIssues) != 0 {
+		t.Fatalf("created issues = %#v, want none", daemon.createdIssues)
+	}
+}
+
+func TestVerifyCommandPassingChecksDoNotCreateFollowUp(t *testing.T) {
+	repoDir := t.TempDir()
+	projectConfigPath := filepath.Join(repoDir, "project-config.json")
+	if err := os.WriteFile(projectConfigPath, []byte(`{"workflow":{"commands":{"test":"make test","build":"make build"}}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(project-config) error = %v", err)
+	}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{{ExitCode: 0}, {ExitCode: 0}}}
+	daemon := &fakeDaemonLifecycle{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetShellExecutor(shell)
+	app.SetDaemonLifecycle(daemon)
+
+	code := app.Run([]string{"verify", "--repo", "owner/repo", "--tracker", "github", "--dir", repoDir, "--project-config", projectConfigPath, "--create-followup-issue"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if len(daemon.createdIssues) != 0 {
+		t.Fatalf("created issues = %#v, want none", daemon.createdIssues)
+	}
+}
+
+func TestVerifyCommandFollowUpUsesMissingLogsFallback(t *testing.T) {
+	repoDir := t.TempDir()
+	projectConfigPath := filepath.Join(repoDir, "project-config.json")
+	if err := os.WriteFile(projectConfigPath, []byte(`{"workflow":{"commands":{"test":"make test"}}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(project-config) error = %v", err)
+	}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{{ExitCode: 1}}}
+	daemon := &fakeDaemonLifecycle{}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetShellExecutor(shell)
+	app.SetDaemonLifecycle(daemon)
+
+	code := app.Run([]string{"verify", "--repo", "owner/repo", "--tracker", "github", "--dir", repoDir, "--project-config", projectConfigPath, "--create-followup-issue"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if len(daemon.createdIssues) != 1 {
+		t.Fatalf("created issues = %#v", daemon.createdIssues)
+	}
+	if !strings.Contains(daemon.createdIssues[0].Body, "no log excerpt was captured") {
+		t.Fatalf("issue body = %q", daemon.createdIssues[0].Body)
 	}
 }
 
@@ -2359,6 +2469,81 @@ func TestRunDaemonTreatsSelfDependencyAsBlocked(t *testing.T) {
 	}
 }
 
+func TestRunDaemonReportsQueueCapacityWaitingCandidates(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{{Number: 330}, {Number: 331}},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{
+			330: {},
+			331: {},
+		},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "2", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run", "--max-parallel-tasks", "1"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "daemon candidate issue #331: waiting (queue_capacity)") {
+		t.Fatalf("stderr = %q, want queue-capacity waiting reason", errOut.String())
+	}
+}
+
+func TestRunDaemonSkipsUnsupportedProviderCandidates(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{{Number: 330, Tracker: "linear"}},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{
+			330: {},
+		},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "unsupported_provider") {
+		t.Fatalf("stderr = %q, want unsupported provider reason code", errOut.String())
+	}
+}
+
+func TestRunDaemonSkipsIssueAfterAgentRetryLimitReached(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{{Number: 330}},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{
+			330: {
+				{Body: orchestration.OrchestrationStateMarker + "\n```json\n{\"status\":\"failed\",\"next_action\":\"inspect_retry_limit\",\"error\":\"retry limit reached\"}\n```"},
+			},
+		},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "agent_failed_retry_limit") {
+		t.Fatalf("stderr = %q, want retry-limit reason code", errOut.String())
+	}
+}
+
 func TestRunDaemonRejectsNonPositiveParallelism(t *testing.T) {
 	runner := &recordingRunner{}
 	var errOut strings.Builder
@@ -2447,6 +2632,121 @@ func TestRunDaemonDetachStartsOneWorkerPerParallelTask(t *testing.T) {
 		if !strings.Contains(printed, want) {
 			t.Fatalf("stdout = %q, want %q", printed, want)
 		}
+	}
+}
+
+func TestRunDaemonDetachPropagatesProjectPresetAndBudgets(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	cloner := &recordingBatchClonePreparer{}
+	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(execPath)
+	projectConfig := `{"defaults":{"preset":"default"},"presets":{"default":{"runner":"opencode","agent":"build","model":"openai/gpt-4o","track_tokens":true,"token_budget":20000}},"budgets":{"max_cost_usd":2.5}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--project-config", "project.json", "--allow-live-side-effects"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	joinedArgs := strings.Join(starter.req.Args, " ")
+	for _, want := range []string{"--preset default", "--runner opencode", "--agent build", "--model openai/gpt-4o", "--track-tokens", "--token-budget 20000"} {
+		if !strings.Contains(joinedArgs, want) {
+			t.Fatalf("worker args = %#v, want %q", starter.req.Args, want)
+		}
+	}
+	statePath := filepath.Join(targetDir, ".orchestrator", "workers", "daemon", "worker.json")
+	state, err := workers.ReadState(statePath)
+	if err != nil {
+		t.Fatalf("workers.ReadState(%q) error = %v", statePath, err)
+	}
+	if state.Preset != "default" || state.Runner != "opencode" || state.Agent != "build" || state.Model != "openai/gpt-4o" || !state.TrackTokens || state.TokenBudget != 20000 || state.CostBudget != 2.5 {
+		t.Fatalf("worker policy metadata = %#v", state)
+	}
+}
+
+func TestRunDaemonDetachKeepsCLIOverridesOverProjectPreset(t *testing.T) {
+	starter := &recordingDetachedStarter{pid: 31337}
+	cloner := &recordingBatchClonePreparer{}
+	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetDetachedStarter(starter)
+	app.SetBatchClonePreparer(cloner)
+	app.SetExecutablePath(execPath)
+	projectConfig := `{"defaults":{"preset":"default"},"presets":{"default":{"runner":"claude","model":"claude-sonnet-4-5","token_budget":20000},"hard":{"runner":"claude","model":"claude-opus-4-1","token_budget":40000}}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--detach", "--project-config", "project.json", "--preset", "hard", "--runner", "opencode", "--allow-live-side-effects"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	joinedArgs := strings.Join(starter.req.Args, " ")
+	for _, want := range []string{"--preset hard", "--runner opencode", "--model claude-opus-4-1", "--token-budget 40000"} {
+		if !strings.Contains(joinedArgs, want) {
+			t.Fatalf("worker args = %#v, want %q", starter.req.Args, want)
+		}
+	}
+	if strings.Contains(joinedArgs, "--runner claude") {
+		t.Fatalf("worker args = %#v, should keep explicit runner override", starter.req.Args)
+	}
+}
+
+func TestRunDaemonAppliesRoutedPresetPerSelectedIssue(t *testing.T) {
+	runner := &recordingRunner{}
+	targetDir := t.TempDir()
+	projectConfig := `{"routing":{"default_preset":"hard","rules":[{"when":{"labels":["docs"],"task_types":["issue"]},"preset":"cheap"}]},"presets":{"cheap":{"runner":"opencode","agent":"build","model":"openai/gpt-4o-mini","token_budget":8000},"hard":{"runner":"claude","agent":"build","model":"claude-opus-4-1","token_budget":40000}}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetBatchClonePreparer(&recordingBatchClonePreparer{})
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{issues: []githublifecycle.Issue{{Number: 71, Labels: []githublifecycle.Label{{Name: "docs"}}}}, commentsByIssue: map[int][]githublifecycle.IssueComment{}})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--project-config", "project.json", "--limit", "1", "--poll-interval-seconds", "1", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	joinedArgs := strings.Join(runner.args, " ")
+	for _, want := range []string{"--preset cheap", "--runner opencode", "--model openai/gpt-4o-mini", "--token-budget 8000"} {
+		if !strings.Contains(joinedArgs, want) {
+			t.Fatalf("runner args = %#v, want routed preset %q", runner.args, want)
+		}
+	}
+}
+
+func TestRunDaemonReportsMissingRoutedPreset(t *testing.T) {
+	runner := &recordingRunner{}
+	targetDir := t.TempDir()
+	var errOut strings.Builder
+	projectConfig := `{"routing":{"default_preset":"missing"},"presets":{"cheap":{"runner":"opencode"}}}`
+	if err := os.WriteFile(filepath.Join(targetDir, "project.json"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile(project.json) error = %v", err)
+	}
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetBatchClonePreparer(&recordingBatchClonePreparer{})
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{issues: []githublifecycle.Issue{{Number: 71}}, commentsByIssue: map[int][]githublifecycle.IssueComment{}})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--project-config", "project.json", "--limit", "1", "--poll-interval-seconds", "1", "--max-cycles", "1", "--dry-run"})
+	if code == 0 {
+		t.Fatalf("Run() code = %d, want failure", code)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if !strings.Contains(errOut.String(), "unknown preset \"missing\"") {
+		t.Fatalf("stderr = %q, want missing preset validation", errOut.String())
 	}
 }
 

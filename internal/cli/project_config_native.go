@@ -84,7 +84,7 @@ func loadNativeDaemonRetryPolicy(cwd, explicitPath string, maxAttempts int) (orc
 func nativeProjectCLIDefaults(projectConfig map[string]any) map[string]any {
 	defaults, _ := projectConfig["defaults"].(map[string]any)
 	cliDefaults := map[string]any{}
-	for _, key := range []string{"tracker", "codehost", "runner", "agent", "model", "preset", "agent_timeout_seconds", "agent_idle_timeout_seconds", "max_attempts"} {
+	for _, key := range []string{"tracker", "codehost", "runner", "agent", "model", "preset", "track_tokens", "token_budget", "agent_timeout_seconds", "agent_idle_timeout_seconds", "max_attempts"} {
 		if value, ok := defaults[key]; ok {
 			cliDefaults[key] = value
 		}
@@ -111,7 +111,7 @@ func nativePresetCLIDefaults(projectConfig map[string]any, presetName string) (m
 		return nil, fmt.Errorf("project config key presets.%s must be an object", presetName)
 	}
 	cliDefaults := map[string]any{"preset": presetName}
-	for _, key := range []string{"runner", "agent", "model", "agent_timeout_seconds", "agent_idle_timeout_seconds", "max_attempts"} {
+	for _, key := range []string{"runner", "agent", "model", "track_tokens", "token_budget", "agent_timeout_seconds", "agent_idle_timeout_seconds", "max_attempts"} {
 		if value, ok := presetConfig[key]; ok {
 			cliDefaults[key] = value
 		}
@@ -126,6 +126,8 @@ func applyNativeCommonDefaults(opts *commonOptions, fs flagState, defaults map[s
 	setStringDefault(opts.agent, fs, "agent", defaults["agent"])
 	setStringDefault(opts.model, fs, "model", defaults["model"])
 	setStringDefault(opts.preset, fs, "preset", defaults["preset"])
+	setBoolDefault(opts.trackTokens, fs, "track-tokens", defaults["track_tokens"])
+	setIntDefault(opts.tokenBudget, fs, "token-budget", defaults["token_budget"])
 	setIntDefault(opts.maxTry, fs, "max-attempts", defaults["max_attempts"])
 	setIntDefault(opts.timeout, fs, "agent-timeout-seconds", defaults["agent_timeout_seconds"])
 	setIntDefault(opts.idleTime, fs, "agent-idle-timeout-seconds", defaults["agent_idle_timeout_seconds"])
@@ -153,6 +155,20 @@ func applyNativeBudgetCaps(opts *commonOptions, projectConfig map[string]any) {
 			*opts.timeout = capSeconds
 		}
 	}
+	if cost := positiveConfigFloat(budgets["max_cost_usd"]); cost > 0 && opts.costBudget != nil {
+		*opts.costBudget = cost
+	}
+}
+
+func applyNativePresetToOptions(opts commonOptions, fs flagState, projectConfig map[string]any, presetName string) (commonOptions, error) {
+	updated := cloneCommonOptions(opts)
+	presetDefaults, err := nativePresetCLIDefaults(projectConfig, presetName)
+	if err != nil {
+		return commonOptions{}, err
+	}
+	applyNativeCommonDefaults(&updated, fs, presetDefaults)
+	applyNativeBudgetCaps(&updated, projectConfig)
+	return updated, nil
 }
 
 func capNativePresetToBudgetTier(projectConfig map[string]any, presetName, maxTier string) string {
@@ -199,6 +215,15 @@ func setIntDefault(target *int, fs flagState, name string, value any) {
 		return
 	}
 	if normalized := positiveConfigInt(value); normalized > 0 {
+		*target = normalized
+	}
+}
+
+func setBoolDefault(target *bool, fs flagState, name string, value any) {
+	if target == nil || (fs != nil && fs.wasPassed(name)) {
+		return
+	}
+	if normalized, ok := value.(bool); ok {
 		*target = normalized
 	}
 }
@@ -253,4 +278,18 @@ func optionalConfigDuration(value any) time.Duration {
 		return 0
 	}
 	return duration
+}
+
+func positiveConfigFloat(value any) float64 {
+	switch typed := value.(type) {
+	case int:
+		if typed > 0 {
+			return float64(typed)
+		}
+	case float64:
+		if typed > 0 {
+			return typed
+		}
+	}
+	return 0
 }

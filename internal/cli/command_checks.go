@@ -217,6 +217,7 @@ func (a *App) runVerify(ctx context.Context, args []string) int {
 	opts := commonOptions{}
 	addCommonFlags(fs, &opts, a.runtime)
 	createFollowupIssue := fs.Bool("create-followup-issue", false, a.runtime.FollowUpIssueFlagDescription("verification"))
+	autonomousSessionFile := fs.String("autonomous-session-file", "", "read/write daemon batch verification status from a session checkpoint file")
 
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -226,7 +227,7 @@ func (a *App) runVerify(ctx context.Context, args []string) int {
 		return 2
 	}
 
-	verification, err := a.runPostBatchVerification(ctx, opts, *createFollowupIssue, "")
+	verification, err := a.runPostBatchVerification(ctx, opts, *createFollowupIssue, strings.TrimSpace(*autonomousSessionFile))
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			_, _ = fmt.Fprintln(a.err, "orchestrator: verification timed out")

@@ -347,6 +347,50 @@ type daemonSelectedIssue struct {
 	issueID    int
 	signature  string
 	workerName string
+	opts       commonOptions
+}
+
+func daemonSelectionOutcome(issueNumber int, decision orchestration.DaemonTaskDecision) string {
+	status := strings.TrimSpace(decision.Status)
+	if status == "" {
+		if decision.Eligible {
+			status = orchestration.DaemonSelectionStatusRunnable
+		} else {
+			status = orchestration.DaemonSelectionStatusSkipped
+		}
+	}
+	code := strings.TrimSpace(decision.Code)
+	if code == "" {
+		code = "unspecified"
+	}
+	reason := strings.TrimSpace(decision.Reason)
+	if reason == "" && decision.Eligible {
+		reason = "eligible for execution"
+	}
+	if reason == "" {
+		reason = "no reason provided"
+	}
+	return fmt.Sprintf("orchestrator: daemon candidate issue #%d: %s (%s) - %s", issueNumber, status, code, reason)
+}
+
+func daemonRetryLimitReached(state *orchestration.ParsedTrackerComment[orchestration.TrackedState]) bool {
+	if state == nil {
+		return false
+	}
+	payload := state.Payload
+	if !strings.EqualFold(strings.TrimSpace(payload.Status), orchestration.StatusFailed) {
+		return false
+	}
+
+	nextAction := strings.ToLower(strings.TrimSpace(payload.NextAction))
+	errorText := strings.ToLower(strings.TrimSpace(payload.Error))
+	if strings.Contains(nextAction, "retry") && strings.Contains(nextAction, "limit") {
+		return true
+	}
+	if strings.Contains(errorText, "retry limit") {
+		return true
+	}
+	return false
 }
 
 func loadDaemonHandledState(sessionPath string) daemonHandledState {
@@ -450,6 +494,7 @@ type daemonParallelConfig struct {
 	retryPolicy          orchestration.DaemonRetryPolicy
 	effectiveMaxCycles   int
 	pollIntervalSeconds  int
+	projectConfig        map[string]any
 }
 
 type daemonParallelPreparedWorker struct {
@@ -582,7 +627,13 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 	now := time.Now().UTC()
 	for _, issue := range issues {
 		if len(selected) >= config.maxParallelTasks {
-			break
+			decision := orchestration.DaemonTaskDecision{
+				Status: orchestration.DaemonSelectionStatusWaiting,
+				Code:   "queue_capacity",
+				Reason: fmt.Sprintf("waiting for free worker slot (%d/%d active this cycle)", len(selected), config.maxParallelTasks),
+			}
+			_, _ = fmt.Fprintln(a.err, daemonSelectionOutcome(issue.Number, decision))
+			continue
 		}
 		if _, ok := seen[issue.Number]; ok {
 			continue
@@ -606,9 +657,12 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 
 		snapshot := orchestration.DaemonTaskSnapshot{
 			IssueNumber:          issue.Number,
+			Tracker:              issue.Tracker,
+			ExpectedTracker:      strings.TrimSpace(*config.opts.tracker),
 			RunID:                config.runID,
 			ForceReprocess:       config.forceReprocess,
 			LastHandledSignature: handled.signatures[issue.Number],
+			RetryLimitReached:    daemonRetryLimitReached(latestState),
 		}
 		if conflictSignal, err := a.daemonPRConflictRecoverySignal(ctx, strings.TrimSpace(*config.opts.repo), issue); err != nil {
 			return nil, err
@@ -643,16 +697,19 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 		}
 		snapshot.OpenDependencyRefs = openDependencies
 		decision := orchestration.EvaluateDaemonTaskSelection(snapshot, now, config.retryPolicy)
+		_, _ = fmt.Fprintln(a.err, daemonSelectionOutcome(issue.Number, decision))
 		if !decision.Eligible {
-			if decision.Reason != "" {
-				_, _ = fmt.Fprintf(a.err, "orchestrator: skipping issue #%d: %s\n", issue.Number, decision.Reason)
-			}
 			continue
+		}
+		workerOpts, err := resolveDaemonIssueOptions(config.opts, config.flags, config.projectConfig, issue, latestDecomposition != nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve daemon policy for issue #%d: %w", issue.Number, err)
 		}
 		selected = append(selected, daemonSelectedIssue{
 			issueID:    issue.Number,
 			signature:  decision.Signature,
 			workerName: daemonWorkerName(len(selected) + 1),
+			opts:       workerOpts,
 		})
 		seen[issue.Number] = struct{}{}
 	}
@@ -716,6 +773,119 @@ func (a *App) openDaemonIssueDependencies(ctx context.Context, repo string, issu
 		}
 	}
 	return openRefs, nil
+}
+
+func resolveDaemonIssueOptions(base commonOptions, fs flagState, projectConfig map[string]any, issue corelifecycle.Issue, needsDecomposition bool) (commonOptions, error) {
+	if len(projectConfig) == 0 || (fs != nil && fs.wasPassed("preset")) {
+		return cloneCommonOptions(base), nil
+	}
+	preset := chooseNativeRoutedPreset(projectConfig, issue, "issue", true, needsDecomposition)
+	if preset == "" {
+		return cloneCommonOptions(base), nil
+	}
+	return applyNativePresetToOptions(base, fs, projectConfig, preset)
+}
+
+func chooseNativeRoutedPreset(projectConfig map[string]any, issue corelifecycle.Issue, taskType string, scopeEligible, needsDecomposition bool) string {
+	routing, _ := projectConfig["routing"].(map[string]any)
+	if len(routing) > 0 {
+		rules, _ := routing["rules"].([]any)
+		for _, rawRule := range rules {
+			rule, _ := rawRule.(map[string]any)
+			when, _ := rule["when"].(map[string]any)
+			if len(rule) == 0 || len(when) == 0 {
+				continue
+			}
+			if matchesNativeRoutingRule(when, issue, taskType, scopeEligible, needsDecomposition) {
+				if preset := optionalConfigString(rule["preset"]); preset != "" {
+					return preset
+				}
+			}
+		}
+		if preset := optionalConfigString(routing["default_preset"]); preset != "" {
+			return preset
+		}
+	}
+	presets, _ := projectConfig["presets"].(map[string]any)
+	if len(presets) == 0 {
+		return ""
+	}
+	if needsDecomposition {
+		if _, ok := presets["hard"]; ok {
+			return "hard"
+		}
+	}
+	for _, candidate := range []string{"cheap", "default", "hard"} {
+		if _, ok := presets[candidate]; ok {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func matchesNativeRoutingRule(when map[string]any, issue corelifecycle.Issue, taskType string, scopeEligible, needsDecomposition bool) bool {
+	if labels := configStringList(when["labels"]); len(labels) > 0 {
+		issueLabels := map[string]struct{}{}
+		for _, label := range issue.Labels {
+			name := strings.ToLower(strings.TrimSpace(label.Name))
+			if name != "" {
+				issueLabels[name] = struct{}{}
+			}
+		}
+		matched := false
+		for _, label := range labels {
+			if _, ok := issueLabels[strings.ToLower(label)]; ok {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	if taskTypes := configStringList(when["task_types"]); len(taskTypes) > 0 {
+		matched := false
+		for _, candidate := range taskTypes {
+			if strings.EqualFold(strings.TrimSpace(candidate), strings.TrimSpace(taskType)) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	switch strings.ToLower(optionalConfigString(when["scope"])) {
+	case "in":
+		if !scopeEligible {
+			return false
+		}
+	case "out":
+		if scopeEligible {
+			return false
+		}
+	}
+	if value, ok := when["needs_decomposition"].(bool); ok && value != needsDecomposition {
+		return false
+	}
+	return true
+}
+
+func configStringList(value any) []string {
+	raw, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	items := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if text, ok := item.(string); ok {
+			text = strings.TrimSpace(text)
+			if text != "" {
+				items = append(items, text)
+			}
+		}
+	}
+	return items
 }
 
 func (a *App) daemonPRConflictRecoverySignal(ctx context.Context, repo string, issue corelifecycle.Issue) (string, error) {
@@ -870,7 +1040,7 @@ func daemonPayloadString(payload map[string]any, key string) string {
 }
 
 func (a *App) prepareParallelDaemonWorker(ctx context.Context, config daemonParallelConfig, issue daemonSelectedIssue, sessionPath string) (daemonParallelPreparedWorker, error) {
-	workerOpts := config.opts
+	workerOpts := issue.opts
 	if config.detach {
 		workerPaths, err := resolveDetachedWorkerPaths(config.workerDir, *config.opts.dir, "daemon", strings.TrimPrefix(issue.workerName, "daemon-"))
 		if err != nil {
@@ -1105,7 +1275,7 @@ func (a *App) runSerialDaemon(ctx context.Context, config daemonParallelConfig) 
 			cycleCode := 0
 			for _, issue := range selected {
 				handled.signatures[issue.issueID] = issue.signature
-				command := a.buildBatchWorkerLaunchCommand(ctx, config.opts, issue.issueID, config.base, config.includeEmpty, config.stopOnError, config.failOnExisting, config.forceIssueFlow, config.skipIfPRExists, config.noSkipIfPRExists, config.skipIfBranchExists, config.noSkipIfBranchExists, config.forceReprocess, false, config.syncReusedBranch, config.noSyncReusedBranch, config.syncStrategy, config.flags)
+				command := a.buildBatchWorkerLaunchCommand(ctx, issue.opts, issue.issueID, config.base, config.includeEmpty, config.stopOnError, config.failOnExisting, config.forceIssueFlow, config.skipIfPRExists, config.noSkipIfPRExists, config.skipIfBranchExists, config.noSkipIfBranchExists, config.forceReprocess, false, config.syncReusedBranch, config.noSyncReusedBranch, config.syncStrategy, config.flags)
 				if command.fallbackReason != "" {
 					_, _ = fmt.Fprintf(a.err, "orchestrator: falling back to python worker for issue #%d: %s\n", issue.issueID, command.fallbackReason)
 				}
@@ -1245,6 +1415,11 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		return 1
 	}
 	retryPolicy, err := loadNativeDaemonRetryPolicy(*opts.dir, *opts.project, *opts.maxTry)
+	if err != nil {
+		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
+		return 1
+	}
+	projectConfig, err := loadNativeProjectConfig(*opts.dir, *opts.project)
 	if err != nil {
 		_, _ = fmt.Fprintf(a.err, "orchestrator: %v\n", err)
 		return 1
@@ -1414,6 +1589,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 			retryPolicy:          retryPolicy,
 			effectiveMaxCycles:   effectiveMaxCycles,
 			pollIntervalSeconds:  *pollIntervalSeconds,
+			projectConfig:        projectConfig,
 		})
 	}
 	return a.runSerialDaemon(ctx, daemonParallelConfig{
@@ -1443,6 +1619,7 @@ func (a *App) runDaemon(ctx context.Context, args []string) int {
 		retryPolicy:          retryPolicy,
 		effectiveMaxCycles:   effectiveMaxCycles,
 		pollIntervalSeconds:  *pollIntervalSeconds,
+		projectConfig:        projectConfig,
 	})
 }
 

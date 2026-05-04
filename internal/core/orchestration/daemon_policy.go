@@ -14,9 +14,12 @@ const (
 
 type DaemonTaskSnapshot struct {
 	IssueNumber          int
+	Tracker              string
+	ExpectedTracker      string
 	RunID                string
 	ForceReprocess       bool
 	FailureLabels        []string
+	RetryLimitReached    bool
 	PRConflictSignal     string
 	ReviewFeedbackSignal string
 	LatestStateStatus    string
@@ -35,11 +38,36 @@ type DaemonRetryPolicy struct {
 }
 
 type DaemonTaskDecision struct {
-	Eligible       bool
-	Reason         string
-	Signature      string
+	Eligible  bool
+	Status    string
+	Code      string
+	Reason    string
+	Signature string
+
 	NextEligibleAt time.Time
 }
+
+const (
+	DaemonSelectionStatusRunnable = "runnable"
+	DaemonSelectionStatusSkipped  = "skipped"
+	DaemonSelectionStatusBlocked  = "blocked"
+	DaemonSelectionStatusWaiting  = "waiting"
+)
+
+const (
+	DaemonSelectionCodeRunnable                 = "runnable"
+	DaemonSelectionCodeOpenDependencies         = "open_dependencies"
+	DaemonSelectionCodeSessionDuplicate         = "session_duplicate"
+	DaemonSelectionCodeExistingClaim            = "existing_claim"
+	DaemonSelectionCodeDecompositionPending     = "decomposition_pending"
+	DaemonSelectionCodeDecompositionChildIssued = "decomposition_children_created"
+	DaemonSelectionCodeBlockedState             = "blocked_state"
+	DaemonSelectionCodeWaitingForAuthor         = "waiting_for_author"
+	DaemonSelectionCodeRetryBackoff             = "retry_backoff"
+	DaemonSelectionCodeScopeMismatch            = "scope_mismatch"
+	DaemonSelectionCodeAgentRetryLimit          = "agent_failed_retry_limit"
+	DaemonSelectionCodeUnsupportedProvider      = "unsupported_provider"
+)
 
 func EvaluateDaemonTaskSelection(snapshot DaemonTaskSnapshot, now time.Time, retryPolicy ...DaemonRetryPolicy) DaemonTaskDecision {
 	signature := daemonTaskSignature(snapshot)
@@ -47,21 +75,33 @@ func EvaluateDaemonTaskSelection(snapshot DaemonTaskSnapshot, now time.Time, ret
 		signature = "state:new"
 	}
 
+	tracker := strings.ToLower(strings.TrimSpace(snapshot.Tracker))
+	expectedTracker := strings.ToLower(strings.TrimSpace(snapshot.ExpectedTracker))
+	if expectedTracker != "" && tracker != "" && tracker != expectedTracker {
+		return DaemonTaskDecision{Status: DaemonSelectionStatusSkipped, Code: DaemonSelectionCodeScopeMismatch, Reason: "scope mismatch: tracker " + tracker + " does not match --tracker=" + expectedTracker, Signature: signature}
+	}
+	if tracker != "" && tracker != "github" {
+		return DaemonTaskDecision{Status: DaemonSelectionStatusSkipped, Code: DaemonSelectionCodeUnsupportedProvider, Reason: "unsupported provider for daemon selection: " + tracker, Signature: signature}
+	}
+	if snapshot.RetryLimitReached {
+		return DaemonTaskDecision{Status: DaemonSelectionStatusSkipped, Code: DaemonSelectionCodeAgentRetryLimit, Reason: "agent failed retry limit reached", Signature: signature}
+	}
+
 	if len(snapshot.OpenDependencyRefs) > 0 {
-		return DaemonTaskDecision{Reason: "blocked by open dependencies: " + formatDependencyRefs(snapshot.OpenDependencyRefs), Signature: signature}
+		return DaemonTaskDecision{Status: DaemonSelectionStatusBlocked, Code: DaemonSelectionCodeOpenDependencies, Reason: "blocked by open dependencies: " + formatDependencyRefs(snapshot.OpenDependencyRefs), Signature: signature}
 	}
 	if snapshot.LastHandledSignature != "" && snapshot.LastHandledSignature == signature {
-		return DaemonTaskDecision{Reason: "already handled in this daemon session", Signature: signature}
+		return DaemonTaskDecision{Status: DaemonSelectionStatusSkipped, Code: DaemonSelectionCodeSessionDuplicate, Reason: "already handled in this daemon session", Signature: signature}
 	}
 
 	claimStatus := normalizePayloadStatus(snapshot.LatestClaim, "status")
 	claimRunID := strings.TrimSpace(payloadString(snapshot.LatestClaim, "run_id"))
 	if claimStatus == DaemonClaimStatusClaimed {
 		if claimRunID == strings.TrimSpace(snapshot.RunID) {
-			return DaemonTaskDecision{Reason: "already claimed by this daemon run", Signature: signature}
+			return DaemonTaskDecision{Status: DaemonSelectionStatusWaiting, Code: DaemonSelectionCodeExistingClaim, Reason: "already claimed by this daemon run", Signature: signature}
 		}
 		if daemonClaimActive(snapshot.LatestClaim, now) {
-			return DaemonTaskDecision{Reason: "actively claimed by another daemon worker", Signature: signature}
+			return DaemonTaskDecision{Status: DaemonSelectionStatusWaiting, Code: DaemonSelectionCodeExistingClaim, Reason: "actively claimed by another daemon worker", Signature: signature}
 		}
 	}
 
@@ -75,23 +115,23 @@ func EvaluateDaemonTaskSelection(snapshot DaemonTaskSnapshot, now time.Time, ret
 
 		switch decompositionStatus {
 		case "proposed":
-			return DaemonTaskDecision{Reason: "waiting for decomposition approval", Signature: signature}
+			return DaemonTaskDecision{Status: DaemonSelectionStatusWaiting, Code: DaemonSelectionCodeDecompositionPending, Reason: "waiting for decomposition approval", Signature: signature}
 		case "children_created":
-			return DaemonTaskDecision{Reason: "parent issue already decomposed into child issues", Signature: signature}
+			return DaemonTaskDecision{Status: DaemonSelectionStatusSkipped, Code: DaemonSelectionCodeDecompositionChildIssued, Reason: "parent issue already decomposed into child issues", Signature: signature}
 		}
 
 		switch stateStatus {
 		case StatusBlocked:
-			return DaemonTaskDecision{Reason: "latest issue state is blocked", Signature: signature}
+			return DaemonTaskDecision{Status: DaemonSelectionStatusBlocked, Code: DaemonSelectionCodeBlockedState, Reason: "latest issue state is blocked", Signature: signature}
 		case StatusWaitingForAuthor:
 			if decompositionStatus == "approved" {
-				return DaemonTaskDecision{Eligible: true, Signature: signature}
+				return DaemonTaskDecision{Eligible: true, Status: DaemonSelectionStatusRunnable, Code: DaemonSelectionCodeRunnable, Signature: signature}
 			}
-			return DaemonTaskDecision{Reason: "latest issue state is waiting-for-author", Signature: signature}
+			return DaemonTaskDecision{Status: DaemonSelectionStatusWaiting, Code: DaemonSelectionCodeWaitingForAuthor, Reason: "latest issue state is waiting-for-author", Signature: signature}
 		}
 	}
 
-	return DaemonTaskDecision{Eligible: true, Signature: signature}
+	return DaemonTaskDecision{Eligible: true, Status: DaemonSelectionStatusRunnable, Code: DaemonSelectionCodeRunnable, Signature: signature}
 }
 
 func firstRetryPolicy(policies []DaemonRetryPolicy) DaemonRetryPolicy {
@@ -110,14 +150,14 @@ func evaluateDaemonRetryPolicy(snapshot DaemonTaskSnapshot, stateStatus, signatu
 		attempt = 1
 	}
 	if policy.MaxAttempts > 0 && attempt >= policy.MaxAttempts {
-		return DaemonTaskDecision{Reason: fmt.Sprintf("retry limit reached after %d/%d attempts", attempt, policy.MaxAttempts), Signature: signature}
+		return DaemonTaskDecision{Status: DaemonSelectionStatusSkipped, Code: DaemonSelectionCodeAgentRetryLimit, Reason: fmt.Sprintf("retry limit reached after %d/%d attempts", attempt, policy.MaxAttempts), Signature: signature}
 	}
 	if policy.Backoff <= 0 || snapshot.LatestStateTimestamp.IsZero() {
 		return DaemonTaskDecision{Eligible: true, Signature: signature}
 	}
 	nextEligibleAt := snapshot.LatestStateTimestamp.Add(policy.Backoff).UTC()
 	if now.Before(nextEligibleAt) {
-		return DaemonTaskDecision{Reason: "retry backoff has not elapsed; next eligible at " + nextEligibleAt.Format(time.RFC3339), Signature: signature, NextEligibleAt: nextEligibleAt}
+		return DaemonTaskDecision{Status: DaemonSelectionStatusWaiting, Code: DaemonSelectionCodeRetryBackoff, Reason: "retry backoff has not elapsed; next eligible at " + nextEligibleAt.Format(time.RFC3339), Signature: signature, NextEligibleAt: nextEligibleAt}
 	}
 	return DaemonTaskDecision{Eligible: true, Signature: signature}
 }

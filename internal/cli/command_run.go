@@ -612,6 +612,7 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 	if err != nil {
 		return nil, err
 	}
+	scopeAllow, scopeDeny := projectScopeLabelRules(config.projectConfig)
 	selected := make([]daemonSelectedIssue, 0, config.maxParallelTasks)
 	seen := make(map[int]struct{}, config.maxParallelTasks)
 	now := time.Now().UTC()
@@ -649,6 +650,8 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 			IssueNumber:          issue.Number,
 			Tracker:              issue.Tracker,
 			ExpectedTracker:      strings.TrimSpace(*config.opts.tracker),
+			ScopeLabelAllow:      scopeAllow,
+			ScopeLabelDeny:       scopeDeny,
 			RunID:                config.runID,
 			ForceReprocess:       config.forceReprocess,
 			LastHandledSignature: handled.signatures[issue.Number],
@@ -678,6 +681,7 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 		}
 		for _, label := range issue.Labels {
 			snapshot.FailureLabels = append(snapshot.FailureLabels, label.Name)
+			snapshot.IssueLabels = append(snapshot.IssueLabels, label.Name)
 		}
 		if latestClaim != nil {
 			snapshot.LatestClaim = latestClaim.Payload
@@ -708,6 +712,13 @@ func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfi
 		seen[issue.Number] = struct{}{}
 	}
 	return selected, nil
+}
+
+func projectScopeLabelRules(projectConfig map[string]any) (allow []string, deny []string) {
+	scope, _ := projectConfig["scope"].(map[string]any)
+	defaults, _ := scope["defaults"].(map[string]any)
+	labels, _ := defaults["labels"].(map[string]any)
+	return configStringList(labels["allow"]), configStringList(labels["deny"])
 }
 
 func daemonCandidateScanLimit(config daemonParallelConfig) int {

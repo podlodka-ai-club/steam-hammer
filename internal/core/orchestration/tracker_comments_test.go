@@ -156,3 +156,34 @@ func TestLatestClarificationRequestFromAgentOutputIgnoresMalformedPayload(t *tes
 		t.Fatalf("LatestClarificationRequestFromAgentOutput() = %#v, want nil", payload)
 	}
 }
+
+func TestParseNoOpResultText(t *testing.T) {
+	body := strings.Join([]string{
+		"No-op explanation",
+		NoOpResultMarker,
+		"```json",
+		`{"explanation":"Already implemented in internal/cli/issue_native.go","next_action":"run go test ./..."}`,
+		"```",
+	}, "\n")
+
+	payload, err := ParseNoOpResultText(body)
+	if err != nil {
+		t.Fatalf("ParseNoOpResultText() error = %v", err)
+	}
+	if payload["explanation"] != "Already implemented in internal/cli/issue_native.go" {
+		t.Fatalf("explanation = %#v, want normalized value", payload["explanation"])
+	}
+}
+
+func TestLatestNoOpResultFromAgentOutputIgnoresMalformedPayload(t *testing.T) {
+	body := strings.Join([]string{
+		NoOpResultMarker,
+		"```json",
+		`{"explanation":"   "}`,
+		"```",
+	}, "\n")
+
+	if payload := LatestNoOpResultFromAgentOutput(body); payload != nil {
+		t.Fatalf("LatestNoOpResultFromAgentOutput() = %#v, want nil", payload)
+	}
+}

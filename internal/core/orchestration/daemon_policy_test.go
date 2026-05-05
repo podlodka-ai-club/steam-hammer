@@ -161,6 +161,59 @@ func TestEvaluateDaemonTaskSelectionSkipsScopeMismatch(t *testing.T) {
 	}
 }
 
+func TestEvaluateDaemonTaskSelectionSkipsWhenAllowLabelMissing(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:     249,
+		IssueLabels:     []string{"bug"},
+		ScopeLabelAllow: []string{"demo"},
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if decision.Eligible {
+		t.Fatalf("Eligible = true, want false")
+	}
+	if decision.Status != DaemonSelectionStatusSkipped || decision.Code != DaemonSelectionCodeScopeLabelMismatch {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
+	}
+	if !strings.Contains(decision.Reason, "scope label mismatch") {
+		t.Fatalf("Reason = %q", decision.Reason)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionAllowsWhenAllowLabelPresent(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:       249,
+		IssueLabels:       []string{"demo"},
+		ScopeLabelAllow:   []string{"demo"},
+		LatestStateStatus: StatusReadyForReview,
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if !decision.Eligible {
+		t.Fatalf("Eligible = false, want true (%q)", decision.Reason)
+	}
+	if decision.Status != DaemonSelectionStatusRunnable || decision.Code != DaemonSelectionCodeRunnable {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionSkipsDeniedLabelEvenWhenAllowMatched(t *testing.T) {
+	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
+		IssueNumber:     249,
+		IssueLabels:     []string{"demo", "human discussion"},
+		ScopeLabelAllow: []string{"demo"},
+		ScopeLabelDeny:  []string{"human discussion"},
+	}, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	if decision.Eligible {
+		t.Fatalf("Eligible = true, want false")
+	}
+	if decision.Status != DaemonSelectionStatusSkipped || decision.Code != DaemonSelectionCodeDeniedByLabel {
+		t.Fatalf("decision status/code = %q/%q", decision.Status, decision.Code)
+	}
+	if !strings.Contains(decision.Reason, "denied by label") {
+		t.Fatalf("Reason = %q", decision.Reason)
+	}
+}
+
 func TestEvaluateDaemonTaskSelectionSkipsUnsupportedProvider(t *testing.T) {
 	decision := EvaluateDaemonTaskSelection(DaemonTaskSnapshot{
 		IssueNumber: 249,
@@ -263,6 +316,32 @@ func TestEvaluateDaemonTaskSelectionSkipsFailureUntilBackoffElapsed(t *testing.T
 	}
 	if !strings.Contains(decision.Reason, "next eligible at 2026-05-01T12:04:00Z") {
 		t.Fatalf("Reason = %q", decision.Reason)
+	}
+}
+
+func TestEvaluateDaemonTaskSelectionNoopFailureRespectsBackoffThenBecomesRunnable(t *testing.T) {
+	policy := DaemonRetryPolicy{MaxAttempts: 3, Backoff: 5 * time.Minute}
+	snapshot := DaemonTaskSnapshot{
+		IssueNumber:          249,
+		LatestStateStatus:    StatusFailed,
+		LatestStateAttempt:   1,
+		LatestStateTimestamp: time.Date(2026, 5, 1, 11, 59, 0, 0, time.UTC),
+	}
+
+	waiting := EvaluateDaemonTaskSelection(snapshot, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC), policy)
+	if waiting.Eligible {
+		t.Fatalf("Eligible = true, want false")
+	}
+	if waiting.Status != DaemonSelectionStatusWaiting || waiting.Code != DaemonSelectionCodeRetryBackoff {
+		t.Fatalf("waiting decision status/code = %q/%q", waiting.Status, waiting.Code)
+	}
+
+	runnable := EvaluateDaemonTaskSelection(snapshot, time.Date(2026, 5, 1, 12, 6, 0, 0, time.UTC), policy)
+	if !runnable.Eligible {
+		t.Fatalf("Eligible = false, want true (%q)", runnable.Reason)
+	}
+	if runnable.Status != DaemonSelectionStatusRunnable || runnable.Code != DaemonSelectionCodeRunnable {
+		t.Fatalf("runnable decision status/code = %q/%q", runnable.Status, runnable.Code)
 	}
 }
 

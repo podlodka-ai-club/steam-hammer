@@ -1107,6 +1107,171 @@ func TestRunIssueUsesGoNativeHappyPath(t *testing.T) {
 	}
 }
 
+func TestRunIssueNoopWithExplanationPersistsStructuredReason(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 1},
+		{ExitCode: 2},
+		{},
+		{},
+		{Stdout: ""},
+		{Stdout: "\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+	}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{Output: strings.Join([]string{
+		"Done",
+		orchestration.NoOpResultMarker,
+		"```json",
+		`{"explanation":"Feature appears already implemented; verified by inspecting issue handler and existing tests","next_action":"Run go test ./... to verify the current behavior"}`,
+		"```",
+	}, "\n")}}
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if len(lifecycle.commentBodies[71]) != 3 {
+		t.Fatalf("comment bodies = %d, want 3 (state + explanation + final state)", len(lifecycle.commentBodies[71]))
+	}
+	if !strings.Contains(lifecycle.commentBodies[71][1], "Automation finished without code changes") {
+		t.Fatalf("noop comment = %q, want explanation heading", lifecycle.commentBodies[71][1])
+	}
+	finalState, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][2])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody(final) error = %v", err)
+	}
+	if finalState.Status != orchestration.StatusFailed || finalState.NextAction != "inspect_noop_result" {
+		t.Fatalf("final state = %#v, want failed inspect_noop_result", finalState)
+	}
+	if !strings.Contains(finalState.Error, "Feature appears already implemented") {
+		t.Fatalf("final error = %q, want persisted explanation", finalState.Error)
+	}
+	if !strings.Contains(out.String(), "recorded no-op explanation") {
+		t.Fatalf("stdout = %q, want no-op summary", out.String())
+	}
+}
+
+func TestRunIssueNoopWithoutExplanationFailsAsAgentQualityIssue(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 1},
+		{ExitCode: 2},
+		{},
+		{},
+		{Stdout: ""},
+		{Stdout: "\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+	}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{Output: "Done, no edits required."}}
+	var errOut strings.Builder
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo"})
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	if len(lifecycle.commentBodies[71]) != 2 {
+		t.Fatalf("comment bodies = %d, want 2 (state + failed state)", len(lifecycle.commentBodies[71]))
+	}
+	finalState, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][1])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody(final) error = %v", err)
+	}
+	if finalState.Status != orchestration.StatusFailed || finalState.NextAction != "inspect_noop_explanation" {
+		t.Fatalf("final state = %#v, want failed inspect_noop_explanation", finalState)
+	}
+	if strings.Contains(strings.ToLower(finalState.Status), "waiting-for-author") {
+		t.Fatalf("final state = %#v, want hard failure not waiting-for-author", finalState)
+	}
+	if !strings.Contains(finalState.Error, "did not provide a no-op explanation") {
+		t.Fatalf("final error = %q, want explicit no-op explanation failure", finalState.Error)
+	}
+	if !strings.Contains(errOut.String(), orchestration.NoOpResultMarker) {
+		t.Fatalf("stderr = %q, want missing marker guidance", errOut.String())
+	}
+}
+
+func TestRunIssueNoopWithQuestionPausesForAuthor(t *testing.T) {
+	runner := &recordingRunner{}
+	shell := &fakeShellExecutor{results: []shellExecutionResult{
+		{Stdout: "/repo\n"},
+		{Stdout: ""},
+		{Stdout: "main\n"},
+		{ExitCode: 1},
+		{ExitCode: 2},
+		{},
+		{},
+		{Stdout: ""},
+		{Stdout: "\n"},
+		{Stdout: "issue-fix/71-fix-runner\n"},
+		{Stdout: "/repo\n"},
+	}}
+	lifecycle := &fakeDaemonLifecycle{
+		issue:         githublifecycle.Issue{Number: 71, Title: "Fix runner", Body: "Issue body", URL: "https://github.com/owner/repo/issues/71", Tracker: githublifecycle.TrackerGitHub},
+		defaultBranch: "main",
+	}
+	agent := &fakeIssueAgentRunner{result: &agentexec.Result{Output: strings.Join([]string{
+		"Done",
+		orchestration.NoOpResultMarker,
+		"```json",
+		`{"explanation":"I need one product decision before changing behavior","question":"Should we prefer retryable failure or explicit author pause for this edge case?"}`,
+		"```",
+	}, "\n")}}
+	var out strings.Builder
+	app := NewApp(&out, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetShellExecutor(shell)
+	app.SetIssueLifecycle(lifecycle)
+	app.SetIssueAgentRunner(agent)
+
+	code := app.Run([]string{"run", "issue", "--id", "71", "--repo", "owner/repo", "--dir", "/repo"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if len(lifecycle.commentBodies[71]) != 3 {
+		t.Fatalf("comment bodies = %d, want 3 (state + explanation + final state)", len(lifecycle.commentBodies[71]))
+	}
+	finalState, err := orchestration.ParseOrchestrationStateCommentBody(lifecycle.commentBodies[71][2])
+	if err != nil {
+		t.Fatalf("ParseOrchestrationStateCommentBody(final) error = %v", err)
+	}
+	if finalState.Status != orchestration.StatusWaitingForAuthor || finalState.NextAction != "await_author_reply" {
+		t.Fatalf("final state = %#v, want waiting-for-author await_author_reply", finalState)
+	}
+	if !strings.Contains(finalState.Error, "Question:") {
+		t.Fatalf("final error = %q, want persisted question", finalState.Error)
+	}
+	if !strings.Contains(out.String(), "posted clarification question and paused") {
+		t.Fatalf("stdout = %q, want clarification summary", out.String())
+	}
+}
+
 func TestRunIssueNativePersistsAutonomousSessionCheckpoint(t *testing.T) {
 	runner := &recordingRunner{}
 	shell := &fakeShellExecutor{results: []shellExecutionResult{
@@ -1748,6 +1913,40 @@ func TestRunBatchDryRunWiresNativeWorkerPerIssue(t *testing.T) {
 	}
 }
 
+func TestRunBatchDryRunUsesNativeIssueWorkerForGitHubIssues(t *testing.T) {
+	runner := &recordingRunner{}
+	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
+	lifecycle := &fakeDaemonLifecycle{commentsByIssue: map[int][]githublifecycle.IssueComment{}}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetExecutablePath(execPath)
+	app.SetIssueLifecycle(lifecycle)
+
+	code := app.Run([]string{"run", "batch", "--ids", "71,72", "--repo", "owner/repo", "--dry-run", "--base", "current"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 2 {
+		t.Fatalf("runner calls = %d, want 2", runner.calls)
+	}
+	for _, cmd := range runner.cmds {
+		assertNativeWorkerCommand(t, cmd, execPath, "issue")
+		if got := flagValue(cmd[1:], "--repo"); got != "owner/repo" {
+			t.Fatalf("worker repo = %q, want owner/repo; cmd=%#v", got, cmd)
+		}
+		if got := flagValue(cmd[1:], "--base"); got != "current" {
+			t.Fatalf("worker base = %q, want current; cmd=%#v", got, cmd)
+		}
+	}
+	if got := flagValue(runner.cmds[0][1:], "--id"); got != "71" {
+		t.Fatalf("first worker issue = %q, want 71", got)
+	}
+	if got := flagValue(runner.cmds[1][1:], "--id"); got != "72" {
+		t.Fatalf("second worker issue = %q, want 72", got)
+	}
+}
+
 func TestRunBatchDetachStartsOneWorkerPerIssue(t *testing.T) {
 	starter := &recordingDetachedStarter{pid: 31337}
 	cloner := &recordingBatchClonePreparer{}
@@ -2270,6 +2469,37 @@ func TestRunDaemonCommandWiresNativeIssueWorker(t *testing.T) {
 	assertCommandContainsFlag(t, runner.args, "--autonomous-session-file")
 }
 
+func TestRunDaemonSelectedGitHubIssueUsesNativeIssueWorker(t *testing.T) {
+	runner := &recordingRunner{}
+	targetDir := t.TempDir()
+	execPath := filepath.Join(targetDir, "orchestrator")
+	lifecycle := &fakeDaemonLifecycle{
+		issues:          []githublifecycle.Issue{{Number: 71, Tracker: githublifecycle.TrackerGitHub}},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	}
+	app := NewApp(&strings.Builder{}, &strings.Builder{})
+	app.SetRunner(runner)
+	app.SetExecutablePath(execPath)
+	app.SetDaemonLifecycle(lifecycle)
+	app.SetIssueLifecycle(lifecycle)
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--limit", "1", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	assertNativeWorkerCommand(t, runner.cmds[0], execPath, "issue")
+	if got := flagValue(runner.args, "--id"); got != "71" {
+		t.Fatalf("worker issue = %q, want 71; args=%#v", got, runner.args)
+	}
+	if got := flagValue(runner.args, "--repo"); got != "owner/repo" {
+		t.Fatalf("worker repo = %q, want owner/repo; args=%#v", got, runner.args)
+	}
+	assertCommandContainsFlag(t, runner.args, "--autonomous-session-file")
+}
+
 func TestRunDaemonRequiresLiveSideEffectsOptIn(t *testing.T) {
 	runner := &recordingRunner{}
 	var errOut strings.Builder
@@ -2656,6 +2886,74 @@ func TestRunDaemonAllowsIssueWhenAllDependenciesClosed(t *testing.T) {
 	}
 	if got := issueIDFlagValue(runner.cmds[0][1:]); got != "330" {
 		t.Fatalf("selected issue = %q, want 330", got)
+	}
+}
+
+func TestRunDaemonAppliesScopeAllowLabelsFromProjectConfig(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	targetDir := t.TempDir()
+	projectConfigPath := filepath.Join(targetDir, "project-config.json")
+	config := `{"scope":{"defaults":{"labels":{"allow":["demo"]}}}}`
+	if err := os.WriteFile(projectConfigPath, []byte(config), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", projectConfigPath, err)
+	}
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{
+			{Number: 370, Labels: []githublifecycle.Label{{Name: "bug"}}},
+			{Number: 371, Labels: []githublifecycle.Label{{Name: "demo"}}},
+		},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--project-config", projectConfigPath, "--limit", "2", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if got := flagValue(runner.cmds[0][1:], "--issue"); got != "371" {
+		t.Fatalf("selected issue = %q, want 371", got)
+	}
+	if !strings.Contains(errOut.String(), "scope_label_mismatch") {
+		t.Fatalf("stderr = %q, want scope-label mismatch skip reason", errOut.String())
+	}
+}
+
+func TestRunDaemonAppliesScopeDenyLabelsFromProjectConfig(t *testing.T) {
+	runner := &recordingRunner{}
+	var errOut strings.Builder
+	targetDir := t.TempDir()
+	projectConfigPath := filepath.Join(targetDir, "project-config.json")
+	config := `{"scope":{"defaults":{"labels":{"allow":["demo"],"deny":["human discussion"]}}}}`
+	if err := os.WriteFile(projectConfigPath, []byte(config), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", projectConfigPath, err)
+	}
+	app := NewApp(&strings.Builder{}, &errOut)
+	app.SetRunner(runner)
+	app.SetDaemonLifecycle(&fakeDaemonLifecycle{
+		issues: []githublifecycle.Issue{
+			{Number: 372, Labels: []githublifecycle.Label{{Name: "demo"}, {Name: "human discussion"}}},
+			{Number: 373, Labels: []githublifecycle.Label{{Name: "demo"}}},
+		},
+		commentsByIssue: map[int][]githublifecycle.IssueComment{},
+	})
+
+	code := app.Run([]string{"run", "daemon", "--repo", "owner/repo", "--dir", targetDir, "--project-config", projectConfigPath, "--limit", "2", "--poll-interval-seconds", "0", "--max-cycles", "1", "--dry-run"})
+	if code != 0 {
+		t.Fatalf("Run() code = %d, want 0", code)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if got := flagValue(runner.cmds[0][1:], "--issue"); got != "373" {
+		t.Fatalf("selected issue = %q, want 373", got)
+	}
+	if !strings.Contains(errOut.String(), "denied_by_label") {
+		t.Fatalf("stderr = %q, want denied-by-label skip reason", errOut.String())
 	}
 }
 
@@ -4147,6 +4445,87 @@ func TestStatusWorkersJSONListsRegistryEntries(t *testing.T) {
 	}
 }
 
+func TestStatusMergeQueuePlanJSONScenarios(t *testing.T) {
+	baseReadiness := &orchestration.PRMergeReadiness{
+		Status:              orchestration.StatusReadyToMerge,
+		ReviewDecision:      orchestration.ReviewDecisionApproved,
+		MergeReadinessState: orchestration.MergeReadinessClean,
+		MergeResultVerification: &orchestration.VerificationVerdict{
+			Status: "passed",
+		},
+	}
+	basePolicy := &orchestration.MergePolicy{Auto: true, Method: "squash"}
+
+	tests := []struct {
+		name          string
+		issueState    orchestration.TrackedState
+		prState       orchestration.TrackedState
+		issueNumber   int
+		prNumber      int
+		branch        string
+		wantEligible  int
+		wantSkip      string
+		withLinkedPR  bool
+		withPRState   bool
+		issueCIChecks []orchestration.PRCICheck
+	}{
+		{name: "eligible pr", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(71), PR: intPtr(101), Branch: "issue-fix/71", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(71), PR: intPtr(101), Branch: "issue-fix/71", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 71, prNumber: 101, branch: "issue-fix/71", wantEligible: 1, withLinkedPR: true, withPRState: true},
+		{name: "missing verification", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(72), PR: intPtr(102), Branch: "issue-fix/72", MergeReadiness: &orchestration.PRMergeReadiness{Status: orchestration.StatusReadyToMerge, ReviewDecision: orchestration.ReviewDecisionApproved, MergeReadinessState: orchestration.MergeReadinessClean}, MergePolicy: basePolicy}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(72), PR: intPtr(102), Branch: "issue-fix/72", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 72, prNumber: 102, branch: "issue-fix/72", wantSkip: "missing-verification", withLinkedPR: true, withPRState: true},
+		{name: "stale linked state", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(73), PR: intPtr(103), Branch: "issue-fix/73", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(73), PR: intPtr(103), Branch: "other-branch", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 73, prNumber: 103, branch: "issue-fix/73", wantSkip: "stale-linked-state", withLinkedPR: true, withPRState: true},
+		{name: "review required", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(74), PR: intPtr(104), Branch: "issue-fix/74", MergeReadiness: &orchestration.PRMergeReadiness{Status: orchestration.StatusReadyToMerge, ReviewDecision: orchestration.ReviewDecisionReviewRequired, MergeReadinessState: orchestration.MergeReadinessClean, MergeResultVerification: &orchestration.VerificationVerdict{Status: "passed"}}, MergePolicy: basePolicy}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(74), PR: intPtr(104), Branch: "issue-fix/74", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 74, prNumber: 104, branch: "issue-fix/74", wantSkip: "review-required", withLinkedPR: true, withPRState: true},
+		{name: "ci failing", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(75), PR: intPtr(105), Branch: "issue-fix/75", MergeReadiness: baseReadiness, MergePolicy: basePolicy, CIChecks: []orchestration.PRCICheck{{Name: "ci/test", State: "failure"}}}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(75), PR: intPtr(105), Branch: "issue-fix/75", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 75, prNumber: 105, branch: "issue-fix/75", wantSkip: "ci-failing", withLinkedPR: true, withPRState: true},
+		{name: "conflict", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(76), PR: intPtr(106), Branch: "issue-fix/76", MergeReadiness: &orchestration.PRMergeReadiness{Status: orchestration.StatusReadyToMerge, ReviewDecision: orchestration.ReviewDecisionApproved, MergeReadinessState: orchestration.MergeReadinessConflicting, MergeResultVerification: &orchestration.VerificationVerdict{Status: "passed"}}, MergePolicy: basePolicy}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(76), PR: intPtr(106), Branch: "issue-fix/76", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 76, prNumber: 106, branch: "issue-fix/76", wantSkip: "merge-conflict", withLinkedPR: true, withPRState: true},
+		{name: "merge policy disabled", issueState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(77), PR: intPtr(107), Branch: "issue-fix/77", MergeReadiness: baseReadiness, MergePolicy: &orchestration.MergePolicy{Auto: false, Method: "squash"}}, prState: orchestration.TrackedState{Status: orchestration.StatusReadyToMerge, Issue: intPtr(77), PR: intPtr(107), Branch: "issue-fix/77", MergeReadiness: baseReadiness, MergePolicy: basePolicy}, issueNumber: 77, prNumber: 107, branch: "issue-fix/77", wantSkip: "merge-policy-disabled", withLinkedPR: true, withPRState: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issueBody, err := orchestration.BuildOrchestrationStateComment(tt.issueState)
+			if err != nil {
+				t.Fatalf("BuildOrchestrationStateComment(issue) error = %v", err)
+			}
+			lifecycle := &fakeDaemonLifecycle{
+				issues:         []githublifecycle.Issue{{Number: tt.issueNumber, Title: "Issue", Body: "Body", URL: "https://github.com/owner/repo/issues/" + strconv.Itoa(tt.issueNumber)}},
+				commentsByIssue: map[int][]githublifecycle.IssueComment{tt.issueNumber: {{ID: 1, Body: issueBody, CreatedAt: "2026-05-01T12:00:00Z"}}},
+			}
+			if tt.withLinkedPR {
+				lifecycle.linkedPR = &githublifecycle.PullRequest{Number: tt.prNumber, HeadRefName: tt.branch, BaseRefName: "main", URL: "https://github.com/owner/repo/pull/" + strconv.Itoa(tt.prNumber)}
+			}
+			if tt.withPRState {
+				prBody, err := orchestration.BuildOrchestrationStateComment(tt.prState)
+				if err != nil {
+					t.Fatalf("BuildOrchestrationStateComment(pr) error = %v", err)
+				}
+				lifecycle.conversation = []githublifecycle.PullRequestConversationComment{{Body: prBody, URL: "https://github.com/owner/repo/pull/" + strconv.Itoa(tt.prNumber) + "#issuecomment-1"}}
+			}
+
+			var out, errOut strings.Builder
+			app := NewApp(&out, &errOut)
+			app.SetDaemonLifecycle(lifecycle)
+			code := app.Run([]string{"status", "--repo", "owner/repo", "--merge-queue-plan", "--json"})
+			if code != 0 {
+				t.Fatalf("Run() code = %d, want 0, stderr=%q", code, errOut.String())
+			}
+			var payload mergeQueuePlanReport
+			if err := json.Unmarshal([]byte(out.String()), &payload); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v\n%s", err, out.String())
+			}
+			if got := len(payload.Eligible); got != tt.wantEligible {
+				t.Fatalf("eligible len = %d, want %d", got, tt.wantEligible)
+			}
+			if tt.wantSkip != "" {
+				if len(payload.Skipped) != 1 {
+					t.Fatalf("skipped len = %d, want 1", len(payload.Skipped))
+				}
+				if payload.Skipped[0].Reason != tt.wantSkip {
+					t.Fatalf("skip reason = %q, want %q", payload.Skipped[0].Reason, tt.wantSkip)
+				}
+			}
+		})
+	}
+}
+
+
 func assertCommand(t *testing.T, runner *recordingRunner, wantArgs []string) {
 	t.Helper()
 	if runner.calls != 1 {
@@ -4157,6 +4536,22 @@ func assertCommand(t *testing.T, runner *recordingRunner, wantArgs []string) {
 	}
 	if !reflect.DeepEqual(stripFlagPair(runner.args, "--autonomous-session-file"), wantArgs) {
 		t.Fatalf("runner args = %#v, want %#v", runner.args, wantArgs)
+	}
+}
+
+func assertNativeWorkerCommand(t *testing.T, cmd []string, execPath string, target string) {
+	t.Helper()
+	if len(cmd) < 3 {
+		t.Fatalf("worker command = %#v, want native run %s command", cmd, target)
+	}
+	if cmd[0] != execPath {
+		t.Fatalf("worker command = %q, want native executable %q", cmd[0], execPath)
+	}
+	if cmd[0] == "python3" || strings.Contains(strings.Join(cmd, "\x00"), runnerScript) {
+		t.Fatalf("worker command = %#v, should not use python runner fallback", cmd)
+	}
+	if !reflect.DeepEqual(cmd[1:3], []string{"run", target}) {
+		t.Fatalf("worker args = %#v, want native run %s entrypoint", cmd[1:], target)
 	}
 }
 

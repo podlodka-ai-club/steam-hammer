@@ -52,3 +52,17 @@ func BuildClarificationRequestComment(question, reason string) string {
 	lines = append(lines, "", "Next action: reply here and rerun the orchestrator.")
 	return strings.Join(lines, "\n")
 }
+
+func BuildNoOpResultComment(explanation, nextAction string) string {
+	explanation = strings.TrimSpace(explanation)
+	nextAction = strings.TrimSpace(nextAction)
+	lines := []string{
+		"Automation finished without code changes and reported this reason:",
+		"",
+		explanation,
+	}
+	if nextAction != "" {
+		lines = append(lines, "", "Suggested next action: "+nextAction)
+	}
+	return strings.Join(lines, "\n")
+}

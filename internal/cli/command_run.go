@@ -528,71 +528,12 @@ func (a *App) buildBatchWorkerLaunchCommand(ctx context.Context, opts commonOpti
 		name: "python3",
 		args: buildIssuePythonArgs(a.runtime.RunnerScript(), opts, id, base, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch, syncStrategy, fs),
 	}
-	if strings.TrimSpace(*opts.repo) == "" {
+	repo := strings.TrimSpace(*opts.repo)
+	if repo == "" {
 		pythonIssue.fallbackReason = "native worker dispatch requires --repo"
 		return pythonIssue
 	}
-	if a.issueLifecycle == nil {
-		pythonIssue.fallbackReason = "native worker dispatch requires issue lifecycle dependencies"
-		return pythonIssue
-	}
-
-	issue, err := a.issueLifecycle.FetchIssue(ctx, strings.TrimSpace(*opts.repo), id)
-	if err != nil {
-		pythonIssue.fallbackReason = fmt.Sprintf("failed to inspect issue #%d for native dispatch: %v", id, err)
-		return pythonIssue
-	}
-	comments, err := a.issueLifecycle.ListIssueComments(ctx, strings.TrimSpace(*opts.repo), id)
-	if err != nil {
-		pythonIssue.fallbackReason = fmt.Sprintf("failed to inspect issue #%d comments for native dispatch: %v", id, err)
-		return pythonIssue
-	}
-	trackerComments := make([]orchestration.TrackerComment, 0, len(comments))
-	for _, comment := range comments {
-		trackerComments = append(trackerComments, orchestration.TrackerComment{ID: comment.ID, CreatedAt: comment.CreatedAt, HTMLURL: comment.HTMLURL, Body: comment.Body})
-	}
-	recoveredState, _ := orchestration.SelectLatestParseableOrchestrationState(trackerComments, fmt.Sprintf("issue #%d", id))
-	linkedPR, err := a.issueLifecycle.FindOpenPullRequestForIssue(ctx, strings.TrimSpace(*opts.repo), issue)
-	if err != nil {
-		pythonIssue.fallbackReason = fmt.Sprintf("failed to inspect linked PR for issue #%d: %v", id, err)
-		return pythonIssue
-	}
-	if linkedPR != nil && prNeedsConflictRecovery(*linkedPR) {
-		pythonPR := workerLaunchCommand{
-			name: "python3",
-			args: buildPRPythonArgs(a.runtime.RunnerScript(), opts, linkedPR.Number, false, true, false, "", true, syncStrategy),
-		}
-		if reason := nativePRFallbackReason(nativePROptions{prID: linkedPR.Number, common: opts, conflictRecoveryOnly: true, syncStrategy: syncStrategy}); reason != "" {
-			pythonPR.fallbackReason = reason
-			return pythonPR
-		}
-		execPath, err := a.currentExecutable()
-		if err != nil {
-			pythonPR.fallbackReason = fmt.Sprintf("failed to resolve orchestrator executable: %v", err)
-			return pythonPR
-		}
-		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, false, false, false, "", true, syncStrategy)}
-	}
-	decision := orchestration.ChooseExecutionMode(id, linkedPRNumber(linkedPR), forceIssueFlow, parsedStatePayload(recoveredState), nil)
-
-	if decision.Mode == orchestration.ExecutionModePRReview && linkedPR != nil {
-		pythonPR := workerLaunchCommand{
-			name: "python3",
-			args: buildPRPythonArgs(a.runtime.RunnerScript(), opts, linkedPR.Number, false, true, false, "", false, ""),
-		}
-		if reason := nativePRFallbackReason(nativePROptions{prID: linkedPR.Number, common: opts}); reason != "" {
-			pythonPR.fallbackReason = reason
-			return pythonPR
-		}
-		execPath, err := a.currentExecutable()
-		if err != nil {
-			pythonPR.fallbackReason = fmt.Sprintf("failed to resolve orchestrator executable: %v", err)
-			return pythonPR
-		}
-		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, false, true, false, "", false, "")}
-	}
-
-	if reason := nativeIssueWorkerDispatchFallbackReason(nativeIssueOptions{
+	if reason := nativeIssueFallbackReason(nativeIssueOptions{
 		issueID:              id,
 		common:               opts,
 		base:                 base,
@@ -617,7 +558,53 @@ func (a *App) buildBatchWorkerLaunchCommand(ctx context.Context, opts commonOpti
 		pythonIssue.fallbackReason = fmt.Sprintf("failed to resolve orchestrator executable: %v", err)
 		return pythonIssue
 	}
-	return workerLaunchCommand{name: execPath, args: buildIssueCLIArgs(opts, id, base, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch, syncStrategy, fs)}
+	nativeIssue := workerLaunchCommand{name: execPath, args: buildIssueCLIArgs(opts, id, base, includeEmpty, stopOnError, failOnExisting, forceIssueFlow, skipIfPRExists, noSkipIfPRExists, skipIfBranchExists, noSkipIfBranchExists, forceReprocess, conflictRecoveryOnly, syncReusedBranch, noSyncReusedBranch, syncStrategy, fs)}
+	if a.issueLifecycle == nil {
+		return nativeIssue
+	}
+
+	issue, err := a.issueLifecycle.FetchIssue(ctx, repo, id)
+	if err != nil {
+		return nativeIssue
+	}
+	comments, err := a.issueLifecycle.ListIssueComments(ctx, repo, id)
+	if err != nil {
+		return nativeIssue
+	}
+	trackerComments := make([]orchestration.TrackerComment, 0, len(comments))
+	for _, comment := range comments {
+		trackerComments = append(trackerComments, orchestration.TrackerComment{ID: comment.ID, CreatedAt: comment.CreatedAt, HTMLURL: comment.HTMLURL, Body: comment.Body})
+	}
+	recoveredState, _ := orchestration.SelectLatestParseableOrchestrationState(trackerComments, fmt.Sprintf("issue #%d", id))
+	linkedPR, err := a.issueLifecycle.FindOpenPullRequestForIssue(ctx, repo, issue)
+	if err != nil {
+		return nativeIssue
+	}
+	if linkedPR != nil && prNeedsConflictRecovery(*linkedPR) {
+		pythonPR := workerLaunchCommand{
+			name: "python3",
+			args: buildPRPythonArgs(a.runtime.RunnerScript(), opts, linkedPR.Number, false, true, false, "", true, syncStrategy),
+		}
+		if reason := nativePRFallbackReason(nativePROptions{prID: linkedPR.Number, common: opts, conflictRecoveryOnly: true, syncStrategy: syncStrategy}); reason != "" {
+			pythonPR.fallbackReason = reason
+			return pythonPR
+		}
+		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, false, false, false, "", true, syncStrategy)}
+	}
+	decision := orchestration.ChooseExecutionMode(id, linkedPRNumber(linkedPR), forceIssueFlow, parsedStatePayload(recoveredState), nil)
+
+	if decision.Mode == orchestration.ExecutionModePRReview && linkedPR != nil {
+		pythonPR := workerLaunchCommand{
+			name: "python3",
+			args: buildPRPythonArgs(a.runtime.RunnerScript(), opts, linkedPR.Number, false, true, false, "", false, ""),
+		}
+		if reason := nativePRFallbackReason(nativePROptions{prID: linkedPR.Number, common: opts}); reason != "" {
+			pythonPR.fallbackReason = reason
+			return pythonPR
+		}
+		return workerLaunchCommand{name: execPath, args: buildPRCLIArgs(opts, linkedPR.Number, false, true, false, "", false, "")}
+	}
+	return nativeIssue
 }
 
 func (a *App) selectDaemonIssues(ctx context.Context, config daemonParallelConfig, handled daemonHandledState) ([]daemonSelectedIssue, error) {
